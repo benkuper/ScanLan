@@ -1,0 +1,71 @@
+# JavaScript / Svelte
+/node_modules/
+/dist/
+/.svelte-kit/
+/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Tauri / Rust
+/src-tauri/target/
+/src-tauri/gen/
+**/*.rs.bk
+
+# Python
+/.venv/
+/venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+/worker/build/
+/worker/dist/
+*.spec.bak
+
+# Native / CMake outputs
+/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/*.vcxproj*
+**/*.sln
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.exe
+*.dll
+
+# Runtime data, logs, and crash reports
+/Log/
+/src-tauri/Log/
+*.log
+*.log.txt
+*.dmp
+/scan-*/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scanlan-worker"
+version = "0.1.0"
+description = "Offline phased RGB-D registration and point-cloud export for ScanLan"
+license = "GPL-3.0-only"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26,<3"]
+
+[project.urls]
+Repository = "https://github.com/benkuper/ScanLan"
+
+[project.optional-dependencies]
+reconstruction = ["open3d>=0.19,<0.20"]
+build = ["pyinstaller>=6.0"]
+
+[project.scripts]
+scanlan-worker = "scanlan.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scanlan*"]

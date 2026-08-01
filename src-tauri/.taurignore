@@ -1,0 +1,4 @@
+# Orbbec SDK writes its runtime log here because the dev app inherits
+# src-tauri as its working directory. Runtime log writes must not restart
+# the Tauri dev process.
+Log/

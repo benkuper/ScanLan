@@ -1,0 +1,32 @@
+[package]
+name = "scanlan"
+version = "0.1.0"
+description = "Phased RGB-D capture and point-cloud reconstruction"
+authors = ["ScanLan contributors"]
+license = "GPL-3.0-only"
+repository = "https://github.com/benkuper/ScanLan"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "scanlan_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2.7.2"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

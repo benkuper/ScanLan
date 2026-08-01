@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ScanLan",
+  "version": "0.1.0",
+  "identifier": "io.github.benkuper.scanlan",
+  "build": {
+    "beforeDevCommand": "npm run desktop:dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run desktop:build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ScanLan",
+        "width": 1460,
+        "height": 900,
+        "minWidth": 1080,
+        "minHeight": 720,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data: blob:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "shortDescription": "Capture phased RGB-D scans and reconstruct them offline.",
+    "longDescription": "ScanLan records calibrated RGB-D phases from Kinect v2, Azure Kinect DK, or Orbbec Femto Mega and reconstructs a colored point cloud plus an RGB-reprojected textured mesh.",
+    "resources": {
+      "../build/kinect-capture/Release": "legacy",
+      "../build/modern-capture/Release": "modern",
+      "../worker/dist/scanlan-worker.exe": "scanlan-worker.exe"
+    }
+  }
+}

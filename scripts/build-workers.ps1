@@ -1,0 +1,154 @@
+$ErrorActionPreference = "Stop"
+
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$BuildRoot = Join-Path $ProjectRoot "build"
+$KinectBuild = Join-Path $BuildRoot "kinect-capture"
+$ModernCaptureBuild = Join-Path $BuildRoot "modern-capture"
+$WorkerVenv = Join-Path $BuildRoot "worker-venv"
+$CudaWheelRoot = Join-Path $BuildRoot "open3d-cuda-wheel"
+$WorkerBuildStamp = Join-Path $ProjectRoot "worker/dist/scanlan-worker.build.json"
+
+New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
+
+$CMakeCommand = Get-Command cmake -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
+if (-not $CMakeCommand) {
+  $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+  if (Test-Path $VsWhere) {
+    $VisualStudioRoot = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if ($VisualStudioRoot) {
+      $BundledCMake = Join-Path $VisualStudioRoot "Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
+      if (Test-Path $BundledCMake) {
+        $CMakeCommand = $BundledCMake
+      }
+    }
+  }
+}
+
+if (-not $CMakeCommand) {
+  throw "CMake was not found. Install Visual Studio with the Desktop development with C++ workload."
+}
+
+& $CMakeCommand -S (Join-Path $ProjectRoot "native/kinect-capture") -B $KinectBuild -A x64
+if ($LASTEXITCODE -ne 0) { throw "Kinect capture worker configuration failed." }
+& $CMakeCommand --build $KinectBuild --config Release
+if ($LASTEXITCODE -ne 0) { throw "Kinect capture worker build failed." }
+& $CMakeCommand -S (Join-Path $ProjectRoot "native/modern-capture") -B $ModernCaptureBuild -A x64
+if ($LASTEXITCODE -ne 0) { throw "Modern sensor worker configuration failed." }
+& $CMakeCommand --build $ModernCaptureBuild --config Release
+if ($LASTEXITCODE -ne 0) { throw "Modern sensor worker build failed." }
+
+$ReconstructionExe = Join-Path $ProjectRoot "worker/dist/scanlan-worker.exe"
+$CudaWheel = Get-ChildItem -Path $CudaWheelRoot -Filter "open3d*.whl" -File -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTimeUtc -Descending |
+  Select-Object -First 1
+if ($CudaWheel) {
+  $CudaRoots = @()
+  if ($env:CUDA_PATH) { $CudaRoots += $env:CUDA_PATH }
+  $CudaInstallRoot = Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit/CUDA"
+  if (Test-Path $CudaInstallRoot) {
+    $CudaRoots += Get-ChildItem -Path $CudaInstallRoot -Directory |
+      Sort-Object Name -Descending |
+      Select-Object -ExpandProperty FullName
+  }
+  $CudaRuntimeBin = $CudaRoots |
+    ForEach-Object { Join-Path $_ "bin/x64" } |
+    Where-Object { Test-Path (Join-Path $_ "cudart64_13.dll") } |
+    Select-Object -First 1
+  if (-not $CudaRuntimeBin) {
+    throw "A CUDA wheel is present, but its CUDA 13 runtime DLL directory was not found."
+  }
+  # CUDA 13 installs redistributable DLLs below bin/x64. Put it first so
+  # Open3D can load CUDA and PyInstaller can discover and embed dependencies.
+  $env:PATH = $CudaRuntimeBin + [IO.Path]::PathSeparator + $env:PATH
+}
+$RuntimeKey = if ($CudaWheel) {
+  "cuda:$($CudaWheel.Name):$((Get-FileHash -Algorithm SHA256 $CudaWheel.FullName).Hash)"
+} else {
+  "pypi:open3d>=0.19,<0.20"
+}
+$WorkerSources = @(
+  Get-ChildItem -Path (Join-Path $ProjectRoot "worker/scanlan") -Recurse -File |
+    Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' }
+  Get-Item -Path (Join-Path $ProjectRoot "worker/entry.py")
+  Get-Item -Path (Join-Path $ProjectRoot "worker/pyproject.toml")
+  Get-Item -Path (Join-Path $ProjectRoot "worker/scanlan-worker.spec")
+  Get-Item -Path (Join-Path $ProjectRoot "scripts/build-workers.ps1")
+)
+$NewestWorkerSource = $WorkerSources | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+$NeedsWorkerBuild = -not (Test-Path $ReconstructionExe)
+if (-not $NeedsWorkerBuild -and $NewestWorkerSource) {
+  $NeedsWorkerBuild = $NewestWorkerSource.LastWriteTimeUtc -gt (Get-Item $ReconstructionExe).LastWriteTimeUtc
+}
+if (-not $NeedsWorkerBuild) {
+  try {
+    $PreviousBuild = Get-Content $WorkerBuildStamp -Raw | ConvertFrom-Json
+    $NeedsWorkerBuild = $PreviousBuild.runtimeKey -ne $RuntimeKey
+  } catch {
+    $NeedsWorkerBuild = $true
+  }
+}
+
+if ($NeedsWorkerBuild) {
+  $PythonCommand = $null
+  $PythonArgs = @()
+
+  if (Get-Command py -ErrorAction SilentlyContinue) {
+    foreach ($version in @("3.11", "3.10", "3.12")) {
+      & py -$version -c "import sys; print(sys.executable)" 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) {
+        $PythonCommand = "py"
+        $PythonArgs = @("-$version")
+        break
+      }
+    }
+  }
+
+  if (-not $PythonCommand -and (Get-Command python -ErrorAction SilentlyContinue)) {
+    $PythonCommand = "python"
+  }
+
+  if (-not $PythonCommand) {
+    throw "Python 3.10-3.12 was not found. Install one of those versions to build the bundled reconstruction worker."
+  }
+
+  $WorkerPython = Join-Path $WorkerVenv "Scripts/python.exe"
+  if (-not (Test-Path $WorkerPython)) {
+    if ($PythonCommand -eq "py") {
+      & py @PythonArgs -m venv $WorkerVenv
+    } else {
+      & $PythonCommand -m venv $WorkerVenv
+    }
+  }
+
+  if ($CudaWheel) {
+    Write-Host "Using CUDA-enabled Open3D wheel: $($CudaWheel.FullName)"
+    & $WorkerPython -m pip install -e "$ProjectRoot/worker[build]"
+    if ($LASTEXITCODE -ne 0) { throw "Reconstruction worker dependencies failed to install." }
+    & $WorkerPython -m pip install --force-reinstall --no-deps $CudaWheel.FullName
+    if ($LASTEXITCODE -ne 0) { throw "CUDA-enabled Open3D wheel failed to install." }
+    & $WorkerPython -c "import open3d as o3d; assert o3d._build_config['BUILD_CUDA_MODULE'], 'Open3D wheel is not CUDA-enabled'; assert o3d.core.cuda.is_available(), 'Open3D cannot access a CUDA device'; print(f'Open3D CUDA devices: {o3d.core.cuda.device_count()}')"
+    if ($LASTEXITCODE -ne 0) { throw "The selected Open3D wheel does not contain CUDA support." }
+  } else {
+    & $WorkerPython -m pip install -e "$ProjectRoot/worker[reconstruction,build]"
+    if ($LASTEXITCODE -ne 0) { throw "Reconstruction worker dependencies failed to install." }
+  }
+  Push-Location (Join-Path $ProjectRoot "worker")
+  try {
+    & $WorkerPython -m PyInstaller --noconfirm --clean --onefile --name scanlan-worker --collect-all open3d entry.py
+    if ($LASTEXITCODE -ne 0) { throw "Reconstruction worker packaging failed." }
+  } finally {
+    Pop-Location
+  }
+  $Stamp = @{ runtimeKey = $RuntimeKey; builtAtUtc = [DateTime]::UtcNow.ToString("o") } | ConvertTo-Json
+  [IO.File]::WriteAllText($WorkerBuildStamp, $Stamp + [Environment]::NewLine)
+} else {
+  Write-Host "Reconstruction worker is up to date."
+}
+
+$KinectExe = Join-Path $KinectBuild "Release/legacy-capture-worker.exe"
+$ModernCaptureExe = Join-Path $ModernCaptureBuild "Release/rgbd-capture-worker.exe"
+Write-Host "Kinect worker: $KinectExe"
+Write-Host "Azure Kinect / Femto Mega worker: $ModernCaptureExe"
+Write-Host "Reconstruction worker: $ReconstructionExe"
+Write-Host "Reconstruction backend: $(if ($CudaWheel) { 'CUDA-capable Open3D' } else { 'CPU Open3D' })"
+Write-Host "All workers will be discovered and bundled automatically."

@@ -1,0 +1,39 @@
+{
+  "name": "scanlan",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Phased RGB-D capture and point-cloud reconstruction",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/benkuper/ScanLan.git"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "npm run debug",
+    "debug": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/debug.ps1",
+    "release": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/release.ps1",
+    "dev": "vite --port 1420",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "prepare:runtime": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-workers.ps1",
+    "prepare:cuda": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-open3d-cuda.ps1",
+    "desktop:dev": "npm run prepare:runtime && vite --port 1420",
+    "desktop:build": "npm run prepare:runtime && vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.2",
+    "svelte": "5.56.8",
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.2.0",
+    "@tauri-apps/cli": "2.11.4",
+    "@types/three": "0.185.1",
+    "svelte-check": "4.7.4",
+    "typescript": "6.0.3",
+    "vite": "8.2.0"
+  }
+}

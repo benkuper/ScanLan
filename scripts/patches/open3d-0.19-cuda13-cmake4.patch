@@ -1,0 +1,137 @@
+diff --git a/3rdparty/find_dependencies.cmake b/3rdparty/find_dependencies.cmake
+index 13f6501..2faced9 100644
+--- a/3rdparty/find_dependencies.cmake
++++ b/3rdparty/find_dependencies.cmake
+@@ -171,6 +171,9 @@ set(ExternalProject_CMAKE_ARGS
+     -DCMAKE_CUDA_FLAGS=${CMAKE_CUDA_FLAGS}
+     -DCMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION}
+     -DCMAKE_INSTALL_LIBDIR=${Open3D_INSTALL_LIB_DIR}
++    # CMake 4 removed implicit compatibility with projects declaring a
++    # pre-3.5 minimum. Open3D 0.19 still bundles a few such dependencies.
++    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+     # Always build 3rd party code in Release mode. Ignored by multi-config
+     # generators (XCode, MSVC). MSVC needs matching config anyway.
+     -DCMAKE_BUILD_TYPE=Release
+diff --git a/3rdparty/stdgpu/stdgpu.cmake b/3rdparty/stdgpu/stdgpu.cmake
+index a725f22..e1b4f64 100644
+--- a/3rdparty/stdgpu/stdgpu.cmake
++++ b/3rdparty/stdgpu/stdgpu.cmake
+@@ -4,6 +4,19 @@
+ 
+ include(ExternalProject)
+ 
++if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
++    set(STDGPU_THRUST_INCLUDE_DIR "${CUDAToolkit_LIBRARY_ROOT}/include/cccl")
++    if(NOT EXISTS "${SCANLAN_STDGPU_CUDA13_PATCH}")
++        message(FATAL_ERROR "CUDA 13 stdgpu compatibility patch not found: ${SCANLAN_STDGPU_CUDA13_PATCH}")
++    endif()
++    set(STDGPU_PATCH_COMMAND
++        ${CMAKE_COMMAND} -E chdir <SOURCE_DIR>
++        ${GIT_EXECUTABLE} apply --ignore-whitespace "${SCANLAN_STDGPU_CUDA13_PATCH}")
++else()
++    set(STDGPU_THRUST_INCLUDE_DIR "${CUDAToolkit_INCLUDE_DIRS}")
++    set(STDGPU_PATCH_COMMAND "")
++endif()
++
+ ExternalProject_Add(
+     ext_stdgpu
+     PREFIX stdgpu
+@@ -11,6 +24,7 @@ ExternalProject_Add(
+     URL_HASH SHA256=86e50789bbe21c57f64358c6acbd4481d56c1e45ce9ba1fb5c5c8482c3973215
+     DOWNLOAD_DIR "${OPEN3D_THIRD_PARTY_DOWNLOAD_DIR}/stdgpu"
+     UPDATE_COMMAND ""
++    PATCH_COMMAND ${STDGPU_PATCH_COMMAND}
+     CMAKE_ARGS
+         -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
+         -DCUDAToolkit_ROOT=${CUDAToolkit_LIBRARY_ROOT}
+@@ -19,7 +33,8 @@ ExternalProject_Add(
+         -DSTDGPU_BUILD_TESTS=OFF
+         -DSTDGPU_BUILD_BENCHMARKS=OFF
+         -DSTDGPU_ENABLE_CONTRACT_CHECKS=OFF
+-        -DTHRUST_INCLUDE_DIR=${CUDAToolkit_INCLUDE_DIRS}
++        -DTHRUST_INCLUDE_DIR=${STDGPU_THRUST_INCLUDE_DIR}
++        "-DCMAKE_CXX_FLAGS:STRING=/Zc:preprocessor /DNOMINMAX"
+         ${ExternalProject_CMAKE_ARGS_hidden}
+     CMAKE_CACHE_ARGS    # Lists must be passed via CMAKE_CACHE_ARGS
+         -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
+diff --git a/cpp/open3d/utility/FileSystem.cpp b/cpp/open3d/utility/FileSystem.cpp
+index 604507e..cabf0d1 100644
+--- a/cpp/open3d/utility/FileSystem.cpp
++++ b/cpp/open3d/utility/FileSystem.cpp
+@@ -28,15 +28,11 @@
+ #include <unistd.h>
+ #endif
+ 
+-#ifdef WIN32
+-#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
+-#endif
+-#ifdef __APPLE__
+ #include <filesystem>
++#ifdef __APPLE__
+ namespace fs = std::__fs::filesystem;
+ #else
+-#include <experimental/filesystem>
+-namespace fs = std::experimental::filesystem;
++namespace fs = std::filesystem;
+ #endif
+ 
+ #include "open3d/utility/Logging.h"
+diff --git a/cpp/open3d/core/kernel/NonZeroCUDA.cu b/cpp/open3d/core/kernel/NonZeroCUDA.cu
+index e0cdbcd..0e4f716 100644
+--- a/cpp/open3d/core/kernel/NonZeroCUDA.cu
++++ b/cpp/open3d/core/kernel/NonZeroCUDA.cu
+@@ -9,6 +9,7 @@
+ #include <thrust/execution_policy.h>
+ #include <thrust/for_each.h>
+ #include <thrust/iterator/zip_iterator.h>
++#include <thrust/tuple.h>
+ 
+ #include "open3d/core/CUDAUtils.h"
+ #include "open3d/core/Indexer.h"
+@@ -75,7 +76,7 @@ Tensor NonZeroCUDA(const Tensor& src) {
+         auto it = thrust::copy_if(index_first, index_last, src_ptr,
+                                   non_zero_indices.begin(),
+                                   NonZeroFunctor<scalar_t>());
+-        non_zero_indices.resize(thrust::distance(non_zero_indices.begin(), it));
++        non_zero_indices.resize(it - non_zero_indices.begin());
+     });
+ 
+     // Transform flattened indices to indices in each dimension.
+diff --git a/cpp/open3d/t/geometry/kernel/VoxelBlockGridCUDA.cu b/cpp/open3d/t/geometry/kernel/VoxelBlockGridCUDA.cu
+index fd44cc8..dcf1e8c 100644
+--- a/cpp/open3d/t/geometry/kernel/VoxelBlockGridCUDA.cu
++++ b/cpp/open3d/t/geometry/kernel/VoxelBlockGridCUDA.cu
+@@ -127,7 +127,10 @@ void DepthTouchCUDA(std::shared_ptr<core::HashMap> &hashmap,
+     const index_t step_size = 3;
+     const index_t est_multipler_factor = (step_size + 1);
+ 
+-    static core::Tensor block_coordi;
++    // Keep the scratch allocation scoped to this call. A function-static CUDA
++    // tensor can be destroyed after Python has begun unloading CUDA, turning a
++    // successful worker run into a cudaErrorCudartUnloading shutdown failure.
++    core::Tensor block_coordi;
+     if (block_coordi.GetLength() != est_multipler_factor * n) {
+         block_coordi = core::Tensor({est_multipler_factor * n, 3},
+                                     core::Dtype::Int32, device);
+diff --git a/cpp/pybind/pybind_filesystem.h b/cpp/pybind/pybind_filesystem.h
+index 3617d6c..13f46d4 100644
+--- a/cpp/pybind/pybind_filesystem.h
++++ b/cpp/pybind/pybind_filesystem.h
+@@ -21,15 +21,11 @@
+ 
+ #include <string>
+ 
+-#ifdef WIN32
+-#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
+-#endif
+-#ifdef __APPLE__
+ #include <filesystem>
++#ifdef __APPLE__
+ namespace fs = std::__fs::filesystem;
+ #else
+-#include <experimental/filesystem>
+-namespace fs = std::experimental::filesystem;
++namespace fs = std::filesystem;
+ #endif
+ 
+ namespace pybind11 {
