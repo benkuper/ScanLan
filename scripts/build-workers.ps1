@@ -2,13 +2,54 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BuildRoot = Join-Path $ProjectRoot "build"
+$KinectSource = Join-Path $ProjectRoot "native/kinect-capture"
 $KinectBuild = Join-Path $BuildRoot "kinect-capture"
+$ModernCaptureSource = Join-Path $ProjectRoot "native/modern-capture"
 $ModernCaptureBuild = Join-Path $BuildRoot "modern-capture"
 $WorkerVenv = Join-Path $BuildRoot "worker-venv"
 $CudaWheelRoot = Join-Path $BuildRoot "open3d-cuda-wheel"
 $WorkerBuildStamp = Join-Path $ProjectRoot "worker/dist/scanlan-worker.build.json"
 
 New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
+
+function ConvertTo-ComparablePath {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  return ([IO.Path]::GetFullPath($Path) -replace '\\', '/').TrimEnd('/')
+}
+
+function Reset-StaleCMakeBuild {
+  param(
+    [Parameter(Mandatory = $true)][string]$SourceDirectory,
+    [Parameter(Mandatory = $true)][string]$BuildDirectory
+  )
+
+  $CachePath = Join-Path $BuildDirectory "CMakeCache.txt"
+  if (-not (Test-Path -LiteralPath $CachePath)) { return }
+
+  $CachedSourceEntry = Get-Content -LiteralPath $CachePath |
+    Where-Object { $_ -like "CMAKE_HOME_DIRECTORY:INTERNAL=*" } |
+    Select-Object -First 1
+  $CachedBuildEntry = Get-Content -LiteralPath $CachePath |
+    Where-Object { $_ -like "CMAKE_CACHEFILE_DIR:INTERNAL=*" } |
+    Select-Object -First 1
+  $ExpectedSource = ConvertTo-ComparablePath $SourceDirectory
+  $ExpectedBuild = ConvertTo-ComparablePath $BuildDirectory
+  $CachedSource = if ($CachedSourceEntry) {
+    ConvertTo-ComparablePath ($CachedSourceEntry -replace '^CMAKE_HOME_DIRECTORY:INTERNAL=', '')
+  } else { $null }
+  $CachedBuild = if ($CachedBuildEntry) {
+    ConvertTo-ComparablePath ($CachedBuildEntry -replace '^CMAKE_CACHEFILE_DIR:INTERNAL=', '')
+  } else { $null }
+
+  if (($CachedSource -ine $ExpectedSource) -or ($CachedBuild -ine $ExpectedBuild)) {
+    Write-Host "Removing stale CMake build state from $BuildDirectory"
+    Remove-Item -LiteralPath $BuildDirectory -Recurse -Force
+  }
+}
+
+Reset-StaleCMakeBuild -SourceDirectory $KinectSource -BuildDirectory $KinectBuild
+Reset-StaleCMakeBuild -SourceDirectory $ModernCaptureSource -BuildDirectory $ModernCaptureBuild
 
 $CMakeCommand = Get-Command cmake -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
 if (-not $CMakeCommand) {
@@ -28,11 +69,11 @@ if (-not $CMakeCommand) {
   throw "CMake was not found. Install Visual Studio with the Desktop development with C++ workload."
 }
 
-& $CMakeCommand -S (Join-Path $ProjectRoot "native/kinect-capture") -B $KinectBuild -A x64
+& $CMakeCommand -S $KinectSource -B $KinectBuild -A x64
 if ($LASTEXITCODE -ne 0) { throw "Kinect capture worker configuration failed." }
 & $CMakeCommand --build $KinectBuild --config Release
 if ($LASTEXITCODE -ne 0) { throw "Kinect capture worker build failed." }
-& $CMakeCommand -S (Join-Path $ProjectRoot "native/modern-capture") -B $ModernCaptureBuild -A x64
+& $CMakeCommand -S $ModernCaptureSource -B $ModernCaptureBuild -A x64
 if ($LASTEXITCODE -ne 0) { throw "Modern sensor worker configuration failed." }
 & $CMakeCommand --build $ModernCaptureBuild --config Release
 if ($LASTEXITCODE -ne 0) { throw "Modern sensor worker build failed." }
@@ -124,10 +165,10 @@ if ($NeedsWorkerBuild) {
     Write-Host "Using CUDA-enabled Open3D wheel: $($CudaWheel.FullName)"
     & $WorkerPython -m pip install -e "$ProjectRoot/worker[build]"
     if ($LASTEXITCODE -ne 0) { throw "Reconstruction worker dependencies failed to install." }
-    & $WorkerPython -m pip install --force-reinstall --no-deps $CudaWheel.FullName
+    & $WorkerPython -m pip install --force-reinstall $CudaWheel.FullName
     if ($LASTEXITCODE -ne 0) { throw "CUDA-enabled Open3D wheel failed to install." }
-    & $WorkerPython -c "import open3d as o3d; assert o3d._build_config['BUILD_CUDA_MODULE'], 'Open3D wheel is not CUDA-enabled'; assert o3d.core.cuda.is_available(), 'Open3D cannot access a CUDA device'; print(f'Open3D CUDA devices: {o3d.core.cuda.device_count()}')"
-    if ($LASTEXITCODE -ne 0) { throw "The selected Open3D wheel does not contain CUDA support." }
+    & $WorkerPython -c "import open3d as o3d; assert o3d._build_config['BUILD_CUDA_MODULE'], 'Open3D wheel is not CUDA-enabled'; assert o3d.core.cuda.is_available(), 'Open3D CUDA backend cannot access a compatible device or runtime'; print(f'Open3D CUDA devices: {o3d.core.cuda.device_count()}')"
+    if ($LASTEXITCODE -ne 0) { throw "CUDA-enabled Open3D validation failed. Review the diagnostic above." }
   } else {
     & $WorkerPython -m pip install -e "$ProjectRoot/worker[reconstruction,build]"
     if ($LASTEXITCODE -ne 0) { throw "Reconstruction worker dependencies failed to install." }
