@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "../build/kinect-capture/Release": "legacy",
+      "../build/modern-capture/Release": "modern",
+      "../worker/dist/scanlan-worker.exe": "scanlan-worker.exe",
+      "../splat-worker/dist/scanlan-splat": "splat-runtime"
+    }
+  }
+}

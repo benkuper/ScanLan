@@ -10,6 +10,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(rgbd-capture-worker src/main.cpp)
+target_include_directories(rgbd-capture-worker PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+target_link_libraries(rgbd-capture-worker PRIVATE windowscodecs ole32)
 target_compile_definitions(rgbd-capture-worker PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(rgbd-capture-worker PRIVATE /W4 /permissive- /EHsc)
 

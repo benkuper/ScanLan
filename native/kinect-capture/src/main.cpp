@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <fcntl.h>
 #include <io.h>
+#include "jpeg_writer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,6 +17,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -45,6 +47,8 @@ struct Options {
     std::string name = "Kinect capture";
     int fps = 10;
     float max_depth_m = 4.2F;
+    int rgb_quality = 92;
+    std::uint32_t max_rgb_dimension = 0;
 };
 
 std::string json_escape(const std::string& input) {
@@ -92,6 +96,8 @@ Options parse_options(int argc, char** argv) {
         else if (argument == "--name") options.name = value();
         else if (argument == "--fps") options.fps = std::stoi(value());
         else if (argument == "--max-depth") options.max_depth_m = std::stof(value());
+        else if (argument == "--rgb-quality") options.rgb_quality = std::stoi(value());
+        else if (argument == "--max-rgb-dimension") options.max_rgb_dimension = static_cast<std::uint32_t>(std::stoul(value()));
         else if (argument == "--help") {
             std::cout << "legacy-capture-worker --probe\n"
                          "legacy-capture-worker --preview PATH [--fps 5|10|15] [--max-depth METERS]\n"
@@ -106,6 +112,7 @@ Options parse_options(int argc, char** argv) {
     }
     options.fps = std::clamp(options.fps, 1, 30);
     options.max_depth_m = std::clamp(options.max_depth_m, 0.5F, 4.5F);
+    options.rgb_quality = std::clamp(options.rgb_quality, 60, 100);
     return options;
 }
 
@@ -311,14 +318,19 @@ void write_phase_manifest(
     const std::string& created_at,
     std::uint32_t frame_count,
     std::uint32_t duration_seconds,
-    const std::string& pose_source
+    const std::string& pose_source,
+    std::uint32_t rgb_drops
 ) {
+    const double rgb_scale = options.max_rgb_dimension > 0 && options.max_rgb_dimension < ColorWidth
+        ? static_cast<double>(options.max_rgb_dimension) / ColorWidth : 1.0;
+    const auto rgb_width = static_cast<std::uint32_t>(std::lround(ColorWidth * rgb_scale));
+    const auto rgb_height = static_cast<std::uint32_t>(std::lround(ColorHeight * rgb_scale));
     const fs::path temporary = options.phase_root / "phase.json.tmp";
     std::ofstream output(temporary, std::ios::trunc);
     if (!output) throw std::runtime_error("Could not create phase.json");
     output << std::fixed << std::setprecision(8);
     output << "{\n"
-           << "  \"schemaVersion\": 1,\n"
+           << "  \"schemaVersion\": 3,\n"
            << "  \"id\": \"" << json_escape(options.id) << "\",\n"
            << "  \"name\": \"" << json_escape(options.name) << "\",\n"
            << "  \"createdAt\": \"" << created_at << "\",\n"
@@ -339,7 +351,17 @@ void write_phase_manifest(
            << intrinsics.RadialDistortionSecondOrder << ", "
            << intrinsics.RadialDistortionFourthOrder << ", "
            << intrinsics.RadialDistortionSixthOrder << "]\n"
-           << "  }\n"
+           << "  },\n"
+           << "  \"rgbCamera\": {\n"
+           << "    \"width\": " << rgb_width << ", \"height\": " << rgb_height << ",\n"
+           << "    \"fx\": " << 1081.0 * rgb_scale << ", \"fy\": " << 1081.0 * rgb_scale << ",\n"
+           << "    \"cx\": " << 959.5 * rgb_scale << ", \"cy\": " << 539.5 * rgb_scale << ",\n"
+           << "    \"model\": \"kinect_coordinate_mapper\", \"distortion\": []\n"
+           << "  },\n"
+           << "  \"rgbFromDepth\": [1,0,0,-0.052,0,1,0,0,0,0,1,0,0,0,0,1],\n"
+           << "  \"sourceRgb\": {\"format\": \"jpeg\", \"quality\": " << options.rgb_quality
+           << ", \"nativeResolution\": " << (options.max_rgb_dimension == 0 ? "true" : "false")
+           << ", \"droppedFrames\": " << rgb_drops << "}\n"
            << "}\n";
     output.close();
     const fs::path destination = options.phase_root / "phase.json";
@@ -397,7 +419,7 @@ void append_csv_pose(std::ostream& output, const Matrix4* pose) {
 }
 
 std::string csv_header() {
-    return "index,timestamp_us,depth_path,color_path,m00,m01,m02,m03,m10,m11,m12,m13,m20,m21,m22,m23,m30,m31,m32,m33\n";
+    return "index,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_us,m00,m01,m02,m03,m10,m11,m12,m13,m20,m21,m22,m23,m30,m31,m32,m33\n";
 }
 
 void write_live_status(
@@ -473,6 +495,7 @@ int capture(const Options& options) {
 
     fs::create_directories(options.phase_root / "depth");
     fs::create_directories(options.phase_root / "color");
+    if (!options.preview) fs::create_directories(options.phase_root / "rgb");
     fs::remove(options.phase_root / "stop.flag");
 
     IKinectSensor* sensor = nullptr;
@@ -497,7 +520,7 @@ int capture(const Options& options) {
     const std::string pose_source = tracker.available() ? "kinect_fusion" : "estimated_offline";
 
     const std::string created_at = utc_now();
-    write_phase_manifest(options, intrinsics, created_at, 0, 0, pose_source);
+    write_phase_manifest(options, intrinsics, created_at, 0, 0, pose_source, 0);
     std::ofstream frame_csv;
     if (!options.preview) {
         frame_csv.open(options.phase_root / "frames.csv", std::ios::trunc);
@@ -506,6 +529,11 @@ int capture(const Options& options) {
 
     std::vector<std::uint16_t> depth(depth_count);
     std::vector<std::uint8_t> color_bgra(color_count * 4);
+    std::unique_ptr<scanlan::JpegWriterQueue> rgb_writer;
+    if (!options.preview) {
+        rgb_writer = std::make_unique<scanlan::JpegWriterQueue>(
+            options.rgb_quality, options.max_rgb_dimension, 6);
+    }
     std::vector<std::uint8_t> aligned_rgb(depth_count * 3);
     std::vector<ColorSpacePoint> depth_to_color(depth_count);
     std::uint32_t saved_frames = 0;
@@ -596,7 +624,7 @@ int capture(const Options& options) {
                     depth_to_color.data()
                 );
                 if (SUCCEEDED(result)) {
-                    std::fill(aligned_rgb.begin(), aligned_rgb.end(), 0);
+                    std::fill(aligned_rgb.begin(), aligned_rgb.end(), std::uint8_t{0});
                     for (int pixel = 0; pixel < depth_count; ++pixel) {
                         const ColorSpacePoint mapped = depth_to_color[pixel];
                         if (!std::isfinite(mapped.X) || !std::isfinite(mapped.Y)) continue;
@@ -612,14 +640,28 @@ int capture(const Options& options) {
 
                     Matrix4 camera_to_world{};
                     const bool tracking = tracker.track(depth, camera_to_world);
+                    INT64 rgb_timestamp_100ns = timestamp_100ns;
+                    color_frame->get_RelativeTime(&rgb_timestamp_100ns);
                     std::ostringstream stem;
                     stem << std::setw(6) << std::setfill('0') << saved_frames;
                     const std::string depth_name = stem.str() + ".u16";
                     const std::string color_name = stem.str() + ".rgb";
+                    const std::string rgb_name = stem.str() + ".jpg";
                     write_binary(options.phase_root / "depth" / depth_name, depth);
                     write_binary(options.phase_root / "color" / color_name, aligned_rgb);
+                    std::vector<std::uint8_t> native_rgb(static_cast<std::size_t>(color_count) * 3);
+                    for (int pixel = 0; pixel < color_count; ++pixel) {
+                        native_rgb[pixel * 3] = color_bgra[pixel * 4 + 2];
+                        native_rgb[pixel * 3 + 1] = color_bgra[pixel * 4 + 1];
+                        native_rgb[pixel * 3 + 2] = color_bgra[pixel * 4];
+                    }
+                    const bool queued_rgb = rgb_writer->enqueue(
+                        options.phase_root / "rgb" / rgb_name, ColorWidth, ColorHeight, std::move(native_rgb));
                     frame_csv << saved_frames << ',' << (timestamp_100ns / 10)
-                              << ",depth/" << depth_name << ",color/" << color_name;
+                              << ",depth/" << depth_name << ",color/" << color_name << ',';
+                    if (queued_rgb) frame_csv << "rgb/" << rgb_name;
+                    frame_csv << ',';
+                    if (queued_rgb) frame_csv << (rgb_timestamp_100ns / 10);
                     append_csv_pose(frame_csv, tracking ? &camera_to_world : nullptr);
                     frame_csv << '\n';
                     frame_csv.flush();
@@ -649,13 +691,15 @@ int capture(const Options& options) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - started
     );
+    if (rgb_writer) rgb_writer->close();
     write_phase_manifest(
         options,
         intrinsics,
         created_at,
         saved_frames,
         static_cast<std::uint32_t>(std::max<std::int64_t>(1, elapsed.count())),
-        pose_source
+        pose_source,
+        rgb_writer ? rgb_writer->dropped() + rgb_writer->failed() : 0
     );
 
     safe_release(reader);

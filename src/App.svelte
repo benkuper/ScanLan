@@ -1,27 +1,37 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { save } from '@tauri-apps/plugin-dialog';
+  import { open, save } from '@tauri-apps/plugin-dialog';
   import * as THREE from 'three';
   import PointCloudPreview from './lib/components/PointCloudPreview.svelte';
   import {
     applyCloudTransform,
+    artifactJobStatus,
     availableSensors,
+    cancelArtifactJob,
     captureStatus,
     createProject,
     currentProject,
+    exportGaussianSplat,
     exportPly,
     exportTexturedMesh,
+    importMediaSource,
+    latestArtifactJob,
     loadCameraFrames,
     loadLivePreviewFrame,
     loadPreview,
     loadPreviewMesh,
     removeCapture,
-    reconstructProject,
+    removeMediaSource,
+    resumeArtifactJob,
+    runtimeInfo,
+    startArtifactJob,
     startSensorPhase,
     stopSensorPhase,
     updateProjectSettings
   } from './lib/api';
   import type {
+    ArtifactJob,
+    ArtifactTarget,
     AvailableSensor,
     CameraFrame,
     CaptureSettings,
@@ -32,12 +42,15 @@
     PreviewMesh,
     PreviewPoint,
     ProjectSummary,
-    ReconstructionProgress
+    ReconstructionProgress,
+    RuntimeInfo
   } from './lib/types';
 
   let project: ProjectSummary | null = null;
   let sensor: CaptureStatus | null = null;
   let reconstruction: ReconstructionProgress | null = null;
+  let activeJob: ArtifactJob | null = null;
+  let runtime: RuntimeInfo | null = null;
   let sensorChoices: AvailableSensor[] = [];
   let selectedSensorOption = '';
   let discoveryInFlight = false;
@@ -61,6 +74,12 @@
   let message = 'Select Scan sensors when you are ready to connect a depth sensor.';
   let viewMode: 'live' | 'preview' = 'live';
   let previewRenderMode: 'points' | 'mesh' = 'points';
+  let buildPointCloud = true;
+  let buildTexturedMesh = true;
+  let buildGaussianSplat = false;
+  let splatIterations = 30_000;
+  let sourceMode: 'rgbd' | 'media' = 'rgbd';
+  let selectedMediaSourceIds: string[] = [];
 
   let pointSize = 0.034;
   let pointOpacity = 0.92;
@@ -378,7 +397,8 @@
   }
 
   $: capturing = sensor?.capturing ?? Boolean(project?.phases.some((phase) => phase.status === 'capturing'));
-  $: processing = project?.processingStatus === 'processing';
+  $: jobRunning = Boolean(activeJob && ['queued', 'running', 'cancelling'].includes(activeJob.status));
+  $: processing = project?.processingStatus === 'processing' || jobRunning;
   $: selectedSensorName = project?.settings.sensorKind === 'azure_kinect'
     ? 'Azure Kinect DK'
     : project?.settings.sensorKind === 'femto_mega'
@@ -388,6 +408,8 @@
   $: viewerTransform = viewMode === 'preview' ? cloudTransform : identityTransform;
   $: effectiveGizmoAnchor = gizmoAnchor ?? pointCloudCenter(previewPoints);
   $: completedPhases = project?.phases.filter((phase) => phase.status === 'complete').length ?? 0;
+  $: hasMediaSources = (project?.mediaSources.length ?? 0) > 0;
+  $: canBuildArtifacts = sourceMode === 'rgbd' ? completedPhases > 0 : selectedMediaSourceIds.length > 0;
   $: totalFrames = sensor?.totalFrameCount ?? project?.phases.reduce((sum, phase) => sum + phase.frameCount, 0) ?? 0;
   $: displayedPointCount = processing
     ? reconstruction?.pointCount ?? previewPoints.length
@@ -416,6 +438,99 @@
     return `about ${Math.ceil(seconds / 60)} min left`;
   };
 
+  const formatEtaValue = (seconds?: number | null) => {
+    if (seconds == null) return 'Calculating';
+    if (seconds <= 0) return 'Finishing';
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return remainder > 0 && minutes < 10 ? `${minutes}m ${remainder}s` : `${Math.ceil(seconds / 60)}m`;
+  };
+
+  type StageDefinition = { key: string; label: string; weight: number };
+  const rgbdBaseStages: StageDefinition[] = [
+    { key: 'prepare', label: 'Preparing inputs', weight: 0.05 },
+    { key: 'track', label: 'Tracking cameras', weight: 0.13 },
+    { key: 'trajectory', label: 'Optimizing trajectory', weight: 0.12 },
+    { key: 'fuse', label: 'Fusing keyframes', weight: 0.08 },
+    { key: 'cloud', label: 'Building point cloud', weight: 0.24 }
+  ];
+  const mediaStages: StageDefinition[] = [
+    { key: 'prepare', label: 'Preparing media', weight: 0.05 },
+    { key: 'filter', label: 'Selecting sharp frames', weight: 0.05 },
+    { key: 'feature', label: 'Extracting GPU features', weight: 0.08 },
+    { key: 'match', label: 'Matching camera views', weight: 0.12 },
+    { key: 'map', label: 'Solving camera poses', weight: 0.15 },
+    { key: 'splat', label: 'Training Gaussian splat', weight: 0.5 },
+    { key: 'publish', label: 'Publishing splat', weight: 0.05 }
+  ];
+
+  function stageKey(value: string) {
+    const stage = value.toLowerCase().replaceAll('_', ' ');
+    if (stage.includes('complete') || stage.includes('export') || stage.includes('publish')) return 'publish';
+    if (stage.includes('splat') && (stage.includes('train') || stage.includes('initial'))) return 'splat';
+    if (stage.includes('mesh')) return 'mesh';
+    if (stage.includes('preparing splat') || stage.includes('posed frame')) return 'dataset';
+    if (stage.includes('mapping') || stage.includes('registration')) return 'map';
+    if (stage.includes('matching')) return 'match';
+    if (stage.includes('feature')) return 'feature';
+    if (stage.includes('filter')) return 'filter';
+    if (stage.includes('building') || stage.includes('cleaning cloud')) return 'cloud';
+    if (stage.includes('fusing') || stage.includes('previewing') || stage.includes('loading cache')) return 'fuse';
+    if (stage.includes('stabiliz') || stage.includes('aligning')) return 'trajectory';
+    if (stage.includes('tracking') || stage.includes('placing') || stage.includes('keyframe')) return 'track';
+    return 'prepare';
+  }
+
+  function stagesFor(job: ArtifactJob | null) {
+    if (job?.pipeline === 'media_gaussian') return mediaStages;
+    const stages = [...rgbdBaseStages];
+    const wantsMesh = job?.targets.includes('texturedMesh') ?? buildTexturedMesh;
+    const wantsSplat = job?.targets.includes('gaussianSplat') ?? buildGaussianSplat;
+    if (wantsMesh || wantsSplat) stages.push({ key: 'dataset', label: 'Preparing posed frames', weight: 0.08 });
+    if (wantsMesh) stages.push({ key: 'mesh', label: 'Texturing mesh', weight: 0.2 });
+    if (wantsSplat) stages.push({ key: 'splat', label: 'Training Gaussian splat', weight: 0.55 });
+    stages.push({ key: 'publish', label: 'Publishing artifacts', weight: 0.05 });
+    return stages;
+  }
+
+  function stageFeedback(job: ArtifactJob | null, progress: ReconstructionProgress | null) {
+    const stages = stagesFor(job);
+    const key = stageKey(job?.stage || progress?.stage || 'preparing');
+    const found = stages.findIndex((stage) => stage.key === key);
+    const index = found < 0 ? 0 : found;
+    return { label: stages[index].label, current: index + 1, total: stages.length };
+  }
+
+  function weightedOverallProgress(job: ArtifactJob | null, progress: ReconstructionProgress | null) {
+    if (!job) return Math.max(0, Math.min(1, progress?.progress ?? 0));
+    const stages = stagesFor(job);
+    const key = stageKey(job.stage || progress?.stage || 'preparing');
+    const index = Math.max(0, stages.findIndex((stage) => stage.key === key));
+    const totalWeight = stages.reduce((sum, stage) => sum + stage.weight, 0);
+    const completedWeight = stages.slice(0, index).reduce((sum, stage) => sum + stage.weight, 0);
+    const phaseProgress = job.stageProgress ?? progress?.stageProgress ?? 0;
+    const fraction = key === 'publish' && job.stage.toLowerCase().includes('complete') ? 1 : phaseProgress;
+    return Math.max(0, Math.min(1, (completedWeight + stages[index].weight * fraction) / totalWeight));
+  }
+
+  function estimateOverallEta(job: ArtifactJob | null, progress: number) {
+    if (!job) return null;
+    if (progress >= 0.995) return 0;
+    const started = Date.parse(job.startedAt ?? job.createdAt);
+    const elapsed = Number.isFinite(started) ? Math.max(0, (Date.now() - started) / 1000) : 0;
+    if (elapsed < 2 || progress < 0.02) return null;
+    return Math.max(1, Math.round(elapsed * (1 - progress) / progress));
+  }
+
+  $: buildStage = stageFeedback(activeJob, reconstruction);
+  $: overallBuildProgress = weightedOverallProgress(activeJob, reconstruction);
+  $: currentStageProgress = Math.max(0, Math.min(1, activeJob?.stageProgress ?? reconstruction?.stageProgress ?? 0));
+  $: buildDetail = activeJob?.detail?.trim() || reconstruction?.detail || 'Preparing the next artifact stage';
+  $: buildBackend = activeJob?.computeBackend || reconstruction?.computeBackend || (activeJob?.stage.includes('splat') ? 'CUDA AMP / gsplat' : 'GPU preferred');
+  $: totalBuildEta = activeJob ? estimateOverallEta(activeJob, overallBuildProgress) : reconstruction?.etaSeconds;
+  $: currentStageEta = activeJob?.stageEtaSeconds ?? reconstruction?.stageEtaSeconds;
+
   const confidenceClass = (score?: number) => score === undefined ? '' : score >= 80 ? 'high' : score >= 60 ? 'medium' : 'low';
 
   async function refreshResultPreview() {
@@ -440,7 +555,7 @@
   }
 
   async function refreshSensorStatus() {
-    if (!project || statusInFlight || (!sensorSessionEnabled && !capturing && !processing)) return;
+    if (!project || statusInFlight || (!sensorSessionEnabled && !capturing && !processing && !activeJob)) return;
     const now = performance.now();
     const minimumInterval = processing ? 250 : 100;
     if (now - lastStatusPoll < minimumInterval) return;
@@ -472,10 +587,45 @@
         }
       }
       else if (!status.sensorConnected && !processing) message = status.sensorStatus;
-      else if (processing && reconstruction) {
+      else if (processing && reconstruction && !activeJob) {
         message = `${reconstruction.stage}: ${reconstruction.detail}`;
       } else if (!status.capturing && status.sensorConnected && viewMode === 'live') {
         message = `Live ${status.sensorName} preview · ${status.previewPointCount.toLocaleString()} visible points · ${status.streamFps.toFixed(1)} sensor fps${previewFps > 0 ? ` · ${previewFps.toFixed(1)} preview fps` : ''}`;
+      }
+      if (activeJob) {
+        try {
+          const updatedJob = await artifactJobStatus(project.path, activeJob.id);
+          activeJob = updatedJob;
+          reconstruction = {
+            stage: updatedJob.stage,
+            detail: updatedJob.iteration != null
+              ? `CUDA splat iteration ${updatedJob.iteration.toLocaleString()} of ${(updatedJob.totalIterations ?? 0).toLocaleString()}${updatedJob.loss != null ? ` · loss ${updatedJob.loss.toFixed(4)}` : ''}`
+              : updatedJob.detail?.trim() || status.reconstruction?.detail || updatedJob.stage.replaceAll('_', ' '),
+            progress: updatedJob.progress,
+            processedUnits: updatedJob.iteration ?? Math.round(updatedJob.progress * 1000),
+            totalUnits: updatedJob.totalIterations ?? 1000,
+            etaSeconds: updatedJob.etaSeconds ?? undefined,
+            stageProgress: updatedJob.stageProgress ?? status.reconstruction?.stageProgress,
+            stageEtaSeconds: updatedJob.stageEtaSeconds ?? status.reconstruction?.stageEtaSeconds,
+            elapsedSeconds: updatedJob.elapsedSeconds ?? status.reconstruction?.elapsedSeconds,
+            computeBackend: updatedJob.computeBackend ?? (updatedJob.stage.includes('splat') ? 'CUDA AMP / gsplat' : status.reconstruction?.computeBackend)
+          };
+          if (['complete', 'failed', 'cancelled'].includes(updatedJob.status)) {
+            project = await currentProject();
+            activeJob = updatedJob.resumable ? updatedJob : null;
+            if (updatedJob.status === 'complete') {
+              viewMode = 'preview';
+              if (project.artifacts.pointCloud || project.artifacts.texturedMesh) {
+                await refreshResultPreview();
+              }
+              message = `Artifact job complete${project.processingBackend ? ` · ${project.processingBackend}` : ''}${project.artifacts.gaussianSplat ? ' · Gaussian PLY ready' : ''}.`;
+            } else {
+              message = updatedJob.error ?? `Artifact job ${updatedJob.status}.`;
+            }
+          }
+        } catch (error) {
+          message = `Artifact status: ${error instanceof Error ? error.message : String(error)}`;
+        }
       }
     } catch (error) {
       sensor = sensor ? { ...sensor, sensorConnected: false, sensorStatus: String(error) } : null;
@@ -618,37 +768,123 @@
     }
   }
 
+  function toggleMediaSource(sourceId: string) {
+    selectedMediaSourceIds = selectedMediaSourceIds.includes(sourceId)
+      ? selectedMediaSourceIds.filter((value) => value !== sourceId)
+      : [...selectedMediaSourceIds, sourceId];
+  }
+
+  async function importPhotosAction() {
+    if (!project) return;
+    const selected = await open({ title: 'Import a photo folder', directory: true, multiple: false });
+    if (!selected || Array.isArray(selected)) return;
+    busy = true;
+    try {
+      project = await importMediaSource(project.path, 'photos', [selected]);
+      selectedMediaSourceIds = project.mediaSources.map((source) => source.id);
+      sourceMode = 'media';
+      buildPointCloud = false;
+      buildTexturedMesh = false;
+      buildGaussianSplat = true;
+      message = 'Photo folder copied into the project. Ready for GPU COLMAP registration and splat training.';
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function importVideoAction() {
+    if (!project) return;
+    const selected = await open({
+      title: 'Import a video',
+      multiple: false,
+      filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'mkv', 'avi', 'm4v', 'webm'] }]
+    });
+    if (!selected || Array.isArray(selected)) return;
+    busy = true;
+    try {
+      project = await importMediaSource(project.path, 'video', [selected]);
+      selectedMediaSourceIds = project.mediaSources.map((source) => source.id);
+      sourceMode = 'media';
+      buildPointCloud = false;
+      buildTexturedMesh = false;
+      buildGaussianSplat = true;
+      message = 'Video copied into the project. FFmpeg will filter frames before GPU COLMAP registration.';
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function removeMediaSourceAction(sourceId: string, name: string) {
+    if (!project || !window.confirm(`Permanently remove media source "${name}"?`)) return;
+    busy = true;
+    try {
+      project = await removeMediaSource(project.path, sourceId);
+      selectedMediaSourceIds = selectedMediaSourceIds.filter((value) => value !== sourceId);
+      message = `${name} removed.`;
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function processCloud() {
-    if (!project || completedPhases === 0) return;
+    if (!project) return;
+    if (activeJob) {
+      try {
+        if (activeJob.resumable && ['failed', 'cancelled'].includes(activeJob.status)) {
+          activeJob = await resumeArtifactJob(project.path, activeJob.id);
+          project = { ...project, processingStatus: 'processing', processingError: undefined, activeJob: activeJob.id };
+          message = 'Resuming CUDA splat training from its matching checkpoint…';
+        } else {
+          activeJob = await cancelArtifactJob(project.path, activeJob.id);
+          message = 'Cancelling artifact workers and saving any splat checkpoint…';
+        }
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      return;
+    }
+    if (!canBuildArtifacts) return;
+    const targets: ArtifactTarget[] = sourceMode === 'media'
+      ? ['gaussianSplat']
+      : [
+          ...(buildPointCloud ? ['pointCloud' as const] : []),
+          ...(buildTexturedMesh ? ['texturedMesh' as const] : []),
+          ...(buildGaussianSplat ? ['gaussianSplat' as const] : [])
+        ];
+    if (targets.length === 0) {
+      message = 'Choose at least one artifact to build.';
+      return;
+    }
+    if (targets.includes('gaussianSplat') && !runtime?.splatWorkerAvailable) {
+      message = runtime?.splatStatus ?? 'Install the optional splat runtime first with npm run prepare:splat.';
+      return;
+    }
     busy = true;
     reconstruction = null;
-    viewMode = 'preview';
     editMode = false;
-    previewPoints = [];
-    cameraFrames = [];
-    previewMesh = null;
     project = {
       ...project,
       processingStatus: 'processing',
-      processingError: undefined,
-      pointCount: undefined,
-      outputPath: undefined,
-      meshTriangleCount: undefined,
-      meshOutputPath: undefined,
-      cameraFrameCount: undefined,
-      confidenceScore: undefined,
-      confidenceLabel: undefined,
-      confidenceDetail: undefined,
-      framesUsed: undefined,
-      processingBackend: undefined,
-      processingDurationSeconds: undefined
+      processingError: undefined
     };
-    message = 'Preparing captured frames…';
+    message = sourceMode === 'media'
+      ? 'Starting GPU media registration and splat training…'
+      : 'Starting GPU-preferred RGB-D artifact build…';
     try {
-      project = await reconstructProject(project.path, project.settings);
-      viewMode = 'preview';
-      await refreshResultPreview();
-      message = `3D model ready with ${project.meshTriangleCount?.toLocaleString() ?? 0} textured triangles and ${project.pointCount?.toLocaleString() ?? 0} points · ${project.confidenceScore ?? 0}% confidence${project.processingBackend ? ` · ${project.processingBackend}` : ''}${project.processingDurationSeconds !== undefined ? ` in ${formatEta(Math.round(project.processingDurationSeconds))}` : ''}.`;
+      activeJob = await startArtifactJob(
+        project.path,
+        sourceMode === 'media' ? 'media_gaussian' : 'rgbd_reconstruction',
+        targets,
+        sourceMode === 'media' ? selectedMediaSourceIds : [],
+        splatIterations
+      );
+      project = { ...project, activeJob: activeJob.id, processingStatus: 'processing' };
     } catch (error) {
       const failure = error instanceof Error ? error.message : String(error);
       try {
@@ -849,6 +1085,25 @@
     }
   }
 
+  async function exportGaussianSplatAction() {
+    if (!project?.artifacts.gaussianSplat || project.artifacts.gaussianSplat.stale) return;
+    busy = true;
+    try {
+      const destinationPath = await save({
+        title: 'Export canonical Gaussian splat',
+        defaultPath: 'room-splat.ply',
+        filters: [{ name: '3D Gaussian splat PLY', extensions: ['ply'] }]
+      });
+      if (!destinationPath) return;
+      const savedPath = await exportGaussianSplat(project.path, destinationPath);
+      message = `Gaussian PLY and coordinate sidecars saved to ${savedPath}.`;
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = false;
+    }
+  }
+
   onMount(() => {
     // Remove the old global transform once. It used to rotate every project and
     // even the raw sensor feed, which could make a new live view appear inverted.
@@ -857,8 +1112,22 @@
     void (async () => {
       try {
         project = await currentProject();
+        runtime = await runtimeInfo().catch(() => null);
         loadTransform(project.id);
         selectedSensorOption = configuredSensorOption(project.settings);
+        selectedMediaSourceIds = project.mediaSources.map((source) => source.id);
+        if (project.phases.length === 0 && project.mediaSources.length > 0) {
+          sourceMode = 'media';
+          buildPointCloud = false;
+          buildTexturedMesh = false;
+          buildGaussianSplat = true;
+        }
+        if (project.activeJob) {
+          activeJob = await artifactJobStatus(project.path, project.activeJob).catch(() => null);
+        } else {
+          const latestJob = await latestArtifactJob(project.path).catch(() => null);
+          activeJob = latestJob?.resumable ? latestJob : null;
+        }
         if (project.processingStatus === 'failed') {
           message = project.processingError ?? 'The last reconstruction failed; captured phases are still available.';
         } else {
@@ -892,12 +1161,12 @@
       <div><h1>ScanLan</h1><p>Track live. Capture phases. Reconstruct when ready.</p></div>
     </div>
     <div class="top-actions">
-      <div class="runtime-pill" class:connected={sensor?.sensorConnected} class:paused={sensor?.sensorPaused} title={sensor?.sensorStatus}>
+      <div class="runtime-pill" class:connected={!processing && sensor?.sensorConnected} class:paused={processing || sensor?.sensorPaused} title={processing ? 'Sensor preview remains paused until the artifact job is fully published' : sensor?.sensorStatus}>
         <span></span>
-        {sensor?.sensorPaused ? 'Sensor paused for build' : discoveryInFlight ? 'Scanning for sensors…' : connecting ? `Opening ${selectedSensorName}…` : sensor?.sensorConnected ? `${sensor.sensorName} · ${sensor.streamFps.toFixed(1)} sensor fps${!capturing && previewFps > 0 ? ` · ${previewFps.toFixed(1)} preview fps` : ''}` : sensorSessionEnabled ? `${selectedSensorName} disconnected` : 'Sensor scan required'}
+        {processing ? 'Sensor paused for artifact build' : sensor?.sensorPaused ? 'Sensor paused for build' : discoveryInFlight ? 'Scanning for sensors…' : connecting ? `Opening ${selectedSensorName}…` : sensor?.sensorConnected ? `${sensor.sensorName} · ${sensor.streamFps.toFixed(1)} sensor fps${!capturing && previewFps > 0 ? ` · ${previewFps.toFixed(1)} preview fps` : ''}` : sensorSessionEnabled ? `${selectedSensorName} disconnected` : 'Sensor scan required'}
       </div>
-      <button class="button ghost" on:click={newProject} disabled={busy || capturing}>New project</button>
-      <button class:stopping={capturing} class="button primary" on:click={captureAction} disabled={busy || !project || (!capturing && !sensor?.sensorConnected)}>
+      <button class="button ghost" on:click={newProject} disabled={busy || capturing || processing}>New project</button>
+      <button class:stopping={capturing} class="button primary" on:click={captureAction} disabled={busy || processing || !project || (!capturing && !sensor?.sensorConnected)}>
         <span class="record-dot"></span>{capturing ? 'Stop capture' : 'Capture phase'}
       </button>
     </div>
@@ -932,6 +1201,21 @@
           {/if}
         </div>
         <button class="add-phase" on:click={captureAction} disabled={busy || capturing || !sensor?.sensorConnected}><span>+</span> Add another phase</button>
+
+        <div class="phase-heading media-heading"><span>Photo &amp; video sources</span><span class="count-badge">{project.mediaSources.length}</span></div>
+        <div class="phase-list media-list">
+          {#each project.mediaSources as source}
+            <article class="phase-card media-card">
+              <input type="checkbox" checked={selectedMediaSourceIds.includes(source.id)} on:change={() => toggleMediaSource(source.id)} disabled={processing} aria-label={`Use ${source.name}`} />
+              <div class="phase-copy"><strong>{source.name}</strong><span>{source.kind === 'video' ? 'Video' : `${source.imageCount} photos`} · {source.status}</span><small><i></i>{source.quality?.detail ?? 'Ready for registration'}</small></div>
+              <button class="remove-phase" title={`Remove ${source.name}`} disabled={busy || processing} on:click={() => removeMediaSourceAction(source.id, source.name)}>×</button>
+            </article>
+          {/each}
+        </div>
+        <div class="media-actions">
+          <button class="add-phase" on:click={importPhotosAction} disabled={busy || processing}>Import photos…</button>
+          <button class="add-phase" on:click={importVideoAction} disabled={busy || processing}>Import video…</button>
+        </div>
 
         <div class="scan-stats">
           <div><span>Saved frames</span><strong>{totalFrames.toLocaleString()}</strong></div>
@@ -986,18 +1270,40 @@
           />
         </div>
 
-        <div class="status-strip" class:with-progress={processing}>
-          <div class="status-copy">
-            <div class="status-message"><span class:busy={busy || processing} class="status-light"></span>{message}</div>
-            {#if processing}
-              <div class="progress-row">
-                <div class="progress-track"><i style={`width: ${Math.max(2, (reconstruction?.progress ?? 0) * 100)}%`}></i></div>
-                <strong>{Math.round((reconstruction?.progress ?? 0) * 100)}%</strong>
-                <span>{reconstruction?.stageEtaSeconds !== undefined ? formatEta(reconstruction.stageEtaSeconds) : reconstruction?.elapsedSeconds !== undefined ? `${reconstruction.elapsedSeconds}s elapsed` : formatEta(reconstruction?.etaSeconds)}{reconstruction?.computeBackend ? ` · ${reconstruction.computeBackend}` : ''}</span>
+        <div class:with-progress={processing} class="status-strip">
+          {#if processing}
+            <div class="job-feedback">
+              <div class="job-heading">
+                <span class="status-light busy"></span>
+                <div>
+                  <span class="job-kicker">{activeJob?.pipeline === 'media_gaussian' ? 'MEDIA SPLAT JOB' : 'RGB-D ARTIFACT JOB'}</span>
+                  <strong>{buildStage.label}</strong>
+                </div>
+                <span class="job-stage-count">Stage {buildStage.current} / {buildStage.total}</span>
               </div>
-            {/if}
-          </div>
-          <button class="button process" on:click={processCloud} disabled={busy || capturing || completedPhases === 0}>{processing ? 'Processing…' : 'Build 3D model'}</button>
+              <div class="job-detail" title={buildDetail}>{buildDetail}</div>
+              <div class="job-progress-grid">
+                <span>Overall</span>
+                <div class="progress-track overall"><i style={`width: ${Math.max(2, overallBuildProgress * 100)}%`}></i></div>
+                <strong>{Math.round(overallBuildProgress * 100)}%</strong>
+                <span>Stage</span>
+                <div class="progress-track stage"><i style={`width: ${Math.max(2, currentStageProgress * 100)}%`}></i></div>
+                <strong>{Math.round(currentStageProgress * 100)}%</strong>
+              </div>
+              <div class="job-backend">{buildBackend}</div>
+            </div>
+            <div class="job-timing">
+              <span>Estimated left</span>
+              <strong>{formatEtaValue(totalBuildEta)}</strong>
+              <small>{currentStageEta != null ? `${formatEtaValue(currentStageEta)} this stage` : reconstruction?.elapsedSeconds != null ? `${reconstruction.elapsedSeconds}s elapsed` : 'Measuring throughput'}</small>
+            </div>
+            <button class="button process cancel-job" on:click={processCloud} disabled={busy || capturing || !activeJob}>{activeJob?.status === 'cancelling' ? 'Cancelling…' : 'Cancel job'}</button>
+          {:else}
+            <div class="status-copy">
+              <div class="status-message"><span class:busy={busy} class="status-light"></span>{message}</div>
+            </div>
+            <button class="button process" on:click={processCloud} disabled={busy || capturing || (!activeJob?.resumable && !canBuildArtifacts)}>{activeJob?.resumable && ['failed', 'cancelled'].includes(activeJob.status) ? 'Resume splat' : 'Build artifacts'}</button>
+          {/if}
         </div>
       </section>
 
@@ -1056,6 +1362,21 @@
         <div class="setting-group range-group"><div class="label-row"><label for="depth">Maximum depth</label><output>{project.settings.maxDepthM.toFixed(1)} m</output></div><input id="depth" disabled={busy || capturing || processing} type="range" min="1.5" max="8" step="0.1" bind:value={project.settings.maxDepthM} on:input={scheduleProjectSettingsSave} /><div class="range-labels"><span>1.5 m</span><span>8.0 m</span></div></div>
         <div class="setting-group range-group"><div class="label-row"><label for="voxel">Point spacing</label><output>{project.settings.voxelSizeMm} mm</output></div><input id="voxel" disabled={busy || capturing || processing} type="range" min="1" max="40" step="1" bind:value={project.settings.voxelSizeMm} on:input={scheduleProjectSettingsSave} /><div class="range-labels"><span>1 mm detail</span><span>Lightweight</span></div></div>
         <div class="setting-group"><label for="fps">Saved-frame rate</label><div class="segmented" id="fps">{#each [5, 10, 15] as fps}<button disabled={busy || capturing || processing} class:active={project.settings.captureFps === fps} on:click={() => setCaptureFps(fps)}>{fps} fps</button>{/each}</div></div>
+
+        <div class="section-divider"><span>Artifact build</span></div>
+        {#if completedPhases > 0 && hasMediaSources}
+          <div class="setting-group"><span class="control-label">Input source</span><div class="segmented two-options"><button class:active={sourceMode === 'rgbd'} on:click={() => sourceMode = 'rgbd'} disabled={processing}>RGB-D</button><button class:active={sourceMode === 'media'} on:click={() => sourceMode = 'media'} disabled={processing}>Photos / video</button></div></div>
+        {/if}
+        <div class="artifact-targets">
+          <label class="toggle-row"><input type="checkbox" bind:checked={buildPointCloud} disabled={processing || sourceMode === 'media'} /><span>Point cloud</span></label>
+          <label class="toggle-row"><input type="checkbox" bind:checked={buildTexturedMesh} disabled={processing || sourceMode === 'media'} /><span>Native-RGB mesh</span></label>
+          <label class="toggle-row"><input type="checkbox" bind:checked={buildGaussianSplat} disabled={processing || sourceMode === 'media'} /><span>Gaussian splat (CUDA)</span></label>
+        </div>
+        {#if buildGaussianSplat || sourceMode === 'media'}
+          <div class="setting-group range-group"><div class="label-row"><label for="splat-iterations">Splat iterations</label><output>{splatIterations.toLocaleString()}</output></div><input id="splat-iterations" type="range" min="5000" max="60000" step="5000" bind:value={splatIterations} disabled={processing} /></div>
+          <p class:splat-ready={runtime?.splatWorkerAvailable} class="runtime-diagnostic">{runtime?.splatStatus ?? 'Checking optional CUDA runtime…'}{runtime?.splatWorkerAvailable ? ' · CUDA mixed precision enabled' : ''}</p>
+          {#if sourceMode === 'media'}<p class="setting-note">FFmpeg: {runtime?.ffmpegAvailable ? 'ready' : 'missing'} · COLMAP GPU: {runtime?.colmapAvailable ? 'ready' : 'missing'}</p>{/if}
+        {/if}
         {/if}
 
         <div class="section-divider"><span>Rendering</span></div>
@@ -1102,6 +1423,12 @@
         <button class="tool-button export-transform" on:click={applyTransformToExport} disabled={busy || project.processingStatus !== 'complete'}>Apply pose to model exports</button>
 
         <div class="section-divider"><span>Export</span></div>
+        <div class:stale={project.artifacts.gaussianSplat?.stale} class="export-card">
+          <span>Canonical 3DGS PLY</span>
+          <strong>{project.artifacts.gaussianSplat ? project.artifacts.gaussianSplat.metric ? 'Metric Gaussian splat' : 'Arbitrary-scale Gaussian splat' : 'Not built'}</strong>
+          <small>Exports the Gaussian PLY plus manifest and GameObject-level coordinate transform. Viewer transforms are not baked into covariance.</small>
+          <button class="tool-button export-ply" on:click={exportGaussianSplatAction} disabled={busy || !project.artifacts.gaussianSplat || project.artifacts.gaussianSplat.stale}>Export Gaussian splat...</button>
+        </div>
         <div class="export-card">
           <span>RGB-reprojected OBJ</span>
           <strong>{formatCount(project.meshTriangleCount)} textured triangles</strong>

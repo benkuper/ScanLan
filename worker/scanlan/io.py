@@ -24,11 +24,25 @@ class CameraModel:
 
 
 @dataclass(frozen=True)
+class RgbCameraModel:
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    model: str
+    distortion: tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class FrameRecord:
     index: int
     timestamp_us: int
     depth_path: Path
     color_path: Path
+    rgb_path: Path | None
+    rgb_timestamp_us: int | None
     pose: np.ndarray | None
 
 
@@ -45,6 +59,8 @@ class PhaseData:
     root: Path
     manifest: dict[str, Any]
     camera: CameraModel
+    rgb_camera: RgbCameraModel | None
+    rgb_from_depth: np.ndarray
     frames: list[FrameRecord]
     imu_samples: list[ImuSample]
 
@@ -92,6 +108,25 @@ def read_phase(root: Path) -> PhaseData:
         depth_scale=float(raw_camera.get("depth_scale", 1000.0)),
         max_depth_m=float(raw_camera.get("max_depth_m", 4.5)),
     )
+    raw_rgb_camera = manifest.get("rgbCamera")
+    rgb_camera = None
+    if isinstance(raw_rgb_camera, dict):
+        rgb_camera = RgbCameraModel(
+            width=int(raw_rgb_camera["width"]),
+            height=int(raw_rgb_camera["height"]),
+            fx=float(raw_rgb_camera["fx"]),
+            fy=float(raw_rgb_camera["fy"]),
+            cx=float(raw_rgb_camera["cx"]),
+            cy=float(raw_rgb_camera["cy"]),
+            model=str(raw_rgb_camera.get("model", "brown_conrady")),
+            distortion=tuple(float(value) for value in raw_rgb_camera.get("distortion", [])),
+        )
+    raw_rgb_from_depth = manifest.get("rgbFromDepth")
+    rgb_from_depth = np.eye(4, dtype=np.float64)
+    if isinstance(raw_rgb_from_depth, list) and len(raw_rgb_from_depth) == 16:
+        candidate = np.asarray(raw_rgb_from_depth, dtype=np.float64).reshape(4, 4)
+        if np.isfinite(candidate).all():
+            rgb_from_depth = candidate
 
     frames: list[FrameRecord] = []
     with (root / "frames.csv").open("r", encoding="utf-8", newline="") as handle:
@@ -108,6 +143,12 @@ def read_phase(root: Path) -> PhaseData:
                     timestamp_us=int(row["timestamp_us"]),
                     depth_path=root / row["depth_path"],
                     color_path=root / row["color_path"],
+                    rgb_path=(root / row["rgb_path"] if row.get("rgb_path", "").strip() else None),
+                    rgb_timestamp_us=(
+                        int(row["rgb_timestamp_us"])
+                        if row.get("rgb_timestamp_us", "").strip()
+                        else None
+                    ),
                     pose=pose,
                 )
             )
@@ -146,6 +187,8 @@ def read_phase(root: Path) -> PhaseData:
         root=root,
         manifest=manifest,
         camera=camera,
+        rgb_camera=rgb_camera,
+        rgb_from_depth=rgb_from_depth,
         frames=frames,
         imu_samples=imu_samples,
     )
@@ -169,6 +212,34 @@ def load_color(frame: FrameRecord, camera: CameraModel) -> np.ndarray:
             f"Color frame {frame.color_path} has {values.size} bytes; expected {expected}"
         )
     return values.reshape(camera.height, camera.width, 3)
+
+
+def load_source_rgb(frame: FrameRecord, phase: PhaseData) -> np.ndarray:
+    """Load native sensor RGB, falling back to the legacy depth-aligned RGB frame."""
+    if frame.rgb_path is None or not frame.rgb_path.is_file():
+        return load_color(frame, phase.camera)
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise RuntimeError("Pillow is required to decode native RGB capture frames") from error
+    with Image.open(frame.rgb_path) as image:
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
+def effective_rgb_camera(phase: PhaseData) -> RgbCameraModel:
+    if phase.rgb_camera is not None:
+        return phase.rgb_camera
+    camera = phase.camera
+    return RgbCameraModel(
+        width=camera.width,
+        height=camera.height,
+        fx=camera.fx,
+        fy=camera.fy,
+        cx=camera.cx,
+        cy=camera.cy,
+        model="pinhole",
+        distortion=(),
+    )
 
 
 def save_binary_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:

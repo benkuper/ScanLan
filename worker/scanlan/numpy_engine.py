@@ -58,26 +58,30 @@ def voxel_downsample(
 def reconstruct_known_poses(
     phases: list[PhaseData],
     voxel_size_m: float,
-    progress: Callable[[str, str, int, int | None], None] | None = None,
+    progress: Callable[..., None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not phases:
         raise ValueError("At least one capture phase is required")
     point_batches: list[np.ndarray] = []
     color_batches: list[np.ndarray] = []
+    total_frames = sum(len(phase.frames) for phase in phases)
+    completed_frames = 0
     for phase in phases:
         for frame_index in range(len(phase.frames)):
             points, colors = depth_to_world_points(phase, frame_index)
             point_batches.append(points)
             color_batches.append(colors)
+            completed_frames += 1
             if progress:
                 progress(
                     "Placing frames",
                     f"Placed frame {frame_index + 1} of {len(phase.frames)} in {phase.manifest['name']}",
                     1,
                     sum(batch.shape[0] for batch in point_batches),
+                    completed_frames / total_frames,
                 )
     if progress:
-        progress("Fusing points", "Voxel-downsampling placed frames", 4, None)
+        progress("Fusing points", "Voxel-downsampling placed frames", 4, None, 1.0)
     return voxel_downsample(
         np.concatenate(point_batches, axis=0),
         np.concatenate(color_batches, axis=0),

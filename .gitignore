@@ -15,18 +15,23 @@ pnpm-debug.log*
 **/*.rs.bk
 
 # Python
-/.venv/
-/venv/
+**/.venv/
+**/venv/
 **/__pycache__/
 *.py[cod]
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.pyd
+*.whl
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
 .coverage
 htmlcov/
 /worker/build/
 /worker/dist/
+/splat-worker/build/
+/splat-worker/dist/
+/splat-worker/*.spec
 *.spec.bak
 
 # Native / CMake outputs
@@ -34,6 +39,10 @@ htmlcov/
 **/CMakeFiles/
 **/CMakeCache.txt
 **/cmake_install.cmake
+**/compile_commands.json
+**/.ninja_deps
+**/.ninja_log
+**/.vs/
 **/*.vcxproj*
 **/*.sln
 *.obj

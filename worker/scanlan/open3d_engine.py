@@ -483,6 +483,7 @@ def _estimate_offline_poses(
                 + (" · CPU fallback" if used_cpu_fallback else ""),
                 1,
                 None,
+                (index + 1) / len(phase.frames),
             )
     positions = np.asarray([pose[:3, 3] for pose in poses])
     path_length = float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
@@ -737,7 +738,13 @@ def estimate_local_phase(
         )
         # Offline tracking reports every frame after the first.
         if progress:
-            progress("Tracking frames", f"Established the reference pose for {phase.manifest['name']}", 1, None)
+            progress(
+                "Tracking frames",
+                f"Established the reference pose for {phase.manifest['name']}",
+                1,
+                None,
+                1 / max(len(phase.frames), 1),
+            )
 
     frame_indices = _select_keyframes(phase, poses)
     skipped = len(phase.frames) - len(frame_indices)
@@ -786,6 +793,7 @@ def estimate_local_phase(
                 f"Integrated keyframe {entry_index + 1} of {len(frame_indices)} in {phase.manifest['name']}",
                 0 if repeated else 1,
                 None,
+                (entry_index + 1) / len(frame_indices),
             )
 
     def fallback(detail: str) -> None:
@@ -1335,7 +1343,13 @@ def reconstruct_open3d(
     ]
     first_count = _publish_preview(local_phases[0].cloud, preview_path, flip_x)
     if progress:
-        progress("Previewing build", "Showing the reconstructed reference phase", 0, first_count)
+        progress(
+            "Previewing build",
+            "Showing the reconstructed reference phase",
+            0,
+            first_count,
+            1 / len(local_phases),
+        )
     phase_to_global, alignments = align_phases(
         local_phases, voxel_size_m, backend, progress
     )
@@ -1375,6 +1389,7 @@ def reconstruct_open3d(
                 f"Showing {index + 1} of {len(local_phases)} confidence-checked phases",
                 0,
                 preview_count,
+                (index + 1) / len(local_phases),
             )
 
     total_final_frames = sum(len(local.frame_indices) for local in local_phases)
@@ -1412,6 +1427,7 @@ def reconstruct_open3d(
                     f"({selected_number}/{phase_frames} in {phase_name})",
                     0 if repeated else 1,
                     None,
+                    (entry_index + 1) / total_final_frames,
                 )
 
         def fallback(detail: str) -> None:
@@ -1463,6 +1479,7 @@ def reconstruct_open3d(
                     f"({selected_number}/{phase_frames} in {phase_name})",
                     0 if repeated else 1,
                     None,
+                    (entry_index + 1) / total_final_frames,
                 )
 
         def fallback(detail: str) -> None:
@@ -1486,6 +1503,14 @@ def reconstruct_open3d(
     # Statistical cleanup on a multi-million-point 5 mm cloud can take longer
     # than fusion itself. TSDF integration already rejects isolated depth noise;
     # reserve the expensive filter for smaller results.
+    if progress:
+        progress(
+            "Cleaning cloud",
+            f"Checking {len(cloud.points):,} fused points for isolated noise",
+            0,
+            len(cloud.points),
+            0.0,
+        )
     if 80 < len(cloud.points) <= 2_000_000:
         cloud, _ = cloud.remove_statistical_outlier(nb_neighbors=24, std_ratio=2.2)
     points = _display_points(cloud, flip_x)
@@ -1499,5 +1524,6 @@ def reconstruct_open3d(
             f"Final cloud contains {len(points):,} points · {quality['score']}/100 confidence",
             4,
             len(points),
+            1.0,
         )
     return points, colors, quality

@@ -91,6 +91,22 @@ To create the Windows installer:
 npm run tauri -- build
 ```
 
+### Optional Gaussian-splat runtime
+
+Gaussian splats use a separate Python 3.11/CUDA environment so CPU-only installations retain the existing capture, point-cloud, and mesh features without carrying PyTorch/gsplat dependencies.
+
+```powershell
+npm run prepare:splat
+```
+
+RGB-D reconstruction automatically prefers CUDA-enabled Open3D. Splat training requires CUDA and uses gsplat mixed precision, fused optimization, packed rasterization, and Splatfacto-style adaptive densification. The pinned PyTorch 2.12 CUDA 13 runtime supports the RTX 50-series/Blackwell path. Photo/video splats additionally require FFmpeg and a CUDA-enabled COLMAP build; the app reports each runtime separately.
+
+The regular installer stays CPU-friendly and omits this large optional environment. To prepare the self-contained CUDA runtime and include it in a separate splat-enabled installer, run:
+
+```powershell
+npm run package:splat
+```
+
 ## Capture guidance
 
 - Watch the tracking status. If it changes to searching/lost, return to the last textured area until it locks again.
@@ -115,6 +131,7 @@ Project layout:
 - `native/kinect-capture/` - Kinect SDK v2 and Kinect Fusion worker
 - `native/modern-capture/` - Azure Kinect and Orbbec Femto Mega worker
 - `worker/` - Open3D/NumPy reconstruction
+- `splat-worker/` - isolated CUDA gsplat runtime, ScanLan depth-aware trainer, and media registration
 - `docs/scan-format.md` - scan archive format
 
 Licensed under the [GNU General Public License v3.0](LICENSE).

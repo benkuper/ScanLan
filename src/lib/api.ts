@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AvailableSensor, CameraFrame, CaptureSettings, CaptureStatus, CloudTransform, PreviewMesh, PreviewPoint, ProjectSummary, RuntimeInfo } from './types';
+import type { ArtifactJob, ArtifactTarget, AvailableSensor, CameraFrame, CaptureSettings, CaptureStatus, CloudTransform, MediaSourceKind, PreviewMesh, PreviewPoint, ProjectSummary, RuntimeInfo } from './types';
 
 const inTauri = () => typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
 
@@ -78,6 +78,54 @@ export async function reconstructProject(
   return invoke<ProjectSummary>('reconstruct_project', { projectPath, settings });
 }
 
+export async function startArtifactJob(
+  projectPath: string,
+  pipeline: 'rgbd_reconstruction' | 'media_gaussian',
+  targets: ArtifactTarget[],
+  sourceIds: string[] = [],
+  iterations = 30_000,
+  resume = false
+): Promise<ArtifactJob> {
+  requireDesktop();
+  return invoke<ArtifactJob>('start_artifact_job', {
+    projectPath, pipeline, targets, sourceIds, iterations, resume
+  });
+}
+
+export async function artifactJobStatus(projectPath: string, jobId: string): Promise<ArtifactJob> {
+  requireDesktop();
+  return invoke<ArtifactJob>('artifact_job_status', { projectPath, jobId });
+}
+
+export async function latestArtifactJob(projectPath: string): Promise<ArtifactJob | null> {
+  requireDesktop();
+  return invoke<ArtifactJob | null>('latest_artifact_job', { projectPath });
+}
+
+export async function cancelArtifactJob(projectPath: string, jobId: string): Promise<ArtifactJob> {
+  requireDesktop();
+  return invoke<ArtifactJob>('cancel_artifact_job', { projectPath, jobId });
+}
+
+export async function resumeArtifactJob(projectPath: string, jobId: string): Promise<ArtifactJob> {
+  requireDesktop();
+  return invoke<ArtifactJob>('resume_artifact_job', { projectPath, jobId });
+}
+
+export async function importMediaSource(
+  projectPath: string,
+  kind: MediaSourceKind,
+  paths: string[]
+): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('import_media_source', { projectPath, kind, paths });
+}
+
+export async function removeMediaSource(projectPath: string, sourceId: string): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('remove_media_source', { projectPath, sourceId });
+}
+
 export async function loadPreview(projectPath: string): Promise<PreviewPoint[]> {
   requireDesktop();
   return invoke<PreviewPoint[]>('load_preview', { projectPath });
@@ -140,4 +188,9 @@ export async function exportPly(projectPath: string, destinationPath: string): P
 export async function exportTexturedMesh(projectPath: string, destinationPath: string): Promise<string> {
   requireDesktop();
   return invoke<string>('export_textured_mesh', { projectPath, destinationPath });
+}
+
+export async function exportGaussianSplat(projectPath: string, destinationPath: string): Promise<string> {
+  requireDesktop();
+  return invoke<string>('export_gaussian_splat', { projectPath, destinationPath });
 }

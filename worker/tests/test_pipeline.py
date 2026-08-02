@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import csv
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,8 @@ from pathlib import Path
 import numpy as np
 
 from scanlan.imu import odometry_rotation_prior
-from scanlan.io import ImuSample, read_phase, read_project
+from scanlan.calibration import rgb_depth_zbuffer
+from scanlan.io import ImuSample, load_depth, load_source_rgb, read_phase, read_project
 from scanlan.mock_data import create_mock_project
 from scanlan.compute import (
     ComputeBackend,
@@ -99,6 +101,15 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue((root / "outputs" / "room-mesh.obj").exists())
             self.assertTrue((root / "outputs" / "room-mesh.mtl").exists())
             self.assertTrue((root / "outputs" / "room-texture.png").exists())
+            current_dataset = root / "outputs" / "cache" / "datasets" / "current.json"
+            self.assertTrue(current_dataset.exists())
+            pointer = json.loads(current_dataset.read_text(encoding="utf-8"))
+            dataset_root = current_dataset.parent / pointer["path"]
+            dataset = json.loads((dataset_root / "dataset.json").read_text(encoding="utf-8"))
+            self.assertTrue(dataset["metric"])
+            self.assertEqual(dataset["coordinateConvention"]["pose"], "worldFromCamera")
+            self.assertEqual(len(dataset["frames"]), 8)
+            self.assertTrue((dataset_root / "initialization.ply").exists())
             self.assertGreater(result["meshTriangleCount"], 100)
             obj_lines = (root / "outputs" / "room-mesh.obj").read_text(encoding="utf-8").splitlines()
             self.assertEqual(sum(line.startswith("v ") for line in obj_lines), result["meshVertexCount"])
@@ -299,6 +310,68 @@ class PipelineTests(unittest.TestCase):
             phase = read_phase(phase_root)
             self.assertEqual(len(phase.imu_samples), 2)
             self.assertEqual(phase.imu_samples[0].kind, "gyro")
+
+    def test_legacy_aligned_rgb_uses_identity_native_rgb_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=1)
+            project = read_project(root)
+            phase = read_phase(root / "phases" / project["phases"][0]["id"])
+            self.assertIsNone(phase.rgb_camera)
+            np.testing.assert_array_equal(phase.rgb_from_depth, np.eye(4))
+            image = load_source_rgb(phase.frames[0], phase)
+            self.assertEqual(image.shape, (phase.camera.height, phase.camera.width, 3))
+            zbuffer, uv_map, visibility = rgb_depth_zbuffer(
+                load_depth(phase.frames[0], phase.camera), phase
+            )
+            self.assertEqual(zbuffer.shape, (phase.camera.height, phase.camera.width))
+            self.assertEqual(uv_map.shape, (phase.camera.height, phase.camera.width, 2))
+            self.assertGreater(int(visibility.sum()), 100)
+
+    def test_phase_v3_loads_native_rgb_calibration_and_timestamp(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=1)
+            project = read_project(root)
+            phase_root = root / "phases" / project["phases"][0]["id"]
+            manifest_path = phase_root / "phase.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update(
+                schemaVersion=3,
+                rgbCamera={
+                    "width": 96,
+                    "height": 72,
+                    "fx": 88.0,
+                    "fy": 88.0,
+                    "cx": 47.5,
+                    "cy": 35.5,
+                    "model": "brown_conrady",
+                    "distortion": [0, 0, 0, 0, 0],
+                },
+                rgbFromDepth=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+                sourceRgb={"format": "jpeg", "quality": 92, "nativeResolution": True},
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            rgb_root = phase_root / "rgb"
+            rgb_root.mkdir()
+            Image.fromarray(np.full((72, 96, 3), [20, 80, 160], dtype=np.uint8)).save(
+                rgb_root / "000000.jpg", quality=95
+            )
+            frames_path = phase_root / "frames.csv"
+            with frames_path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+                original_fields = list(rows[0])
+            fields = original_fields[:4] + ["rgb_path", "rgb_timestamp_us"] + original_fields[4:]
+            rows[0]["rgb_path"] = "rgb/000000.jpg"
+            rows[0]["rgb_timestamp_us"] = "123456"
+            with frames_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            phase = read_phase(phase_root)
+            self.assertEqual(phase.rgb_camera.width, 96)
+            self.assertEqual(phase.frames[0].rgb_timestamp_us, 123456)
+            self.assertEqual(load_source_rgb(phase.frames[0], phase).shape, (72, 96, 3))
 
     def test_gyro_prior_maps_previous_camera_into_current_camera(self) -> None:
         samples = [

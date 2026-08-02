@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Literal
 
 import numpy as np
 
+from .dataset import build_posed_dataset
 from .io import phase_roots, read_phase, read_project, save_binary_ply, save_preview, write_json
 from .mesh import PosedFrame, build_mesh_artifacts
 from .numpy_engine import reconstruct_known_poses
@@ -56,6 +58,19 @@ class ProgressReporter:
                 )
             self.current_stage = stage
             self.stage_started = now
+        stage_elapsed = max(0, round(now - self.stage_started))
+        if elapsed_seconds is None:
+            elapsed_seconds = stage_elapsed
+        if (
+            stage_eta_seconds is None
+            and stage_progress is not None
+            and 0.01 < stage_progress < 1.0
+            and stage_elapsed >= 1
+        ):
+            stage_eta_seconds = max(
+                1,
+                round(stage_elapsed * (1.0 - stage_progress) / stage_progress),
+            )
         if compute_backend is not None:
             self.compute_backend = compute_backend
         self.processed_units = min(self.total_units, self.processed_units + advance)
@@ -90,6 +105,7 @@ def reconstruct_project(
     project_root: Path,
     engine: Engine = "auto",
     device: Device = "auto",
+    targets: tuple[str, ...] = ("point_cloud", "textured_mesh"),
 ) -> dict:
     project_root = project_root.resolve()
     project = read_project(project_root)
@@ -174,15 +190,33 @@ def reconstruct_project(
             raise RuntimeError("Reconstruction produced no valid points")
 
         output_dir = project_root / "outputs"
-        mesh = build_mesh_artifacts(
-            output_dir,
-            artifact_context.get("posed_frames", []),
-            reporter.update,
+        posed_frames = artifact_context.get("posed_frames", [])
+        needs_dataset = "gaussian_splat" in targets or "textured_mesh" in targets
+        dataset = (
+            build_posed_dataset(output_dir / "cache", posed_frames, reporter.update)
+            if needs_dataset
+            else None
         )
-        reporter.update("Exporting", "Writing point-cloud and textured-mesh artifacts", 4, len(points))
+        mesh = (
+            build_mesh_artifacts(output_dir, posed_frames, reporter.update)
+            if "textured_mesh" in targets
+            else {
+                "cameraFrameCount": len(posed_frames),
+                "meshVertexCount": 0,
+                "meshTriangleCount": 0,
+            }
+        )
+        reporter.update(
+            "Exporting",
+            "Writing selected reconstruction artifacts",
+            4,
+            len(points),
+            0.0,
+        )
         output_path = output_dir / "room-cloud.ply"
-        save_binary_ply(output_path, points, colors)
-        save_preview(output_dir / "preview.json", points, colors)
+        if "point_cloud" in targets:
+            save_binary_ply(output_path, points, colors)
+            save_preview(output_dir / "preview.json", points, colors)
         result = {
             "engine": selected_engine,
             "pointCount": int(points.shape[0]),
@@ -197,15 +231,40 @@ def reconstruct_project(
             "quality": quality,
             "computeBackend": quality.get("computeBackend", reporter.compute_backend or "NumPy CPU"),
             **mesh,
+            "targets": list(targets),
+            "datasetFingerprint": dataset.get("fingerprint") if dataset else None,
         }
 
         project["processingStatus"] = "complete"
         project.pop("processingError", None)
-        project["pointCount"] = result["pointCount"]
-        project["outputPath"] = "outputs/room-cloud.ply"
-        project["meshTriangleCount"] = result["meshTriangleCount"]
-        project["meshOutputPath"] = result.get("meshOutputPath")
-        project["cameraFrameCount"] = result["cameraFrameCount"]
+        project["schemaVersion"] = max(int(project.get("schemaVersion", 1)), 2)
+        project.setdefault("mediaSources", [])
+        artifacts = project.setdefault("artifacts", {})
+        updated_at = datetime.now(timezone.utc).isoformat()
+        fingerprint = dataset.get("fingerprint", "") if dataset else ""
+        if "point_cloud" in targets:
+            project["pointCount"] = result["pointCount"]
+            project["outputPath"] = "outputs/room-cloud.ply"
+            artifacts["pointCloud"] = {
+                "path": "outputs/room-cloud.ply",
+                "status": "ready",
+                "sourceFingerprint": fingerprint,
+                "updatedAt": updated_at,
+                "metric": True,
+                "stale": False,
+            }
+        if "textured_mesh" in targets:
+            project["meshTriangleCount"] = result["meshTriangleCount"]
+            project["meshOutputPath"] = result.get("meshOutputPath")
+            project["cameraFrameCount"] = result["cameraFrameCount"]
+            artifacts["texturedMesh"] = {
+                "path": "outputs/room-mesh.obj",
+                "status": "ready",
+                "sourceFingerprint": fingerprint,
+                "updatedAt": updated_at,
+                "metric": True,
+                "stale": False,
+            }
         project["confidenceScore"] = result["confidenceScore"]
         project["confidenceLabel"] = result["confidenceLabel"]
         project["confidenceDetail"] = result["confidenceDetail"]

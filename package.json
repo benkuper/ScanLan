@@ -18,6 +18,8 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "prepare:runtime": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-workers.ps1",
     "prepare:cuda": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-open3d-cuda.ps1",
+    "prepare:splat": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-splat-runtime.ps1",
+    "package:splat": "npm run prepare:splat && tauri build --config src-tauri/tauri.splat.conf.json",
     "desktop:dev": "npm run prepare:runtime && vite --port 1420",
     "desktop:build": "npm run prepare:runtime && vite build",
     "tauri": "tauri"

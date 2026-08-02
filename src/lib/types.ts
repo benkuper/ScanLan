@@ -17,6 +17,48 @@ export interface CaptureSettings {
   useImu: boolean;
   depthFieldOfView: DepthFieldOfView;
   depthBinned: boolean;
+  rgbJpegQuality: number;
+  /** Zero keeps the sensor's native RGB dimensions. */
+  maxRgbDimension: number;
+}
+
+export type MediaSourceKind = 'photos' | 'video';
+export type ArtifactStatus = 'ready' | 'building' | 'stale' | 'failed';
+
+export interface MediaSourceQuality {
+  registeredImages: number;
+  totalImages: number;
+  reprojectionError?: number;
+  disconnectedComponents: number;
+  detail: string;
+}
+
+export interface MediaSource {
+  id: string;
+  kind: MediaSourceKind;
+  name: string;
+  createdAt: string;
+  path: string;
+  originals: string[];
+  status: string;
+  imageCount: number;
+  metric: boolean;
+  quality: MediaSourceQuality | null;
+}
+
+export interface ArtifactSummary {
+  path: string;
+  status: ArtifactStatus;
+  sourceFingerprint: string;
+  updatedAt: string;
+  metric: boolean;
+  stale: boolean;
+}
+
+export interface ArtifactCatalog {
+  pointCloud: ArtifactSummary | null;
+  texturedMesh: ArtifactSummary | null;
+  gaussianSplat: ArtifactSummary | null;
 }
 
 export interface AvailableSensor {
@@ -40,11 +82,15 @@ export interface PhaseSummary {
 }
 
 export interface ProjectSummary {
+  schemaVersion: number;
   id: string;
   name: string;
   path: string;
   createdAt: string;
   phases: PhaseSummary[];
+  mediaSources: MediaSource[];
+  artifacts: ArtifactCatalog;
+  activeJob: string | null;
   settings: CaptureSettings;
   processingStatus: ProcessingStatus;
   processingError?: string;
@@ -67,6 +113,40 @@ export interface RuntimeInfo {
   sensorConnected: boolean;
   sensorStatus: string;
   reconstructionWorkerAvailable: boolean;
+  splatWorkerAvailable: boolean;
+  splatStatus: string;
+  ffmpegAvailable: boolean;
+  colmapAvailable: boolean;
+}
+
+export type ArtifactTarget = 'pointCloud' | 'texturedMesh' | 'gaussianSplat';
+export type ArtifactJobStatus = 'queued' | 'running' | 'cancelling' | 'cancelled' | 'failed' | 'complete';
+
+export interface ArtifactJob {
+  id: string;
+  projectPath: string;
+  pipeline: 'rgbd_reconstruction' | 'media_gaussian';
+  targets: ArtifactTarget[];
+  sourceIds: string[];
+  stage: string;
+  detail: string;
+  progress: number;
+  iteration: number | null;
+  totalIterations: number | null;
+  loss: number | null;
+  etaSeconds: number | null;
+  stageProgress: number | null;
+  stageEtaSeconds: number | null;
+  elapsedSeconds: number | null;
+  computeBackend: string | null;
+  status: ArtifactJobStatus;
+  createdAt: string;
+  startedAt: string | null;
+  updatedAt: string;
+  sourceFingerprint: string;
+  logPath: string;
+  error: string | null;
+  resumable: boolean;
 }
 
 export interface CaptureStatus {

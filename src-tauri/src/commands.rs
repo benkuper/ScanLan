@@ -1,6 +1,6 @@
 use crate::models::{
     AvailableSensor, CameraFrame, CaptureSettings, CaptureStatus, CloudTransform, LiveWorkerStatus,
-    PreviewPoint, ProjectSummary, ReconstructionProgress, RuntimeInfo,
+    MediaSource, PreviewPoint, ProjectSummary, ReconstructionProgress, RuntimeInfo,
 };
 use crate::storage;
 use chrono::Utc;
@@ -44,6 +44,7 @@ pub struct AppState {
     pub project: Arc<Mutex<ProjectSummary>>,
     pub active_capture: Arc<Mutex<Option<ActiveCapture>>>,
     pub active_live_preview: Arc<Mutex<Option<ActiveLivePreview>>>,
+    pub jobs: crate::jobs::JobManager,
 }
 
 impl Default for AppState {
@@ -52,11 +53,13 @@ impl Default for AppState {
             project: Arc::new(Mutex::new(ProjectSummary::placeholder())),
             active_capture: Arc::new(Mutex::new(None)),
             active_live_preview: Arc::new(Mutex::new(None)),
+            jobs: crate::jobs::JobManager::default(),
         }
     }
 }
 
 pub fn terminate_active_capture(state: &AppState) {
+    state.jobs.cancel_all();
     if let Ok(mut active) = state.active_capture.lock() {
         if let Some(mut capture) = active.take() {
             File::create(capture.phase_root.join("stop.flag")).ok();
@@ -225,7 +228,10 @@ fn ensure_project(app: &AppHandle, state: &AppState) -> Result<ProjectSummary, S
         .map_err(|_| "Project state is unavailable".to_string())?
         .clone();
     if !existing.path.is_empty() && Path::new(&existing.path).join("project.json").exists() {
-        if normalize_project(&mut existing) | restore_sensor_preference(app, &mut existing) {
+        if normalize_project(&mut existing)
+            | restore_sensor_preference(app, &mut existing)
+            | crate::jobs::recover_interrupted_job(&mut existing, &state.jobs)
+        {
             storage::write_project(&existing)?;
             *state
                 .project
@@ -243,7 +249,10 @@ fn ensure_project(app: &AppHandle, state: &AppState) -> Result<ProjectSummary, S
         let folder = format!("scan-{}", Utc::now().format("%Y%m%d-%H%M%S"));
         storage::create_project(&base.join(folder))?
     };
-    if normalize_project(&mut project) | restore_sensor_preference(app, &mut project) {
+    if normalize_project(&mut project)
+        | restore_sensor_preference(app, &mut project)
+        | crate::jobs::recover_interrupted_job(&mut project, &state.jobs)
+    {
         storage::write_project(&project)?;
     }
     *state
@@ -253,15 +262,15 @@ fn ensure_project(app: &AppHandle, state: &AppState) -> Result<ProjectSummary, S
     Ok(project)
 }
 
-fn resource_root(app: &AppHandle) -> Option<PathBuf> {
+pub(crate) fn resource_root(app: &AppHandle) -> Option<PathBuf> {
     app.path().resource_dir().ok()
 }
 
-fn first_existing(paths: Vec<PathBuf>) -> Option<PathBuf> {
+pub(crate) fn first_existing(paths: Vec<PathBuf>) -> Option<PathBuf> {
     paths.into_iter().find(|path| path.is_file())
 }
 
-fn worker_command(worker: &Path) -> Command {
+pub(crate) fn worker_command(worker: &Path) -> Command {
     let mut command = Command::new(worker);
 
     // The capture and reconstruction helpers are console executables so they
@@ -299,6 +308,12 @@ fn sensor_key(settings: &CaptureSettings) -> String {
 }
 
 fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String> {
+    settings.rgb_jpeg_quality = settings.rgb_jpeg_quality.clamp(60, 100);
+    settings.max_rgb_dimension = if settings.max_rgb_dimension == 0 {
+        0
+    } else {
+        settings.max_rgb_dimension.clamp(640, 8192)
+    };
     settings.sensor_id = settings.sensor_id.trim().to_string();
     if !matches!(
         settings.sensor_kind.as_str(),
@@ -348,6 +363,14 @@ fn sensor_worker(app: &AppHandle, settings: &CaptureSettings) -> Result<PathBuf,
 }
 
 fn append_sensor_args(command: &mut Command, settings: &CaptureSettings) {
+    command
+        .arg("--rgb-quality")
+        .arg(settings.rgb_jpeg_quality.to_string());
+    if settings.max_rgb_dimension > 0 {
+        command
+            .arg("--max-rgb-dimension")
+            .arg(settings.max_rgb_dimension.to_string());
+    }
     if settings.sensor_kind == "kinect_v2" {
         return;
     }
@@ -807,6 +830,70 @@ pub async fn runtime_info(
             storage::candidate_reconstruction_worker_paths(resources.as_deref()),
         )
         .is_some();
+        let splat_worker =
+            first_existing(storage::candidate_splat_worker_paths(resources.as_deref()));
+        let (splat_worker_available, splat_status) = match splat_worker {
+            Some(worker) => {
+                let mut command = worker_command(&worker);
+                command.arg("diagnostics");
+                match command.output() {
+                    Ok(output) => {
+                        let diagnostics =
+                            serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                                .unwrap_or_default();
+                        let cuda = diagnostics
+                            .get("cuda")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let device = diagnostics
+                            .get("device")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("CUDA device");
+                        if output.status.success() && cuda {
+                            (
+                                true,
+                                format!("Gaussian-splat CUDA runtime ready on {device}"),
+                            )
+                        } else if output.status.success() {
+                            (
+                                false,
+                                "Splat runtime is installed, but CUDA is unavailable".to_string(),
+                            )
+                        } else {
+                            let detail = output_message(&output);
+                            (
+                                false,
+                                if detail.is_empty() {
+                                    "Splat runtime diagnostics failed".to_string()
+                                } else {
+                                    detail
+                                },
+                            )
+                        }
+                    }
+                    Err(error) => (
+                        false,
+                        format!("Could not start splat runtime diagnostics: {error}"),
+                    ),
+                }
+            }
+            None => (
+                false,
+                "Not installed; run npm run prepare:splat".to_string(),
+            ),
+        };
+        let ffmpeg_available = Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let colmap_available = Command::new("colmap")
+            .arg("-h")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
 
         let (sensor_connected, sensor_status) = match &sensor_worker {
             Some(worker) => {
@@ -847,6 +934,10 @@ pub async fn runtime_info(
             sensor_connected,
             sensor_status,
             reconstruction_worker_available,
+            splat_worker_available,
+            splat_status,
+            ffmpeg_available,
+            colmap_available,
         }
     })
     .await
@@ -856,6 +947,10 @@ pub async fn runtime_info(
         sensor_connected: false,
         sensor_status: format!("Sensor connection check failed: {error}"),
         reconstruction_worker_available: false,
+        splat_worker_available: false,
+        splat_status: "Splat runtime detection failed".to_string(),
+        ffmpeg_available: false,
+        colmap_available: false,
     });
     Ok(runtime)
 }
@@ -913,7 +1008,7 @@ pub fn update_project_settings(
     if project.path != project_path {
         return Err("The selected project is no longer active".to_string());
     }
-    if project.processing_status == "processing" {
+    if project.processing_status == "processing" || project.active_job.is_some() {
         return Err("Capture settings cannot change during reconstruction".to_string());
     }
     settings.capture_fps = settings.capture_fps.clamp(1, 30);
@@ -959,6 +1054,9 @@ pub fn start_sensor_phase(
     let project_root = PathBuf::from(project_path);
     let worker = sensor_worker(&app, &settings)?;
     let mut project = storage::read_project(&project_root)?;
+    if project.active_job.is_some() {
+        return Err("Cancel the active artifact job before capturing another phase".to_string());
+    }
     project.settings = settings;
     write_sensor_preference(&app, &project.settings)?;
     project.settings.voxel_size_mm = project.settings.voxel_size_mm.clamp(1, 40);
@@ -975,6 +1073,7 @@ pub fn start_sensor_phase(
     project.frames_used = None;
     project.processing_backend = None;
     project.processing_duration_seconds = None;
+    project.artifacts = crate::models::ArtifactCatalog::default();
     project.confidence_score = None;
     project.confidence_label = None;
     project.confidence_detail = None;
@@ -1371,6 +1470,145 @@ pub fn remove_capture(
     project.frames_used = None;
     project.processing_backend = None;
     project.processing_duration_seconds = None;
+    project.artifacts = crate::models::ArtifactCatalog::default();
+    storage::write_project(&project)?;
+    *state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
+    Ok(project)
+}
+
+fn supported_photo(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp"
+            )
+        })
+}
+
+#[tauri::command]
+pub fn import_media_source(
+    project_path: String,
+    kind: String,
+    paths: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    if !matches!(kind.as_str(), "photos" | "video") {
+        return Err("Media kind must be photos or video".to_string());
+    }
+    if paths.is_empty() {
+        return Err("Choose photos or a video to import".to_string());
+    }
+    let root = PathBuf::from(project_path);
+    let mut selected = Vec::new();
+    for raw in paths {
+        let path = PathBuf::from(raw);
+        if path.is_dir() && kind == "photos" {
+            for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                if entry
+                    .file_type()
+                    .map_err(|error| error.to_string())?
+                    .is_file()
+                    && supported_photo(&entry.path())
+                {
+                    selected.push(entry.path());
+                }
+            }
+        } else if path.is_file() {
+            selected.push(path);
+        }
+    }
+    if kind == "photos" {
+        selected.retain(|path| supported_photo(path));
+    } else if selected.len() != 1 {
+        return Err("Choose one video at a time".to_string());
+    }
+    selected.sort();
+    if selected.is_empty() {
+        return Err("No supported media files were selected".to_string());
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let relative_root = PathBuf::from("sources").join(&id);
+    let originals_root = root.join(&relative_root).join("originals");
+    fs::create_dir_all(&originals_root).map_err(|error| error.to_string())?;
+    let mut originals = Vec::new();
+    for (index, source) in selected.iter().enumerate() {
+        let original_name = source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("media");
+        let destination_name = format!("{index:05}-{original_name}");
+        fs::copy(source, originals_root.join(&destination_name))
+            .map_err(|error| format!("Could not copy {}: {error}", source.display()))?;
+        originals.push(format!("originals/{destination_name}"));
+    }
+    let mut project = storage::read_project(&root)?;
+    project.media_sources.push(MediaSource {
+        id: id.clone(),
+        kind: kind.clone(),
+        name: if kind == "video" {
+            selected[0]
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Imported video")
+                .to_string()
+        } else {
+            format!("Photo set {}", project.media_sources.len() + 1)
+        },
+        created_at: Utc::now().to_rfc3339(),
+        path: relative_root.to_string_lossy().replace('\\', "/"),
+        originals,
+        status: "ready".to_string(),
+        image_count: if kind == "photos" {
+            selected.len() as u32
+        } else {
+            0
+        },
+        metric: false,
+        quality: None,
+    });
+    project.artifacts.gaussian_splat = None;
+    storage::write_project(&project)?;
+    *state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn remove_media_source(
+    project_path: String,
+    source_id: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    let root = PathBuf::from(project_path);
+    let mut project = storage::read_project(&root)?;
+    if project.active_job.is_some() {
+        return Err("Cancel the active artifact job before removing media".to_string());
+    }
+    let index = project
+        .media_sources
+        .iter()
+        .position(|source| source.id == source_id)
+        .ok_or_else(|| "The media source no longer exists".to_string())?;
+    let sources_root = root.join("sources");
+    let source_root = sources_root.join(&source_id);
+    if source_root.parent() != Some(sources_root.as_path()) {
+        return Err("Refusing an invalid media-source path".to_string());
+    }
+    if source_root.exists() {
+        fs::remove_dir_all(&source_root)
+            .map_err(|error| format!("Could not remove media source: {error}"))?;
+    }
+    project.media_sources.remove(index);
+    project.artifacts.gaussian_splat = None;
     storage::write_project(&project)?;
     *state
         .project
@@ -1892,6 +2130,58 @@ pub fn export_textured_mesh(
     Ok(destination_obj.to_string_lossy().into_owned())
 }
 
+#[tauri::command]
+pub fn export_gaussian_splat(
+    project_path: String,
+    destination_path: String,
+) -> Result<String, String> {
+    let root = PathBuf::from(project_path);
+    let project = storage::read_project(&root)?;
+    let relative = project
+        .artifacts
+        .gaussian_splat
+        .as_ref()
+        .filter(|artifact| !artifact.stale)
+        .map(|artifact| artifact.path.as_str())
+        .unwrap_or("outputs/room-splat.ply");
+    let source = root.join(relative);
+    if !source.is_file() {
+        return Err("Build a Gaussian splat before exporting it".to_string());
+    }
+    let mut destination = PathBuf::from(destination_path);
+    if destination.as_os_str().is_empty() || !destination.is_absolute() {
+        return Err("Choose a valid destination for the Gaussian PLY".to_string());
+    }
+    if !destination
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ply"))
+    {
+        destination.set_extension("ply");
+    }
+    write_export(
+        &destination,
+        &fs::read(&source).map_err(|error| format!("Could not read Gaussian PLY: {error}"))?,
+    )?;
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("room-splat");
+    for (source_name, suffix) in [
+        ("room-splat.transform.json", "transform.json"),
+        ("splat-manifest.json", "manifest.json"),
+    ] {
+        let sidecar = root.join("outputs").join(source_name);
+        if sidecar.is_file() {
+            let destination_sidecar = destination.with_file_name(format!("{stem}.{suffix}"));
+            write_export(
+                &destination_sidecar,
+                &fs::read(&sidecar).map_err(|error| error.to_string())?,
+            )?;
+        }
+    }
+    Ok(destination.to_string_lossy().into_owned())
+}
+
 fn transformed_position(position: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
     let [x_angle, y_angle, z_angle] = transform.rotation.map(f32::to_radians);
     let (sx, cx) = (x_angle * 0.5).sin_cos();
@@ -2240,6 +2530,8 @@ mod tests {
         .unwrap();
         assert_eq!(settings.depth_field_of_view, "narrow");
         assert!(!settings.depth_binned);
+        assert_eq!(settings.rgb_jpeg_quality, 92);
+        assert_eq!(settings.max_rgb_dimension, 0);
     }
 
     #[test]

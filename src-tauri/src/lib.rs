@@ -1,4 +1,5 @@
 mod commands;
+mod jobs;
 mod models;
 mod storage;
 
@@ -29,6 +30,14 @@ pub fn run() {
             commands::apply_cloud_transform,
             commands::export_ply,
             commands::export_textured_mesh,
+            commands::import_media_source,
+            commands::remove_media_source,
+            commands::export_gaussian_splat,
+            jobs::start_artifact_job,
+            jobs::artifact_job_status,
+            jobs::latest_artifact_job,
+            jobs::cancel_artifact_job,
+            jobs::resume_artifact_job,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ScanLan");

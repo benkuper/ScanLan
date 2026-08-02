@@ -22,6 +22,7 @@
 
 #include <fcntl.h>
 #include <io.h>
+#include "jpeg_writer.h"
 
 #ifdef SCANLAN_HAS_AZURE_KINECT
 #include <k4a/k4a.h>
@@ -49,6 +50,8 @@ struct Options {
     bool depth_binned = false;
     int fps = 10;
     float max_depth_m = 4.5F;
+    int rgb_quality = 92;
+    std::uint32_t max_rgb_dimension = 0;
 };
 
 struct DepthModeInfo {
@@ -83,6 +86,17 @@ struct CameraInfo {
     float cy = 0;
 };
 
+struct RgbCameraInfo {
+    int width = 0;
+    int height = 0;
+    float fx = 0;
+    float fy = 0;
+    float cx = 0;
+    float cy = 0;
+    std::vector<float> distortion;
+    std::array<float, 16> rgb_from_depth{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+};
+
 struct SensorInfo {
     std::string kind;
     std::string name;
@@ -113,10 +127,13 @@ Options parse_options(int argc, char **argv) {
         else if(argument == "--depth-binned") options.depth_binned = true;
         else if(argument == "--fps") options.fps = std::stoi(value());
         else if(argument == "--max-depth") options.max_depth_m = std::stof(value());
+        else if(argument == "--rgb-quality") options.rgb_quality = std::stoi(value());
+        else if(argument == "--max-rgb-dimension") options.max_rgb_dimension = static_cast<std::uint32_t>(std::stoul(value()));
         else if(argument == "--imu") options.use_imu = true;
         else throw std::runtime_error("Unknown argument: " + argument);
     }
     if(!options.probe && !options.list && options.root.empty()) throw std::runtime_error("Pass --phase PATH or --preview PATH");
+    options.rgb_quality = std::clamp(options.rgb_quality, 60, 100);
     if(options.sensor != "azure_kinect" && options.sensor != "femto_mega") {
         throw std::runtime_error("Modern worker supports azure_kinect or femto_mega");
     }
@@ -273,12 +290,16 @@ void write_binary(const fs::path &path, const std::vector<T> &values) {
 }
 
 void write_manifest(const Options &options, const SensorInfo &sensor, const CameraInfo &camera,
+                    const RgbCameraInfo &source_rgb,
                     const std::string &created_at, std::uint32_t frame_count, std::uint32_t duration_seconds,
-                    bool imu_active) {
+                    bool imu_active, std::uint32_t rgb_drops) {
+    const double rgb_scale = options.max_rgb_dimension > 0
+        && options.max_rgb_dimension < static_cast<std::uint32_t>(std::max(source_rgb.width, source_rgb.height))
+        ? static_cast<double>(options.max_rgb_dimension) / std::max(source_rgb.width, source_rgb.height) : 1.0;
     std::ostringstream output;
     output << std::fixed << std::setprecision(6)
            << "{\n"
-           << "  \"schemaVersion\": 2,\n"
+           << "  \"schemaVersion\": 3,\n"
            << "  \"id\": \"" << json_escape(options.id) << "\",\n"
            << "  \"name\": \"" << json_escape(options.name) << "\",\n"
            << "  \"createdAt\": \"" << created_at << "\",\n"
@@ -302,7 +323,24 @@ void write_manifest(const Options &options, const SensorInfo &sensor, const Came
            << "    \"depth_scale\": 1000.0, \"max_depth_m\": " << options.max_depth_m << ",\n"
            << "    \"depth_field_of_view\": \"" << options.depth_fov << "\", "
            << "\"depth_binned\": " << (options.depth_binned ? "true" : "false") << "\n"
-           << "  }\n"
+           << "  },\n"
+           << "  \"rgbCamera\": {\"width\": " << std::lround(source_rgb.width * rgb_scale)
+           << ", \"height\": " << std::lround(source_rgb.height * rgb_scale)
+           << ", \"fx\": " << source_rgb.fx * rgb_scale << ", \"fy\": " << source_rgb.fy * rgb_scale
+           << ", \"cx\": " << source_rgb.cx * rgb_scale << ", \"cy\": " << source_rgb.cy * rgb_scale
+           << ", \"model\": \"brown_conrady\", \"distortion\": [";
+    for(std::size_t index = 0; index < source_rgb.distortion.size(); ++index) {
+        if(index) output << ',';
+        output << source_rgb.distortion[index];
+    }
+    output << "]},\n  \"rgbFromDepth\": [";
+    for(std::size_t index = 0; index < source_rgb.rgb_from_depth.size(); ++index) {
+        if(index) output << ',';
+        output << source_rgb.rgb_from_depth[index];
+    }
+    output << "],\n  \"sourceRgb\": {\"format\": \"jpeg\", \"quality\": " << options.rgb_quality
+           << ", \"nativeResolution\": " << (options.max_rgb_dimension == 0 ? "true" : "false")
+           << ", \"droppedFrames\": " << rgb_drops << "}\n"
            << "}\n";
     write_text_atomic(options.root / "phase.json", output.str());
 }
@@ -396,26 +434,31 @@ void prepare_root(const Options &options) {
     if(!options.preview) {
         fs::create_directories(options.root / "depth");
         fs::create_directories(options.root / "color");
+        fs::create_directories(options.root / "rgb");
     }
 }
 
 std::string csv_header() {
     std::ostringstream output;
-    output << "index,timestamp_us,depth_path,color_path";
+    output << "index,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_us";
     for(int row = 0; row < 4; ++row) for(int column = 0; column < 4; ++column) output << ",m" << row << column;
     output << '\n';
     return output.str();
 }
 
 void save_frame(const Options &options, std::ofstream &frames, std::uint32_t index, std::uint64_t timestamp_us,
-                const std::vector<std::uint16_t> &depth, const std::vector<std::uint8_t> &rgb) {
+                const std::vector<std::uint16_t> &depth, const std::vector<std::uint8_t> &rgb,
+                const std::string &rgb_name, std::uint64_t rgb_timestamp_us) {
     std::ostringstream stem;
     stem << std::setw(6) << std::setfill('0') << index;
     const std::string depth_name = stem.str() + ".u16";
     const std::string color_name = stem.str() + ".rgb";
     write_binary(options.root / "depth" / depth_name, depth);
     write_binary(options.root / "color" / color_name, rgb);
-    frames << index << ',' << timestamp_us << ",depth/" << depth_name << ",color/" << color_name;
+    frames << index << ',' << timestamp_us << ",depth/" << depth_name << ",color/" << color_name << ',';
+    if(!rgb_name.empty()) frames << "rgb/" << rgb_name;
+    frames << ',';
+    if(!rgb_name.empty()) frames << rgb_timestamp_us;
     for(int value = 0; value < 16; ++value) frames << ',';
     frames << '\n';
     frames.flush();
@@ -467,7 +510,7 @@ int run_azure(const Options &options) {
         config.synchronized_images_only = !options.preview && !options.probe;
         if(!options.preview) {
             config.color_format = K4A_IMAGE_FORMAT_COLOR_BGRA32;
-            config.color_resolution = K4A_COLOR_RESOLUTION_720P;
+            config.color_resolution = K4A_COLOR_RESOLUTION_2160P;
         }
         k4a_calibration_t calibration{};
         if(k4a_device_get_calibration(device, config.depth_mode, config.color_resolution, &calibration) != K4A_RESULT_SUCCEEDED) {
@@ -477,6 +520,20 @@ int run_azure(const Options &options) {
         CameraInfo camera{calibration.depth_camera_calibration.resolution_width,
                           calibration.depth_camera_calibration.resolution_height,
                           intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy};
+        const auto &rgb_intrinsics = calibration.color_camera_calibration.intrinsics.parameters.param;
+        const auto &depth_to_rgb = calibration.extrinsics[K4A_CALIBRATION_TYPE_DEPTH][K4A_CALIBRATION_TYPE_COLOR];
+        RgbCameraInfo rgb_camera{
+            calibration.color_camera_calibration.resolution_width,
+            calibration.color_camera_calibration.resolution_height,
+            rgb_intrinsics.fx, rgb_intrinsics.fy, rgb_intrinsics.cx, rgb_intrinsics.cy,
+            {rgb_intrinsics.k1, rgb_intrinsics.k2, rgb_intrinsics.p1, rgb_intrinsics.p2, rgb_intrinsics.k3},
+            {
+                depth_to_rgb.rotation[0], depth_to_rgb.rotation[1], depth_to_rgb.rotation[2], depth_to_rgb.translation[0] / 1000.0F,
+                depth_to_rgb.rotation[3], depth_to_rgb.rotation[4], depth_to_rgb.rotation[5], depth_to_rgb.translation[1] / 1000.0F,
+                depth_to_rgb.rotation[6], depth_to_rgb.rotation[7], depth_to_rgb.rotation[8], depth_to_rgb.translation[2] / 1000.0F,
+                0, 0, 0, 1
+            }
+        };
         if(k4a_device_start_cameras(device, &config) != K4A_RESULT_SUCCEEDED) {
             throw std::runtime_error("Azure Kinect cameras could not start; close other camera applications and check USB 3/power");
         }
@@ -499,6 +556,11 @@ int run_azure(const Options &options) {
             frames.open(options.root / "frames.csv", std::ios::trunc);
             frames << csv_header();
         }
+        std::unique_ptr<scanlan::JpegWriterQueue> rgb_writer;
+        if(!options.preview) {
+            rgb_writer = std::make_unique<scanlan::JpegWriterQueue>(
+                options.rgb_quality, options.max_rgb_dimension, 6);
+        }
         std::unique_ptr<ImuCsv> imu;
         bool imu_active = false;
         auto accel_to_depth = calibration.extrinsics[K4A_CALIBRATION_TYPE_ACCEL][K4A_CALIBRATION_TYPE_DEPTH];
@@ -517,7 +579,7 @@ int run_azure(const Options &options) {
                 imu->write(sample.gyro_timestamp_usec, "gyro", gyro[0], gyro[1], gyro[2], sample.temperature);
             }
         };
-        write_manifest(options, sensor, camera, created_at, 0, 0, imu_active);
+        write_manifest(options, sensor, camera, rgb_camera, created_at, 0, 0, imu_active, 0);
 
         k4a_transformation_t transformation = options.preview ? nullptr : k4a_transformation_create(&calibration);
         std::uint64_t source_frames = 0;
@@ -578,7 +640,24 @@ int run_azure(const Options &options) {
                     const std::size_t target = static_cast<std::size_t>((y * camera.width + x) * 3);
                     rgb[target] = source[2]; rgb[target + 1] = source[1]; rgb[target + 2] = source[0];
                 }
-                save_frame(options, frames, saved_frames - 1, timestamp_us, depth, rgb);
+                const int source_width = k4a_image_get_width_pixels(color_image);
+                const int source_height = k4a_image_get_height_pixels(color_image);
+                const int source_stride = k4a_image_get_stride_bytes(color_image);
+                const auto *source_bgra = k4a_image_get_buffer(color_image);
+                std::vector<std::uint8_t> native_rgb(static_cast<std::size_t>(source_width * source_height * 3));
+                for(int y = 0; y < source_height; ++y) for(int x = 0; x < source_width; ++x) {
+                    const auto *source = source_bgra + y * source_stride + x * 4;
+                    const std::size_t target = static_cast<std::size_t>((y * source_width + x) * 3);
+                    native_rgb[target] = source[2]; native_rgb[target + 1] = source[1]; native_rgb[target + 2] = source[0];
+                }
+                std::ostringstream rgb_stem;
+                rgb_stem << std::setw(6) << std::setfill('0') << (saved_frames - 1);
+                const std::string rgb_name = rgb_stem.str() + ".jpg";
+                const std::uint64_t rgb_timestamp_us = k4a_image_get_device_timestamp_usec(color_image);
+                const bool queued_rgb = rgb_writer->enqueue(
+                    options.root / "rgb" / rgb_name, source_width, source_height, std::move(native_rgb));
+                save_frame(options, frames, saved_frames - 1, timestamp_us, depth, rgb,
+                           queued_rgb ? rgb_name : "", rgb_timestamp_us);
                 k4a_image_release(aligned);
                 k4a_image_release(color_image);
             }
@@ -595,7 +674,9 @@ int run_azure(const Options &options) {
         }
         const auto duration = static_cast<std::uint32_t>(std::max<std::int64_t>(1,
             std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count()));
-        write_manifest(options, sensor, camera, created_at, saved_frames, duration, imu_active);
+        if(rgb_writer) rgb_writer->close();
+        write_manifest(options, sensor, camera, rgb_camera, created_at, saved_frames, duration, imu_active,
+                       rgb_writer ? rgb_writer->dropped() + rgb_writer->failed() : 0);
         k4a_device_stop_cameras(device);
         k4a_device_close(device);
         return options.preview || saved_frames > 0 ? 0 : 2;
@@ -658,7 +739,8 @@ std::shared_ptr<ob::Config> femto_video_config(const std::shared_ptr<ob::Pipelin
     auto color_profiles = pipeline->getStreamProfileList(OB_SENSOR_COLOR);
     std::shared_ptr<ob::StreamProfile> best_color;
     std::shared_ptr<ob::StreamProfile> best_depth;
-    long best_score = LONG_MAX;
+    long best_fps_delta = LONG_MAX;
+    long best_pixels = 0;
     for(std::uint32_t color_index = 0; color_index < color_profiles->getCount(); ++color_index) {
         auto color = color_profiles->getProfile(color_index);
         auto color_video = color->as<ob::VideoStreamProfile>();
@@ -670,11 +752,12 @@ std::shared_ptr<ob::Config> femto_video_config(const std::shared_ptr<ob::Pipelin
             if(static_cast<int>(depth_video->getWidth()) != requested.width
                 || static_cast<int>(depth_video->getHeight()) != requested.height) continue;
             if(depth_video->getFps() != color_video->getFps()) continue;
-            const long score = std::labs(static_cast<long>(color_video->getWidth()) - 1280L)
-                + std::labs(static_cast<long>(color_video->getHeight()) - 720L)
-                + std::labs(static_cast<long>(color_video->getFps()) - requested.native_fps) * 100L;
-            if(score < best_score) {
-                best_score = score;
+            const long fps_delta = std::labs(static_cast<long>(color_video->getFps()) - requested.native_fps);
+            const long pixels = static_cast<long>(color_video->getWidth() * color_video->getHeight());
+            if(!best_color || fps_delta < best_fps_delta
+                || (fps_delta == best_fps_delta && pixels > best_pixels)) {
+                best_fps_delta = fps_delta;
+                best_pixels = pixels;
                 best_color = color;
                 best_depth = depth;
             }
@@ -743,11 +826,36 @@ int run_orbbec(const Options &options) {
     const auto intrinsic = video_profile->getIntrinsic();
     CameraInfo camera{static_cast<int>(first_depth->getWidth()), static_cast<int>(first_depth->getHeight()),
                       intrinsic.fx, intrinsic.fy, intrinsic.cx, intrinsic.cy};
+    RgbCameraInfo rgb_camera{camera.width, camera.height, camera.fx, camera.fy, camera.cx, camera.cy};
+    if(!options.preview) {
+        auto first_color = aligned_first->getColorFrame();
+        if(!first_color) throw std::runtime_error("Femto Mega did not deliver synchronized native RGB");
+        auto color_profile = first_color->getStreamProfile()->as<ob::VideoStreamProfile>();
+        const auto color_intrinsic = color_profile->getIntrinsic();
+        const auto depth_to_rgb = depth_profile->getExtrinsicTo(color_profile);
+        rgb_camera.width = static_cast<int>(first_color->getWidth());
+        rgb_camera.height = static_cast<int>(first_color->getHeight());
+        rgb_camera.fx = color_intrinsic.fx;
+        rgb_camera.fy = color_intrinsic.fy;
+        rgb_camera.cx = color_intrinsic.cx;
+        rgb_camera.cy = color_intrinsic.cy;
+        rgb_camera.rgb_from_depth = {
+            depth_to_rgb.rot[0], depth_to_rgb.rot[1], depth_to_rgb.rot[2], depth_to_rgb.trans[0] / 1000.0F,
+            depth_to_rgb.rot[3], depth_to_rgb.rot[4], depth_to_rgb.rot[5], depth_to_rgb.trans[1] / 1000.0F,
+            depth_to_rgb.rot[6], depth_to_rgb.rot[7], depth_to_rgb.rot[8], depth_to_rgb.trans[2] / 1000.0F,
+            0, 0, 0, 1
+        };
+    }
     const std::string created_at = utc_now();
     std::ofstream frames;
     if(!options.preview) {
         frames.open(options.root / "frames.csv", std::ios::trunc);
         frames << csv_header();
+    }
+    std::unique_ptr<scanlan::JpegWriterQueue> rgb_writer;
+    if(!options.preview) {
+        rgb_writer = std::make_unique<scanlan::JpegWriterQueue>(
+            options.rgb_quality, options.max_rgb_dimension, 6);
     }
 
     std::unique_ptr<ImuCsv> imu;
@@ -784,7 +892,7 @@ int run_orbbec(const Options &options) {
             gyro_sensor.reset();
         }
     }
-    write_manifest(options, sensor, camera, created_at, 0, 0, imu_active);
+    write_manifest(options, sensor, camera, rgb_camera, created_at, 0, 0, imu_active, 0);
 
     auto format_converter = std::make_shared<ob::FormatConvertFilter>();
     const int native_fps = std::max(1, static_cast<int>(video_profile->getFps()));
@@ -828,7 +936,18 @@ int run_orbbec(const Options &options) {
             }
             const auto *rgb_data = color_frame->getData();
             std::vector<std::uint8_t> rgb(rgb_data, rgb_data + camera.width * camera.height * 3);
-            save_frame(options, frames, saved_frames - 1, timestamp_us, depth, rgb);
+            std::vector<std::uint8_t> native_rgb(rgb_data, rgb_data + color_frame->getWidth() * color_frame->getHeight() * 3);
+            std::ostringstream rgb_stem;
+            rgb_stem << std::setw(6) << std::setfill('0') << (saved_frames - 1);
+            const std::string rgb_name = rgb_stem.str() + ".jpg";
+            const std::uint64_t rgb_timestamp_us = color_frame->getTimeStampUs();
+            const bool queued_rgb = rgb_writer->enqueue(
+                options.root / "rgb" / rgb_name,
+                static_cast<std::uint32_t>(color_frame->getWidth()),
+                static_cast<std::uint32_t>(color_frame->getHeight()),
+                std::move(native_rgb));
+            save_frame(options, frames, saved_frames - 1, timestamp_us, depth, rgb,
+                       queued_rgb ? rgb_name : "", rgb_timestamp_us);
         }
         write_live_status(options, sensor, timestamp_us, saved_frames, stream_fps, imu_active,
                           imu ? imu->rate_hz() : 0.0F,
@@ -841,7 +960,9 @@ int run_orbbec(const Options &options) {
     }
     const auto duration = static_cast<std::uint32_t>(std::max<std::int64_t>(1,
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count()));
-    write_manifest(options, sensor, camera, created_at, saved_frames, duration, imu_active);
+    if(rgb_writer) rgb_writer->close();
+    write_manifest(options, sensor, camera, rgb_camera, created_at, saved_frames, duration, imu_active,
+                   rgb_writer ? rgb_writer->dropped() + rgb_writer->failed() : 0);
     pipeline->stop();
     return options.preview || saved_frames > 0 ? 0 : 2;
 }

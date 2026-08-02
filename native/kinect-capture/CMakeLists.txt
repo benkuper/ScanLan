@@ -16,9 +16,9 @@ endif()
 
 if(EXISTS "${KINECT_SDK_ROOT}/inc/Kinect.h")
   add_executable(legacy-capture-worker src/main.cpp)
-  target_include_directories(legacy-capture-worker PRIVATE "${KINECT_SDK_ROOT}/inc")
+  target_include_directories(legacy-capture-worker PRIVATE "${KINECT_SDK_ROOT}/inc" "${CMAKE_CURRENT_SOURCE_DIR}/../common")
   target_link_directories(legacy-capture-worker PRIVATE "${KINECT_SDK_ROOT}/Lib/x64")
-  target_link_libraries(legacy-capture-worker PRIVATE Kinect20 Kinect20.Fusion)
+  target_link_libraries(legacy-capture-worker PRIVATE Kinect20 Kinect20.Fusion windowscodecs ole32)
   target_compile_definitions(legacy-capture-worker PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(legacy-capture-worker PRIVATE /W4 /permissive- /EHsc)
 

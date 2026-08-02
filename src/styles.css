@@ -139,6 +139,14 @@ button { color: inherit; }
 .count-badge { min-width: 22px; padding: 3px 6px; border-radius: 10px; background: #112a39; color: #7fc4d7; text-align: center; }
 .phase-list { display: flex; flex-direction: column; gap: 8px; }
 .phase-card { display: grid; grid-template-columns: 31px 1fr 22px; gap: 9px; align-items: start; padding: 11px; border: 1px solid rgba(131, 181, 202, 0.08); border-radius: 12px; background: rgba(12, 32, 46, 0.72); }
+.media-heading { margin-top: 18px; }
+.media-card { grid-template-columns: 18px 1fr 22px; align-items: center; }
+.media-card > input { accent-color: #54d4bd; }
+.media-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.media-actions .add-phase { padding-inline: 7px; font-size: 9px; }
+.artifact-targets { display: grid; gap: 5px; }
+.runtime-diagnostic { margin: 8px 0 0; padding: 8px; border: 1px solid rgba(223, 126, 104, 0.22); border-radius: 8px; color: #bf857a; background: rgba(91, 34, 31, 0.14); font-size: 9px; line-height: 1.4; }
+.runtime-diagnostic.splat-ready { border-color: rgba(84, 212, 189, 0.25); color: #75cdbc; background: rgba(26, 91, 78, 0.14); }
 .phase-index { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; background: #102e3e; color: #61bad2; font-size: 10px; font-weight: 800; }
 .phase-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .phase-copy strong { overflow: hidden; color: #d5e4e9; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
@@ -187,16 +195,40 @@ button { color: inherit; }
 .metrics strong.confidence.low { color: #ef8d82; }
 .viewer-wrap { flex: 1 1 0; min-width: 0; min-height: 0; overflow: hidden; }
 .status-strip { min-height: 58px; padding: 9px 10px 9px 14px; display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--line); border-radius: 14px; background: rgba(9, 22, 33, 0.82); }
-.status-strip.with-progress { min-height: 72px; }
+.status-strip.with-progress {
+  min-height: 108px;
+  padding: 12px 12px 12px 16px;
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) 128px auto;
+  gap: 16px;
+  border-color: rgba(90, 185, 203, 0.2);
+  background: linear-gradient(110deg, rgba(10, 28, 40, 0.96), rgba(8, 21, 32, 0.94));
+  box-shadow: inset 0 1px 0 rgba(139, 215, 224, 0.035);
+}
 .status-copy { min-width: 0; flex: 1; padding-right: 16px; }
 .status-message { display: flex; align-items: center; gap: 10px; color: #7f96a2; font-size: 11px; }
 .status-light { width: 7px; height: 7px; border-radius: 50%; background: #57cfb1; box-shadow: 0 0 0 5px rgba(87, 207, 177, 0.07); }
 .status-light.busy { background: var(--amber); animation: blink 1s infinite; }
 .button.process { background: linear-gradient(135deg, #173b4b, #175064); color: #9ed6e4; }
-.progress-row { display: grid; grid-template-columns: minmax(140px, 1fr) 36px 90px; align-items: center; gap: 9px; margin-top: 9px; color: #657f8d; font-size: 9px; }
-.progress-row strong { color: #8fd2df; text-align: right; }
 .progress-track { height: 5px; overflow: hidden; border-radius: 5px; background: #122a38; }
 .progress-track i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #3d9cbc, #58d0ae); transition: width 180ms linear; }
+.progress-track.stage { height: 3px; background: #102531; }
+.progress-track.stage i { background: linear-gradient(90deg, #bd8749, #e0b66f); }
+.job-feedback { min-width: 0; }
+.job-heading { display: flex; align-items: center; gap: 10px; }
+.job-heading > div { min-width: 0; }
+.job-heading strong { display: block; overflow: hidden; color: #dcebf0; font-size: 12px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.job-kicker { display: block; margin-bottom: 2px; color: #64808e; font-size: 7.5px; font-weight: 800; letter-spacing: 0.13em; }
+.job-stage-count { flex: 0 0 auto; margin-left: auto; padding: 4px 7px; border: 1px solid rgba(95, 180, 198, 0.14); border-radius: 999px; background: rgba(20, 54, 70, 0.46); color: #78a8b6; font-size: 8px; font-weight: 750; }
+.job-detail { overflow: hidden; margin: 7px 0 8px 17px; color: #78929e; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+.job-progress-grid { display: grid; grid-template-columns: 42px minmax(110px, 1fr) 34px; align-items: center; gap: 5px 8px; color: #5e7986; font-size: 8px; }
+.job-progress-grid strong { color: #8dd0dc; font-size: 8.5px; text-align: right; }
+.job-backend { margin-top: 6px; color: #536e7b; font-size: 8px; text-align: right; }
+.job-timing { min-height: 70px; padding: 7px 14px; display: flex; flex-direction: column; justify-content: center; border-right: 1px solid rgba(146, 190, 207, 0.1); border-left: 1px solid rgba(146, 190, 207, 0.1); text-align: right; }
+.job-timing > span { color: #5f7885; font-size: 7.5px; font-weight: 800; letter-spacing: 0.11em; text-transform: uppercase; }
+.job-timing strong { margin: 4px 0 2px; color: #d7e8ec; font-size: 18px; letter-spacing: -0.03em; }
+.job-timing small { color: #6d8a96; font-size: 8px; line-height: 1.35; }
+.button.cancel-job { min-width: 94px; border: 1px solid rgba(224, 164, 91, 0.18); background: linear-gradient(135deg, #214352, #27576a); }
 
 .settings > p { margin: 7px 0 22px; color: #637d8b; font-size: 10px; line-height: 1.5; }
 .editor-mode-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -225,6 +257,7 @@ button { color: inherit; }
 .quality-bar i { display: block; width: 74%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #3f9ec0, #5ed2ae); }
 .quality-card ul { margin: 0; padding: 0 0 0 14px; color: #617986; font-size: 8.5px; line-height: 1.7; }
 .export-card { margin-top: 14px; padding: 12px; display: flex; flex-direction: column; gap: 4px; border-radius: 11px; background: linear-gradient(135deg, rgba(30, 91, 110, 0.15), rgba(39, 111, 91, 0.08)); }
+.export-card.stale { opacity: 0.62; }
 .export-card span { color: #617d8a; font-size: 8px; text-transform: uppercase; letter-spacing: 0.08em; }
 .export-card strong { color: #b8d3da; font-size: 11px; }
 .export-card small { color: #58717e; font-size: 8px; }
