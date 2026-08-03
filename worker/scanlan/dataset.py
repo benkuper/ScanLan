@@ -10,13 +10,13 @@ import numpy as np
 from PIL import Image
 
 from .calibration import (
-    depth_camera_points,
     rgb_depth_zbuffer,
     robust_depth_mask,
     world_from_depth_opencv,
     world_from_rgb_camera,
 )
 from .io import effective_rgb_camera, load_depth, load_source_rgb, save_binary_ply, write_json
+from .splat_seed import SEED_VERSION, GaussianSeeds, compact_seed_batches, seed_rgbd_gaussians
 
 if TYPE_CHECKING:
     from .mesh import PosedFrame
@@ -33,6 +33,7 @@ def _hash_file(digest: Any, path: Path) -> None:
 
 def dataset_fingerprint(frames: list[PosedFrame]) -> str:
     digest = hashlib.sha256()
+    digest.update(SEED_VERSION.encode("ascii"))
     seen_phases: set[Path] = set()
     for frame in frames:
         if frame.source.root not in seen_phases:
@@ -68,32 +69,6 @@ def _save_depth_png(path: Path, depth_m: np.ndarray) -> None:
     Image.fromarray(millimetres).save(path, compress_level=3)
 
 
-def _initialization_points(
-    frame: PosedFrame,
-    depth: np.ndarray,
-    image: np.ndarray,
-    uv_map: np.ndarray,
-    visibility: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    camera = frame.source.camera
-    stride = max(1, int(np.ceil(max(camera.width, camera.height) / 180)))
-    sampled_depth = np.zeros_like(depth)
-    sampled_depth[::stride, ::stride] = depth[::stride, ::stride]
-    points, valid, _ = depth_camera_points(sampled_depth, frame.source)
-    valid_indices = np.flatnonzero(valid)
-    visible = visibility.reshape(-1)[valid_indices]
-    points = points[visible]
-    valid_indices = valid_indices[visible]
-    if not len(points):
-        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
-    world_from_depth = world_from_depth_opencv(frame.camera_to_global, frame.image_y_up)
-    world = (world_from_depth @ points.T).T[:, :3]
-    uv = uv_map.reshape(-1, 2)[valid_indices]
-    u = np.rint(uv[:, 0]).astype(np.int64).clip(0, image.shape[1] - 1)
-    v = np.rint(uv[:, 1]).astype(np.int64).clip(0, image.shape[0] - 1)
-    return world.astype(np.float32), image[v, u].astype(np.uint8)
-
-
 def build_posed_dataset(
     cache_root: Path,
     frames: list[PosedFrame],
@@ -119,8 +94,7 @@ def build_posed_dataset(
         (temporary / name).mkdir(parents=True, exist_ok=True)
 
     records: list[dict[str, Any]] = []
-    point_batches: list[np.ndarray] = []
-    color_batches: list[np.ndarray] = []
+    seed_batches: list[GaussianSeeds] = []
     for output_index, frame in enumerate(frames):
         source_frame = frame.source.frames[frame.frame_index]
         rgb_camera = effective_rgb_camera(frame.source)
@@ -171,10 +145,16 @@ def build_posed_dataset(
                 "metric": True,
             }
         )
-        points, colors = _initialization_points(frame, depth, image, uv_map, visibility)
-        if len(points):
-            point_batches.append(points)
-            color_batches.append(colors)
+        seeds = seed_rgbd_gaussians(
+            depth,
+            image,
+            uv_map,
+            visibility,
+            frame.source.camera,
+            world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
+        )
+        if len(seeds.points):
+            seed_batches.append(seeds)
         if progress:
             progress(
                 "Preparing splat data",
@@ -184,21 +164,17 @@ def build_posed_dataset(
                 (output_index + 1) / len(frames),
             )
 
-    if point_batches:
-        points = np.concatenate(point_batches)
-        colors = np.concatenate(color_batches)
-        voxel_keys = np.floor(points / 0.015).astype(np.int64)
-        _, unique = np.unique(voxel_keys, axis=0, return_index=True)
-        unique.sort()
-        save_binary_ply(temporary / "initialization.ply", points[unique], colors[unique])
-    else:
-        save_binary_ply(
-            temporary / "initialization.ply",
-            np.empty((0, 3), dtype=np.float32),
-            np.empty((0, 3), dtype=np.uint8),
-        )
+    seeds = compact_seed_batches(seed_batches)
+    save_binary_ply(temporary / "initialization.ply", seeds.points, seeds.colors)
+    np.savez(
+        temporary / "initialization-2dgs.npz",
+        points=seeds.points,
+        colors=seeds.colors,
+        scales=seeds.scales,
+        quaternions=seeds.quaternions,
+    )
     payload: dict[str, Any] = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "fingerprint": fingerprint,
         "coordinateConvention": {
             "handedness": "right",
@@ -210,6 +186,10 @@ def build_posed_dataset(
         "metric": True,
         "frames": records,
         "initialization": "initialization.ply",
+        "initializationParameters": "initialization-2dgs.npz",
+        "gaussianRepresentation": "2d_surface_discs",
+        "seedVersion": SEED_VERSION,
+        "initialGaussianCount": int(len(seeds.points)),
     }
     write_json(temporary / "dataset.json", payload)
     datasets_root.mkdir(parents=True, exist_ok=True)

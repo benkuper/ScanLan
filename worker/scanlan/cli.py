@@ -23,17 +23,33 @@ def parser() -> argparse.ArgumentParser:
         help="Comma-separated point_cloud,textured_mesh,gaussian_splat targets",
     )
 
+    live = commands.add_parser("live", help="Track and fuse a capture phase while it is recorded")
+    live.add_argument("phase", type=Path)
+    live.add_argument("--mode", choices=["points", "mesh"], default="points")
+    live.add_argument("--voxel-size", type=float, default=0.015, help="TSDF voxel size in metres")
+    live.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
-        targets = tuple(value.strip() for value in arguments.targets.split(",") if value.strip())
-        unknown = set(targets) - {"point_cloud", "textured_mesh", "gaussian_splat"}
-        if unknown:
-            raise ValueError(f"Unknown artifact targets: {', '.join(sorted(unknown))}")
-        result = reconstruct_project(arguments.project, arguments.engine, arguments.device, targets)
+        if arguments.command == "live":
+            from .live import live_reconstruct
+
+            result = live_reconstruct(
+                arguments.phase,
+                arguments.voxel_size,
+                arguments.mode,
+                arguments.device,
+            )
+        else:
+            targets = tuple(value.strip() for value in arguments.targets.split(",") if value.strip())
+            unknown = set(targets) - {"point_cloud", "textured_mesh", "gaussian_splat"}
+            if unknown:
+                raise ValueError(f"Unknown artifact targets: {', '.join(sorted(unknown))}")
+            result = reconstruct_project(arguments.project, arguments.engine, arguments.device, targets)
         print(json.dumps(result))
         return 0
     except Exception as error:  # CLI boundary: preserve a useful project status before exiting.

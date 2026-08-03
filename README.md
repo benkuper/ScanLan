@@ -7,9 +7,9 @@ ScanLan continuously previews a depth stream, records room-scale RGB-D captures 
 - Sensor discovery is manual: select **Capture profile → Available sensor → Scan sensors** when you are ready to connect. No hardware probes run in the background.
 - The preferred physical device is saved by serial number but is not opened at launch. If it is absent, scan and choose another supported sensor; a Femto Mega can also be added directly by network IP.
 - Kinect v2 is listed when its capture support is installed without probing or opening the camera. Its light and streams start only after Kinect v2 is explicitly selected.
-- Live depth/color points remain visible even when a phase is not being recorded.
-- Kinect v2 can use Kinect Fusion for live diagnostics. Azure Kinect and Femto Mega record calibrated IMU samples that seed offline RGB-D odometry.
-- If live tracking is unavailable or lost, the original RGB-D frames remain usable by the offline Open3D fallback.
+- Live depth/color points remain visible even when a phase is not being recorded. During capture, **Sensor frames**, **Live points**, and **Live mesh** modes choose between the raw camera view and an incrementally fused Open3D map.
+- Kinect v2 live fusion consumes Kinect Fusion poses. Azure Kinect and Femto Mega use incremental RGB-D odometry with their calibrated IMU rotation prior and prefer the bundled CUDA Open3D backend when available.
+- If continuity is lost, live fusion freezes and asks the operator to return to the last reconstructed surface. Gap frames are recorded but marked rejected in `live-frame-selection.csv`; the offline build automatically excludes them and resumes from frames accepted after tracking recovers.
 - Reconstruction reports its current stage, percent complete, point count, and estimated time remaining.
 - The viewer supports point size, opacity, color display, manual translation/rotation, and click-assisted floor alignment.
 - A chosen viewer pose can be applied to the exported PLY; the original is retained as `room-cloud.untransformed.ply`.
@@ -36,7 +36,7 @@ Rust session manager -------- project.json + phase folders
                                        +-- outputs/camera-poses.json
 ```
 
-Each native worker maps color into the active depth-camera view and writes the same sensor-neutral archive. IMU measurements are rotated into depth-camera coordinates before being saved. The final offline pass estimates the trajectory, aligns separate phases, produces the cleaned point cloud, and builds a depth-connected surface whose UVs sample a packed atlas of posed RGB keyframes.
+Each native worker maps color into the active depth-camera view and writes the same sensor-neutral archive. IMU measurements are rotated into depth-camera coordinates before being saved. The final offline pass estimates the trajectory, aligns separate phases, produces the cleaned point cloud, and TSDF-fuses posed depth keyframes into one indexed surface. Native RGB from every visible texture view is exposure-, angle-, and occlusion-weighted into padded UV charts so neighboring faces retain matching edge colors.
 
 ## Supported sensors
 
@@ -99,17 +99,22 @@ Gaussian splats use a separate Python 3.11/CUDA environment so CPU-only installa
 npm run prepare:splat
 ```
 
-RGB-D reconstruction automatically prefers CUDA-enabled Open3D. Splat training requires CUDA and uses gsplat mixed precision, fused optimization, packed rasterization, and Splatfacto-style adaptive densification. The pinned PyTorch 2.12 CUDA 13 runtime supports the RTX 50-series/Blackwell path. Photo/video splats additionally require FFmpeg and a CUDA-enabled COLMAP build; the app reports each runtime separately.
+This command also downloads checksum-pinned, project-local FFmpeg and CUDA COLMAP runtimes; no global `PATH` setup is required. To prepare or validate only the photo/video tools, run `npm run prepare:media`.
 
-The regular installer stays CPU-friendly and omits this large optional environment. To prepare the self-contained CUDA runtime and include it in a separate splat-enabled installer, run:
+RGB-D reconstruction automatically prefers CUDA-enabled Open3D. Splat training requires CUDA and uses gsplat mixed precision, fused optimization, packed rasterization, and Splatfacto-style adaptive densification. The pinned PyTorch 2.12 CUDA 13 runtime supports the RTX 50-series/Blackwell path. Photo/video sources are extracted with FFmpeg, registered with CUDA COLMAP, trained into canonical 3DGS PLY, and displayed in the app's Splat preview mode.
+
+The regular installer stays CPU-friendly and omits this large optional environment. The complete CUDA runtime is too large for a reliable single-file NSIS installer, so the full build is packaged as a portable ZIP instead. To build it, run:
 
 ```powershell
 npm run package:splat
 ```
 
+Extract `build/ScanLan-splat-portable.zip` and start `ScanLan.exe`; the splat worker, FFmpeg, and COLMAP are discovered beside the app without global installation.
+
 ## Capture guidance
 
 - Watch the tracking status. If it changes to searching/lost, return to the last textured area until it locks again.
+- Do not continue through a tracking warning: the displayed map is intentionally frozen, and those intervening frames are excluded from the clean offline input.
 - Move slowly and keep useful geometry inside the configured reliable depth range.
 - Start each additional phase while looking at textured geometry from an earlier phase.
 - Prefer corners, furniture, rocks, or marker boards over blank walls and flat ground.

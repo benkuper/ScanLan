@@ -5,7 +5,9 @@
       "../build/kinect-capture/Release": "legacy",
       "../build/modern-capture/Release": "modern",
       "../worker/dist/scanlan-worker.exe": "scanlan-worker.exe",
-      "../splat-worker/dist/scanlan-splat": "splat-runtime"
+      "../splat-worker/dist/scanlan-splat": "splat-runtime",
+      "../media-tools/ffmpeg": "media-tools/ffmpeg",
+      "../media-tools/colmap": "media-tools/colmap"
     }
   }
 }

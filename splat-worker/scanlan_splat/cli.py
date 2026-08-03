@@ -13,7 +13,7 @@ from .train import train_dataset
 
 def _cuda_smoke_test() -> None:
     import torch
-    from gsplat import rasterization
+    from gsplat.rendering import rasterization_2dgs
 
     means = torch.tensor([[0.0, 0.0, 2.0]], device="cuda", requires_grad=True)
     quaternions = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device="cuda")
@@ -25,7 +25,7 @@ def _cuda_smoke_test() -> None:
         [[[8.0, 0.0, 3.5], [0.0, 8.0, 3.5], [0.0, 0.0, 1.0]]],
         device="cuda",
     )
-    rendering, _, _ = rasterization(
+    rendering, _, normals, _surface_normals, distortion, _median, _ = rasterization_2dgs(
         means=means,
         quats=quaternions,
         scales=scales,
@@ -36,8 +36,10 @@ def _cuda_smoke_test() -> None:
         width=8,
         height=8,
         packed=True,
+        render_mode="RGB+ED",
+        distloss=True,
     )
-    rendering.sum().backward()
+    (rendering.sum() + normals.sum() + distortion.sum()).backward()
     torch.cuda.synchronize()
     if means.grad is None or not torch.isfinite(means.grad).all():
         raise RuntimeError("gsplat CUDA backward smoke test produced invalid gradients")

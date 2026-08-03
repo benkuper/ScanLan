@@ -95,7 +95,7 @@ def read_project(root: Path) -> dict[str, Any]:
     return project
 
 
-def read_phase(root: Path) -> PhaseData:
+def read_phase(root: Path, respect_live_selection: bool = True) -> PhaseData:
     manifest = read_json(root / "phase.json")
     raw_camera = manifest["camera"]
     camera = CameraModel(
@@ -152,6 +152,19 @@ def read_phase(root: Path) -> PhaseData:
                     pose=pose,
                 )
             )
+    selection_path = root / "live-frame-selection.csv"
+    if respect_live_selection and selection_path.is_file():
+        accepted: set[int] = set()
+        with selection_path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    if str(row.get("accepted", "")).strip().lower() == "true":
+                        accepted.add(int(row["index"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        # Once live tracking owns frame selection, an unclassified or rejected
+        # frame is unsafe to feed into the authoritative offline trajectory.
+        frames = [frame for frame in frames if frame.index in accepted]
     if not frames:
         raise ValueError(f"Phase contains no frames: {root}")
 

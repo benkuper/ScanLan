@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import torch
-
-
 def masked_robust_depth_loss(
     predicted: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
     delta: float = 0.05,
 ) -> torch.Tensor:
+    import torch
+
     valid = mask & torch.isfinite(predicted) & torch.isfinite(target) & (target > 0)
     if not torch.any(valid):
         return predicted.sum() * 0.0

@@ -24,7 +24,7 @@ from .imu import odometry_rotation_prior
 from .io import PhaseData, load_color, load_depth, save_preview
 
 
-LOCAL_CACHE_VERSION = 4
+LOCAL_CACHE_VERSION = 5
 
 # Frame-to-frame RGB-D odometry is locally accurate but inevitably drifts over a
 # long handheld capture.  Short internal fragments let the already-seen room
@@ -68,6 +68,7 @@ class TrajectoryStabilization:
     fragment_count: int
     weakest_score: int
     maximum_correction_m: float
+    relocalization_count: int
 
 
 def _phase_cache_signature(
@@ -573,6 +574,26 @@ def _tracking_fragment_cloud(
     return cloud
 
 
+def _trajectory_alignment_acceptable(
+    alignment: PhaseAlignment,
+    incremental_correction: np.ndarray,
+) -> bool:
+    return (
+        alignment.fitness >= 0.07
+        and alignment.source_overlap >= 0.08
+        and alignment.inlier_rmse_m <= 0.045
+        and float(np.linalg.norm(incremental_correction[:3, 3])) <= 1.2
+        and _rotation_degrees(incremental_correction) <= 35.0
+    )
+
+
+def _prefer_alignment(candidate: PhaseAlignment, current: PhaseAlignment) -> bool:
+    return candidate.score > current.score or (
+        candidate.score == current.score
+        and candidate.inlier_rmse_m < current.inlier_rmse_m
+    )
+
+
 def _stabilize_offline_trajectory(
     o3d: Any,
     phase: PhaseData,
@@ -613,6 +634,7 @@ def _stabilize_offline_trajectory(
     accumulated = o3d.geometry.PointCloud(fragments[0])
     accumulated.transform(fragment_transforms[0])
     alignments: list[PhaseAlignment] = []
+    relocalization_count = 0
     for fragment_index in range(1, len(ranges)):
         start, _ = ranges[fragment_index]
         previous_start, _ = ranges[fragment_index - 1]
@@ -645,15 +667,75 @@ def _stabilize_offline_trajectory(
             target_fine,
         )
         incremental_correction = refined.transformation @ np.linalg.inv(initial)
-        correction_distance = float(np.linalg.norm(incremental_correction[:3, 3]))
-        correction_angle = _rotation_degrees(incremental_correction)
-        acceptable = (
-            alignment.fitness >= 0.07
-            and alignment.source_overlap >= 0.08
-            and alignment.inlier_rmse_m <= 0.045
-            and correction_distance <= 1.2
-            and correction_angle <= 35.0
+        acceptable = _trajectory_alignment_acceptable(
+            alignment,
+            incremental_correction,
         )
+        if not acceptable:
+            if progress:
+                progress(
+                    "Stabilizing trajectory",
+                    f"Local ICP was uncertain near frame {frame_indices[start]}; "
+                    "trying bounded room relocalization",
+                    0,
+                    len(accumulated.points),
+                )
+            try:
+                o3d.utility.random.seed(1)
+                registration_voxel = 0.08
+                source_down, source_features = _preprocess(
+                    o3d,
+                    fragments[fragment_index],
+                    registration_voxel,
+                )
+                target_down, target_features = _preprocess(
+                    o3d,
+                    accumulated,
+                    registration_voxel,
+                )
+                coarse = o3d.pipelines.registration.registration_fgr_based_on_feature_matching(
+                    source_down,
+                    target_down,
+                    source_features,
+                    target_features,
+                    o3d.pipelines.registration.FastGlobalRegistrationOption(
+                        maximum_correspondence_distance=registration_voxel * 1.55,
+                        iteration_number=32,
+                        maximum_tuple_count=500,
+                    ),
+                )
+                candidate, candidate_source, candidate_target = _refine_registration(
+                    o3d,
+                    fragments[fragment_index],
+                    accumulated,
+                    coarse.transformation,
+                    backend,
+                )
+                candidate_alignment = _alignment_quality(
+                    o3d,
+                    fragment_index + 1,
+                    "feature relocalization + ICP",
+                    candidate,
+                    candidate_source,
+                    candidate_target,
+                )
+                candidate_correction = candidate.transformation @ np.linalg.inv(initial)
+                candidate_acceptable = _trajectory_alignment_acceptable(
+                    candidate_alignment,
+                    candidate_correction,
+                )
+                if candidate_acceptable and (
+                    not acceptable or _prefer_alignment(candidate_alignment, alignment)
+                ):
+                    refined = candidate
+                    alignment = candidate_alignment
+                    incremental_correction = candidate_correction
+                    acceptable = True
+                    relocalization_count += 1
+            except RuntimeError:
+                # The original confidence-checked ICP result remains the
+                # fallback and will be rejected below when it is unsafe.
+                pass
         if not acceptable:
             first_frame = frame_indices[start]
             raise RuntimeError(
@@ -693,6 +775,7 @@ def _stabilize_offline_trajectory(
         fragment_count=len(ranges),
         weakest_score=min(value.score for value in alignments),
         maximum_correction_m=maximum_correction_m,
+        relocalization_count=relocalization_count,
     )
 
 
@@ -775,6 +858,11 @@ def estimate_local_phase(
                 f"; stabilized with {stabilization.fragment_count} local maps "
                 f"(maximum correction {stabilization.maximum_correction_m:.2f} m)"
             )
+            if stabilization.relocalization_count:
+                tracking_detail += (
+                    f"; relocalized {stabilization.relocalization_count} local map"
+                    + ("s" if stabilization.relocalization_count != 1 else "")
+                )
 
     # Matching does not benefit from a multi-million-point 5 mm cloud. Build a
     # 10 mm local TSDF for registration; the requested precision is retained in

@@ -1,4 +1,4 @@
-use crate::commands::{worker_command, AppState};
+use crate::commands::{configure_media_tools, worker_command, AppState};
 use crate::models::{ArtifactJob, ProjectSummary};
 use crate::storage;
 use chrono::Utc;
@@ -8,13 +8,24 @@ use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 
 #[derive(Clone, Default)]
 pub struct JobManager {
@@ -35,6 +46,101 @@ impl JobManager {
         self.cancellations
             .lock()
             .is_ok_and(|jobs| jobs.contains_key(job_id))
+    }
+}
+
+fn accelerator_lock_path() -> PathBuf {
+    std::env::temp_dir().join("scanlan-artifact-accelerator.lock")
+}
+
+fn acquire_accelerator_lock_at(path: &Path) -> Result<File, String> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("Could not open the reconstruction accelerator lock: {error}"))?;
+    fs2::FileExt::try_lock_exclusive(&lock).map_err(|error| {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::PermissionDenied
+        ) || error.raw_os_error() == Some(33)
+        {
+            "Another ScanLan artifact worker is already using the reconstruction accelerator"
+                .to_string()
+        } else {
+            format!("Could not lock the reconstruction accelerator: {error}")
+        }
+    })?;
+    Ok(lock)
+}
+
+fn acquire_accelerator_lock() -> Result<File, String> {
+    acquire_accelerator_lock_at(&accelerator_lock_path())
+}
+
+#[cfg(windows)]
+struct ChildLifetimeGuard(HANDLE);
+
+#[cfg(windows)]
+impl ChildLifetimeGuard {
+    fn attach(child: &Child) -> Result<Self, String> {
+        // A kill-on-close Job Object makes Windows terminate the worker even if
+        // the app is force-closed or the Tauri dev runner replaces the process.
+        // Without it, an orphan can keep writing the shared project progress and
+        // checkpoint files while a restarted app launches a second worker.
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return Err(format!(
+                    "Could not create the artifact worker lifetime guard: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(handle);
+                return Err(format!(
+                    "Could not configure the artifact worker lifetime guard: {error}"
+                ));
+            }
+            if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(handle);
+                return Err(format!(
+                    "Could not attach the artifact worker lifetime guard: {error}"
+                ));
+            }
+            Ok(Self(handle))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildLifetimeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct ChildLifetimeGuard;
+
+#[cfg(not(windows))]
+impl ChildLifetimeGuard {
+    fn attach(_child: &Child) -> Result<Self, String> {
+        Ok(Self)
     }
 }
 
@@ -154,7 +260,7 @@ fn stage_plan(job: &ArtifactJob) -> Vec<(&'static str, f32)> {
         ("fuse", 0.08),
         ("cloud", 0.24),
     ];
-    if wants_mesh || wants_splat {
+    if wants_splat {
         plan.push(("dataset", 0.08));
     }
     if wants_mesh {
@@ -173,7 +279,7 @@ fn stage_key(stage: &str) -> Option<&'static str> {
         Some("publish")
     } else if stage.contains("splat") && (stage.contains("train") || stage.contains("initial")) {
         Some("splat")
-    } else if stage.contains("mesh") {
+    } else if stage.contains("mesh") || stage.contains("textur") {
         Some("mesh")
     } else if stage.contains("preparing splat") || stage.contains("posed frame") {
         Some("dataset")
@@ -374,6 +480,14 @@ fn run_command(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Could not start artifact worker: {error}"))?;
+    let _lifetime_guard = match ChildLifetimeGuard::attach(&child) {
+        Ok(guard) => guard,
+        Err(error) => {
+            child.kill().ok();
+            child.wait().ok();
+            return Err(error);
+        }
+    };
     if let Some(stdout) = child.stdout.take() {
         append_log_reader(stdout, Arc::clone(&log));
     }
@@ -481,6 +595,7 @@ fn run_pipeline(
                 .join("datasets")
                 .join("current.json");
             let mut command = worker_command(&splat_worker);
+            configure_media_tools(&mut command, resources);
             command
                 .arg("train")
                 .arg("--project")
@@ -497,6 +612,7 @@ fn run_pipeline(
     } else if job.pipeline == "media_gaussian" {
         let splat_worker = existing_runtime(resources, true)?;
         let mut command = worker_command(&splat_worker);
+        configure_media_tools(&mut command, resources);
         command
             .arg("media")
             .arg("--project")
@@ -552,6 +668,9 @@ fn spawn_job(
     project_state: Arc<Mutex<ProjectSummary>>,
 ) -> Result<ArtifactJob, String> {
     let cancel = Arc::new(AtomicBool::new(false));
+    // This OS lock complements the in-memory owner. It covers multiple ScanLan
+    // app instances and is released automatically if the owning app exits.
+    let accelerator_lock = acquire_accelerator_lock()?;
     {
         let mut owner = manager
             .accelerator_owner
@@ -582,6 +701,17 @@ fn spawn_job(
     job.updated_at = Utc::now().to_rfc3339();
     fs::remove_file(project_root.join("outputs").join("progress.json")).ok();
     fs::remove_file(project_root.join("outputs").join("splat-progress.json")).ok();
+    if !resume {
+        fs::remove_file(project_root.join("outputs").join("build-preview.json")).ok();
+    }
+    if !resume && job.targets.iter().any(|target| target == "gaussianSplat") {
+        fs::remove_file(
+            project_root
+                .join("outputs")
+                .join("room-splat.preview.splat"),
+        )
+        .ok();
+    }
     if let Err(error) = write_job(&project_root, &job) {
         if let Ok(mut cancellations) = manager.cancellations.lock() {
             cancellations.remove(&job.id);
@@ -595,6 +725,7 @@ fn spawn_job(
 
     let returned = job.clone();
     thread::spawn(move || {
+        let _accelerator_lock = accelerator_lock;
         let result = run_pipeline(
             resources.as_deref(),
             &project_root,
@@ -752,9 +883,70 @@ pub fn cancel_artifact_job(
     cancellation.store(true, Ordering::SeqCst);
     File::create(root.join("outputs").join("cancel.flag")).ok();
     let mut job = read_job(&root, &job_id)?;
+    job.status = "cancelling".to_string();
     job.stage = "cancelling".to_string();
     job.updated_at = Utc::now().to_rfc3339();
     write_job(&root, &job)?;
+    Ok(job)
+}
+
+fn discard_job_record(root: &Path, job_id: &str) -> Result<ArtifactJob, String> {
+    let mut job = read_job(root, job_id)?;
+    if !matches!(job.status.as_str(), "failed" | "cancelled") {
+        return Err("Only a stopped artifact job can be discarded".to_string());
+    }
+
+    job.status = "cancelled".to_string();
+    job.stage = "cancelled".to_string();
+    job.detail = "Interrupted artifact job cancelled".to_string();
+    job.error = None;
+    job.resumable = false;
+    job.updated_at = Utc::now().to_rfc3339();
+    write_job(root, &job)?;
+
+    let outputs = root.join("outputs");
+    for transient in [
+        "cancel.flag",
+        "splat-checkpoint.pt",
+        "splat-progress.json",
+        "progress.json",
+        "build-preview.json",
+        "room-splat.preview.splat",
+    ] {
+        fs::remove_file(outputs.join(transient)).ok();
+    }
+    Ok(job)
+}
+
+#[tauri::command]
+pub fn discard_artifact_job(
+    project_path: String,
+    job_id: String,
+    state: State<'_, AppState>,
+) -> Result<ArtifactJob, String> {
+    let root = PathBuf::from(project_path);
+    if state.jobs.is_running(&job_id) {
+        return Err("Cancel the running artifact job before discarding its checkpoint".to_string());
+    }
+
+    let mut project = storage::read_project(&root)?;
+    if project
+        .active_job
+        .as_deref()
+        .is_some_and(|active| active != job_id)
+    {
+        return Err("A different artifact job is active for this project".to_string());
+    }
+    let job = discard_job_record(&root, &job_id)?;
+    project.active_job = None;
+    project.processing_status = "idle".to_string();
+    project.processing_error = None;
+    storage::write_project(&project)?;
+    if let Ok(mut current) = state.project.lock() {
+        if current.path == project.path {
+            *current = project;
+        }
+    }
     Ok(job)
 }
 
@@ -831,8 +1023,24 @@ mod tests {
             "Meshing",
         );
         let overall = planned_progress(&job, Some(0.5)).expect("meshing belongs to the job plan");
-        assert!((overall - 0.8421).abs() < 0.001);
+        assert!((overall - 0.8276).abs() < 0.001);
         assert!((overall - 0.5).abs() > 0.3);
+    }
+
+    #[test]
+    fn mesh_only_jobs_do_not_plan_a_gaussian_dataset_stage() {
+        let mesh = job(
+            "rgbd_reconstruction",
+            &["pointCloud", "texturedMesh"],
+            "Meshing",
+        );
+        let splat = job(
+            "rgbd_reconstruction",
+            &["pointCloud", "gaussianSplat"],
+            "Preparing splat data",
+        );
+        assert!(!stage_plan(&mesh).iter().any(|(key, _)| *key == "dataset"));
+        assert!(stage_plan(&splat).iter().any(|(key, _)| *key == "dataset"));
     }
 
     #[test]
@@ -841,5 +1049,80 @@ mod tests {
         let training = job("media_gaussian", &["gaussianSplat"], "splat_training");
         assert!(planned_progress(&mapping, Some(1.0)).unwrap() < 0.5);
         assert!(planned_progress(&training, Some(0.5)).unwrap() > 0.5);
+    }
+
+    #[test]
+    fn accelerator_lock_rejects_a_second_owner_and_recovers_after_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "scanlan-accelerator-test-{}.lock",
+            uuid::Uuid::new_v4()
+        ));
+        let first = acquire_accelerator_lock_at(&path).expect("first owner should acquire lock");
+        let error = acquire_accelerator_lock_at(&path)
+            .expect_err("a second owner must not acquire the accelerator");
+        assert!(error.contains("already using"), "unexpected error: {error}");
+        drop(first);
+        let second = acquire_accelerator_lock_at(&path)
+            .expect("lock should become available when its owner exits");
+        drop(second);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn discarding_an_interrupted_job_removes_its_resume_state() {
+        let root =
+            std::env::temp_dir().join(format!("scanlan-discard-job-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("outputs").join("jobs")).unwrap();
+        let mut interrupted = job("rgbd_reconstruction", &["gaussianSplat"], "interrupted");
+        interrupted.status = "failed".to_string();
+        interrupted.resumable = true;
+        write_job(&root, &interrupted).unwrap();
+        for transient in [
+            "splat-checkpoint.pt",
+            "splat-progress.json",
+            "build-preview.json",
+        ] {
+            fs::write(root.join("outputs").join(transient), b"partial").unwrap();
+        }
+
+        let discarded = discard_job_record(&root, &interrupted.id).unwrap();
+
+        assert_eq!(discarded.status, "cancelled");
+        assert!(!discarded.resumable);
+        assert!(discarded.error.is_none());
+        assert!(!root.join("outputs").join("splat-checkpoint.pt").exists());
+        assert!(!root.join("outputs").join("splat-progress.json").exists());
+        assert!(!root.join("outputs").join("build-preview.json").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_lifetime_guard_terminates_its_worker_when_dropped() {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test worker should start");
+        let guard = ChildLifetimeGuard::attach(&child)
+            .expect("test worker should attach to a kill-on-close Job Object");
+        drop(guard);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if child
+                .try_wait()
+                .expect("test worker status should be readable")
+                .is_some()
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.kill().ok();
+        child.wait().ok();
+        panic!("test worker survived after its lifetime guard closed");
     }
 }

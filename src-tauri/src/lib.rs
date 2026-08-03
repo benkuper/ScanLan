@@ -20,6 +20,7 @@ pub fn run() {
             commands::start_sensor_phase,
             commands::capture_status,
             commands::live_preview_frame,
+            commands::live_reconstruction_mesh,
             commands::stop_sensor_phase,
             commands::remove_capture,
             commands::reconstruct_project,
@@ -27,6 +28,7 @@ pub fn run() {
             commands::load_preview_mesh_geometry,
             commands::load_preview_mesh_texture,
             commands::load_camera_frames,
+            commands::load_gaussian_splat,
             commands::apply_cloud_transform,
             commands::export_ply,
             commands::export_textured_mesh,
@@ -37,6 +39,7 @@ pub fn run() {
             jobs::artifact_job_status,
             jobs::latest_artifact_job,
             jobs::cancel_artifact_job,
+            jobs::discard_artifact_job,
             jobs::resume_artifact_job,
         ])
         .build(tauri::generate_context!())

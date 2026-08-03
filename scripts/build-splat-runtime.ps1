@@ -5,7 +5,19 @@ $PackageRoot = Join-Path $ProjectRoot "splat-worker"
 $RuntimeRoot = Join-Path $PackageRoot ".venv"
 $Python = Join-Path $RuntimeRoot "Scripts/python.exe"
 $RuntimeScripts = Join-Path $RuntimeRoot "Scripts"
+$SitePackages = Join-Path $RuntimeRoot "Lib/site-packages"
 $GsplatExtension = Join-Path $RuntimeRoot "Lib/site-packages/gsplat/csrc.pyd"
+$GsplatFeatureStamp = Join-Path $RuntimeRoot "Lib/site-packages/gsplat/scanlan-build.txt"
+$ExpectedGsplatFeatures = "2dgs-rgbd-v3"
+$MediaToolsScript = Join-Path $PSScriptRoot "prepare-media-tools.ps1"
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $MediaToolsScript
+if ($LASTEXITCODE -ne 0) { throw "Photo/video support tools could not be prepared." }
+$MediaToolPaths = @(
+  (Join-Path $ProjectRoot "media-tools/ffmpeg/bin"),
+  (Join-Path $ProjectRoot "media-tools/colmap/bin")
+) -join [IO.Path]::PathSeparator
+$env:PATH = $MediaToolPaths + [IO.Path]::PathSeparator + $env:PATH
 
 if (-not (Test-Path -LiteralPath $Python)) {
   if (Get-Command py -ErrorAction SilentlyContinue) {
@@ -18,10 +30,29 @@ if (-not (Test-Path -LiteralPath $Python)) {
   }
 }
 
+if (Test-Path -LiteralPath $SitePackages) {
+  $StalePipDistributions = @(Get-ChildItem -LiteralPath $SitePackages -Force |
+    Where-Object { $_.PSIsContainer -and ($_.Name -eq "~ip" -or $_.Name -like "~ip-*.dist-info") })
+  foreach ($Distribution in $StalePipDistributions) {
+    Write-Host "Removing stale pip upgrade artifact: $($Distribution.Name)"
+    Remove-Item -LiteralPath $Distribution.FullName -Recurse -Force
+  }
+}
+
 & $Python -m pip install --upgrade pip wheel
 if ($LASTEXITCODE -ne 0) { throw "Could not update the splat runtime installer." }
-& $Python -c "import torch; assert torch.__version__.startswith('2.12.0+cu130'); assert torch.cuda.is_available()" 2>$null
-if ($LASTEXITCODE -ne 0) {
+$PreviousErrorActionPreference = $ErrorActionPreference
+try {
+  # This is an expected-failure probe: a fresh environment does not have torch yet.
+  # Windows PowerShell promotes native stderr to NativeCommandError when the global
+  # preference is Stop, so suppress it until the probe exit code has been captured.
+  $ErrorActionPreference = "SilentlyContinue"
+  & $Python -c "import importlib.util, sys; found = importlib.util.find_spec('torch') is not None; sys.exit(1) if not found else None; import torch; sys.exit(0 if torch.__version__.startswith('2.12.0+cu130') and torch.cuda.is_available() else 1)" 2>$null
+  $TorchReady = $LASTEXITCODE -eq 0
+} finally {
+  $ErrorActionPreference = $PreviousErrorActionPreference
+}
+if (-not $TorchReady) {
   & $Python -m pip install --upgrade --force-reinstall "torch==2.12.0" --index-url "https://download.pytorch.org/whl/cu130"
   if ($LASTEXITCODE -ne 0) { throw "CUDA-enabled PyTorch could not be installed." }
 }
@@ -50,11 +81,19 @@ foreach ($Entry in $VcEnvironment) {
 $env:PATH = $RuntimeScripts + [IO.Path]::PathSeparator + $env:PATH
 $env:CL = (($env:CL + " /Zc:preprocessor").Trim())
 $env:MAX_JOBS = [Math]::Min([Environment]::ProcessorCount, 4).ToString()
+$InstalledGsplatFeatures = if (Test-Path -LiteralPath $GsplatFeatureStamp) {
+  (Get-Content -Raw -LiteralPath $GsplatFeatureStamp).Trim()
+} else { "" }
+if ((Test-Path -LiteralPath $GsplatExtension) -and $InstalledGsplatFeatures -ne $ExpectedGsplatFeatures) {
+  Write-Host "Rebuilding gsplat with ScanLan 2DGS kernels."
+  Remove-Item -LiteralPath $GsplatExtension -Force
+}
 if (-not (Test-Path -LiteralPath $GsplatExtension)) {
   & $Python -m pip install --upgrade --force-reinstall --no-deps --only-binary=:all: "gsplat==1.5.3"
   if ($LASTEXITCODE -ne 0) { throw "gsplat could not be installed." }
   & $Python (Join-Path $PackageRoot "build_gsplat_extension.py")
-  if ($LASTEXITCODE -ne 0) { throw "The 3D gsplat CUDA extension could not be compiled for architecture $CudaArchitecture." }
+  if ($LASTEXITCODE -ne 0) { throw "The gsplat 2DGS CUDA extension could not be compiled for architecture $CudaArchitecture." }
+  Set-Content -LiteralPath $GsplatFeatureStamp -Value $ExpectedGsplatFeatures -Encoding ASCII
 } else {
   Write-Host "Reusing gsplat CUDA extension: $GsplatExtension"
 }

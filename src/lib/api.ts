@@ -70,6 +70,38 @@ export async function loadLivePreviewFrame(afterFrame: number): Promise<ArrayBuf
   return Uint8Array.from(response).buffer;
 }
 
+export async function loadLiveReconstructionMesh(afterFrame: number): Promise<{ frameCount: number; mesh: PreviewMesh } | null> {
+  requireDesktop();
+  const response = await invoke<ArrayBuffer | Uint8Array | number[]>('live_reconstruction_mesh', { afterFrame });
+  const bytes = response instanceof ArrayBuffer
+    ? new Uint8Array(response)
+    : ArrayBuffer.isView(response)
+      ? new Uint8Array(response.buffer.slice(response.byteOffset, response.byteOffset + response.byteLength))
+      : Uint8Array.from(response);
+  if (bytes.byteLength === 0) return null;
+  if (bytes.byteLength < 16 || new TextDecoder().decode(bytes.subarray(0, 4)) !== 'K2M2') {
+    throw new Error('The live reconstruction mesh has an invalid header.');
+  }
+  const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const frameCount = header.getUint32(4, true);
+  const vertexCount = header.getUint32(8, true);
+  const indexCount = header.getUint32(12, true);
+  const positionStart = 16;
+  const colorStart = positionStart + vertexCount * 12;
+  const indexStart = colorStart + vertexCount * 3;
+  if (vertexCount > 500_000 || indexCount > 300_000 || bytes.byteLength !== indexStart + indexCount * 4) {
+    throw new Error('The live reconstruction mesh is incomplete.');
+  }
+  return {
+    frameCount,
+    mesh: {
+      positions: new Float32Array(bytes.buffer.slice(bytes.byteOffset + positionStart, bytes.byteOffset + colorStart)),
+      colors: new Uint8Array(bytes.buffer.slice(bytes.byteOffset + colorStart, bytes.byteOffset + indexStart)),
+      indices: new Uint32Array(bytes.buffer.slice(bytes.byteOffset + indexStart, bytes.byteOffset + bytes.byteLength))
+    }
+  };
+}
+
 export async function reconstructProject(
   projectPath: string,
   settings: CaptureSettings
@@ -105,6 +137,11 @@ export async function latestArtifactJob(projectPath: string): Promise<ArtifactJo
 export async function cancelArtifactJob(projectPath: string, jobId: string): Promise<ArtifactJob> {
   requireDesktop();
   return invoke<ArtifactJob>('cancel_artifact_job', { projectPath, jobId });
+}
+
+export async function discardArtifactJob(projectPath: string, jobId: string): Promise<ArtifactJob> {
+  requireDesktop();
+  return invoke<ArtifactJob>('discard_artifact_job', { projectPath, jobId });
 }
 
 export async function resumeArtifactJob(projectPath: string, jobId: string): Promise<ArtifactJob> {
@@ -160,9 +197,9 @@ export async function loadPreviewMesh(projectPath: string): Promise<PreviewMesh>
     throw new Error('The reconstructed mesh preview is incomplete.');
   }
   return {
-    positions: new Float32Array(bytes.slice(positionStart, uvStart).buffer),
-    uvs: new Float32Array(bytes.slice(uvStart, indexStart).buffer),
-    indices: new Uint32Array(bytes.slice(indexStart, expectedLength).buffer),
+    positions: new Float32Array(bytes.buffer, bytes.byteOffset + positionStart, vertexCount * 3),
+    uvs: new Float32Array(bytes.buffer, bytes.byteOffset + uvStart, vertexCount * 2),
+    indices: new Uint32Array(bytes.buffer, bytes.byteOffset + indexStart, indexCount),
     texture: normalizeBinary(texture)
   };
 }
@@ -170,6 +207,12 @@ export async function loadPreviewMesh(projectPath: string): Promise<PreviewMesh>
 export async function loadCameraFrames(projectPath: string): Promise<CameraFrame[]> {
   requireDesktop();
   return invoke<CameraFrame[]>('load_camera_frames', { projectPath });
+}
+
+export async function loadGaussianSplat(projectPath: string): Promise<Uint8Array> {
+  requireDesktop();
+  const response = await invoke<ArrayBuffer | Uint8Array | number[]>('load_gaussian_splat', { projectPath });
+  return normalizeBinary(response);
 }
 
 export async function applyCloudTransform(

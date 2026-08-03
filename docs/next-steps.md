@@ -397,13 +397,13 @@ Default targets:
 * Photo/video project: splat.
 * Mixed project: explicit source selection.
 
-Ship splat export before embedded splat visualization. Later add a dedicated renderer and extend render mode to:
+Embedded splat visualization uses a dedicated Gaussian renderer and extends render mode to:
 
 ```ts
 'points' | 'mesh' | 'splat'
 ```
 
-The existing `THREE.Points` renderer must not be used to approximate Gaussian splats.
+The existing `THREE.Points` renderer is not used to approximate Gaussian splats.
 
 ## PR sequence
 

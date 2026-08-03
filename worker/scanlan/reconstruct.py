@@ -7,7 +7,7 @@ from typing import Literal
 
 import numpy as np
 
-from .dataset import build_posed_dataset
+from .dataset import build_posed_dataset, dataset_fingerprint
 from .io import phase_roots, read_phase, read_project, save_binary_ply, save_preview, write_json
 from .mesh import PosedFrame, build_mesh_artifacts
 from .numpy_engine import reconstruct_known_poses
@@ -188,17 +188,35 @@ def reconstruct_project(
 
         if points.shape[0] == 0:
             raise RuntimeError("Reconstruction produced no valid points")
+        # Keep the last usable geometry visible while later mesh/dataset/splat
+        # stages continue, including the fast known-pose (NumPy) pipeline.
+        save_preview(build_preview_path, points, colors, limit=30_000)
 
         output_dir = project_root / "outputs"
         posed_frames = artifact_context.get("posed_frames", [])
-        needs_dataset = "gaussian_splat" in targets or "textured_mesh" in targets
+        # The canonical RGB/depth dataset and Gaussian initialization are only
+        # consumed by the splat trainer.  Building them for a mesh-only job used
+        # to reproject and compress every captured frame before meshing could
+        # even begin, despite the mesh path reading its selected source frames
+        # directly.
+        needs_dataset = "gaussian_splat" in targets
         dataset = (
             build_posed_dataset(output_dir / "cache", posed_frames, reporter.update)
             if needs_dataset
             else None
         )
+        source_fingerprint = (
+            str(dataset["fingerprint"])
+            if dataset is not None
+            else dataset_fingerprint(posed_frames)
+        )
         mesh = (
-            build_mesh_artifacts(output_dir, posed_frames, reporter.update)
+            build_mesh_artifacts(
+                output_dir,
+                posed_frames,
+                reporter.update,
+                voxel_size_m=voxel_size_m,
+            )
             if "textured_mesh" in targets
             else {
                 "cameraFrameCount": len(posed_frames),
@@ -232,7 +250,7 @@ def reconstruct_project(
             "computeBackend": quality.get("computeBackend", reporter.compute_backend or "NumPy CPU"),
             **mesh,
             "targets": list(targets),
-            "datasetFingerprint": dataset.get("fingerprint") if dataset else None,
+            "datasetFingerprint": source_fingerprint,
         }
 
         project["processingStatus"] = "complete"
@@ -241,7 +259,7 @@ def reconstruct_project(
         project.setdefault("mediaSources", [])
         artifacts = project.setdefault("artifacts", {})
         updated_at = datetime.now(timezone.utc).isoformat()
-        fingerprint = dataset.get("fingerprint", "") if dataset else ""
+        fingerprint = source_fingerprint
         if "point_cloud" in targets:
             project["pointCount"] = result["pointCount"]
             project["outputPath"] = "outputs/room-cloud.ply"

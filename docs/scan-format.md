@@ -9,6 +9,7 @@ scan-project/
 |   `-- <phase-id>/
 |       |-- phase.json
 |       |-- frames.csv
+|       |-- live-frame-selection.csv
 |       |-- depth/000000.u16
 |       |-- color/000000.rgb
 |       `-- rgb/000000.jpg
@@ -95,6 +96,14 @@ The phase manifest records the stored RGB camera model and the explicit transfor
 index,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_us,m00,...,m33
 ```
 
+When live reconstruction is enabled, `live-frame-selection.csv` contains:
+
+```text
+index,accepted,reason
+```
+
+The live tracker writes one decision per processed frame. `accepted=false` marks a continuity gap: raw depth/RGB files and the main frame index are retained, while the normal offline loader excludes that frame. A later `accepted=true` row means the sensor returned to known geometry and tracking continuity was recovered. Removing this optional selection file restores access to every raw frame for diagnostics or manual recovery.
+
 `rgb_path` and `rgb_timestamp_us` are optional. The optional 4×4 row-major matrix maps camera coordinates into the phase coordinate system. Mock and imported tracked data may supply it. Untracked captures leave it empty so Open3D estimates the trajectory offline.
 
 ## Sensor and IMU metadata
@@ -157,7 +166,7 @@ The matrix maps points in the current phase into the previous phase.
 
 The artifact coordinate system is right-handed and uses metres for RGB-D captures. PLY vertex colors are 8-bit sRGB. Viewer exports use +Y up and record their display-axis conversion separately.
 
-`room-mesh.obj` is reconstructed from selected posed depth keyframes. Native-RGB texturing transforms each sampled depth point through `rgbFromDepth`, applies RGB intrinsics/distortion, and rejects occluded samples against the same RGB-view z-buffer used by the canonical dataset. Atlas tiles crop unused pixels, extend padded edges, compensate exposure, and scale up to the configured 8K/16K capacity. Legacy archives follow the same path with aligned-RGB identity calibration.
+`room-mesh.obj` is a single indexed surface extracted after TSDF fusion of selected posed depth keyframes; dependency-free known-pose builds spatially weld and de-duplicate the same depth surfaces. Native-RGB texturing projects every fused vertex through each visible depth and RGB camera, applies `rgbFromDepth`, RGB intrinsics/distortion, depth-occlusion rejection, exposure compensation, view-angle weighting, and bilinear sampling. Per-triangle padded atlas charts share the same blended colors at common mesh vertices, preventing view-tile seams without reintroducing overlapping geometry. Atlases scale up to the configured 8K/16K capacity. Legacy archives use aligned-RGB identity calibration through the same projection path.
 
 `camera-poses.json` stores reconstructed camera-to-viewer matrices, field of view, phase, timestamp, and source-frame index. `textureFrame` marks the texture subset. These matrices are flattened row-major 4×4 transforms.
 

@@ -4,6 +4,8 @@ export type ProcessingStatus = 'idle' | 'processing' | 'complete' | 'failed';
 export type SensorKind = 'kinect_v2' | 'azure_kinect' | 'femto_mega';
 export type SensorConnection = 'usb' | 'network';
 export type DepthFieldOfView = 'narrow' | 'wide';
+export type MeshViewMode = 'surface' | 'surface-wireframe' | 'wireframe' | 'shaded';
+export type LiveReconstructionMode = 'off' | 'points' | 'mesh';
 
 export interface CaptureSettings {
   captureFps: number;
@@ -20,6 +22,7 @@ export interface CaptureSettings {
   rgbJpegQuality: number;
   /** Zero keeps the sensor's native RGB dimensions. */
   maxRgbDimension: number;
+  liveReconstruction: LiveReconstructionMode;
 }
 
 export type MediaSourceKind = 'photos' | 'video';
@@ -165,6 +168,13 @@ export interface CaptureStatus {
   trackingStatus: string;
   imuActive: boolean;
   imuRateHz: number;
+  liveReconstructionActive: boolean;
+  liveReconstructionMode: LiveReconstructionMode;
+  liveProcessedFrameCount: number;
+  liveIntegratedFrameCount: number;
+  liveRejectedFrameCount: number;
+  liveTriangleCount: number;
+  liveReconstructionBackend?: string;
   reconstruction?: ReconstructionProgress;
   error?: string;
 }
@@ -204,9 +214,10 @@ export interface PackedPreviewFrame {
 
 export interface PreviewMesh {
   positions: Float32Array;
-  uvs: Float32Array;
+  uvs?: Float32Array;
+  colors?: Uint8Array;
   indices: Uint32Array;
-  texture: Uint8Array;
+  texture?: Uint8Array;
 }
 
 export interface CameraFrame {

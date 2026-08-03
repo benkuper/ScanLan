@@ -28,6 +28,8 @@ pub struct CaptureSettings {
     pub rgb_jpeg_quality: u8,
     #[serde(default)]
     pub max_rgb_dimension: u32,
+    #[serde(default = "default_live_reconstruction")]
+    pub live_reconstruction: String,
 }
 
 fn default_sensor_kind() -> String {
@@ -50,6 +52,10 @@ fn default_rgb_jpeg_quality() -> u8 {
     92
 }
 
+fn default_live_reconstruction() -> String {
+    "points".to_string()
+}
+
 impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
@@ -66,6 +72,7 @@ impl Default for CaptureSettings {
             depth_binned: false,
             rgb_jpeg_quality: default_rgb_jpeg_quality(),
             max_rgb_dimension: 0,
+            live_reconstruction: default_live_reconstruction(),
         }
     }
 }
@@ -269,6 +276,14 @@ pub struct CaptureStatus {
     pub tracking_status: String,
     pub imu_active: bool,
     pub imu_rate_hz: f32,
+    pub live_reconstruction_active: bool,
+    pub live_reconstruction_mode: String,
+    pub live_processed_frame_count: u32,
+    pub live_integrated_frame_count: u32,
+    pub live_rejected_frame_count: u32,
+    pub live_triangle_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_reconstruction_backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconstruction: Option<ReconstructionProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -311,6 +326,31 @@ pub struct LiveWorkerStatus {
     pub imu_active: bool,
     #[serde(default)]
     pub imu_rate_hz: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveReconstructionStatus {
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub tracking: bool,
+    #[serde(default)]
+    pub tracking_status: String,
+    #[serde(default)]
+    pub processed_frames: u32,
+    #[serde(default)]
+    pub integrated_frames: u32,
+    #[serde(default)]
+    pub rejected_frames: u32,
+    #[serde(default)]
+    pub point_count: u64,
+    #[serde(default)]
+    pub triangle_count: u64,
+    #[serde(default)]
+    pub backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

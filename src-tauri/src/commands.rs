@@ -1,6 +1,7 @@
 use crate::models::{
-    AvailableSensor, CameraFrame, CaptureSettings, CaptureStatus, CloudTransform, LiveWorkerStatus,
-    MediaSource, PreviewPoint, ProjectSummary, ReconstructionProgress, RuntimeInfo,
+    AvailableSensor, CameraFrame, CaptureSettings, CaptureStatus, CloudTransform,
+    LiveReconstructionStatus, LiveWorkerStatus, MediaSource, PreviewPoint, ProjectSummary,
+    ReconstructionProgress, RuntimeInfo,
 };
 use crate::storage;
 use chrono::Utc;
@@ -18,6 +19,7 @@ use uuid::Uuid;
 
 pub struct ActiveCapture {
     child: Child,
+    live_reconstruction: Option<Child>,
     project_root: PathBuf,
     phase_root: PathBuf,
     phase_id: String,
@@ -77,9 +79,54 @@ pub fn terminate_active_capture(state: &AppState) {
                     }
                 }
             }
+            stop_live_reconstruction(&mut capture, Duration::from_secs(2));
         }
     }
     terminate_live_preview(state);
+}
+
+fn stop_live_reconstruction(capture: &mut ActiveCapture, timeout: Duration) {
+    let Some(mut child) = capture.live_reconstruction.take() else {
+        return;
+    };
+    File::create(capture.phase_root.join("live-reconstruction.stop")).ok();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                break;
+            }
+        }
+    }
+}
+
+fn drain_live_reconstruction(capture: &mut ActiveCapture, timeout: Duration) {
+    if capture.live_reconstruction.is_none() {
+        return;
+    }
+    let expected = indexed_frame_count(&capture.phase_root);
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if live_reconstruction_status(&capture.phase_root)
+            .is_some_and(|status| status.processed_frames >= expected)
+        {
+            break;
+        }
+        if capture
+            .live_reconstruction
+            .as_mut()
+            .and_then(|child| child.try_wait().ok())
+            .flatten()
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn terminate_live_preview(state: &AppState) {
@@ -286,6 +333,16 @@ pub(crate) fn worker_command(worker: &Path) -> Command {
     command
 }
 
+pub(crate) fn configure_media_tools(command: &mut Command, resource_root: Option<&Path>) {
+    let mut paths = storage::media_tool_directories(resource_root);
+    if let Some(current_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current_path));
+    }
+    if let Ok(path) = std::env::join_paths(paths) {
+        command.env("PATH", path);
+    }
+}
+
 fn sensor_name(settings: &CaptureSettings) -> &'static str {
     match settings.sensor_kind.as_str() {
         "azure_kinect" => "Azure Kinect DK",
@@ -344,6 +401,9 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
         settings.sensor_address.clear();
         settings.use_imu = false;
     }
+    if !matches!(settings.live_reconstruction.as_str(), "off" | "points" | "mesh") {
+        return Err("Unknown live reconstruction mode".to_string());
+    }
     Ok(())
 }
 
@@ -360,6 +420,50 @@ fn sensor_worker(app: &AppHandle, settings: &CaptureSettings) -> Result<PathBuf,
             sensor_name(settings)
         )
     })
+}
+
+fn start_live_reconstruction(
+    app: &AppHandle,
+    phase_root: &Path,
+    settings: &CaptureSettings,
+) -> Result<Option<Child>, String> {
+    if settings.live_reconstruction == "off" {
+        return Ok(None);
+    }
+    let worker = first_existing(storage::candidate_reconstruction_worker_paths(
+        resource_root(app).as_deref(),
+    ))
+    .ok_or_else(|| {
+        "Live reconstruction support is missing from this app build; choose Sensor frames or install the reconstruction runtime"
+            .to_string()
+    })?;
+    for name in [
+        "live-reconstruction.stop",
+        "live-reconstruction.json",
+        "live-reconstruction.points",
+        "live-reconstruction.mesh",
+        "live-frame-selection.csv",
+    ] {
+        fs::remove_file(phase_root.join(name)).ok();
+    }
+    let stderr = File::create(phase_root.join("live-reconstruction.log"))
+        .map_err(|error| error.to_string())?;
+    let live_voxel_size_m = (settings.voxel_size_mm.max(10) as f32) / 1000.0;
+    let mut command = worker_command(&worker);
+    command
+        .arg("live")
+        .arg(phase_root)
+        .arg("--mode")
+        .arg(&settings.live_reconstruction)
+        .arg("--voxel-size")
+        .arg(live_voxel_size_m.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr));
+    command
+        .spawn()
+        .map(Some)
+        .map_err(|error| format!("Could not start live reconstruction: {error}"))
 }
 
 fn append_sensor_args(command: &mut Command, settings: &CaptureSettings) {
@@ -524,6 +628,31 @@ fn live_worker_status(root: &Path) -> Option<LiveWorkerStatus> {
     serde_json::from_reader(File::open(path).ok()?).ok()
 }
 
+fn live_reconstruction_status(root: &Path) -> Option<LiveReconstructionStatus> {
+    let path = root.join("live-reconstruction.json");
+    let modified = fs::metadata(&path).ok()?.modified().ok()?;
+    if modified.elapsed().ok()? > Duration::from_secs(3) {
+        return None;
+    }
+    serde_json::from_reader(File::open(path).ok()?).ok()
+}
+
+fn live_reconstruction_packet(root: &Path, name: &str, magic: &[u8; 4], after_frame: u32) -> Vec<u8> {
+    let bytes = match fs::read(root.join(name)) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    if bytes.len() < 8 || &bytes[0..4] != magic {
+        return Vec::new();
+    }
+    let frame_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if frame_count == after_frame {
+        Vec::new()
+    } else {
+        bytes
+    }
+}
+
 fn read_live_preview_stream(
     stdout: std::process::ChildStdout,
     latest: Arc<Mutex<Option<LivePreviewFrame>>>,
@@ -577,11 +706,48 @@ pub fn live_preview_frame(
     after_frame: u32,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
+    let capture_root = state
+        .active_capture
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|capture| capture.phase_root.clone()));
+    if let Some(root) = capture_root {
+        let body = live_reconstruction_packet(
+            &root,
+            "live-reconstruction.points",
+            b"K2P1",
+            after_frame,
+        );
+        return Ok(tauri::ipc::Response::new(body));
+    }
     let frame = live_preview_snapshot(state.inner());
     let body = match frame {
         Some(frame) if frame.frame_count != after_frame => frame.packet.as_ref().clone(),
         _ => Vec::new(),
     };
+    Ok(tauri::ipc::Response::new(body))
+}
+
+#[tauri::command]
+pub fn live_reconstruction_mesh(
+    after_frame: u32,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let capture_root = state
+        .active_capture
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|capture| capture.phase_root.clone()));
+    let body = capture_root
+        .map(|root| {
+            live_reconstruction_packet(
+                &root,
+                "live-reconstruction.mesh",
+                b"K2M2",
+                after_frame,
+            )
+        })
+        .unwrap_or_default();
     Ok(tauri::ipc::Response::new(body))
 }
 
@@ -835,6 +1001,7 @@ pub async fn runtime_info(
         let (splat_worker_available, splat_status) = match splat_worker {
             Some(worker) => {
                 let mut command = worker_command(&worker);
+                configure_media_tools(&mut command, resources.as_deref());
                 command.arg("diagnostics");
                 match command.output() {
                     Ok(output) => {
@@ -882,13 +1049,21 @@ pub async fn runtime_info(
                 "Not installed; run npm run prepare:splat".to_string(),
             ),
         };
-        let ffmpeg_available = Command::new("ffmpeg")
+        let ffmpeg = first_existing(storage::candidate_ffmpeg_paths(resources.as_deref()))
+            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+        let mut ffmpeg_command = worker_command(&ffmpeg);
+        configure_media_tools(&mut ffmpeg_command, resources.as_deref());
+        let ffmpeg_available = ffmpeg_command
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
-        let colmap_available = Command::new("colmap")
+        let colmap = first_existing(storage::candidate_colmap_paths(resources.as_deref()))
+            .unwrap_or_else(|| PathBuf::from("colmap"));
+        let mut colmap_command = worker_command(&colmap);
+        configure_media_tools(&mut colmap_command, resources.as_deref());
+        let colmap_available = colmap_command
             .arg("-h")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1139,6 +1314,16 @@ pub fn start_sensor_phase(
         thread::sleep(Duration::from_millis(50));
     }
 
+    let live_reconstruction = match start_live_reconstruction(&app, &phase_root, &project.settings) {
+        Ok(child) => child,
+        Err(error) => {
+            File::create(phase_root.join("stop.flag")).ok();
+            child.kill().ok();
+            child.wait().ok();
+            return Err(error);
+        }
+    };
+
     let is_reference = project.phases.is_empty();
     project.phases.push(crate::models::PhaseSummary {
         id: phase_id.clone(),
@@ -1160,6 +1345,7 @@ pub fn start_sensor_phase(
         .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
     *active = Some(ActiveCapture {
         child,
+        live_reconstruction,
         project_root,
         phase_root,
         phase_id,
@@ -1198,6 +1384,8 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
         .clone();
 
     if let Some((mut capture, status)) = ended_capture {
+        drain_live_reconstruction(&mut capture, Duration::from_secs(1));
+        stop_live_reconstruction(&mut capture, Duration::from_secs(2));
         let detail = read_child_stderr(&mut capture.child);
         let frame_count = indexed_frame_count(&capture.phase_root);
         let completed = status.success() && frame_count > 0;
@@ -1225,7 +1413,7 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
         let reconstruction = reconstruction_progress(Path::new(&project.path));
         let selected_sensor_name = sensor_name(&project.settings).to_string();
         return Ok(CaptureStatus {
-            project,
+            project: project.clone(),
             preview: Vec::new(),
             capturing: false,
             sensor_connected: false,
@@ -1244,6 +1432,13 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             tracking_status: "Tracking stopped".to_string(),
             imu_active: false,
             imu_rate_hz: 0.0,
+            live_reconstruction_active: false,
+            live_reconstruction_mode: project.settings.live_reconstruction.clone(),
+            live_processed_frame_count: 0,
+            live_integrated_frame_count: 0,
+            live_rejected_frame_count: 0,
+            live_triangle_count: 0,
+            live_reconstruction_backend: None,
             reconstruction,
             error: (!completed).then_some(if detail.is_empty() {
                 "The sensor capture stopped before a usable phase was completed".to_string()
@@ -1264,7 +1459,12 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             .lock()
             .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
         let live = live_worker_status(&phase_root);
-        let preview = load_phase_preview(&phase_root).unwrap_or_default();
+        let live_reconstruction = live_reconstruction_status(&phase_root);
+        let preview = if live_reconstruction.is_some() {
+            Vec::new()
+        } else {
+            load_phase_preview(&phase_root).unwrap_or_default()
+        };
         let total_frame_count = project.phases.iter().map(|phase| phase.frame_count).sum();
         let reconstruction = reconstruction_progress(Path::new(&project.path));
         let selected_sensor_name = live
@@ -1274,8 +1474,11 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             .map(str::to_string)
             .unwrap_or_else(|| sensor_name(&project.settings).to_string());
         return Ok(CaptureStatus {
-            project,
-            preview_point_count: preview.len() as u64,
+            project: project.clone(),
+            preview_point_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.point_count)
+                .unwrap_or(preview.len() as u64),
             preview,
             capturing: true,
             sensor_connected: live.is_some(),
@@ -1293,10 +1496,15 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             frame_count,
             total_frame_count,
             stream_fps: live.as_ref().map(|status| status.stream_fps).unwrap_or(0.0),
-            tracking: live.as_ref().map(|status| status.tracking).unwrap_or(false),
-            tracking_status: live
+            tracking: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking)
+                .or_else(|| live.as_ref().map(|status| status.tracking))
+                .unwrap_or(false),
+            tracking_status: live_reconstruction
                 .as_ref()
                 .map(|status| status.tracking_status.clone())
+                .or_else(|| live.as_ref().map(|status| status.tracking_status.clone()))
                 .unwrap_or_else(|| "Initializing camera tracking".to_string()),
             imu_active: live
                 .as_ref()
@@ -1306,13 +1514,40 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
                 .as_ref()
                 .map(|status| status.imu_rate_hz)
                 .unwrap_or(0.0),
+            live_reconstruction_active: live_reconstruction
+                .as_ref()
+                .map(|status| status.active)
+                .unwrap_or(project.settings.live_reconstruction != "off"),
+            live_reconstruction_mode: live_reconstruction
+                .as_ref()
+                .map(|status| status.mode.clone())
+                .unwrap_or_else(|| project.settings.live_reconstruction.clone()),
+            live_processed_frame_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.processed_frames)
+                .unwrap_or(0),
+            live_integrated_frame_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.integrated_frames)
+                .unwrap_or(0),
+            live_rejected_frame_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.rejected_frames)
+                .unwrap_or(0),
+            live_triangle_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.triangle_count)
+                .unwrap_or(0),
+            live_reconstruction_backend: live_reconstruction
+                .as_ref()
+                .map(|status| status.backend.clone()),
             reconstruction,
             error: None,
         });
     }
 
     let project_root = PathBuf::from(&project.path);
-    if project.processing_status == "processing" {
+    if project.processing_status == "processing" || project.active_job.is_some() {
         let preview_path = project_root.join("outputs").join("build-preview.json");
         // Close the Windows file handle immediately after the raw read, before
         // spending time parsing the multi-megabyte JSON payload. This leaves a
@@ -1324,7 +1559,7 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
         let total_frame_count = project.phases.iter().map(|phase| phase.frame_count).sum();
         let selected_sensor_name = sensor_name(&project.settings).to_string();
         return Ok(CaptureStatus {
-            project,
+            project: project.clone(),
             preview_point_count: preview.len() as u64,
             preview,
             capturing: false,
@@ -1339,6 +1574,13 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             tracking_status: "Reconstruction preview".to_string(),
             imu_active: false,
             imu_rate_hz: 0.0,
+            live_reconstruction_active: false,
+            live_reconstruction_mode: project.settings.live_reconstruction.clone(),
+            live_processed_frame_count: 0,
+            live_integrated_frame_count: 0,
+            live_rejected_frame_count: 0,
+            live_triangle_count: 0,
+            live_reconstruction_backend: None,
             reconstruction: reconstruction_progress(&project_root),
             error: None,
         });
@@ -1371,7 +1613,7 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
         .map(str::to_string)
         .unwrap_or_else(|| sensor_name(&project.settings).to_string());
     Ok(CaptureStatus {
-        project,
+        project: project.clone(),
         preview_point_count,
         preview,
         capturing: false,
@@ -1404,6 +1646,13 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             .as_ref()
             .map(|status| status.imu_rate_hz)
             .unwrap_or(0.0),
+        live_reconstruction_active: false,
+        live_reconstruction_mode: project.settings.live_reconstruction.clone(),
+        live_processed_frame_count: 0,
+        live_integrated_frame_count: 0,
+        live_rejected_frame_count: 0,
+        live_triangle_count: 0,
+        live_reconstruction_backend: None,
         reconstruction: reconstruction_progress(&project_root),
         error: live_error,
     })
@@ -1644,6 +1893,8 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
             }
             thread::sleep(Duration::from_millis(80));
         };
+        drain_live_reconstruction(&mut capture, Duration::from_secs(3));
+        stop_live_reconstruction(&mut capture, Duration::from_secs(5));
 
         let manifest_path = capture.phase_root.join("phase.json");
         let capture_summary = if manifest_path.exists() {
@@ -1685,6 +1936,7 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
             };
         }
         fs::remove_file(capture.phase_root.join("stop.flag")).ok();
+        fs::remove_file(capture.phase_root.join("live-reconstruction.stop")).ok();
         storage::write_project(&project)?;
         *project_state
             .lock()
@@ -1791,8 +2043,10 @@ pub async fn reconstruct_project(
 }
 
 #[tauri::command]
-pub fn load_preview(project_path: String) -> Result<Vec<PreviewPoint>, String> {
-    load_project_preview(&PathBuf::from(project_path))
+pub async fn load_preview(project_path: String) -> Result<Vec<PreviewPoint>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_project_preview(&PathBuf::from(project_path)))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 fn load_preview_mesh_file(project_path: &str, filename: &str) -> Result<Response, String> {
@@ -1815,49 +2069,67 @@ fn obj_index(value: &str, item_count: usize) -> Option<usize> {
 }
 
 fn pack_preview_mesh(path: &Path, _triangle_count: usize) -> Result<Vec<u8>, String> {
-    // Mesh generation already bounds each of its 16 keyframes to roughly
-    // 280x280 samples. Keep every face: striding an indexed surface by face
-    // disconnects neighboring depth-cell triangles and produces "confetti".
-    let reader = BufReader::new(
-        File::open(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))?,
-    );
+    // Keep every face in the fused indexed surface: striding by face disconnects
+    // neighboring triangles and produces "confetti" along otherwise shared edges.
+    let source =
+        fs::read(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
     let mut source_positions: Vec<[f32; 3]> = Vec::new();
     let mut source_uvs: Vec<[f32; 2]> = Vec::new();
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let mut remapped: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut requires_remapping = false;
 
-    for line in reader.lines() {
-        let line = line.map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+    // Reading the whole OBJ and splitting borrowed lines avoids millions of
+    // String allocations in debug builds. ScanLan meshes also use matching
+    // position/UV indices, so their common path needs no hash-map lookup.
+    for raw_line in source.split(|byte| *byte == b'\n') {
+        let line = std::str::from_utf8(raw_line)
+            .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
         let mut values = line.split_ascii_whitespace();
         match values.next() {
             Some("v") => {
-                let coordinates = values
-                    .take(3)
-                    .map(str::parse::<f32>)
-                    .collect::<Result<Vec<_>, _>>()
+                let x = values
+                    .next()
+                    .ok_or_else(|| "Invalid mesh vertex".to_string())?
+                    .parse::<f32>()
                     .map_err(|error| format!("Invalid mesh vertex: {error}"))?;
-                if coordinates.len() == 3 {
-                    source_positions.push([coordinates[0], coordinates[1], coordinates[2]]);
-                }
+                let y = values
+                    .next()
+                    .ok_or_else(|| "Invalid mesh vertex".to_string())?
+                    .parse::<f32>()
+                    .map_err(|error| format!("Invalid mesh vertex: {error}"))?;
+                let z = values
+                    .next()
+                    .ok_or_else(|| "Invalid mesh vertex".to_string())?
+                    .parse::<f32>()
+                    .map_err(|error| format!("Invalid mesh vertex: {error}"))?;
+                source_positions.push([x, y, z]);
             }
             Some("vt") => {
-                let coordinates = values
-                    .take(2)
-                    .map(str::parse::<f32>)
-                    .collect::<Result<Vec<_>, _>>()
+                let u = values
+                    .next()
+                    .ok_or_else(|| "Invalid mesh UV".to_string())?
+                    .parse::<f32>()
                     .map_err(|error| format!("Invalid mesh UV: {error}"))?;
-                if coordinates.len() == 2 {
-                    source_uvs.push([coordinates[0], coordinates[1]]);
-                }
+                let v = values
+                    .next()
+                    .ok_or_else(|| "Invalid mesh UV".to_string())?
+                    .parse::<f32>()
+                    .map_err(|error| format!("Invalid mesh UV: {error}"))?;
+                source_uvs.push([u, v]);
             }
             Some("f") => {
-                let corners = values.take(3).collect::<Vec<_>>();
-                if corners.len() != 3 {
+                let Some(corners) = values
+                    .next()
+                    .zip(values.next())
+                    .zip(values.next())
+                    .map(|((first, second), third)| [first, second, third])
+                else {
                     continue;
-                }
-                let mut triangle = [0u32; 3];
+                };
+                let mut source_triangle = [(0usize, 0usize); 3];
                 let mut valid = true;
                 for (corner_index, corner) in corners.iter().enumerate() {
                     let mut components = corner.split('/');
@@ -1871,27 +2143,58 @@ fn pack_preview_mesh(path: &Path, _triangle_count: usize) -> Result<Vec<u8>, Str
                         valid = false;
                         break;
                     };
-                    let key = (position_index, uv_index);
-                    let preview_index = if let Some(index) = remapped.get(&key) {
-                        *index
-                    } else {
-                        let index = positions.len() as u32;
-                        positions.push(source_positions[position_index]);
-                        uvs.push(source_uvs[uv_index]);
-                        remapped.insert(key, index);
-                        index
-                    };
-                    triangle[corner_index] = preview_index;
+                    source_triangle[corner_index] = (position_index, uv_index);
                 }
                 if valid {
-                    indices.extend_from_slice(&triangle);
+                    if !requires_remapping
+                        && source_triangle
+                            .iter()
+                            .all(|(position_index, uv_index)| position_index == uv_index)
+                    {
+                        indices.extend(
+                            source_triangle
+                                .iter()
+                                .map(|(position_index, _)| *position_index as u32),
+                        );
+                        continue;
+                    }
+                    if !requires_remapping {
+                        requires_remapping = true;
+                        let aligned_indices = std::mem::take(&mut indices);
+                        for source_index in aligned_indices {
+                            let source_index = source_index as usize;
+                            let preview_index = *remapped
+                                .entry((source_index, source_index))
+                                .or_insert_with(|| {
+                                    let index = positions.len() as u32;
+                                    positions.push(source_positions[source_index]);
+                                    uvs.push(source_uvs[source_index]);
+                                    index
+                                });
+                            indices.push(preview_index);
+                        }
+                    }
+                    for key in source_triangle {
+                        let preview_index = *remapped.entry(key).or_insert_with(|| {
+                            let index = positions.len() as u32;
+                            positions.push(source_positions[key.0]);
+                            uvs.push(source_uvs[key.1]);
+                            index
+                        });
+                        indices.push(preview_index);
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    if positions.is_empty() || indices.is_empty() {
+    if !requires_remapping {
+        positions = source_positions;
+        uvs = source_uvs;
+    }
+
+    if positions.is_empty() || positions.len() != uvs.len() || indices.is_empty() {
         return Err("The reconstructed mesh does not contain previewable triangles".to_string());
     }
     let vertex_count = u32::try_from(positions.len())
@@ -1918,29 +2221,85 @@ fn pack_preview_mesh(path: &Path, _triangle_count: usize) -> Result<Vec<u8>, Str
     Ok(bytes)
 }
 
-#[tauri::command]
-pub fn load_preview_mesh_geometry(project_path: String) -> Result<Response, String> {
-    let project_root = PathBuf::from(&project_path);
-    let project = storage::read_project(&project_root)?;
-    let path = project_root.join("outputs").join("room-mesh.obj");
-    pack_preview_mesh(&path, project.mesh_triangle_count.unwrap_or(0) as usize).map(Response::new)
-}
-
-#[tauri::command]
-pub fn load_preview_mesh_texture(project_path: String) -> Result<Response, String> {
-    load_preview_mesh_file(&project_path, "room-texture.png")
-}
-
-#[tauri::command]
-pub fn load_camera_frames(project_path: String) -> Result<Vec<CameraFrame>, String> {
-    let path = PathBuf::from(project_path)
-        .join("outputs")
-        .join("camera-poses.json");
-    if !path.is_file() {
-        return Ok(Vec::new());
+fn valid_packed_preview_mesh(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[..4] != b"K2M1" {
+        return false;
     }
-    serde_json::from_reader(File::open(path).map_err(|error| error.to_string())?)
-        .map_err(|error| format!("Could not read reconstructed camera poses: {error}"))
+    let vertex_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let index_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    12usize
+        .checked_add(vertex_count.checked_mul(20).unwrap_or(usize::MAX))
+        .and_then(|length| length.checked_add(index_count.checked_mul(4)?))
+        == Some(bytes.len())
+}
+
+fn preview_cache_is_current(source: &Path, cache: &Path) -> bool {
+    let Ok(source_modified) = source.metadata().and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    let Ok(cache_modified) = cache.metadata().and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    cache_modified >= source_modified
+}
+
+fn load_or_pack_preview_mesh(project_root: &Path) -> Result<Vec<u8>, String> {
+    let output_root = project_root.join("outputs");
+    let source = output_root.join("room-mesh.obj");
+    let cache = output_root.join("room-mesh.preview.bin");
+    if preview_cache_is_current(&source, &cache) {
+        if let Ok(bytes) = fs::read(&cache) {
+            if valid_packed_preview_mesh(&bytes) {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    let bytes = pack_preview_mesh(&source, 0)?;
+    let temporary = output_root.join(format!(".room-mesh.preview.{}.tmp", Uuid::new_v4()));
+    if fs::write(&temporary, &bytes).is_ok() {
+        if cache.exists() {
+            fs::remove_file(&cache).ok();
+        }
+        if fs::rename(&temporary, &cache).is_err() {
+            fs::remove_file(&temporary).ok();
+        }
+    }
+    Ok(bytes)
+}
+
+#[tauri::command]
+pub async fn load_preview_mesh_geometry(project_path: String) -> Result<Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        load_or_pack_preview_mesh(&PathBuf::from(project_path)).map(Response::new)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn load_preview_mesh_texture(project_path: String) -> Result<Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        load_preview_mesh_file(&project_path, "room-texture.png")
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn load_camera_frames(project_path: String) -> Result<Vec<CameraFrame>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(project_path)
+            .join("outputs")
+            .join("camera-poses.json");
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        serde_json::from_reader(File::open(path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("Could not read reconstructed camera poses: {error}"))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 const PLY_VERTEX_STRIDE: usize = 15;
@@ -2130,6 +2489,281 @@ pub fn export_textured_mesh(
     Ok(destination_obj.to_string_lossy().into_owned())
 }
 
+#[derive(Clone, Copy)]
+enum PlyScalarType {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    F32,
+    F64,
+}
+
+impl PlyScalarType {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "char" | "int8" => Some(Self::I8),
+            "uchar" | "uint8" => Some(Self::U8),
+            "short" | "int16" => Some(Self::I16),
+            "ushort" | "uint16" => Some(Self::U16),
+            "int" | "int32" => Some(Self::I32),
+            "uint" | "uint32" => Some(Self::U32),
+            "float" | "float32" => Some(Self::F32),
+            "double" | "float64" => Some(Self::F64),
+            _ => None,
+        }
+    }
+
+    fn size(self) -> usize {
+        match self {
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
+    }
+
+    fn read(self, bytes: &[u8]) -> f32 {
+        match self {
+            Self::I8 => bytes[0] as i8 as f32,
+            Self::U8 => bytes[0] as f32,
+            Self::I16 => i16::from_le_bytes(bytes.try_into().unwrap()) as f32,
+            Self::U16 => u16::from_le_bytes(bytes.try_into().unwrap()) as f32,
+            Self::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f32,
+            Self::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as f32,
+            Self::F32 => f32::from_le_bytes(bytes.try_into().unwrap()),
+            Self::F64 => f64::from_le_bytes(bytes.try_into().unwrap()) as f32,
+        }
+    }
+}
+
+fn gaussian_splat_preview_path(source: &Path) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("room-splat");
+    source.with_file_name(format!("{stem}.preview.splat"))
+}
+
+fn compact_splat_preview(bytes: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    if bytes.is_empty() || bytes.len() % 32 != 0 {
+        return Err("The Gaussian preview is incomplete".to_string());
+    }
+    if limit == 0 {
+        return Err("The Gaussian preview limit must be positive".to_string());
+    }
+    let splat_count = bytes.len() / 32;
+    if splat_count <= limit {
+        return Ok(bytes.to_vec());
+    }
+    if limit == 1 {
+        return Ok(bytes[..32].to_vec());
+    }
+    let mut compact = Vec::with_capacity(limit * 32);
+    for target_index in 0..limit {
+        let source_index = target_index * (splat_count - 1) / (limit - 1);
+        compact.extend_from_slice(&bytes[source_index * 32..source_index * 32 + 32]);
+    }
+    Ok(compact)
+}
+
+fn convert_3dgs_ply_to_splat(source: &Path) -> Result<Vec<u8>, String> {
+    const SH_C0: f32 = 0.282_094_8;
+    let file = File::open(source)
+        .map_err(|error| format!("Could not open the canonical Gaussian PLY: {error}"))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut vertex_count = None;
+    let mut in_vertex_element = false;
+    let mut properties: HashMap<String, (usize, PlyScalarType)> = HashMap::new();
+    let mut vertex_stride = 0usize;
+    let mut saw_binary_little_endian = false;
+
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Could not read the Gaussian PLY header: {error}"))?
+            == 0
+        {
+            return Err("The Gaussian PLY header is incomplete".to_string());
+        }
+        let header_line = line.trim_end_matches(|value| value == '\r' || value == '\n');
+        let fields: Vec<_> = header_line.split_whitespace().collect();
+        if fields.first() == Some(&"format") {
+            saw_binary_little_endian = fields.get(1) == Some(&"binary_little_endian");
+        } else if fields.first() == Some(&"element") && fields.len() >= 3 {
+            in_vertex_element = fields[1] == "vertex";
+            if in_vertex_element {
+                vertex_count = Some(
+                    fields[2]
+                        .parse::<usize>()
+                        .map_err(|_| "The Gaussian PLY has an invalid vertex count".to_string())?,
+                );
+            }
+        } else if fields.first() == Some(&"property") && in_vertex_element {
+            if fields.get(1) == Some(&"list") || fields.len() < 3 {
+                return Err(
+                    "List-valued Gaussian PLY vertex properties are unsupported".to_string()
+                );
+            }
+            let scalar_type = PlyScalarType::parse(fields[1])
+                .ok_or_else(|| format!("Unsupported Gaussian PLY property type: {}", fields[1]))?;
+            properties.insert(fields[2].to_string(), (vertex_stride, scalar_type));
+            vertex_stride = vertex_stride
+                .checked_add(scalar_type.size())
+                .ok_or_else(|| "The Gaussian PLY vertex layout is too large".to_string())?;
+        }
+        if header_line == "end_header" {
+            break;
+        }
+    }
+    if !saw_binary_little_endian {
+        return Err("Only binary little-endian Gaussian PLY files can be previewed".to_string());
+    }
+    let vertex_count =
+        vertex_count.ok_or_else(|| "The Gaussian PLY has no vertices".to_string())?;
+    if vertex_count == 0 || vertex_stride == 0 {
+        return Err("The Gaussian PLY contains no splats".to_string());
+    }
+    for required in [
+        "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2",
+        "rot_0", "rot_1", "rot_2", "rot_3",
+    ] {
+        if !properties.contains_key(required) {
+            return Err(format!("The Gaussian PLY is missing property {required}"));
+        }
+    }
+
+    let property = |record: &[u8], name: &str| -> f32 {
+        let (offset, scalar_type) = properties[name];
+        scalar_type.read(&record[offset..offset + scalar_type.size()])
+    };
+    let output_size = vertex_count
+        .checked_mul(32)
+        .ok_or_else(|| "The Gaussian preview is too large".to_string())?;
+    let mut output = Vec::with_capacity(output_size);
+    let mut record = vec![0u8; vertex_stride];
+    for _ in 0..vertex_count {
+        reader
+            .read_exact(&mut record)
+            .map_err(|error| format!("The Gaussian PLY vertex payload is incomplete: {error}"))?;
+        for name in ["x", "y", "z"] {
+            output.extend_from_slice(&property(&record, name).to_le_bytes());
+        }
+        for name in ["scale_0", "scale_1", "scale_2"] {
+            let scale = property(&record, name).exp();
+            if !scale.is_finite() {
+                return Err("The Gaussian PLY contains an invalid scale".to_string());
+            }
+            output.extend_from_slice(&scale.to_le_bytes());
+        }
+        for name in ["f_dc_0", "f_dc_1", "f_dc_2"] {
+            let color = (0.5 + SH_C0 * property(&record, name)).clamp(0.0, 1.0);
+            output.push((color * 255.0).round() as u8);
+        }
+        let opacity_logit = property(&record, "opacity");
+        let opacity = if opacity_logit >= 0.0 {
+            1.0 / (1.0 + (-opacity_logit).exp())
+        } else {
+            let exponent = opacity_logit.exp();
+            exponent / (1.0 + exponent)
+        };
+        output.push((opacity.clamp(0.0, 1.0) * 255.0).round() as u8);
+
+        let mut quaternion = [
+            property(&record, "rot_0"),
+            property(&record, "rot_1"),
+            property(&record, "rot_2"),
+            property(&record, "rot_3"),
+        ];
+        let norm = quaternion
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        if norm > 1e-8 && norm.is_finite() {
+            for value in &mut quaternion {
+                *value /= norm;
+            }
+        } else {
+            quaternion = [1.0, 0.0, 0.0, 0.0];
+        }
+        for value in quaternion {
+            output.push((value.mul_add(128.0, 128.0).round().clamp(0.0, 255.0)) as u8);
+        }
+    }
+    Ok(output)
+}
+
+fn ensure_gaussian_splat_preview(source: &Path) -> Result<PathBuf, String> {
+    const MAX_PREVIEW_SPLATS: usize = 500_000;
+    let preview = gaussian_splat_preview_path(source);
+    let preview_is_current = fs::metadata(&preview).ok().is_some_and(|preview_metadata| {
+        preview_metadata.len() > 0
+            && preview_metadata.len() % 32 == 0
+            && match (
+                preview_metadata.modified(),
+                fs::metadata(source).and_then(|value| value.modified()),
+            ) {
+                (Ok(preview_time), Ok(source_time)) => preview_time >= source_time,
+                _ => true,
+            }
+    });
+    if preview_is_current {
+        let bytes = fs::read(&preview)
+            .map_err(|error| format!("Could not read the Gaussian preview cache: {error}"))?;
+        if bytes.len() / 32 > MAX_PREVIEW_SPLATS {
+            let compact = compact_splat_preview(&bytes, MAX_PREVIEW_SPLATS)?;
+            write_export(&preview, &compact).map_err(|error| {
+                format!("Could not compact the realtime Gaussian preview: {error}")
+            })?;
+        }
+    } else {
+        let bytes = convert_3dgs_ply_to_splat(source)?;
+        let compact = compact_splat_preview(&bytes, MAX_PREVIEW_SPLATS)?;
+        write_export(&preview, &compact)
+            .map_err(|error| format!("Could not cache the realtime Gaussian preview: {error}"))?;
+    }
+    Ok(preview)
+}
+
+#[tauri::command]
+pub async fn load_gaussian_splat(project_path: String) -> Result<Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = PathBuf::from(project_path);
+        let project = storage::read_project(&root)?;
+        if project.processing_status == "processing" {
+            let live_preview = root.join("outputs").join("room-splat.preview.splat");
+            let bytes = fs::read(&live_preview).map_err(|_| {
+                "The trainer has not published its first live splat preview yet".to_string()
+            })?;
+            if bytes.is_empty() || bytes.len() % 32 != 0 {
+                return Err("The live splat preview is still being published".to_string());
+            }
+            return Ok(Response::new(bytes));
+        }
+        let artifact = project
+            .artifacts
+            .gaussian_splat
+            .as_ref()
+            .filter(|artifact| !artifact.stale)
+            .ok_or_else(|| "Build a Gaussian splat before previewing it".to_string())?;
+        let source = root.join(&artifact.path);
+        if !source.is_file() {
+            return Err("The Gaussian splat artifact is missing".to_string());
+        }
+        let preview = ensure_gaussian_splat_preview(&source)?;
+        let bytes = fs::read(preview)
+            .map_err(|error| format!("Could not read the Gaussian splat preview: {error}"))?;
+        Ok(Response::new(bytes))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub fn export_gaussian_splat(
     project_path: String,
@@ -2216,6 +2850,27 @@ fn transformed_direction(direction: [f32; 3], transform: &CloudTransform) -> [f3
     ]
 }
 
+fn transformed_normal(normal: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
+    // Normals use the inverse transpose of the scale before the same rotation
+    // as positions. transformed_direction applies scale once, so pre-dividing
+    // by scale squared produces R * inverse(S) here.
+    let adjusted = std::array::from_fn(|axis| {
+        let scale = transform.scale[axis];
+        if scale.abs() > f32::EPSILON {
+            normal[axis] / (scale * scale)
+        } else {
+            normal[axis]
+        }
+    });
+    let transformed = transformed_direction(adjusted, transform);
+    let length = transformed.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if length > f32::EPSILON {
+        transformed.map(|value| value / length)
+    } else {
+        transformed
+    }
+}
+
 fn transform_camera_frame(frame: &mut CameraFrame, transform: &CloudTransform) {
     let origin = transformed_position(
         [frame.matrix[3], frame.matrix[7], frame.matrix[11]],
@@ -2257,6 +2912,21 @@ fn transformed_obj(source: &str, transform: &CloudTransform) -> Result<String, S
             output.push_str(&format!(
                 "v {:.7} {:.7} {:.7}\n",
                 position[0], position[1], position[2]
+            ));
+        } else if let Some(normal) = line.strip_prefix("vn ") {
+            let values = normal
+                .split_whitespace()
+                .take(3)
+                .map(str::parse::<f32>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "The generated OBJ contains an invalid normal".to_string())?;
+            if values.len() != 3 {
+                return Err("The generated OBJ contains an incomplete normal".to_string());
+            }
+            let normal = transformed_normal([values[0], values[1], values[2]], transform);
+            output.push_str(&format!(
+                "vn {:.7} {:.7} {:.7}\n",
+                normal[0], normal[1], normal[2]
             ));
         } else if reverse_winding && line.starts_with("f ") {
             let vertices = line[2..].split_whitespace().collect::<Vec<_>>();
@@ -2368,7 +3038,8 @@ pub fn apply_cloud_transform(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_project, pack_preview_mesh, transformed_position, unity_compatible_ply,
+        compact_splat_preview, convert_3dgs_ply_to_splat, normalize_project, pack_preview_mesh,
+        transformed_normal, transformed_position, unity_compatible_ply, valid_packed_preview_mesh,
         validate_sensor_settings,
     };
     use crate::models::{CaptureSettings, CloudTransform, ProjectSummary};
@@ -2398,6 +3069,70 @@ mod tests {
         assert_eq!(u32::from_le_bytes(packed[8..12].try_into().unwrap()), 3);
         assert_eq!(f32::from_le_bytes(packed[12..16].try_into().unwrap()), 1.0);
         assert_eq!(packed.len(), 12 + 3 * 20 + 3 * 4);
+        assert!(valid_packed_preview_mesh(&packed));
+        assert!(!valid_packed_preview_mesh(&packed[..packed.len() - 1]));
+    }
+
+    #[test]
+    fn canonical_gaussian_ply_converts_to_compact_preview() {
+        let path = std::env::temp_dir().join(format!("scanlan-splat-{}.ply", uuid::Uuid::new_v4()));
+        let names = [
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+            "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let mut source = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex 1\n{}end_header\n",
+            names
+                .iter()
+                .map(|name| format!("property float {name}\n"))
+                .collect::<String>()
+        )
+        .into_bytes();
+        let dc = (0.25_f32 - 0.5) / 0.282_094_8;
+        for value in [
+            1.0_f32,
+            2.0,
+            3.0,
+            dc,
+            0.0,
+            -dc,
+            0.0,
+            0.1_f32.ln(),
+            0.2_f32.ln(),
+            0.4_f32.ln(),
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        ] {
+            source.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&path, source).unwrap();
+        let preview = convert_3dgs_ply_to_splat(&path).unwrap();
+        fs::remove_file(path).ok();
+
+        assert_eq!(preview.len(), 32);
+        let floats: Vec<_> = preview[..24]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(&floats[..3], &[1.0, 2.0, 3.0]);
+        assert!((floats[3] - 0.1).abs() < 1e-6);
+        assert!((floats[4] - 0.2).abs() < 1e-6);
+        assert!((floats[5] - 0.4).abs() < 1e-6);
+        assert_eq!(&preview[24..28], &[64, 128, 191, 128]);
+        assert_eq!(&preview[28..32], &[255, 128, 128, 128]);
+    }
+
+    #[test]
+    fn oversized_gaussian_preview_is_evenly_compacted() {
+        let source = (0u8..5).flat_map(|value| [value; 32]).collect::<Vec<_>>();
+        let compact = compact_splat_preview(&source, 3).unwrap();
+
+        assert_eq!(compact.len(), 96);
+        assert_eq!(compact[0], 0);
+        assert_eq!(compact[32], 2);
+        assert_eq!(compact[64], 4);
     }
 
     #[test]
@@ -2451,6 +3186,20 @@ mod tests {
             transformed_position([1.0, 2.0, 3.0], &transform),
             [-0.5, 1.0, 5.0]
         );
+    }
+
+    #[test]
+    fn mesh_normals_use_inverse_transpose_scale() {
+        let transform = CloudTransform {
+            position: [4.0, 5.0, 6.0],
+            rotation: [0.0, 0.0, 0.0],
+            scale: [2.0, 1.0, 0.5],
+        };
+        let normal = transformed_normal([1.0, 0.0, 1.0], &transform);
+        let length = (0.5_f32 * 0.5 + 2.0 * 2.0).sqrt();
+        assert!((normal[0] - 0.5 / length).abs() < 1e-6);
+        assert_eq!(normal[1], 0.0);
+        assert!((normal[2] - 2.0 / length).abs() < 1e-6);
     }
 
     #[test]
@@ -2532,6 +3281,7 @@ mod tests {
         assert!(!settings.depth_binned);
         assert_eq!(settings.rgb_jpeg_quality, 92);
         assert_eq!(settings.max_rgb_dimension, 0);
+        assert_eq!(settings.live_reconstruction, "points");
     }
 
     #[test]
@@ -2543,5 +3293,17 @@ mod tests {
             ..CaptureSettings::default()
         };
         assert!(validate_sensor_settings(&mut settings).is_ok());
+    }
+
+    #[test]
+    fn capture_settings_reject_unknown_live_reconstruction_modes() {
+        let mut settings = CaptureSettings {
+            live_reconstruction: "teleport".to_string(),
+            ..CaptureSettings::default()
+        };
+        assert_eq!(
+            validate_sensor_settings(&mut settings),
+            Err("Unknown live reconstruction mode".to_string())
+        );
     }
 }

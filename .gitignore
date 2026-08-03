@@ -32,6 +32,7 @@ htmlcov/
 /splat-worker/build/
 /splat-worker/dist/
 /splat-worker/*.spec
+/media-tools/
 *.spec.bak
 
 # Native / CMake outputs

@@ -14,9 +14,20 @@ from PIL import Image
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        for attempt in range(40):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.025)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def resolve_dataset(path: Path) -> Path:
@@ -208,6 +219,23 @@ def _write_initialization(path: Path, points: np.ndarray, colors: np.ndarray) ->
         handle.write(header); vertices.tofile(handle)
 
 
+def _write_point_preview(path: Path, points: np.ndarray, colors: np.ndarray, limit: int = 30_000) -> None:
+    if len(points) > limit:
+        indices = np.linspace(0, len(points) - 1, limit, dtype=np.int64)
+        points = points[indices]
+        colors = colors[indices]
+    _write_json_atomic(
+        path,
+        [
+            {
+                "position": [round(float(value), 5) for value in point],
+                "color": [int(value) for value in color],
+            }
+            for point, color in zip(points, colors, strict=True)
+        ],
+    )
+
+
 def prepare_media_dataset(project_root: Path, source_ids: list[str]) -> Path:
     reporter = _MediaProgress(project_root)
     reporter.update("media_preparing", "Reading imported media sources", 0.0, 0.0)
@@ -260,13 +288,13 @@ def prepare_media_dataset(project_root: Path, source_ids: list[str]) -> Path:
     )
     if len(accepted) < 8:
         raise RuntimeError(f"Only {len(accepted)} sharp, distinct images remain; at least 8 are required")
-    _run_phase(reporter, ["colmap", "feature_extractor", "--database_path", str(database), "--image_path", str(images_root), "--ImageReader.single_camera", "0", "--SiftExtraction.use_gpu", "1"], "feature_extraction", f"Extracting CUDA SIFT features from {len(accepted)} frames", 0.07, 0.11, 45, cancel_path)
+    _run_phase(reporter, ["colmap", "feature_extractor", "--database_path", str(database), "--image_path", str(images_root), "--ImageReader.single_camera", "0", "--FeatureExtraction.use_gpu", "1"], "feature_extraction", f"Extracting CUDA SIFT features from {len(accepted)} frames", 0.07, 0.11, 45, cancel_path)
     if ordered:
-        _run_phase(reporter, ["colmap", "sequential_matcher", "--database_path", str(database), "--SequentialMatching.loop_detection", "1", "--SiftMatching.use_gpu", "1"], "matching_views", "Matching ordered video views on CUDA", 0.11, 0.16, 60, cancel_path)
+        _run_phase(reporter, ["colmap", "sequential_matcher", "--database_path", str(database), "--SequentialMatching.loop_detection", "1", "--FeatureMatching.use_gpu", "1"], "matching_views", "Matching ordered video views on CUDA", 0.11, 0.16, 60, cancel_path)
     elif len(accepted) > 500 and os.environ.get("COLMAP_VOCAB_TREE"):
-        _run_phase(reporter, ["colmap", "vocab_tree_matcher", "--database_path", str(database), "--VocabTreeMatching.vocab_tree_path", os.environ["COLMAP_VOCAB_TREE"], "--SiftMatching.use_gpu", "1"], "matching_views", "Matching large photo collection on CUDA", 0.11, 0.16, 90, cancel_path)
+        _run_phase(reporter, ["colmap", "vocab_tree_matcher", "--database_path", str(database), "--VocabTreeMatching.vocab_tree_path", os.environ["COLMAP_VOCAB_TREE"], "--FeatureMatching.use_gpu", "1"], "matching_views", "Matching large photo collection on CUDA", 0.11, 0.16, 90, cancel_path)
     else:
-        _run_phase(reporter, ["colmap", "exhaustive_matcher", "--database_path", str(database), "--SiftMatching.use_gpu", "1"], "matching_views", "Matching overlapping photo views on CUDA", 0.11, 0.16, 90, cancel_path)
+        _run_phase(reporter, ["colmap", "exhaustive_matcher", "--database_path", str(database), "--FeatureMatching.use_gpu", "1"], "matching_views", "Matching overlapping photo views on CUDA", 0.11, 0.16, 90, cancel_path)
     sparse.mkdir(parents=True, exist_ok=True)
     _run_phase(reporter, ["colmap", "mapper", "--database_path", str(database), "--image_path", str(images_root), "--output_path", str(sparse)], "mapping_cameras", "Solving connected camera poses and sparse geometry", 0.16, 0.23, 120, cancel_path)
     components = [path for path in sparse.iterdir() if path.is_dir()]
@@ -289,6 +317,7 @@ def prepare_media_dataset(project_root: Path, source_ids: list[str]) -> Path:
         shutil.copy2(images_root / record["name"], destination)
         frames.append({"image": f"registered/{destination.name}", "worldFromRgbCamera": record["worldFromCamera"].reshape(-1).tolist(), "intrinsics": cameras[record["camera"]], "timestampUs": 0, "phaseId": "colmap", "metric": False})
     _write_initialization(root / "initialization.ply", points, colors)
+    _write_point_preview(project_root / "outputs" / "build-preview.json", points, colors)
     dataset = {"schemaVersion": 1, "fingerprint": digest, "coordinateConvention": {"handedness": "right", "units": "arbitrary", "cameraAxes": "opencv_x_right_y_down_z_forward", "pose": "worldFromCamera", "matrixStorage": "row-major"}, "metric": False, "frames": frames, "initialization": "initialization.ply", "quality": {"registeredImages": len(registered), "totalImages": len(accepted), "reprojectionError": error, "disconnectedComponents": max(0, len(components) - 1)}}
     _write_json_atomic(root / "dataset.json", dataset)
     for source in project.get("mediaSources", []):

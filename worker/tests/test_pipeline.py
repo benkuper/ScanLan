@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import csv
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,16 @@ import numpy as np
 
 from scanlan.imu import odometry_rotation_prior
 from scanlan.calibration import rgb_depth_zbuffer
-from scanlan.io import ImuSample, load_depth, load_source_rgb, read_phase, read_project
+from scanlan.io import (
+    CameraModel,
+    FrameRecord,
+    ImuSample,
+    PhaseData,
+    load_depth,
+    load_source_rgb,
+    read_phase,
+    read_project,
+)
 from scanlan.mock_data import create_mock_project
 from scanlan.compute import (
     ComputeBackend,
@@ -22,12 +32,16 @@ from scanlan.compute import (
     tensor_rgbd,
 )
 from scanlan.open3d_engine import (
+    PhaseAlignment,
     _apply_fragment_corrections,
     _display_points,
     _interpolate_rigid_transform,
+    _prefer_alignment,
     _tracking_fragment_ranges,
+    _trajectory_alignment_acceptable,
     reconstruct_open3d,
 )
+from scanlan.mesh import PosedFrame, _bake_triangle_atlas, _weld_depth_meshes
 from scanlan.reconstruct import reconstruct_project
 
 
@@ -73,6 +87,19 @@ class PipelineTests(unittest.TestCase):
             atol=1e-8,
         )
 
+    def test_trajectory_relocalization_keeps_strict_quality_and_motion_gates(self) -> None:
+        accepted = PhaseAlignment(2, "test", 0.4, 0.02, 0.3, 0.3, 0.8, 2.0, 72)
+        better = PhaseAlignment(2, "test", 0.5, 0.015, 0.4, 0.4, 0.85, 1.0, 80)
+        poor_overlap = PhaseAlignment(2, "test", 0.4, 0.02, 0.05, 0.3, 0.8, 2.0, 72)
+        correction = np.eye(4)
+        correction[0, 3] = 0.2
+
+        self.assertTrue(_trajectory_alignment_acceptable(accepted, correction))
+        self.assertTrue(_prefer_alignment(better, accepted))
+        self.assertFalse(_trajectory_alignment_acceptable(poor_overlap, correction))
+        correction[0, 3] = 1.3
+        self.assertFalse(_trajectory_alignment_acceptable(accepted, correction))
+
     def test_rigid_interpolation_preserves_endpoints(self) -> None:
         left = np.eye(4)
         right = np.eye(4)
@@ -101,20 +128,28 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue((root / "outputs" / "room-mesh.obj").exists())
             self.assertTrue((root / "outputs" / "room-mesh.mtl").exists())
             self.assertTrue((root / "outputs" / "room-texture.png").exists())
+            mesh_preview = (root / "outputs" / "room-mesh.preview.bin").read_bytes()
             current_dataset = root / "outputs" / "cache" / "datasets" / "current.json"
-            self.assertTrue(current_dataset.exists())
-            pointer = json.loads(current_dataset.read_text(encoding="utf-8"))
-            dataset_root = current_dataset.parent / pointer["path"]
-            dataset = json.loads((dataset_root / "dataset.json").read_text(encoding="utf-8"))
-            self.assertTrue(dataset["metric"])
-            self.assertEqual(dataset["coordinateConvention"]["pose"], "worldFromCamera")
-            self.assertEqual(len(dataset["frames"]), 8)
-            self.assertTrue((dataset_root / "initialization.ply").exists())
+            self.assertFalse(current_dataset.exists())
+            self.assertEqual(len(result["datasetFingerprint"]), 24)
             self.assertGreater(result["meshTriangleCount"], 100)
+            self.assertFalse(result["meshCacheHit"])
             obj_lines = (root / "outputs" / "room-mesh.obj").read_text(encoding="utf-8").splitlines()
             self.assertEqual(sum(line.startswith("v ") for line in obj_lines), result["meshVertexCount"])
-            self.assertEqual(sum(line.startswith("vt ") for line in obj_lines), result["meshVertexCount"])
+            self.assertEqual(sum(line.startswith("vn ") for line in obj_lines), result["meshVertexCount"])
+            self.assertEqual(
+                sum(line.startswith("vt ") for line in obj_lines),
+                result["meshTextureVertexCount"],
+            )
             self.assertEqual(sum(line.startswith("f ") for line in obj_lines), result["meshTriangleCount"])
+            self.assertEqual(mesh_preview[:4], b"K2M1")
+            preview_vertex_count, preview_index_count = struct.unpack("<II", mesh_preview[4:12])
+            self.assertEqual(preview_vertex_count, result["meshRenderVertexCount"])
+            self.assertEqual(preview_index_count, result["meshTriangleCount"] * 3)
+            self.assertEqual(len(mesh_preview), 12 + preview_vertex_count * 20 + preview_index_count * 4)
+            self.assertIn(result["meshFusionMethod"], {"tsdf", "welded_depth"})
+            self.assertEqual(result["textureSource"], "best_view_native_rgb_texel_projection")
+            self.assertGreaterEqual(result["textureCoveragePercent"], 99.0)
             self.assertEqual((root / "outputs" / "room-texture.png").read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
             with (root / "outputs" / "camera-poses.json").open("r", encoding="utf-8") as handle:
                 camera_frames = json.load(handle)
@@ -135,6 +170,92 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(result["processingSeconds"], 0)
             self.assertIn("Exporting", result["stageTimingsSeconds"])
             self.assertEqual(project["processingBackend"], "NumPy CPU")
+
+            cached_result = reconstruct_project(root, engine="numpy")
+            self.assertTrue(cached_result["meshCacheHit"])
+            self.assertEqual(cached_result["meshTriangleCount"], result["meshTriangleCount"])
+
+    def test_gaussian_target_builds_the_canonical_posed_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=2)
+
+            result = reconstruct_project(root, engine="numpy", targets=("gaussian_splat",))
+
+            current = root / "outputs" / "cache" / "datasets" / "current.json"
+            pointer = json.loads(current.read_text(encoding="utf-8"))
+            dataset_root = current.parent / pointer["path"]
+            dataset = json.loads((dataset_root / "dataset.json").read_text(encoding="utf-8"))
+            self.assertEqual(dataset["fingerprint"], result["datasetFingerprint"])
+            self.assertEqual(len(dataset["frames"]), 2)
+            self.assertTrue((dataset_root / "initialization.ply").exists())
+
+    def test_depth_mesh_welding_merges_positions_and_duplicate_faces(self) -> None:
+        first_vertices = np.asarray(
+            [[0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]], dtype=np.float32
+        )
+        second_vertices = first_vertices + np.asarray([0.004, 0, 0], dtype=np.float32)
+        triangles = np.asarray([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+
+        vertices, fused = _weld_depth_meshes(
+            [(first_vertices, triangles), (second_vertices, triangles)],
+            voxel_size_m=0.01,
+        )
+
+        self.assertEqual(vertices.shape, (4, 3))
+        self.assertEqual(fused.shape, (2, 3))
+        np.testing.assert_allclose(vertices[:, 0].min(), 0.002, atol=1e-6)
+
+    def test_triangle_charts_share_blended_edge_colors(self) -> None:
+        colors = np.asarray(
+            [[240, 20, 20], [20, 240, 20], [20, 20, 240], [220, 220, 220]],
+            dtype=np.uint8,
+        )
+        triangles = np.asarray([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+
+        atlas, uvs, _ = _bake_triangle_atlas(colors, triangles)
+
+        def atlas_color(uv: np.ndarray) -> np.ndarray:
+            x = min(atlas.shape[1] - 1, int(uv[0] * atlas.shape[1]))
+            y = min(atlas.shape[0] - 1, int((1.0 - uv[1]) * atlas.shape[0]))
+            return atlas[y, x]
+
+        np.testing.assert_allclose(atlas_color(uvs[0, 1]), atlas_color(uvs[1, 0]), atol=1)
+        np.testing.assert_allclose(atlas_color(uvs[0, 2]), atlas_color(uvs[1, 2]), atol=1)
+
+    def test_triangle_charts_retain_native_image_detail_between_vertices(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            depth_path = root / "depth.u16"
+            color_path = root / "color.rgb"
+            np.full((8, 8), 2000, dtype="<u2").tofile(depth_path)
+            yy, xx = np.indices((8, 8))
+            checker = (((xx + yy) % 2) * 255).astype(np.uint8)
+            np.repeat(checker[..., None], 3, axis=2).tofile(color_path)
+            camera = CameraModel(8, 8, 4.0, 4.0, 3.5, 3.5, 1000.0, 4.0)
+            record = FrameRecord(0, 0, depth_path, color_path, None, None, np.eye(4))
+            phase = PhaseData(root, {}, camera, None, np.eye(4), [record], [])
+            frame = PosedFrame("test", "test", phase, 0, np.eye(4), (1.0, 1.0, 1.0), False)
+            image_pixels = np.asarray([[0.0, 0.0], [6.0, 0.0], [0.0, 6.0]])
+            z = np.full(3, 2.0)
+            vertices = np.column_stack(
+                (
+                    (image_pixels[:, 0] - camera.cx) * z / camera.fx,
+                    (image_pixels[:, 1] - camera.cy) * z / camera.fy,
+                    z,
+                )
+            ).astype(np.float32)
+            triangles = np.asarray([[0, 1, 2]], dtype=np.int64)
+
+            atlas, _, _ = _bake_triangle_atlas(
+                np.full((3, 3), 128, dtype=np.uint8),
+                triangles,
+                vertices=vertices,
+                frames=[frame],
+                triangle_frames=np.asarray([0], dtype=np.int16),
+                exposure_gains=np.asarray([1.0], dtype=np.float32),
+            )
+
+            self.assertGreater(int(np.ptp(atlas[..., 0])), 150)
 
     def test_numpy_reconstruction_honors_one_mm_point_spacing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

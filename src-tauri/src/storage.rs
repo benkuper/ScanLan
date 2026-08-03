@@ -181,6 +181,7 @@ pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf
         candidates.push(development_binary.clone());
     }
     if let Some(root) = resource_root {
+        candidates.push(root.join("splat-runtime").join("scanlan-splat.exe"));
         candidates.push(
             root.join("splat-runtime")
                 .join("Scripts")
@@ -190,10 +191,17 @@ pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf
     }
     if let Ok(executable) = std::env::current_exe() {
         if let Some(parent) = executable.parent() {
+            candidates.push(parent.join("splat-runtime").join("scanlan-splat.exe"));
             candidates.push(
                 parent
                     .join("splat-runtime")
                     .join("Scripts")
+                    .join("scanlan-splat.exe"),
+            );
+            candidates.push(
+                parent
+                    .join("resources")
+                    .join("splat-runtime")
                     .join("scanlan-splat.exe"),
             );
             candidates.push(
@@ -210,6 +218,61 @@ pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf
         candidates.push(development_binary);
     }
     candidates
+}
+
+fn development_media_tool_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("media-tools")
+}
+
+pub fn candidate_ffmpeg_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = vec![development_media_tool_root()
+        .join("ffmpeg")
+        .join("bin")
+        .join("ffmpeg.exe")];
+    if let Some(root) = resource_root {
+        candidates.push(
+            root.join("media-tools")
+                .join("ffmpeg")
+                .join("bin")
+                .join("ffmpeg.exe"),
+        );
+    }
+    candidates
+}
+
+pub fn candidate_colmap_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = vec![development_media_tool_root()
+        .join("colmap")
+        .join("bin")
+        .join("colmap.exe")];
+    if let Some(root) = resource_root {
+        candidates.push(
+            root.join("media-tools")
+                .join("colmap")
+                .join("bin")
+                .join("colmap.exe"),
+        );
+    }
+    candidates
+}
+
+pub fn media_tool_directories(resource_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec![development_media_tool_root()];
+    if let Some(root) = resource_root {
+        roots.push(root.join("media-tools"));
+    }
+    roots
+        .into_iter()
+        .flat_map(|root| {
+            [
+                root.join("ffmpeg").join("bin"),
+                root.join("colmap").join("bin"),
+            ]
+        })
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 pub fn candidate_reconstruction_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
