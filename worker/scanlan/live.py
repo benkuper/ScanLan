@@ -377,18 +377,49 @@ def live_reconstruct(
     if voxel_size_m < 0.005 or voxel_size_m > 0.08:
         raise ValueError("Live reconstruction voxel size must be between 5 and 80 mm")
 
-    try:
-        import open3d as o3d
-    except ImportError as error:
-        raise RuntimeError("Open3D is required for live reconstruction") from error
-
     point_path = phase_root / "live-reconstruction.points"
     mesh_path = phase_root / "live-reconstruction.mesh"
     status_path = phase_root / "live-reconstruction.json"
     stop_path = phase_root / "live-reconstruction.stop"
     selection_path = phase_root / "live-frame-selection.csv"
-    for path in (point_path, mesh_path, status_path, stop_path):
+
+    try:
+        import open3d as o3d
+    except ImportError as error:
+        raise RuntimeError("Open3D is required for live reconstruction") from error
+
+    # The desktop removes a stale stop marker before spawning us. Never remove
+    # it here: a one-file packaged worker can spend several seconds unpacking,
+    # and a capture may be cancelled during that interval.
+    if stop_path.exists():
+        return {
+            "processedFrames": 0,
+            "integratedFrames": 0,
+            "rejectedFrames": 0,
+            "pointCount": 0,
+            "triangleCount": 0,
+            "backend": "Open3D",
+        }
+    for path in (point_path, mesh_path, status_path):
         path.unlink(missing_ok=True)
+
+    backend = select_compute_backend(o3d, requested_device)
+    write_json(
+        status_path,
+        {
+            "active": True,
+            "mode": mode,
+            "tracking": False,
+            "trackingStatus": "Live reconstruction ready - waiting for the first RGB-D frame",
+            "processedFrames": 0,
+            "integratedFrames": 0,
+            "rejectedFrames": 0,
+            "pointCount": 0,
+            "triangleCount": 0,
+            "backend": backend.label,
+            "updateFps": 0.0,
+        },
+    )
 
     selection = selection_path.open("w", encoding="utf-8", newline="")
     selection_writer = csv.writer(selection, lineterminator="\n")
@@ -396,7 +427,6 @@ def live_reconstruct(
     selection.flush()
 
     phase: PhaseData | None = None
-    backend: ComputeBackend | None = None
     tracker: LiveTracker | None = None
     volume: LiveVolume | None = None
     processed = 0
@@ -409,22 +439,41 @@ def live_reconstruct(
     started = time.monotonic()
     last_publish = 0.0
     last_published_integrated = 0
+    last_waiting_heartbeat = time.monotonic()
 
     while not stop_path.exists():
         try:
             candidate = read_phase(phase_root, respect_live_selection=False)
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            now = time.monotonic()
+            if now - last_waiting_heartbeat >= 0.5:
+                write_json(
+                    status_path,
+                    {
+                        "active": True,
+                        "mode": mode,
+                        "tracking": False,
+                        "trackingStatus": "Live reconstruction ready - waiting for the first RGB-D frame",
+                        "processedFrames": 0,
+                        "integratedFrames": 0,
+                        "rejectedFrames": 0,
+                        "pointCount": 0,
+                        "triangleCount": 0,
+                        "backend": backend.label,
+                        "updateFps": 0.0,
+                    },
+                )
+                last_waiting_heartbeat = now
             time.sleep(poll_seconds)
             continue
         if phase is None:
             phase = candidate
-            backend = select_compute_backend(o3d, requested_device)
             tracker = LiveTracker(o3d, phase, backend, voxel_size_m)
             volume = LiveVolume(o3d, phase, voxel_size_m, backend)
         else:
             phase = candidate
 
-        assert backend is not None and tracker is not None and volume is not None
+        assert tracker is not None and volume is not None
         if processed >= len(phase.frames):
             time.sleep(poll_seconds)
             continue
@@ -527,5 +576,5 @@ def live_reconstruct(
         "rejectedFrames": rejected,
         "pointCount": point_count,
         "triangleCount": triangle_count,
-        "backend": backend.label if backend is not None else "Open3D",
+        "backend": backend.label,
     }

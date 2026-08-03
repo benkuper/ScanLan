@@ -86,10 +86,22 @@ pub fn terminate_active_capture(state: &AppState) {
 }
 
 fn stop_live_reconstruction(capture: &mut ActiveCapture, timeout: Duration) {
-    let Some(mut child) = capture.live_reconstruction.take() else {
+    stop_live_reconstruction_child(
+        &capture.phase_root,
+        &mut capture.live_reconstruction,
+        timeout,
+    );
+}
+
+fn stop_live_reconstruction_child(
+    phase_root: &Path,
+    live_reconstruction: &mut Option<Child>,
+    timeout: Duration,
+) {
+    let Some(mut child) = live_reconstruction.take() else {
         return;
     };
-    File::create(capture.phase_root.join("live-reconstruction.stop")).ok();
+    File::create(phase_root.join("live-reconstruction.stop")).ok();
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -466,6 +478,38 @@ fn start_live_reconstruction(
         .map_err(|error| format!("Could not start live reconstruction: {error}"))
 }
 
+fn wait_for_live_reconstruction_ready(
+    phase_root: &Path,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if live_reconstruction_status(phase_root).is_some_and(|status| status.active) {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let detail = fs::read_to_string(phase_root.join("live-reconstruction.log"))
+                .unwrap_or_default();
+            return Err(if detail.trim().is_empty() {
+                format!("Live reconstruction stopped while warming up ({status})")
+            } else {
+                detail.trim().to_string()
+            });
+        }
+        if Instant::now() >= deadline {
+            File::create(phase_root.join("live-reconstruction.stop")).ok();
+            child.kill().ok();
+            child.wait().ok();
+            return Err(
+                "Live reconstruction did not become ready within 45 seconds; choose Sensor frames or inspect live-reconstruction.log"
+                    .to_string(),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn append_sensor_args(command: &mut Command, settings: &CaptureSettings) {
     command
         .arg("--rgb-quality")
@@ -638,19 +682,29 @@ fn live_reconstruction_status(root: &Path) -> Option<LiveReconstructionStatus> {
 }
 
 fn live_reconstruction_packet(root: &Path, name: &str, magic: &[u8; 4], after_frame: u32) -> Vec<u8> {
-    let bytes = match fs::read(root.join(name)) {
-        Ok(bytes) => bytes,
+    let mut file = match File::open(root.join(name)) {
+        Ok(file) => file,
         Err(_) => return Vec::new(),
     };
-    if bytes.len() < 8 || &bytes[0..4] != magic {
+    let mut header = [0_u8; 8];
+    if file.read_exact(&mut header).is_err() || &header[0..4] != magic {
         return Vec::new();
     }
-    let frame_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let frame_count = u32::from_le_bytes(header[4..8].try_into().unwrap());
     if frame_count == after_frame {
-        Vec::new()
-    } else {
-        bytes
+        return Vec::new();
     }
+    let mut bytes = Vec::with_capacity(
+        file.metadata()
+            .ok()
+            .and_then(|metadata| usize::try_from(metadata.len()).ok())
+            .unwrap_or(8),
+    );
+    bytes.extend_from_slice(&header);
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    bytes
 }
 
 fn read_live_preview_stream(
@@ -702,7 +756,7 @@ fn live_preview_snapshot(state: &AppState) -> Option<LivePreviewFrame> {
 }
 
 #[tauri::command]
-pub fn live_preview_frame(
+pub async fn live_preview_frame(
     after_frame: u32,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
@@ -712,12 +766,16 @@ pub fn live_preview_frame(
         .ok()
         .and_then(|active| active.as_ref().map(|capture| capture.phase_root.clone()));
     if let Some(root) = capture_root {
-        let body = live_reconstruction_packet(
-            &root,
-            "live-reconstruction.points",
-            b"K2P1",
-            after_frame,
-        );
+        let body = tauri::async_runtime::spawn_blocking(move || {
+            live_reconstruction_packet(
+                &root,
+                "live-reconstruction.points",
+                b"K2P1",
+                after_frame,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?;
         return Ok(tauri::ipc::Response::new(body));
     }
     let frame = live_preview_snapshot(state.inner());
@@ -729,7 +787,7 @@ pub fn live_preview_frame(
 }
 
 #[tauri::command]
-pub fn live_reconstruction_mesh(
+pub async fn live_reconstruction_mesh(
     after_frame: u32,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
@@ -738,8 +796,8 @@ pub fn live_reconstruction_mesh(
         .lock()
         .ok()
         .and_then(|active| active.as_ref().map(|capture| capture.phase_root.clone()));
-    let body = capture_root
-        .map(|root| {
+    let body = if let Some(root) = capture_root {
+        tauri::async_runtime::spawn_blocking(move || {
             live_reconstruction_packet(
                 &root,
                 "live-reconstruction.mesh",
@@ -747,7 +805,11 @@ pub fn live_reconstruction_mesh(
                 after_frame,
             )
         })
-        .unwrap_or_default();
+        .await
+        .map_err(|error| error.to_string())?
+    } else {
+        Vec::new()
+    };
     Ok(tauri::ipc::Response::new(body))
 }
 
@@ -1262,6 +1324,25 @@ pub fn start_sensor_phase(
     let phase_root = project_root.join("phases").join(&phase_id);
     fs::create_dir_all(&phase_root).map_err(|error| error.to_string())?;
 
+    // PyInstaller's one-file Open3D runtime can take several seconds to unpack
+    // on a cold launch. Warm it completely before opening the sensor so the
+    // first captured frames can already contribute to the visible map.
+    let mut live_reconstruction = start_live_reconstruction(&app, &phase_root, &project.settings)?;
+    if let Some(live_child) = live_reconstruction.as_mut() {
+        if let Err(error) = wait_for_live_reconstruction_ready(
+            &phase_root,
+            live_child,
+            Duration::from_secs(45),
+        ) {
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
+            return Err(error);
+        }
+    }
+
     let mut command = worker_command(&worker);
     command
         .arg("--phase")
@@ -1275,23 +1356,36 @@ pub fn start_sensor_phase(
         .arg("--max-depth")
         .arg(project.settings.max_depth_m.to_string());
     append_sensor_args(&mut command, &project.settings);
-    let mut child = command
+    let mut child = match command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            format!(
+    {
+        Ok(child) => child,
+        Err(error) => {
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
+            return Err(format!(
                 "Could not start {} capture: {error}",
                 sensor_name(&project.settings)
-            )
-        })?;
+            ));
+        }
+    };
 
     let manifest_path = phase_root.join("phase.json");
     let startup_deadline = Instant::now() + Duration::from_secs(12);
     while !manifest_path.exists() {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             let detail = read_child_stderr(&mut child);
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
             return Err(if detail.is_empty() {
                 format!("Sensor capture stopped during startup ({status})")
             } else {
@@ -1302,6 +1396,11 @@ pub fn start_sensor_phase(
             child.kill().ok();
             child.wait().ok();
             let detail = read_child_stderr(&mut child);
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
             return Err(if detail.is_empty() {
                 format!(
                     "{} did not begin streaming within 12 seconds",
@@ -1313,16 +1412,6 @@ pub fn start_sensor_phase(
         }
         thread::sleep(Duration::from_millis(50));
     }
-
-    let live_reconstruction = match start_live_reconstruction(&app, &phase_root, &project.settings) {
-        Ok(child) => child,
-        Err(error) => {
-            File::create(phase_root.join("stop.flag")).ok();
-            child.kill().ok();
-            child.wait().ok();
-            return Err(error);
-        }
-    };
 
     let is_reference = project.phases.is_empty();
     project.phases.push(crate::models::PhaseSummary {
@@ -1936,7 +2025,6 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
             };
         }
         fs::remove_file(capture.phase_root.join("stop.flag")).ok();
-        fs::remove_file(capture.phase_root.join("live-reconstruction.stop")).ok();
         storage::write_project(&project)?;
         *project_state
             .lock()

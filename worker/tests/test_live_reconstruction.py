@@ -1,19 +1,51 @@
 from __future__ import annotations
 
 import csv
+import json
 import struct
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 import numpy as np
 
 from scanlan.io import read_phase, read_project
-from scanlan.live import MESH_MAGIC, POINT_MAGIC, mesh_packet, point_packet
+from scanlan.live import MESH_MAGIC, POINT_MAGIC, live_reconstruct, mesh_packet, point_packet
 from scanlan.mock_data import create_mock_project
 
 
 class LiveReconstructionTests(unittest.TestCase):
+    def test_worker_warms_before_capture_and_keeps_a_late_stop_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            phase_root = Path(temporary) / "phase"
+            phase_root.mkdir()
+            outcome: dict[str, object] = {}
+
+            def run() -> None:
+                outcome["result"] = live_reconstruct(
+                    phase_root, 0.03, "points", "cpu", poll_seconds=0.01
+                )
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            status_path = phase_root / "live-reconstruction.json"
+            deadline = time.monotonic() + 10
+            while not status_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(status_path.is_file())
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertTrue(status["active"])
+            self.assertIn("ready", status["trackingStatus"].lower())
+
+            stop_path = phase_root / "live-reconstruction.stop"
+            stop_path.touch()
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(stop_path.exists())
+            self.assertEqual(outcome["result"]["processedFrames"], 0)  # type: ignore[index]
+
     def test_point_packet_matches_the_desktop_binary_contract(self) -> None:
         points = np.asarray([[1.0, 2.0, 3.0], [-1.0, 0.5, 4.0]], dtype=np.float32)
         colors = np.asarray([[10, 20, 30], [40, 50, 60]], dtype=np.uint8)

@@ -1123,7 +1123,9 @@
         storeWorkspaceMode('capture');
         setSourceMode('rgbd');
         viewMode = 'live';
-        message = `Starting ${selectedSensorName} capture…`;
+        message = project.settings.liveReconstruction === 'off'
+          ? `Starting ${selectedSensorName} capture…`
+          : `Warming ${project.settings.liveReconstruction === 'mesh' ? 'live mesh' : 'live point'} reconstruction before recording…`;
         project = await startSensorPhase(project.path, project.settings);
       }
     } catch (error) {
