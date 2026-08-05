@@ -46,12 +46,9 @@ try {
 
   Copy-Required (Join-Path $ProjectRoot "src-tauri/target/release/scanlan.exe") (Join-Path $PortableRoot "ScanLan.exe")
   Copy-Required (Join-Path $ProjectRoot "worker/dist/scanlan-worker.exe") (Join-Path $PortableRoot "scanlan-worker.exe")
-  Copy-Required (Join-Path $ProjectRoot "build/kinect-capture/Release") (Join-Path $PortableRoot "legacy")
+  Copy-Required (Join-Path $ProjectRoot "build/kinect-capture/Release") (Join-Path $PortableRoot "kinect2")
   Copy-Required (Join-Path $ProjectRoot "build/modern-capture/Release") (Join-Path $PortableRoot "modern")
   Copy-Required (Join-Path $ProjectRoot "splat-worker/dist/scanlan-splat") (Join-Path $PortableRoot "splat-runtime")
-  $null = New-Item -ItemType Directory -Path (Join-Path $PortableRoot "media-tools")
-  Copy-Required (Join-Path $ProjectRoot "media-tools/ffmpeg") (Join-Path $PortableRoot "media-tools/ffmpeg")
-  Copy-Required (Join-Path $ProjectRoot "media-tools/colmap") (Join-Path $PortableRoot "media-tools/colmap")
   Copy-Required (Join-Path $ProjectRoot "LICENSE") (Join-Path $PortableRoot "LICENSE")
 
   if (-not $SkipArchive) {

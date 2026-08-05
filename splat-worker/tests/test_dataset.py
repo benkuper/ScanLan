@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from scanlan_splat.dataset import load_dataset
+
+
+def _write_dataset(root: Path, *, schema: int = 3, model: str = "pinhole", distortion: list[float] | None = None) -> None:
+    root.mkdir(parents=True)
+    (root / "dataset.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": schema,
+                "metric": True,
+                "frames": [
+                    {
+                        "intrinsics": {
+                            "width": 8,
+                            "height": 6,
+                            "fx": 7.0,
+                            "fy": 7.0,
+                            "cx": 3.5,
+                            "cy": 2.5,
+                            "model": model,
+                            "distortion": [] if distortion is None else distortion,
+                        },
+                        "worldFromRgbCamera": [
+                            1, 0, 0, 0,
+                            0, 1, 0, 0,
+                            0, 0, 1, 0,
+                            0, 0, 0, 1,
+                        ],
+                        "image": "images/000000.jpg",
+                        "depth": "depths/000000.png",
+                        "depthMask": "masks/000000.png",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class DatasetTests(unittest.TestCase):
+    def test_schema_three_pinhole_dataset_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            _write_dataset(root)
+
+            resolved, dataset = load_dataset(root)
+
+            self.assertEqual(resolved, root.resolve())
+            self.assertEqual(dataset["schemaVersion"], 3)
+
+    def test_distorted_training_frames_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            _write_dataset(root, model="opencv_rational", distortion=[0.0] * 8)
+
+            with self.assertRaisesRegex(ValueError, "not undistorted"):
+                load_dataset(root)
+
+    def test_previous_dataset_schema_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            _write_dataset(root, schema=2)
+
+            with self.assertRaisesRegex(ValueError, "schema 3"):
+                load_dataset(root)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -2,7 +2,7 @@
   "name": "scanlan",
   "private": true,
   "version": "0.1.0",
-  "description": "Phased RGB-D capture and point-cloud reconstruction",
+  "description": "Realtime RGB-D capture, mesh reconstruction, and 2D Gaussian surfaces",
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
@@ -18,7 +18,6 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "prepare:runtime": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-workers.ps1",
     "prepare:cuda": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-open3d-cuda.ps1",
-    "prepare:media": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-media-tools.ps1",
     "prepare:splat": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-splat-runtime.ps1",
     "package:splat": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-splat-portable.ps1",
     "desktop:dev": "npm run prepare:runtime && vite --port 1420",

@@ -1,4 +1,4 @@
-use crate::commands::{configure_media_tools, worker_command, AppState};
+use crate::commands::{worker_command, AppState};
 use crate::models::{ArtifactJob, ProjectSummary};
 use crate::storage;
 use chrono::Utc;
@@ -47,6 +47,20 @@ impl JobManager {
             .lock()
             .is_ok_and(|jobs| jobs.contains_key(job_id))
     }
+}
+
+fn validate_job_id(job_id: &str) -> Result<(), String> {
+    Uuid::parse_str(job_id)
+        .map(|_| ())
+        .map_err(|_| "The artifact job identifier is invalid".to_string())
+}
+
+fn splat_checkpoint_available(project_root: &Path, job: &ArtifactJob) -> bool {
+    job.targets.iter().any(|target| target == "gaussianSplat")
+        && project_root
+            .join("outputs")
+            .join("splat-checkpoint.pt")
+            .is_file()
 }
 
 fn accelerator_lock_path() -> PathBuf {
@@ -152,22 +166,27 @@ pub fn recover_interrupted_job(project: &mut ProjectSummary, manager: &JobManage
         return false;
     }
     let root = Path::new(&project.path);
+    let mut resumable = false;
     if let Ok(mut job) = read_job(root, &job_id) {
         if matches!(job.status.as_str(), "queued" | "running" | "cancelling") {
             job.status = "failed".to_string();
             job.stage = "interrupted".to_string();
             job.error = Some("The app closed while this artifact job was running".to_string());
-            job.resumable = job.targets.iter().any(|target| target == "gaussianSplat");
+            job.resumable = splat_checkpoint_available(root, &job);
+            resumable = job.resumable;
             job.updated_at = Utc::now().to_rfc3339();
             let _ = write_job(root, &job);
         }
     }
     project.active_job = None;
     project.processing_status = "failed".to_string();
-    project.processing_error = Some(
-        "The previous artifact job was interrupted; existing artifacts are safe and splat checkpoints can be resumed."
-            .to_string(),
-    );
+    project.processing_error = Some(if resumable {
+        "The previous artifact job was interrupted; existing artifacts are safe and its Gaussian checkpoint can be resumed."
+            .to_string()
+    } else {
+        "The previous artifact job was interrupted; existing completed artifacts are safe, but the stopped job must be restarted."
+            .to_string()
+    });
     true
 }
 
@@ -190,7 +209,6 @@ fn write_job(project_root: &Path, job: &ArtifactJob) -> Result<(), String> {
 fn source_fingerprint(
     project_root: &Path,
     project: &ProjectSummary,
-    source_ids: &[String],
 ) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     project.schema_version.hash(&mut hasher);
@@ -202,16 +220,6 @@ fn source_fingerprint(
         for name in ["phase.json", "frames.csv"] {
             let path = project_root.join("phases").join(&phase.id).join(name);
             hash_file_metadata(&path, &mut hasher);
-        }
-    }
-    for source in &project.media_sources {
-        if !source_ids.is_empty() && !source_ids.contains(&source.id) {
-            continue;
-        }
-        source.id.hash(&mut hasher);
-        source.kind.hash(&mut hasher);
-        for original in &source.originals {
-            hash_file_metadata(&project_root.join(&source.path).join(original), &mut hasher);
         }
     }
     format!("{:016x}", hasher.finish())
@@ -240,17 +248,6 @@ fn progress_file(project_root: &Path, splat: bool) -> PathBuf {
 }
 
 fn stage_plan(job: &ArtifactJob) -> Vec<(&'static str, f32)> {
-    if job.pipeline == "media_gaussian" {
-        return vec![
-            ("prepare", 0.05),
-            ("filter", 0.05),
-            ("feature", 0.08),
-            ("match", 0.12),
-            ("map", 0.15),
-            ("splat", 0.50),
-            ("publish", 0.05),
-        ];
-    }
     let wants_mesh = job.targets.iter().any(|target| target == "texturedMesh");
     let wants_splat = job.targets.iter().any(|target| target == "gaussianSplat");
     let mut plan = vec![
@@ -283,14 +280,6 @@ fn stage_key(stage: &str) -> Option<&'static str> {
         Some("mesh")
     } else if stage.contains("preparing splat") || stage.contains("posed frame") {
         Some("dataset")
-    } else if stage.contains("mapping") || stage.contains("registration") {
-        Some("map")
-    } else if stage.contains("matching") {
-        Some("match")
-    } else if stage.contains("feature") {
-        Some("feature")
-    } else if stage.contains("filter") {
-        Some("filter")
     } else if stage.contains("building") || stage.contains("cleaning cloud") {
         Some("cloud")
     } else if stage.contains("fusing")
@@ -304,8 +293,6 @@ fn stage_key(stage: &str) -> Option<&'static str> {
     {
         Some("track")
     } else if matches!(stage.as_str(), "queued" | "preparing" | "resuming")
-        || stage.contains("media preparing")
-        || stage.contains("extracting")
     {
         Some("prepare")
     } else {
@@ -558,76 +545,54 @@ fn run_pipeline(
     resume: bool,
 ) -> Result<(), String> {
     fs::remove_file(project_root.join("outputs").join("cancel.flag")).ok();
-    if job.pipeline == "rgbd_reconstruction" {
-        let reconstruction = existing_runtime(resources, false)?;
-        let targets = job
-            .targets
-            .iter()
-            .map(|target| match target.as_str() {
-                "pointCloud" => "point_cloud",
-                "texturedMesh" => "textured_mesh",
-                "gaussianSplat" => "gaussian_splat",
-                value => value,
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut command = worker_command(&reconstruction);
-        command
-            .arg("reconstruct")
-            .arg(project_root)
-            .arg("--engine")
-            .arg("auto")
-            .arg("--targets")
-            .arg(targets);
-        run_command(command, project_root, job, cancel, false)?;
-        if job.targets.iter().any(|target| target == "gaussianSplat") {
-            job.stage = "splat_training".to_string();
-            job.detail = "Initializing depth-aware Gaussian optimization".to_string();
-            job.stage_progress = Some(0.0);
-            if let Some(progress) = planned_progress(job, job.stage_progress) {
-                job.progress = job.progress.max(progress);
-            }
-            write_job(project_root, job)?;
-            let splat_worker = existing_runtime(resources, true)?;
-            let dataset = project_root
-                .join("outputs")
-                .join("cache")
-                .join("datasets")
-                .join("current.json");
-            let mut command = worker_command(&splat_worker);
-            configure_media_tools(&mut command, resources);
-            command
-                .arg("train")
-                .arg("--project")
-                .arg(project_root)
-                .arg("--dataset")
-                .arg(dataset)
-                .arg("--iterations")
-                .arg(iterations.to_string());
-            if resume {
-                command.arg("--resume");
-            }
-            run_command(command, project_root, job, cancel, true)?;
+    let reconstruction = existing_runtime(resources, false)?;
+    let targets = job
+        .targets
+        .iter()
+        .map(|target| match target.as_str() {
+            "pointCloud" => "point_cloud",
+            "texturedMesh" => "textured_mesh",
+            "gaussianSplat" => "gaussian_splat",
+            value => value,
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut command = worker_command(&reconstruction);
+    command
+        .arg("reconstruct")
+        .arg(project_root)
+        .arg("--engine")
+        .arg("auto")
+        .arg("--targets")
+        .arg(targets);
+    run_command(command, project_root, job, cancel, false)?;
+    if job.targets.iter().any(|target| target == "gaussianSplat") {
+        job.stage = "splat_training".to_string();
+        job.detail = "Initializing depth-aware 2D Gaussian optimization".to_string();
+        job.stage_progress = Some(0.0);
+        if let Some(progress) = planned_progress(job, job.stage_progress) {
+            job.progress = job.progress.max(progress);
         }
-    } else if job.pipeline == "media_gaussian" {
+        write_job(project_root, job)?;
         let splat_worker = existing_runtime(resources, true)?;
         let mut command = worker_command(&splat_worker);
-        configure_media_tools(&mut command, resources);
+        let dataset = project_root
+            .join("outputs")
+            .join("cache")
+            .join("datasets")
+            .join("current.json");
         command
-            .arg("media")
+            .arg("train")
             .arg("--project")
             .arg(project_root)
+            .arg("--dataset")
+            .arg(dataset)
             .arg("--iterations")
             .arg(iterations.to_string());
-        for source_id in &job.source_ids {
-            command.arg("--source-id").arg(source_id);
-        }
         if resume {
             command.arg("--resume");
         }
         run_command(command, project_root, job, cancel, true)?;
-    } else {
-        return Err(format!("Unknown artifact pipeline: {}", job.pipeline));
     }
     Ok(())
 }
@@ -749,7 +714,7 @@ fn spawn_job(
                 job.status = if cancelled { "cancelled" } else { "failed" }.to_string();
                 job.stage = job.status.clone();
                 job.error = Some(error.clone());
-                job.resumable = job.targets.iter().any(|target| target == "gaussianSplat");
+                job.resumable = splat_checkpoint_available(&project_root, &job);
                 if cancelled {
                     if let Ok(mut project) = storage::read_project(&project_root) {
                         project.active_job = None;
@@ -783,28 +748,72 @@ fn spawn_job(
 pub fn start_artifact_job(
     app: AppHandle,
     project_path: String,
-    pipeline: String,
     targets: Vec<String>,
-    source_ids: Option<Vec<String>>,
     iterations: Option<u32>,
-    resume: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ArtifactJob, String> {
     let root = PathBuf::from(project_path);
-    let project = storage::read_project(&root)?;
+    if state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .is_some()
+    {
+        return Err("Stop RGB-D capture before starting reconstruction".to_string());
+    }
     if targets.is_empty() {
         return Err("Choose at least one artifact target".to_string());
     }
-    let source_ids = source_ids.unwrap_or_default();
-    let fingerprint = source_fingerprint(&root, &project, &source_ids);
+    if let Some(target) = targets.iter().find(|target| {
+        !matches!(
+            target.as_str(),
+            "pointCloud" | "texturedMesh" | "gaussianSplat"
+        )
+    }) {
+        return Err(format!("Unknown artifact target: {target}"));
+    }
+    let targets = ["pointCloud", "texturedMesh", "gaussianSplat"]
+        .into_iter()
+        .filter(|candidate| {
+            targets
+                .iter()
+                .any(|target| target.as_str() == *candidate)
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut project = storage::read_project(&root)?;
+    let active_project_path = state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?
+        .path
+        .clone();
+    if active_project_path != project.path {
+        return Err("The selected project is no longer active".to_string());
+    }
+    if recover_interrupted_job(&mut project, &state.jobs) {
+        storage::write_project(&project)?;
+        if let Ok(mut current) = state.project.lock() {
+            *current = project.clone();
+        }
+    }
+    if project.active_job.is_some() || project.processing_status == "processing" {
+        return Err("An artifact job is already running for this project".to_string());
+    }
+    if !project
+        .phases
+        .iter()
+        .any(|phase| phase.status == "complete" && phase.frame_count > 0)
+    {
+        return Err("Capture at least one usable RGB-D phase before reconstruction".to_string());
+    }
+    let fingerprint = source_fingerprint(&root, &project);
     let now = Utc::now().to_rfc3339();
     let id = Uuid::new_v4().to_string();
     let job = ArtifactJob {
         id: id.clone(),
         project_path: root.to_string_lossy().into_owned(),
-        pipeline,
         targets,
-        source_ids,
         stage: "queued".to_string(),
         detail: "Preparing durable artifact job".to_string(),
         progress: 0.0,
@@ -832,19 +841,23 @@ pub fn start_artifact_job(
         root,
         job,
         iterations.unwrap_or(30_000).clamp(1_000, 100_000),
-        resume.unwrap_or(false),
+        false,
         Arc::clone(&state.project),
     )
 }
 
 #[tauri::command]
 pub fn artifact_job_status(project_path: String, job_id: String) -> Result<ArtifactJob, String> {
-    read_job(Path::new(&project_path), &job_id)
+    validate_job_id(&job_id)?;
+    let root = Path::new(&project_path);
+    storage::read_project(root)?;
+    read_job(root, &job_id)
 }
 
 #[tauri::command]
 pub fn latest_artifact_job(project_path: String) -> Result<Option<ArtifactJob>, String> {
     let root = PathBuf::from(project_path);
+    storage::read_project(&root)?;
     let jobs_root = root.join("outputs").join("jobs");
     if !jobs_root.is_dir() {
         return Ok(None);
@@ -872,6 +885,8 @@ pub fn cancel_artifact_job(
     state: State<'_, AppState>,
 ) -> Result<ArtifactJob, String> {
     let root = PathBuf::from(project_path);
+    validate_job_id(&job_id)?;
+    storage::read_project(&root)?;
     let cancellation = state
         .jobs
         .cancellations
@@ -925,6 +940,7 @@ pub fn discard_artifact_job(
     state: State<'_, AppState>,
 ) -> Result<ArtifactJob, String> {
     let root = PathBuf::from(project_path);
+    validate_job_id(&job_id)?;
     if state.jobs.is_running(&job_id) {
         return Err("Cancel the running artifact job before discarding its checkpoint".to_string());
     }
@@ -958,14 +974,41 @@ pub fn resume_artifact_job(
     state: State<'_, AppState>,
 ) -> Result<ArtifactJob, String> {
     let root = PathBuf::from(project_path);
+    validate_job_id(&job_id)?;
+    if state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .is_some()
+    {
+        return Err("Stop RGB-D capture before resuming reconstruction".to_string());
+    }
     let mut job = read_job(&root, &job_id)?;
     if !matches!(job.status.as_str(), "failed" | "cancelled") || !job.resumable {
         return Err("This artifact job has no resumable checkpoint".to_string());
     }
     let project = storage::read_project(&root)?;
-    let current_fingerprint = source_fingerprint(&root, &project, &job.source_ids);
+    let active_project_path = state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?
+        .path
+        .clone();
+    if active_project_path != project.path {
+        return Err("The selected project is no longer active".to_string());
+    }
+    if project.active_job.is_some() || project.processing_status == "processing" {
+        return Err("An artifact job is already running for this project".to_string());
+    }
+    let current_fingerprint = source_fingerprint(&root, &project);
     if current_fingerprint != job.source_fingerprint {
-        return Err("Capture or media sources changed; start a new splat job".to_string());
+        return Err("RGB-D captures changed; start a new reconstruction job".to_string());
+    }
+    if !splat_checkpoint_available(&root, &job) {
+        job.resumable = false;
+        job.updated_at = Utc::now().to_rfc3339();
+        write_job(&root, &job)?;
+        return Err("The Gaussian checkpoint is missing; start a new artifact job".to_string());
     }
     job.status = "queued".to_string();
     job.stage = "resuming".to_string();
@@ -986,13 +1029,11 @@ pub fn resume_artifact_job(
 mod tests {
     use super::*;
 
-    fn job(pipeline: &str, targets: &[&str], stage: &str) -> ArtifactJob {
+    fn job(targets: &[&str], stage: &str) -> ArtifactJob {
         ArtifactJob {
             id: "job".to_string(),
             project_path: "project".to_string(),
-            pipeline: pipeline.to_string(),
             targets: targets.iter().map(|value| (*value).to_string()).collect(),
-            source_ids: Vec::new(),
             stage: stage.to_string(),
             detail: String::new(),
             progress: 0.0,
@@ -1018,7 +1059,6 @@ mod tests {
     #[test]
     fn overall_progress_is_weighted_separately_from_mesh_stage_progress() {
         let job = job(
-            "rgbd_reconstruction",
             &["pointCloud", "texturedMesh"],
             "Meshing",
         );
@@ -1030,25 +1070,15 @@ mod tests {
     #[test]
     fn mesh_only_jobs_do_not_plan_a_gaussian_dataset_stage() {
         let mesh = job(
-            "rgbd_reconstruction",
             &["pointCloud", "texturedMesh"],
             "Meshing",
         );
         let splat = job(
-            "rgbd_reconstruction",
             &["pointCloud", "gaussianSplat"],
             "Preparing splat data",
         );
         assert!(!stage_plan(&mesh).iter().any(|(key, _)| *key == "dataset"));
         assert!(stage_plan(&splat).iter().any(|(key, _)| *key == "dataset"));
-    }
-
-    #[test]
-    fn media_registration_and_training_have_distinct_overall_ranges() {
-        let mapping = job("media_gaussian", &["gaussianSplat"], "mapping_cameras");
-        let training = job("media_gaussian", &["gaussianSplat"], "splat_training");
-        assert!(planned_progress(&mapping, Some(1.0)).unwrap() < 0.5);
-        assert!(planned_progress(&training, Some(0.5)).unwrap() > 0.5);
     }
 
     #[test]
@@ -1073,7 +1103,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("scanlan-discard-job-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("outputs").join("jobs")).unwrap();
-        let mut interrupted = job("rgbd_reconstruction", &["gaussianSplat"], "interrupted");
+        let mut interrupted = job(&["gaussianSplat"], "interrupted");
         interrupted.status = "failed".to_string();
         interrupted.resumable = true;
         write_job(&root, &interrupted).unwrap();
@@ -1084,6 +1114,7 @@ mod tests {
         ] {
             fs::write(root.join("outputs").join(transient), b"partial").unwrap();
         }
+        assert!(splat_checkpoint_available(&root, &interrupted));
 
         let discarded = discard_job_record(&root, &interrupted.id).unwrap();
 
@@ -1093,6 +1124,7 @@ mod tests {
         assert!(!root.join("outputs").join("splat-checkpoint.pt").exists());
         assert!(!root.join("outputs").join("splat-progress.json").exists());
         assert!(!root.join("outputs").join("build-preview.json").exists());
+        assert!(!splat_checkpoint_available(&root, &discarded));
         fs::remove_dir_all(root).ok();
     }
 

@@ -22,9 +22,11 @@ from .compute import (
 )
 from .imu import odometry_rotation_prior
 from .io import PhaseData, load_color, load_depth, save_preview
+from .realtime import evaluate_depth_alignment
+from .stream import StreamCamera
 
 
-LOCAL_CACHE_VERSION = 5
+LOCAL_CACHE_VERSION = 7
 
 # Frame-to-frame RGB-D odometry is locally accurate but inevitably drifts over a
 # long handheld capture.  Short internal fragments let the already-seen room
@@ -37,6 +39,9 @@ TRACKING_FRAGMENT_KEYFRAMES = 4
 TRACKING_FRAGMENT_MIN_REMAINDER = 2
 TRACKING_FRAGMENT_MATCH_FRAMES = 4
 TRACKING_FRAGMENT_VOXEL_M = 0.03
+LOOP_CLOSURE_MIN_FRAGMENT_GAP = 6
+LOOP_CLOSURE_SEARCH_RADIUS_M = 3.0
+LOOP_CLOSURE_MAX_CANDIDATES = 2
 
 
 @dataclass
@@ -69,6 +74,7 @@ class TrajectoryStabilization:
     weakest_score: int
     maximum_correction_m: float
     relocalization_count: int
+    loop_closure_count: int
 
 
 def _phase_cache_signature(
@@ -90,6 +96,9 @@ def _phase_cache_signature(
 
     add_file(phase.root / "phase.json", True)
     add_file(phase.root / "frames.csv", True)
+    tracking_path = phase.root / "tracking.jsonl"
+    if tracking_path.is_file():
+        add_file(tracking_path, True)
     imu = phase.manifest.get("imu")
     if isinstance(imu, dict):
         imu_path = phase.root / str(imu.get("path", "imu.csv"))
@@ -330,13 +339,44 @@ def _apply_fragment_corrections(
 
 
 def _captured_poses(phase: PhaseData) -> tuple[list[np.ndarray], int, str] | None:
-    if phase.manifest.get("poseSource") != "kinect_fusion" or any(
-        frame.pose is None for frame in phase.frames
-    ):
+    kinect_fusion = phase.manifest.get("poseSource") == "kinect_fusion" and all(
+        frame.pose is not None for frame in phase.frames
+    )
+    realtime_tracking = bool(phase.frames) and all(
+        frame.source_sequence in phase.tracking_camera_to_world for frame in phase.frames
+    )
+    if kinect_fusion:
+        raw = [np.asarray(frame.pose, dtype=np.float64) for frame in phase.frames]
+        source_label = "Kinect Fusion"
+    elif realtime_tracking:
+        raw = [
+            np.asarray(phase.tracking_camera_to_world[frame.source_sequence], dtype=np.float64)
+            for frame in phase.frames
+        ]
+        source_label = "realtime RGB-D"
+    else:
         return None
-    raw = [np.asarray(frame.pose, dtype=np.float64) for frame in phase.frames]
-    origin_inverse = np.linalg.inv(raw[0])
+    if any(pose.shape != (4, 4) or not np.isfinite(pose).all() for pose in raw):
+        return None
+    try:
+        origin_inverse = np.linalg.inv(raw[0])
+    except np.linalg.LinAlgError:
+        return None
     poses = [origin_inverse @ pose for pose in raw]
+    camera = StreamCamera(
+        phase.camera.width,
+        phase.camera.height,
+        phase.camera.fx,
+        phase.camera.fy,
+        phase.camera.cx,
+        phase.camera.cy,
+        phase.camera.depth_scale,
+        0.1,
+        phase.camera.max_depth_m,
+    )
+    previous_depth = load_depth(phase.frames[0], phase.camera) if kinect_fusion else None
+    depth_overlaps: list[float] = []
+    depth_errors_mm: list[float] = []
     path_length = 0.0
     max_speed = 0.0
     max_angular_speed = 0.0
@@ -360,6 +400,25 @@ def _captured_poses(phase: PhaseData) -> tuple[list[np.ndarray], int, str] | Non
         path_length += distance
         max_speed = max(max_speed, distance / elapsed)
         max_angular_speed = max(max_angular_speed, angle / elapsed)
+        if previous_depth is not None:
+            current_depth = load_depth(phase.frames[index], phase.camera)
+            previous_to_current = np.linalg.inv(pose) @ poses[index - 1]
+            quality = evaluate_depth_alignment(
+                previous_depth,
+                current_depth,
+                camera,
+                previous_to_current,
+                depth_threshold_m=0.06,
+                minimum_samples=min(
+                    350,
+                    max(40, phase.camera.width * phase.camera.height // 80),
+                ),
+            )
+            if not quality.accepted:
+                return None
+            depth_overlaps.append(quality.overlap)
+            depth_errors_mm.append(quality.rmse_m * 1000.0)
+            previous_depth = current_depth
     duration = max(
         (phase.frames[-1].timestamp_us - phase.frames[0].timestamp_us) / 1_000_000.0,
         0.1,
@@ -373,9 +432,25 @@ def _captured_poses(phase: PhaseData) -> tuple[list[np.ndarray], int, str] | Non
         - min(average_speed / 1.35, 1.0) * 8
         - min(max_angular_speed / 190.0, 1.0) * 5
     )
+    quality_suffix = ""
+    if realtime_tracking and phase.tracking_quality:
+        overlap = phase.tracking_quality.get("meanOverlap")
+        error_mm = phase.tracking_quality.get("meanDepthRmseMm")
+        metrics = []
+        if overlap is not None:
+            metrics.append(f"{overlap * 100:.0f}% mean overlap")
+        if error_mm is not None:
+            metrics.append(f"{error_mm:.1f} mm mean depth error")
+        if metrics:
+            quality_suffix = "; " + ", ".join(metrics)
+    elif depth_overlaps:
+        quality_suffix = (
+            f"; {np.mean(depth_overlaps) * 100:.0f}% mean overlap, "
+            f"{np.mean(depth_errors_mm):.1f} mm mean depth error"
+        )
     detail = (
-        f"Validated Kinect Fusion motion "
-        f"({average_speed:.2f} m/s average, {max_speed:.2f} m/s peak)"
+        f"Validated {source_label} motion "
+        f"({average_speed:.2f} m/s average, {max_speed:.2f} m/s peak{quality_suffix})"
     )
     return poses, max(65, confidence), detail
 
@@ -397,7 +472,48 @@ def _estimate_offline_poses(
     option = o3d.pipelines.odometry.OdometryOption()
     option.depth_diff_max = max(voxel_size_m * 3.0, 0.06)
     imu_aided_frames = 0
+    camera = StreamCamera(
+        phase.camera.width,
+        phase.camera.height,
+        phase.camera.fx,
+        phase.camera.fy,
+        phase.camera.cx,
+        phase.camera.cy,
+        phase.camera.depth_scale,
+        0.1,
+        phase.camera.max_depth_m,
+    )
+    previous_depth = load_depth(phase.frames[0], phase.camera)
     for index in range(1, len(phase.frames)):
+        current_depth = load_depth(phase.frames[index], phase.camera)
+
+        def alignment_is_credible(candidate: np.ndarray) -> bool:
+            quality = evaluate_depth_alignment(
+                previous_depth,
+                current_depth,
+                camera,
+                candidate,
+                depth_threshold_m=option.depth_diff_max,
+                minimum_samples=min(
+                    350,
+                    max(40, phase.camera.width * phase.camera.height // 80),
+                ),
+            )
+            if not quality.accepted:
+                return False
+            elapsed = max(
+                (
+                    phase.frames[index].timestamp_us
+                    - phase.frames[index - 1].timestamp_us
+                )
+                / 1_000_000.0,
+                1.0 / 30.0,
+            )
+            return (
+                float(np.linalg.norm(candidate[:3, 3])) / elapsed <= 2.4
+                and _rotation_degrees(candidate) / elapsed <= 220.0
+            )
+
         initial = odometry_rotation_prior(
             phase.imu_samples,
             phase.frames[index - 1].timestamp_us,
@@ -419,8 +535,8 @@ def _estimate_offline_poses(
                     option.depth_diff_max,
                     backend,
                 )
-                success = True
-                if initial is not None:
+                success = alignment_is_credible(transformation)
+                if initial is not None and success:
                     imu_aided_frames += 1
             except RuntimeError:
                 if initial is not None:
@@ -434,7 +550,7 @@ def _estimate_offline_poses(
                             option.depth_diff_max,
                             backend,
                         )
-                        success = True
+                        success = alignment_is_credible(transformation)
                     except RuntimeError:
                         pass
             if not success:
@@ -453,6 +569,7 @@ def _estimate_offline_poses(
                 o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(),
                 option,
             )
+            success = success and alignment_is_credible(transformation)
             if not success and initial is not None:
                 # A bad or temporally incomplete IMU window must never make RGB-D
                 # tracking less robust than the original identity initialization.
@@ -464,6 +581,7 @@ def _estimate_offline_poses(
                     o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(),
                     option,
                 )
+                success = success and alignment_is_credible(transformation)
             elif initial is not None:
                 imu_aided_frames += 1
         if not success:
@@ -477,6 +595,7 @@ def _estimate_offline_poses(
             previous_tensor = current_tensor
         else:
             previous = current
+        previous_depth = current_depth
         if progress:
             progress(
                 "Tracking frames",
@@ -592,6 +711,190 @@ def _prefer_alignment(candidate: PhaseAlignment, current: PhaseAlignment) -> boo
         candidate.score == current.score
         and candidate.inlier_rmse_m < current.inlier_rmse_m
     )
+
+
+def _fragment_information(
+    o3d: Any,
+    source: Any,
+    target: Any,
+    transformation: np.ndarray,
+) -> Any:
+    return o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+        source,
+        target,
+        0.08,
+        transformation,
+    )
+
+
+def _optimize_fragment_pose_graph(
+    o3d: Any,
+    phase: PhaseData,
+    fragments: list[Any],
+    initial_poses: list[np.ndarray],
+    ranges: list[tuple[int, int]],
+    frame_indices: list[int],
+    backend: ComputeBackend,
+    progress: ProgressCallback | None,
+) -> tuple[list[np.ndarray], int]:
+    """Add bounded non-local constraints and globally distribute loop error."""
+    if len(fragments) < LOOP_CLOSURE_MIN_FRAGMENT_GAP + 1:
+        return initial_poses, 0
+
+    pose_graph = o3d.pipelines.registration.PoseGraph()
+    for pose in initial_poses:
+        pose_graph.nodes.append(
+            o3d.pipelines.registration.PoseGraphNode(np.asarray(pose).copy())
+        )
+
+    for current in range(1, len(fragments)):
+        previous = current - 1
+        previous_to_current = (
+            np.linalg.inv(initial_poses[current]) @ initial_poses[previous]
+        )
+        pose_graph.edges.append(
+            o3d.pipelines.registration.PoseGraphEdge(
+                previous,
+                current,
+                previous_to_current,
+                _fragment_information(
+                    o3d,
+                    fragments[previous],
+                    fragments[current],
+                    previous_to_current,
+                ),
+                False,
+            )
+        )
+
+    accepted_loops = 0
+    for current in range(LOOP_CLOSURE_MIN_FRAGMENT_GAP, len(fragments)):
+        if current != len(fragments) - 1 and current % 3:
+            continue
+        candidates: list[tuple[float, int, np.ndarray]] = []
+        current_position = initial_poses[current][:3, 3]
+        for previous in range(0, current - LOOP_CLOSURE_MIN_FRAGMENT_GAP + 1):
+            distance = float(
+                np.linalg.norm(current_position - initial_poses[previous][:3, 3])
+            )
+            if distance > LOOP_CLOSURE_SEARCH_RADIUS_M:
+                continue
+            current_to_previous = (
+                np.linalg.inv(initial_poses[previous]) @ initial_poses[current]
+            )
+            prescore = o3d.pipelines.registration.evaluate_registration(
+                fragments[current],
+                fragments[previous],
+                0.12,
+                current_to_previous,
+            )
+            if float(prescore.fitness) >= 0.04:
+                candidates.append(
+                    (float(prescore.fitness), previous, current_to_previous)
+                )
+
+        candidates.sort(reverse=True, key=lambda value: value[0])
+        for _, previous, current_to_previous in candidates[:LOOP_CLOSURE_MAX_CANDIDATES]:
+            if progress:
+                progress(
+                    "Stabilizing trajectory",
+                    f"Testing loop closure near frame {frame_indices[ranges[current][0]]} "
+                    f"against frame {frame_indices[ranges[previous][0]]}",
+                    0,
+                    None,
+                )
+            try:
+                refined, source_fine, target_fine = _refine_registration(
+                    o3d,
+                    fragments[current],
+                    fragments[previous],
+                    current_to_previous,
+                    backend,
+                )
+            except RuntimeError:
+                continue
+            quality = _alignment_quality(
+                o3d,
+                current + 1,
+                "loop closure + ICP",
+                refined,
+                source_fine,
+                target_fine,
+            )
+            correction = refined.transformation @ np.linalg.inv(current_to_previous)
+            if not (
+                quality.fitness >= 0.12
+                and quality.source_overlap >= 0.12
+                and quality.inlier_rmse_m <= 0.035
+                and quality.color_consistency >= 0.52
+                and quality.score >= 55
+                and float(np.linalg.norm(correction[:3, 3])) <= 0.75
+                and _rotation_degrees(correction) <= 20.0
+            ):
+                continue
+
+            previous_to_current = np.linalg.inv(refined.transformation)
+            pose_graph.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(
+                    previous,
+                    current,
+                    previous_to_current,
+                    _fragment_information(
+                        o3d,
+                        fragments[previous],
+                        fragments[current],
+                        previous_to_current,
+                    ),
+                    True,
+                )
+            )
+            accepted_loops += 1
+
+    if not accepted_loops:
+        return initial_poses, 0
+
+    if progress:
+        progress(
+            "Stabilizing trajectory",
+            f"Globally optimizing {phase.manifest['name']} across {len(initial_poses)} local maps with "
+            f"{accepted_loops} loop closure{'s' if accepted_loops != 1 else ''}",
+            0,
+            None,
+        )
+    option = o3d.pipelines.registration.GlobalOptimizationOption(
+        max_correspondence_distance=0.06,
+        edge_prune_threshold=0.25,
+        preference_loop_closure=0.2,
+        reference_node=0,
+    )
+    try:
+        o3d.pipelines.registration.global_optimization(
+            pose_graph,
+            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+            option,
+        )
+    except RuntimeError:
+        return initial_poses, 0
+    optimized = [np.asarray(node.pose).copy() for node in pose_graph.nodes]
+    deltas = [
+        candidate @ np.linalg.inv(initial)
+        for candidate, initial in zip(optimized, initial_poses, strict=True)
+    ]
+    if (
+        not all(np.isfinite(value).all() for value in optimized)
+        or max(float(np.linalg.norm(value[:3, 3])) for value in deltas) > 1.5
+        or max(_rotation_degrees(value) for value in deltas) > 30.0
+    ):
+        if progress:
+            progress(
+                "Stabilizing trajectory",
+                "Rejected an excessive global loop correction; keeping the validated local trajectory",
+                0,
+                None,
+            )
+        return initial_poses, 0
+    return optimized, accepted_loops
 
 
 def _stabilize_offline_trajectory(
@@ -761,6 +1064,16 @@ def _stabilize_offline_trajectory(
                 len(accumulated.points),
             )
 
+    fragment_transforms, loop_closure_count = _optimize_fragment_pose_graph(
+        o3d,
+        phase,
+        fragments,
+        fragment_transforms,
+        ranges,
+        frame_indices,
+        backend,
+        progress,
+    )
     anchor_frames = [frame_indices[start] for start, _ in ranges]
     corrections = [
         transform @ np.linalg.inv(selected_poses[start])
@@ -776,6 +1089,7 @@ def _stabilize_offline_trajectory(
         weakest_score=min(value.score for value in alignments),
         maximum_correction_m=maximum_correction_m,
         relocalization_count=relocalization_count,
+        loop_closure_count=loop_closure_count,
     )
 
 
@@ -805,7 +1119,6 @@ def estimate_local_phase(
                 )
             return cached
     captured = _captured_poses(phase)
-    offline_tracked = captured is None
     if captured is not None:
         poses, tracking_confidence, tracking_detail = captured
         if progress:
@@ -839,30 +1152,34 @@ def estimate_local_phase(
             None,
         )
 
-    if offline_tracked:
-        stabilization = _stabilize_offline_trajectory(
-            o3d,
-            phase,
-            poses,
-            frame_indices,
-            backend,
-            progress,
+    stabilization = _stabilize_offline_trajectory(
+        o3d,
+        phase,
+        poses,
+        frame_indices,
+        backend,
+        progress,
+    )
+    if stabilization is not None:
+        poses = stabilization.poses
+        tracking_confidence = min(
+            tracking_confidence,
+            max(60, stabilization.weakest_score + 8),
         )
-        if stabilization is not None:
-            poses = stabilization.poses
-            tracking_confidence = min(
-                tracking_confidence,
-                max(60, stabilization.weakest_score + 8),
-            )
+        tracking_detail += (
+            f"; stabilized with {stabilization.fragment_count} local maps "
+            f"(maximum correction {stabilization.maximum_correction_m:.2f} m)"
+        )
+        if stabilization.relocalization_count:
             tracking_detail += (
-                f"; stabilized with {stabilization.fragment_count} local maps "
-                f"(maximum correction {stabilization.maximum_correction_m:.2f} m)"
+                f"; relocalized {stabilization.relocalization_count} local map"
+                + ("s" if stabilization.relocalization_count != 1 else "")
             )
-            if stabilization.relocalization_count:
-                tracking_detail += (
-                    f"; relocalized {stabilization.relocalization_count} local map"
-                    + ("s" if stabilization.relocalization_count != 1 else "")
-                )
+        if stabilization.loop_closure_count:
+            tracking_detail += (
+                f"; globally optimized {stabilization.loop_closure_count} loop closure"
+                + ("s" if stabilization.loop_closure_count != 1 else "")
+            )
 
     # Matching does not benefit from a multi-million-point 5 mm cloud. Build a
     # 10 mm local TSDF for registration; the requested precision is retained in
@@ -1481,6 +1798,8 @@ def reconstruct_open3d(
             )
 
     total_final_frames = sum(len(local.frame_indices) for local in local_phases)
+    needs_mesh = bool(artifact_context and artifact_context.get("needs_mesh"))
+    final_fusion_method = "shared_tsdf_cuda" if backend.uses_cuda else "shared_tsdf_cpu"
     if voxel_size_m < 0.01:
         # A room-scale high-detail TSDF can exceed 10 GB even though only its
         # surface is needed. Fuse posed RGB-D surfels into a streaming voxel map
@@ -1535,6 +1854,44 @@ def reconstruct_open3d(
             merged,
             fallback,
         )
+        if needs_mesh:
+            mesh_voxel_size = float(
+                artifact_context.get("mesh_voxel_size_m", max(voxel_size_m, 0.008))
+            )
+
+            def meshed(entry_index: int, repeated: bool) -> None:
+                if progress:
+                    progress(
+                        "Meshing geometry",
+                        f"Integrated mesh keyframe {entry_index + 1} of {total_final_frames}",
+                        0,
+                        None,
+                        (entry_index + 1) / total_final_frames,
+                    )
+
+            def mesh_fallback(detail: str) -> None:
+                nonlocal final_fusion_method
+                final_fusion_method = "shared_tsdf_cpu"
+                if progress:
+                    progress(
+                        "Meshing geometry",
+                        f"CUDA mesh fusion unavailable; retrying on CPU · {detail}",
+                        0,
+                        None,
+                    )
+
+            _, fused_mesh = integrate_tsdf(
+                o3d,
+                entries,
+                mesh_voxel_size,
+                max(mesh_voxel_size * 4.0, 0.03),
+                backend,
+                meshed,
+                mesh_fallback,
+                extract_mesh=True,
+            )
+            artifact_context["fused_mesh"] = fused_mesh
+            artifact_context["fused_mesh_method"] = final_fusion_method
         preview_count = _publish_preview(cloud, preview_path, flip_x)
         if progress:
             progress(
@@ -1571,6 +1928,8 @@ def reconstruct_open3d(
                 )
 
         def fallback(detail: str) -> None:
+            nonlocal final_fusion_method
+            final_fusion_method = "shared_tsdf_cpu"
             if progress:
                 progress(
                     "Building final cloud",
@@ -1579,7 +1938,7 @@ def reconstruct_open3d(
                     None,
                 )
 
-        cloud = integrate_tsdf(
+        fused = integrate_tsdf(
             o3d,
             entries,
             voxel_size_m,
@@ -1587,7 +1946,15 @@ def reconstruct_open3d(
             backend,
             integrated,
             fallback,
-        ).voxel_down_sample(voxel_size_m)
+            extract_mesh=needs_mesh,
+        )
+        if needs_mesh:
+            cloud, fused_mesh = fused
+            artifact_context["fused_mesh"] = fused_mesh
+            artifact_context["fused_mesh_method"] = final_fusion_method
+        else:
+            cloud = fused
+        cloud = cloud.voxel_down_sample(voxel_size_m)
     # Statistical cleanup on a multi-million-point 5 mm cloud can take longer
     # than fusion itself. TSDF integration already rejects isolated depth noise;
     # reserve the expensive filter for smaller results.

@@ -9,26 +9,15 @@ pub struct CaptureSettings {
     pub capture_fps: u32,
     pub max_depth_m: f32,
     pub voxel_size_mm: u32,
-    pub environment: String,
-    #[serde(default = "default_sensor_kind")]
     pub sensor_kind: String,
-    #[serde(default)]
     pub sensor_id: String,
-    #[serde(default = "default_sensor_connection")]
     pub sensor_connection: String,
-    #[serde(default)]
     pub sensor_address: String,
-    #[serde(default = "default_use_imu")]
     pub use_imu: bool,
-    #[serde(default = "default_depth_field_of_view")]
     pub depth_field_of_view: String,
-    #[serde(default)]
     pub depth_binned: bool,
-    #[serde(default = "default_rgb_jpeg_quality")]
     pub rgb_jpeg_quality: u8,
-    #[serde(default)]
     pub max_rgb_dimension: u32,
-    #[serde(default = "default_live_reconstruction")]
     pub live_reconstruction: String,
 }
 
@@ -61,8 +50,7 @@ impl Default for CaptureSettings {
         Self {
             capture_fps: 10,
             max_depth_m: 4.2,
-            voxel_size_mm: 15,
-            environment: "outdoor_low_light".to_string(),
+            voxel_size_mm: 10,
             sensor_kind: default_sensor_kind(),
             sensor_id: String::new(),
             sensor_connection: default_sensor_connection(),
@@ -79,63 +67,20 @@ impl Default for CaptureSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MediaSource {
-    pub id: String,
-    pub kind: String,
-    pub name: String,
-    pub created_at: String,
-    pub path: String,
-    #[serde(default)]
-    pub originals: Vec<String>,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub image_count: u32,
-    #[serde(default)]
-    pub metric: bool,
-    #[serde(default)]
-    pub quality: Option<MediaSourceQuality>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct MediaSourceQuality {
-    #[serde(default)]
-    pub registered_images: u32,
-    #[serde(default)]
-    pub total_images: u32,
-    #[serde(default)]
-    pub reprojection_error: Option<f32>,
-    #[serde(default)]
-    pub disconnected_components: u32,
-    #[serde(default)]
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ArtifactSummary {
     pub path: String,
-    #[serde(default)]
     pub status: String,
-    #[serde(default)]
     pub source_fingerprint: String,
-    #[serde(default)]
     pub updated_at: String,
-    #[serde(default)]
     pub metric: bool,
-    #[serde(default)]
     pub stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactCatalog {
-    #[serde(default)]
     pub point_cloud: Option<ArtifactSummary>,
-    #[serde(default)]
     pub textured_mesh: Option<ArtifactSummary>,
-    #[serde(default)]
     pub gaussian_splat: Option<ArtifactSummary>,
 }
 
@@ -174,11 +119,7 @@ pub struct ProjectSummary {
     pub path: String,
     pub created_at: String,
     pub phases: Vec<PhaseSummary>,
-    #[serde(default)]
-    pub media_sources: Vec<MediaSource>,
-    #[serde(default)]
     pub artifacts: ArtifactCatalog,
-    #[serde(default)]
     pub active_job: Option<String>,
     pub settings: CaptureSettings,
     pub processing_status: String,
@@ -211,13 +152,12 @@ pub struct ProjectSummary {
 impl ProjectSummary {
     pub fn placeholder() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             id: Uuid::new_v4().to_string(),
-            name: "Untitled phased scan".to_string(),
+            name: "Untitled RGB-D scan".to_string(),
             path: String::new(),
             created_at: Utc::now().to_rfc3339(),
             phases: Vec::new(),
-            media_sources: Vec::new(),
             artifacts: ArtifactCatalog::default(),
             active_job: None,
             settings: CaptureSettings::default(),
@@ -248,14 +188,12 @@ impl ProjectSummary {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeInfo {
     pub platform: String,
+    pub sensor_capabilities: Vec<String>,
     pub sensor_worker_available: bool,
-    pub sensor_connected: bool,
     pub sensor_status: String,
     pub reconstruction_worker_available: bool,
     pub splat_worker_available: bool,
     pub splat_status: String,
-    pub ffmpeg_available: bool,
-    pub colmap_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +220,13 @@ pub struct CaptureStatus {
     pub live_integrated_frame_count: u32,
     pub live_rejected_frame_count: u32,
     pub live_triangle_count: u64,
+    pub tracking_fps: f32,
+    pub source_drop_count: u64,
+    pub tracking_queue_drop_count: u64,
+    pub mapping_drop_count: u64,
+    pub tracking_overlap: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth_rmse_mm: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_reconstruction_backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -317,6 +262,8 @@ pub struct ReconstructionProgress {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveWorkerStatus {
+    #[serde(default)]
+    pub frame_count: u32,
     pub stream_fps: f32,
     pub tracking: bool,
     pub tracking_status: String,
@@ -351,6 +298,18 @@ pub struct LiveReconstructionStatus {
     pub triangle_count: u64,
     #[serde(default)]
     pub backend: String,
+    #[serde(default)]
+    pub tracking_fps: f32,
+    #[serde(default)]
+    pub source_drops: u64,
+    #[serde(default)]
+    pub tracking_queue_drops: u64,
+    #[serde(default)]
+    pub mapping_drops: u64,
+    #[serde(default)]
+    pub overlap: f32,
+    #[serde(default)]
+    pub depth_rmse_mm: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,31 +333,17 @@ pub struct RgbCameraModel {
     pub fy: f64,
     pub cx: f64,
     pub cy: f64,
-    #[serde(default = "default_rgb_model")]
     pub model: String,
-    #[serde(default)]
     pub distortion: Vec<f64>,
-}
-
-fn default_rgb_model() -> String {
-    "brown_conrady".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceRgbManifest {
-    #[serde(default = "default_rgb_format")]
     pub format: String,
-    #[serde(default = "default_rgb_jpeg_quality")]
     pub quality: u8,
-    #[serde(default)]
     pub native_resolution: bool,
-    #[serde(default)]
     pub dropped_frames: u32,
-}
-
-fn default_rgb_format() -> String {
-    "jpeg".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,14 +358,10 @@ pub struct PhaseManifest {
     pub frame_format: String,
     pub pose_source: String,
     pub camera: CameraModel,
-    #[serde(default)]
-    pub rgb_camera: Option<RgbCameraModel>,
-    #[serde(default)]
-    pub rgb_from_depth: Option<[f64; 16]>,
-    #[serde(default)]
-    pub source_rgb: Option<SourceRgbManifest>,
-    #[serde(default)]
-    pub sensor: Option<SensorManifest>,
+    pub rgb_camera: RgbCameraModel,
+    pub rgb_from_depth: [f64; 16],
+    pub source_rgb: SourceRgbManifest,
+    pub sensor: SensorManifest,
     #[serde(default)]
     pub imu: Option<ImuManifest>,
 }
@@ -430,11 +371,8 @@ pub struct PhaseManifest {
 pub struct ArtifactJob {
     pub id: String,
     pub project_path: String,
-    pub pipeline: String,
     #[serde(default)]
     pub targets: Vec<String>,
-    #[serde(default)]
-    pub source_ids: Vec<String>,
     pub stage: String,
     #[serde(default)]
     pub detail: String,
@@ -476,9 +414,7 @@ pub struct SensorManifest {
     pub kind: String,
     pub name: String,
     pub connection: String,
-    #[serde(default)]
     pub serial: String,
-    #[serde(default)]
     pub address: String,
 }
 
@@ -495,31 +431,4 @@ pub struct ImuManifest {
 pub struct PreviewPoint {
     pub position: [f32; 3],
     pub color: [u8; 3],
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CameraFrame {
-    pub phase_name: String,
-    pub phase_id: String,
-    pub frame_index: u32,
-    pub timestamp_us: u64,
-    pub matrix: [f32; 16],
-    pub aspect: f32,
-    pub fov_y_degrees: f32,
-    pub image_y_up: bool,
-    pub texture_frame: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CloudTransform {
-    pub position: [f32; 3],
-    pub rotation: [f32; 3],
-    #[serde(default = "unit_scale")]
-    pub scale: [f32; 3],
-}
-
-fn unit_scale() -> [f32; 3] {
-    [1.0, 1.0, 1.0]
 }

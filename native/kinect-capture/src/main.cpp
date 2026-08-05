@@ -3,14 +3,14 @@
 #include <Windows.h>
 #include <fcntl.h>
 #include <io.h>
-#include "jpeg_writer.h"
+#include "rgbd_archive.h"
+#include "rgbd_stream.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
-#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -40,15 +40,14 @@ void safe_release(T*& value) {
 }
 
 struct Options {
+    bool capabilities = false;
     bool probe = false;
-    bool preview = false;
+    bool stream_rgbd = false;
     fs::path phase_root;
     std::string id;
     std::string name = "Kinect capture";
     int fps = 10;
     float max_depth_m = 4.2F;
-    int rgb_quality = 92;
-    std::uint32_t max_rgb_dimension = 0;
 };
 
 std::string json_escape(const std::string& input) {
@@ -84,35 +83,28 @@ Options parse_options(int argc, char** argv) {
             if (index + 1 >= argc) throw std::runtime_error("Missing value after " + argument);
             return argv[++index];
         };
-        if (argument == "--probe") options.probe = true;
-        else if (argument == "--preview") {
-            options.preview = true;
-            options.phase_root = fs::path(value());
-            options.id = "live-preview";
-            options.name = "Live Kinect preview";
-        }
+        if (argument == "--capabilities") options.capabilities = true;
+        else if (argument == "--probe") options.probe = true;
         else if (argument == "--phase") options.phase_root = fs::path(value());
+        else if (argument == "--stream-rgbd") options.stream_rgbd = true;
         else if (argument == "--id") options.id = value();
         else if (argument == "--name") options.name = value();
         else if (argument == "--fps") options.fps = std::stoi(value());
         else if (argument == "--max-depth") options.max_depth_m = std::stof(value());
-        else if (argument == "--rgb-quality") options.rgb_quality = std::stoi(value());
-        else if (argument == "--max-rgb-dimension") options.max_rgb_dimension = static_cast<std::uint32_t>(std::stoul(value()));
         else if (argument == "--help") {
-            std::cout << "legacy-capture-worker --probe\n"
-                         "legacy-capture-worker --preview PATH [--fps 5|10|15] [--max-depth METERS]\n"
-                         "legacy-capture-worker --phase PATH --id ID [--name NAME] [--fps 5|10|15] [--max-depth METERS]\n";
+            std::cout << "kinect2-capture-worker --capabilities\n"
+                         "kinect2-capture-worker --probe\n"
+                         "kinect2-capture-worker --phase PATH --id ID [--name NAME] [--fps 1..30] [--max-depth METERS] [--stream-rgbd]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown argument: " + argument);
         }
     }
-    if (!options.probe && (options.phase_root.empty() || options.id.empty())) {
+    if (!options.capabilities && !options.probe && (options.phase_root.empty() || options.id.empty())) {
         throw std::runtime_error("--phase and --id are required");
     }
     options.fps = std::clamp(options.fps, 1, 30);
     options.max_depth_m = std::clamp(options.max_depth_m, 0.5F, 4.5F);
-    options.rgb_quality = std::clamp(options.rgb_quality, 60, 100);
     return options;
 }
 
@@ -318,13 +310,8 @@ void write_phase_manifest(
     const std::string& created_at,
     std::uint32_t frame_count,
     std::uint32_t duration_seconds,
-    const std::string& pose_source,
-    std::uint32_t rgb_drops
+    const std::string& pose_source
 ) {
-    const double rgb_scale = options.max_rgb_dimension > 0 && options.max_rgb_dimension < ColorWidth
-        ? static_cast<double>(options.max_rgb_dimension) / ColorWidth : 1.0;
-    const auto rgb_width = static_cast<std::uint32_t>(std::lround(ColorWidth * rgb_scale));
-    const auto rgb_height = static_cast<std::uint32_t>(std::lround(ColorHeight * rgb_scale));
     const fs::path temporary = options.phase_root / "phase.json.tmp";
     std::ofstream output(temporary, std::ios::trunc);
     if (!output) throw std::runtime_error("Could not create phase.json");
@@ -338,6 +325,8 @@ void write_phase_manifest(
            << "  \"durationSeconds\": " << duration_seconds << ",\n"
            << "  \"frameFormat\": \"depth=u16le,color=rgb8,aligned=true\",\n"
            << "  \"poseSource\": \"" << json_escape(pose_source) << "\",\n"
+           << "  \"sensor\": {\"kind\": \"kinect_v2\", \"name\": \"Kinect v2\", "
+           << "\"connection\": \"usb\", \"serial\": \"\", \"address\": \"\"},\n"
            << "  \"camera\": {\n"
            << "    \"width\": " << DepthWidth << ",\n"
            << "    \"height\": " << DepthHeight << ",\n"
@@ -353,43 +342,31 @@ void write_phase_manifest(
            << intrinsics.RadialDistortionSixthOrder << "]\n"
            << "  },\n"
            << "  \"rgbCamera\": {\n"
-           << "    \"width\": " << rgb_width << ", \"height\": " << rgb_height << ",\n"
-           << "    \"fx\": " << 1081.0 * rgb_scale << ", \"fy\": " << 1081.0 * rgb_scale << ",\n"
-           << "    \"cx\": " << 959.5 * rgb_scale << ", \"cy\": " << 539.5 * rgb_scale << ",\n"
-           << "    \"model\": \"kinect_coordinate_mapper\", \"distortion\": []\n"
+           << "    \"width\": " << DepthWidth << ", \"height\": " << DepthHeight << ",\n"
+           << "    \"fx\": " << intrinsics.FocalLengthX << ", \"fy\": " << intrinsics.FocalLengthY << ",\n"
+           << "    \"cx\": " << intrinsics.PrincipalPointX << ", \"cy\": " << intrinsics.PrincipalPointY << ",\n"
+           << "    \"model\": \"pinhole\", \"distortion\": []\n"
            << "  },\n"
-           << "  \"rgbFromDepth\": [1,0,0,-0.052,0,1,0,0,0,0,1,0,0,0,0,1],\n"
-           << "  \"sourceRgb\": {\"format\": \"jpeg\", \"quality\": " << options.rgb_quality
-           << ", \"nativeResolution\": " << (options.max_rgb_dimension == 0 ? "true" : "false")
-           << ", \"droppedFrames\": " << rgb_drops << "}\n"
+           << "  \"rgbFromDepth\": [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],\n"
+           << "  \"sourceRgb\": {\"format\": \"aligned-rgb8\", \"quality\": 100, "
+           << "\"nativeResolution\": false, \"droppedFrames\": 0}\n"
            << "}\n";
+    output.flush();
+    if (!output) throw std::runtime_error("Could not flush phase.json");
     output.close();
+    if (!output) throw std::runtime_error("Could not close phase.json");
     const fs::path destination = options.phase_root / "phase.json";
-    std::error_code error;
-    fs::remove(destination, error);
-    fs::rename(temporary, destination);
-}
-
-template <typename T>
-void write_binary(const fs::path& path, const std::vector<T>& values) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) throw std::runtime_error("Could not write " + path.string());
-    output.write(
-        reinterpret_cast<const char*>(values.data()),
-        static_cast<std::streamsize>(values.size() * sizeof(T))
-    );
-}
-
-template <typename T>
-void write_binary_atomic(const fs::path& path, const std::vector<T>& values) {
-    const fs::path temporary = path.string() + ".tmp";
-    write_binary(temporary, values);
-    if (!MoveFileExW(
-            temporary.c_str(),
-            path.c_str(),
-            MOVEFILE_REPLACE_EXISTING)) {
-        throw std::runtime_error("Could not publish " + path.string());
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        if (MoveFileExW(
+                temporary.c_str(),
+                destination.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5 + attempt));
     }
+    throw std::runtime_error(
+        "Could not publish phase.json (Windows error " + std::to_string(GetLastError()) + ")");
 }
 
 void write_text_atomic(const fs::path& path, const std::string& value) {
@@ -397,29 +374,34 @@ void write_text_atomic(const fs::path& path, const std::string& value) {
     std::ofstream output(temporary, std::ios::trunc);
     if (!output) throw std::runtime_error("Could not write " + path.string());
     output << value;
+    output.flush();
+    if (!output) throw std::runtime_error("Could not flush " + temporary.string());
     output.close();
-    if (!MoveFileExW(
-            temporary.c_str(),
-            path.c_str(),
-            MOVEFILE_REPLACE_EXISTING)) {
-        throw std::runtime_error("Could not publish " + path.string());
+    if (!output) throw std::runtime_error("Could not close " + temporary.string());
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        if (MoveFileExW(
+                temporary.c_str(),
+                path.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5 + attempt));
     }
+    throw std::runtime_error(
+        "Could not publish " + path.string() + " (Windows error "
+        + std::to_string(GetLastError()) + ")");
 }
 
-void append_csv_pose(std::ostream& output, const Matrix4* pose) {
-    if (pose == nullptr) {
-        output << ",,,,,,,,,,,,,,,,";
-        return;
-    }
-    // Kinect Fusion stores translation in M41..M43; CSV consumers use column vectors.
-    output << ',' << pose->M11 << ',' << pose->M21 << ',' << pose->M31 << ',' << pose->M41
-           << ',' << pose->M12 << ',' << pose->M22 << ',' << pose->M32 << ',' << pose->M42
-           << ',' << pose->M13 << ',' << pose->M23 << ',' << pose->M33 << ',' << pose->M43
-           << ",0,0,0,1";
-}
-
-std::string csv_header() {
-    return "index,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_us,m00,m01,m02,m03,m10,m11,m12,m13,m20,m21,m22,m23,m30,m31,m32,m33\n";
+std::array<float, 16> stream_pose(const Matrix4& pose) {
+    // Kinect Fusion's Matrix4 stores translation in M41..M43 and uses row
+    // vectors. The engine protocol standardizes on a column-vector
+    // worldFromCamera matrix.
+    return {
+        pose.M11, pose.M21, pose.M31, pose.M41,
+        pose.M12, pose.M22, pose.M32, pose.M42,
+        pose.M13, pose.M23, pose.M33, pose.M43,
+        0, 0, 0, 1,
+    };
 }
 
 void write_live_status(
@@ -443,59 +425,12 @@ void write_live_status(
     write_text_atomic(root / "live.json", output.str());
 }
 
-void append_packet_float(std::vector<std::uint8_t>& packet, float value) {
-    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&value);
-    packet.insert(packet.end(), bytes, bytes + sizeof(float));
-}
-
-void write_compact_preview(
-    const std::vector<std::uint16_t>& depth,
-    const CameraIntrinsics& intrinsics,
-    std::uint32_t frame_count,
-    std::uint64_t timestamp_us,
-    float stream_fps
-) {
-    constexpr int preview_stride = 6;
-    constexpr std::size_t header_size = 24;
-    std::vector<std::uint8_t> packet(header_size, 0);
-    packet.reserve(header_size + (DepthWidth / preview_stride) * (DepthHeight / preview_stride) * 15);
-    std::uint32_t count = 0;
-    for (int y = 0; y < DepthHeight; y += preview_stride) {
-        for (int x = 0; x < DepthWidth; x += preview_stride) {
-            const int pixel = y * DepthWidth + x;
-            if (depth[pixel] == 0) continue;
-            const float z = depth[pixel] / 1000.0F;
-            // Present the scene rather than a camera-mirror image: screen-left
-            // remains world-left in the operator and reconstruction previews.
-            const float point_x = -(x - intrinsics.PrincipalPointX) * z / intrinsics.FocalLengthX;
-            const float point_y = -(y - intrinsics.PrincipalPointY) * z / intrinsics.FocalLengthY;
-            append_packet_float(packet, point_x);
-            append_packet_float(packet, point_y);
-            append_packet_float(packet, -z);
-            const float normalized = std::clamp((z - 0.5F) / 4.0F, 0.0F, 1.0F);
-            packet.push_back(static_cast<std::uint8_t>(72 + normalized * 58));
-            packet.push_back(static_cast<std::uint8_t>(190 - normalized * 52));
-            packet.push_back(static_cast<std::uint8_t>(220 - normalized * 35));
-            ++count;
-        }
-    }
-    std::memcpy(packet.data(), "K2P1", 4);
-    std::memcpy(packet.data() + 4, &frame_count, sizeof(frame_count));
-    std::memcpy(packet.data() + 8, &timestamp_us, sizeof(timestamp_us));
-    std::memcpy(packet.data() + 16, &stream_fps, sizeof(stream_fps));
-    std::memcpy(packet.data() + 20, &count, sizeof(count));
-    std::cout.write(reinterpret_cast<const char*>(packet.data()), static_cast<std::streamsize>(packet.size()));
-    std::cout.flush();
-}
-
 int capture(const Options& options) {
     constexpr int depth_count = DepthWidth * DepthHeight;
     constexpr int color_count = ColorWidth * ColorHeight;
-    const int sensor_stride = std::max(1, static_cast<int>(std::lround(30.0 / options.fps)));
-
     fs::create_directories(options.phase_root / "depth");
     fs::create_directories(options.phase_root / "color");
-    if (!options.preview) fs::create_directories(options.phase_root / "rgb");
+    fs::create_directories(options.phase_root / "rgb");
     fs::remove(options.phase_root / "stop.flag");
 
     IKinectSensor* sensor = nullptr;
@@ -508,35 +443,27 @@ int capture(const Options& options) {
     wait_for_sensor(sensor);
     result = sensor->get_CoordinateMapper(&mapper);
     if (FAILED(result)) throw std::runtime_error("Coordinate mapper is unavailable");
-    const DWORD frame_sources = options.preview
-        ? FrameSourceTypes_Depth
-        : FrameSourceTypes_Depth | FrameSourceTypes_Color;
-    result = sensor->OpenMultiSourceFrameReader(frame_sources, &reader);
+    result = sensor->OpenMultiSourceFrameReader(
+        FrameSourceTypes_Depth | FrameSourceTypes_Color,
+        &reader);
     if (FAILED(result)) throw std::runtime_error("Could not open synchronized depth/color reader");
 
     const CameraIntrinsics intrinsics = wait_for_intrinsics(mapper);
     FusionTracker tracker;
-    if (!options.preview) tracker.initialize(intrinsics, options.max_depth_m);
+    tracker.initialize(intrinsics, options.max_depth_m);
     const std::string pose_source = tracker.available() ? "kinect_fusion" : "estimated_offline";
 
     const std::string created_at = utc_now();
-    write_phase_manifest(options, intrinsics, created_at, 0, 0, pose_source, 0);
-    std::ofstream frame_csv;
-    if (!options.preview) {
-        frame_csv.open(options.phase_root / "frames.csv", std::ios::trunc);
-        frame_csv << csv_header();
-    }
-
+    write_phase_manifest(options, intrinsics, created_at, 0, 0, pose_source);
     std::vector<std::uint16_t> depth(depth_count);
     std::vector<std::uint8_t> color_bgra(color_count * 4);
-    std::unique_ptr<scanlan::JpegWriterQueue> rgb_writer;
-    if (!options.preview) {
-        rgb_writer = std::make_unique<scanlan::JpegWriterQueue>(
-            options.rgb_quality, options.max_rgb_dimension, 6);
-    }
+    scanlan::RgbdArchiveWriter archive(options.phase_root, 100, 0, 8);
     std::vector<std::uint8_t> aligned_rgb(depth_count * 3);
     std::vector<ColorSpacePoint> depth_to_color(depth_count);
-    std::uint32_t saved_frames = 0;
+    std::unique_ptr<scanlan::RgbdStreamWriter> rgbd_stream;
+    if (options.stream_rgbd) {
+        rgbd_stream = std::make_unique<scanlan::RgbdStreamWriter>(std::cout, 3);
+    }
     std::uint64_t sensor_frames = 0;
     const auto started = std::chrono::steady_clock::now();
     auto last_synchronized_frame = started;
@@ -559,10 +486,7 @@ int capture(const Options& options) {
             continue;
         }
         ++sensor_frames;
-        if ((sensor_frames - 1) % sensor_stride != 0) {
-            safe_release(multi_frame);
-            continue;
-        }
+        const bool save_source = scanlan::archive_frame_due(sensor_frames, 30, options.fps);
 
         IDepthFrameReference* depth_reference = nullptr;
         IColorFrameReference* color_reference = nullptr;
@@ -573,7 +497,7 @@ int capture(const Options& options) {
         if (depth_reference != nullptr) depth_reference->AcquireFrame(&depth_frame);
         if (color_reference != nullptr) color_reference->AcquireFrame(&color_frame);
 
-        if (depth_frame != nullptr && (options.preview || color_frame != nullptr)) {
+        if (depth_frame != nullptr && color_frame != nullptr) {
             last_synchronized_frame = std::chrono::steady_clock::now();
             UINT depth_buffer_size = 0;
             UINT16* depth_buffer = nullptr;
@@ -592,93 +516,83 @@ int capture(const Options& options) {
                     depth[pixel] = value >= minimum_depth && value <= maximum_depth ? value : 0;
                 }
 
-                if (options.preview) {
-                    ++saved_frames;
-                    const auto elapsed_seconds = std::max(
-                        0.001,
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
-                    const auto stream_fps = static_cast<float>(saved_frames / elapsed_seconds);
-                    write_compact_preview(
-                        depth,
-                        intrinsics,
-                        saved_frames,
-                        static_cast<std::uint64_t>(timestamp_100ns / 10),
-                        stream_fps);
-                    if (saved_frames == 1 || saved_frames % 15 == 0) {
-                        write_live_status(
-                            options.phase_root,
-                            static_cast<std::uint64_t>(timestamp_100ns / 10),
-                            saved_frames,
-                            stream_fps,
-                            false,
-                            "30 Hz live depth preview");
-                    }
-                } else if (SUCCEEDED(color_frame->CopyConvertedFrameDataToArray(
+                if (SUCCEEDED(color_frame->CopyConvertedFrameDataToArray(
                     static_cast<UINT>(color_bgra.size()),
                     color_bgra.data(),
                     ColorImageFormat_Bgra))) {
                     result = mapper->MapDepthFrameToColorSpace(
-                    depth_count,
-                    depth.data(),
-                    depth_count,
-                    depth_to_color.data()
-                );
-                if (SUCCEEDED(result)) {
-                    std::fill(aligned_rgb.begin(), aligned_rgb.end(), std::uint8_t{0});
-                    for (int pixel = 0; pixel < depth_count; ++pixel) {
-                        const ColorSpacePoint mapped = depth_to_color[pixel];
-                        if (!std::isfinite(mapped.X) || !std::isfinite(mapped.Y)) continue;
-                        const int color_x = static_cast<int>(std::lround(mapped.X));
-                        const int color_y = static_cast<int>(std::lround(mapped.Y));
-                        if (color_x < 0 || color_x >= ColorWidth || color_y < 0 || color_y >= ColorHeight) continue;
-                        const std::size_t source = static_cast<std::size_t>((color_y * ColorWidth + color_x) * 4);
-                        const std::size_t target = static_cast<std::size_t>(pixel * 3);
-                        aligned_rgb[target] = color_bgra[source + 2];
-                        aligned_rgb[target + 1] = color_bgra[source + 1];
-                        aligned_rgb[target + 2] = color_bgra[source];
-                    }
+                        depth_count,
+                        depth.data(),
+                        depth_count,
+                        depth_to_color.data()
+                    );
+                    if (SUCCEEDED(result)) {
+                        std::fill(aligned_rgb.begin(), aligned_rgb.end(), std::uint8_t{0});
+                        for (int pixel = 0; pixel < depth_count; ++pixel) {
+                            const ColorSpacePoint mapped = depth_to_color[pixel];
+                            if (!std::isfinite(mapped.X) || !std::isfinite(mapped.Y)) continue;
+                            const int color_x = static_cast<int>(std::lround(mapped.X));
+                            const int color_y = static_cast<int>(std::lround(mapped.Y));
+                            if (color_x < 0 || color_x >= ColorWidth || color_y < 0 || color_y >= ColorHeight) continue;
+                            const std::size_t source = static_cast<std::size_t>((color_y * ColorWidth + color_x) * 4);
+                            const std::size_t target = static_cast<std::size_t>(pixel * 3);
+                            aligned_rgb[target] = color_bgra[source + 2];
+                            aligned_rgb[target + 1] = color_bgra[source + 1];
+                            aligned_rgb[target + 2] = color_bgra[source];
+                        }
 
-                    Matrix4 camera_to_world{};
-                    const bool tracking = tracker.track(depth, camera_to_world);
-                    INT64 rgb_timestamp_100ns = timestamp_100ns;
-                    color_frame->get_RelativeTime(&rgb_timestamp_100ns);
-                    std::ostringstream stem;
-                    stem << std::setw(6) << std::setfill('0') << saved_frames;
-                    const std::string depth_name = stem.str() + ".u16";
-                    const std::string color_name = stem.str() + ".rgb";
-                    const std::string rgb_name = stem.str() + ".jpg";
-                    write_binary(options.phase_root / "depth" / depth_name, depth);
-                    write_binary(options.phase_root / "color" / color_name, aligned_rgb);
-                    std::vector<std::uint8_t> native_rgb(static_cast<std::size_t>(color_count) * 3);
-                    for (int pixel = 0; pixel < color_count; ++pixel) {
-                        native_rgb[pixel * 3] = color_bgra[pixel * 4 + 2];
-                        native_rgb[pixel * 3 + 1] = color_bgra[pixel * 4 + 1];
-                        native_rgb[pixel * 3 + 2] = color_bgra[pixel * 4];
+                        Matrix4 camera_to_world{};
+                        const bool tracking = tracker.track(depth, camera_to_world);
+                        INT64 rgb_timestamp_100ns = timestamp_100ns;
+                        color_frame->get_RelativeTime(&rgb_timestamp_100ns);
+                        if (rgbd_stream) {
+                            const auto pose = tracking ? stream_pose(camera_to_world) : scanlan::identity_pose();
+                            rgbd_stream->publish(
+                                sensor_frames - 1,
+                                static_cast<std::uint64_t>(timestamp_100ns / 10),
+                                static_cast<std::uint64_t>(rgb_timestamp_100ns / 10),
+                                DepthWidth,
+                                DepthHeight,
+                                intrinsics.FocalLengthX,
+                                intrinsics.FocalLengthY,
+                                intrinsics.PrincipalPointX,
+                                intrinsics.PrincipalPointY,
+                                1000.0F,
+                                0.5F,
+                                options.max_depth_m,
+                                depth,
+                                aligned_rgb,
+                                nullptr,
+                                tracking ? &pose : nullptr,
+                                true);
+                        }
+                        if (save_source) {
+                            scanlan::RgbdArchiveFrame archive_frame;
+                            archive_frame.source_sequence = sensor_frames - 1;
+                            archive_frame.depth_timestamp_us =
+                                static_cast<std::uint64_t>(timestamp_100ns / 10);
+                            archive_frame.color_timestamp_us =
+                                static_cast<std::uint64_t>(rgb_timestamp_100ns / 10);
+                            archive_frame.depth = depth;
+                            archive_frame.aligned_color = aligned_rgb;
+                            if(tracking) archive_frame.camera_to_world = stream_pose(camera_to_world);
+                            archive.submit(std::move(archive_frame));
+                        }
+                        const auto elapsed_seconds = std::max(
+                            0.001,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+                        if(sensor_frames == 1 || sensor_frames % 3 == 0) {
+                            write_live_status(
+                                options.phase_root,
+                                static_cast<std::uint64_t>(timestamp_100ns / 10),
+                                archive.saved(),
+                                sensor_frames / elapsed_seconds,
+                                tracking,
+                                tracker.status());
+                        }
                     }
-                    const bool queued_rgb = rgb_writer->enqueue(
-                        options.phase_root / "rgb" / rgb_name, ColorWidth, ColorHeight, std::move(native_rgb));
-                    frame_csv << saved_frames << ',' << (timestamp_100ns / 10)
-                              << ",depth/" << depth_name << ",color/" << color_name << ',';
-                    if (queued_rgb) frame_csv << "rgb/" << rgb_name;
-                    frame_csv << ',';
-                    if (queued_rgb) frame_csv << (rgb_timestamp_100ns / 10);
-                    append_csv_pose(frame_csv, tracking ? &camera_to_world : nullptr);
-                    frame_csv << '\n';
-                    frame_csv.flush();
-                    ++saved_frames;
-                    const auto elapsed_seconds = std::max(
-                        0.001,
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
-                    write_live_status(
-                        options.phase_root,
-                        static_cast<std::uint64_t>(timestamp_100ns / 10),
-                        saved_frames,
-                        saved_frames / elapsed_seconds,
-                        tracking,
-                        tracker.status());
                 }
             }
-        }
         }
 
         safe_release(color_frame);
@@ -691,31 +605,36 @@ int capture(const Options& options) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - started
     );
-    if (rgb_writer) rgb_writer->close();
+    if (rgbd_stream) rgbd_stream->close();
+    archive.close();
+    const auto saved_frames = archive.saved();
     write_phase_manifest(
         options,
         intrinsics,
         created_at,
         saved_frames,
         static_cast<std::uint32_t>(std::max<std::int64_t>(1, elapsed.count())),
-        pose_source,
-        rgb_writer ? rgb_writer->dropped() + rgb_writer->failed() : 0
+        pose_source
     );
 
     safe_release(reader);
     safe_release(mapper);
     sensor->Close();
     safe_release(sensor);
-    return options.preview || saved_frames > 0 ? 0 : 2;
+    return saved_frames > 0 ? 0 : 2;
 }
 
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
-        if (options.preview) _setmode(_fileno(stdout), _O_BINARY);
+        if (options.capabilities) {
+            std::cout << "[\"kinect_v2\"]\n";
+            return 0;
+        }
+        if (options.stream_rgbd) _setmode(_fileno(stdout), _O_BINARY);
         return options.probe ? probe_sensor() : capture(options);
     } catch (const std::exception& error) {
-        std::cerr << "legacy-capture-worker: " << error.what() << '\n';
+        std::cerr << "kinect2-capture-worker: " << error.what() << '\n';
         return 1;
     }
 }

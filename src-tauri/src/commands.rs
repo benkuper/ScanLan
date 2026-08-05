@@ -1,14 +1,13 @@
 use crate::models::{
-    AvailableSensor, CameraFrame, CaptureSettings, CaptureStatus, CloudTransform,
-    LiveReconstructionStatus, LiveWorkerStatus, MediaSource, PreviewPoint, ProjectSummary,
-    ReconstructionProgress, RuntimeInfo,
+    AvailableSensor, CaptureSettings, CaptureStatus, LiveReconstructionStatus, LiveWorkerStatus,
+    PreviewPoint, ProjectSummary, ReconstructionProgress, RuntimeInfo,
 };
 use crate::storage;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -19,33 +18,83 @@ use uuid::Uuid;
 
 pub struct ActiveCapture {
     child: Child,
+    sensor_relay: Option<thread::JoinHandle<()>>,
     live_reconstruction: Option<Child>,
+    realtime: Arc<Mutex<RealtimeEngineSnapshot>>,
     project_root: PathBuf,
     phase_root: PathBuf,
     phase_id: String,
 }
 
-pub struct ActiveLivePreview {
-    child: Child,
-    root: PathBuf,
-    sensor_key: String,
-    latest: Arc<Mutex<Option<LivePreviewFrame>>>,
+impl Drop for ActiveCapture {
+    fn drop(&mut self) {
+        // Child handles do not terminate their processes when dropped. Make
+        // every early-return path fail closed so a disk or state error cannot
+        // leave a camera, relay, or reconstruction worker running invisibly.
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.child.kill().ok();
+            self.child.wait().ok();
+        }
+        drain_sensor_relay(self, Duration::from_millis(750));
+        stop_live_reconstruction(self, Duration::from_secs(1));
+        drain_sensor_relay(self, Duration::from_millis(750));
+    }
 }
 
 #[derive(Clone)]
-struct LivePreviewFrame {
-    updated: Instant,
+struct LiveGeometryFrame {
     frame_count: u32,
-    stream_fps: f32,
-    point_count: usize,
     packet: Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Default)]
+struct RealtimeEngineSnapshot {
+    updated: Option<Instant>,
+    status: LiveReconstructionStatus,
+    points: Option<LiveGeometryFrame>,
+    mesh: Option<LiveGeometryFrame>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RealtimeEngineStatusMessage {
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    processed_frames: u32,
+    #[serde(default)]
+    rejected_frames: u32,
+    #[serde(default)]
+    integrated_frames: u32,
+    #[serde(default)]
+    point_count: u64,
+    #[serde(default)]
+    triangle_count: u64,
+    #[serde(default)]
+    tracking_fps: f32,
+    #[serde(default)]
+    source_drops: u64,
+    #[serde(default)]
+    tracking_queue_drops: u64,
+    #[serde(default)]
+    mapping_drops: u64,
+    #[serde(default)]
+    overlap: f32,
+    #[serde(default)]
+    depth_rmse_mm: Option<f32>,
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub project: Arc<Mutex<ProjectSummary>>,
     pub active_capture: Arc<Mutex<Option<ActiveCapture>>>,
-    pub active_live_preview: Arc<Mutex<Option<ActiveLivePreview>>>,
     pub jobs: crate::jobs::JobManager,
 }
 
@@ -54,7 +103,6 @@ impl Default for AppState {
         Self {
             project: Arc::new(Mutex::new(ProjectSummary::placeholder())),
             active_capture: Arc::new(Mutex::new(None)),
-            active_live_preview: Arc::new(Mutex::new(None)),
             jobs: crate::jobs::JobManager::default(),
         }
     }
@@ -79,10 +127,32 @@ pub fn terminate_active_capture(state: &AppState) {
                     }
                 }
             }
+            drain_sensor_relay(&mut capture, Duration::from_secs(1));
             stop_live_reconstruction(&mut capture, Duration::from_secs(2));
+            drain_sensor_relay(&mut capture, Duration::from_secs(1));
         }
     }
-    terminate_live_preview(state);
+}
+
+fn drain_sensor_relay(capture: &mut ActiveCapture, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while capture
+        .sensor_relay
+        .as_ref()
+        .is_some_and(|relay| !relay.is_finished())
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if capture
+        .sensor_relay
+        .as_ref()
+        .is_some_and(|relay| relay.is_finished())
+    {
+        if let Some(relay) = capture.sensor_relay.take() {
+            relay.join().ok();
+        }
+    }
 }
 
 fn stop_live_reconstruction(capture: &mut ActiveCapture, timeout: Duration) {
@@ -94,14 +164,13 @@ fn stop_live_reconstruction(capture: &mut ActiveCapture, timeout: Duration) {
 }
 
 fn stop_live_reconstruction_child(
-    phase_root: &Path,
+    _phase_root: &Path,
     live_reconstruction: &mut Option<Child>,
     timeout: Duration,
 ) {
     let Some(mut child) = live_reconstruction.take() else {
         return;
     };
-    File::create(phase_root.join("live-reconstruction.stop")).ok();
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -120,14 +189,8 @@ fn drain_live_reconstruction(capture: &mut ActiveCapture, timeout: Duration) {
     if capture.live_reconstruction.is_none() {
         return;
     }
-    let expected = indexed_frame_count(&capture.phase_root);
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if live_reconstruction_status(&capture.phase_root)
-            .is_some_and(|status| status.processed_frames >= expected)
-        {
-            break;
-        }
         if capture
             .live_reconstruction
             .as_mut()
@@ -138,28 +201,6 @@ fn drain_live_reconstruction(capture: &mut ActiveCapture, timeout: Duration) {
             break;
         }
         thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn terminate_live_preview(state: &AppState) {
-    if let Ok(mut active) = state.active_live_preview.lock() {
-        if let Some(mut preview) = active.take() {
-            File::create(preview.root.join("stop.flag")).ok();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                match preview.child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(40))
-                    }
-                    _ => {
-                        preview.child.kill().ok();
-                        preview.child.wait().ok();
-                        break;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -345,14 +386,53 @@ pub(crate) fn worker_command(worker: &Path) -> Command {
     command
 }
 
-pub(crate) fn configure_media_tools(command: &mut Command, resource_root: Option<&Path>) {
-    let mut paths = storage::media_tool_directories(resource_root);
-    if let Some(current_path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&current_path));
+fn worker_capabilities(worker: &Path) -> Vec<String> {
+    let Ok(output) = worker_command(worker).arg("--capabilities").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
     }
-    if let Ok(path) = std::env::join_paths(paths) {
-        command.env("PATH", path);
+    serde_json::from_slice(&output.stdout).unwrap_or_default()
+}
+
+fn first_sensor_worker(paths: Vec<PathBuf>, sensor_kind: &str) -> Option<PathBuf> {
+    paths.into_iter().find(|path| {
+        path.is_file()
+            && worker_capabilities(path)
+                .iter()
+                .any(|capability| capability == sensor_kind)
+    })
+}
+
+fn first_modern_sensor_worker(paths: Vec<PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().find(|path| {
+        if !path.is_file() {
+            return false;
+        }
+        worker_capabilities(path)
+            .iter()
+            .any(|capability| matches!(capability.as_str(), "azure_kinect" | "femto_mega"))
+    })
+}
+
+fn installed_sensor_capabilities(resource_root: Option<&Path>) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    let workers = storage::candidate_kinect_worker_paths(resource_root)
+        .into_iter()
+        .chain(storage::candidate_modern_sensor_worker_paths(resource_root));
+    for worker in workers.filter(|path| path.is_file()) {
+        for capability in worker_capabilities(&worker) {
+            if matches!(
+                capability.as_str(),
+                "kinect_v2" | "azure_kinect" | "femto_mega"
+            ) && !capabilities.contains(&capability)
+            {
+                capabilities.push(capability);
+            }
+        }
     }
+    capabilities
 }
 
 fn sensor_name(settings: &CaptureSettings) -> &'static str {
@@ -361,19 +441,6 @@ fn sensor_name(settings: &CaptureSettings) -> &'static str {
         "femto_mega" => "Orbbec Femto Mega",
         _ => "Kinect v2",
     }
-}
-
-fn sensor_key(settings: &CaptureSettings) -> String {
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        settings.sensor_kind,
-        settings.sensor_id,
-        settings.sensor_connection,
-        settings.sensor_address.trim(),
-        settings.use_imu,
-        settings.depth_field_of_view,
-        settings.depth_binned
-    )
 }
 
 fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String> {
@@ -413,7 +480,7 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
         settings.sensor_address.clear();
         settings.use_imu = false;
     }
-    if !matches!(settings.live_reconstruction.as_str(), "off" | "points" | "mesh") {
+    if !matches!(settings.live_reconstruction.as_str(), "points" | "mesh") {
         return Err("Unknown live reconstruction mode".to_string());
     }
     Ok(())
@@ -426,7 +493,7 @@ fn sensor_worker(app: &AppHandle, settings: &CaptureSettings) -> Result<PathBuf,
     } else {
         storage::candidate_modern_sensor_worker_paths(resources.as_deref())
     };
-    first_existing(candidates).ok_or_else(|| {
+    first_sensor_worker(candidates, &settings.sensor_kind).ok_or_else(|| {
         format!(
             "{} capture support is missing from this app build",
             sensor_name(settings)
@@ -434,75 +501,91 @@ fn sensor_worker(app: &AppHandle, settings: &CaptureSettings) -> Result<PathBuf,
     })
 }
 
-fn start_live_reconstruction(
+fn start_realtime_engine(
     app: &AppHandle,
     phase_root: &Path,
     settings: &CaptureSettings,
-) -> Result<Option<Child>, String> {
-    if settings.live_reconstruction == "off" {
-        return Ok(None);
-    }
+) -> Result<
+    (
+        Child,
+        std::process::ChildStdin,
+        Arc<Mutex<RealtimeEngineSnapshot>>,
+    ),
+    String,
+> {
     let worker = first_existing(storage::candidate_reconstruction_worker_paths(
         resource_root(app).as_deref(),
     ))
     .ok_or_else(|| {
-        "Live reconstruction support is missing from this app build; choose Sensor frames or install the reconstruction runtime"
-            .to_string()
+        "Realtime reconstruction support is missing from this app build".to_string()
     })?;
-    for name in [
-        "live-reconstruction.stop",
-        "live-reconstruction.json",
-        "live-reconstruction.points",
-        "live-reconstruction.mesh",
-        "live-frame-selection.csv",
-    ] {
-        fs::remove_file(phase_root.join(name)).ok();
-    }
     let stderr = File::create(phase_root.join("live-reconstruction.log"))
         .map_err(|error| error.to_string())?;
-    let live_voxel_size_m = (settings.voxel_size_mm.max(10) as f32) / 1000.0;
+    let live_voxel_size_m = (settings.voxel_size_mm.clamp(5, 40) as f32) / 1000.0;
     let mut command = worker_command(&worker);
     command
-        .arg("live")
-        .arg(phase_root)
+        .arg("realtime")
         .arg("--mode")
         .arg(&settings.live_reconstruction)
         .arg("--voxel-size")
         .arg(live_voxel_size_m.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .arg("--session")
+        .arg(phase_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
-    command
+    let mut child = command
         .spawn()
-        .map(Some)
-        .map_err(|error| format!("Could not start live reconstruction: {error}"))
+        .map_err(|error| format!("Could not start realtime reconstruction: {error}"))?;
+    let input = match child.stdin.take() {
+        Some(input) => input,
+        None => {
+            child.kill().ok();
+            child.wait().ok();
+            return Err("Could not open the realtime engine input".to_string());
+        }
+    };
+    let output = match child.stdout.take() {
+        Some(output) => output,
+        None => {
+            drop(input);
+            child.kill().ok();
+            child.wait().ok();
+            return Err("Could not open the realtime engine output".to_string());
+        }
+    };
+    let snapshot = Arc::new(Mutex::new(RealtimeEngineSnapshot::default()));
+    let reader_snapshot = Arc::clone(&snapshot);
+    let mode = settings.live_reconstruction.clone();
+    thread::spawn(move || read_realtime_engine_stream(output, reader_snapshot, mode));
+    Ok((child, input, snapshot))
 }
 
-fn wait_for_live_reconstruction_ready(
-    phase_root: &Path,
+fn wait_for_realtime_engine_ready(
     child: &mut Child,
+    snapshot: &Arc<Mutex<RealtimeEngineSnapshot>>,
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if live_reconstruction_status(phase_root).is_some_and(|status| status.active) {
-            return Ok(());
+        if let Ok(latest) = snapshot.lock() {
+            if latest.status.active && latest.status.tracking_status.contains("ready") {
+                return Ok(());
+            }
+            if let Some(error) = &latest.error {
+                return Err(error.clone());
+            }
         }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            let detail = fs::read_to_string(phase_root.join("live-reconstruction.log"))
-                .unwrap_or_default();
-            return Err(if detail.trim().is_empty() {
-                format!("Live reconstruction stopped while warming up ({status})")
-            } else {
-                detail.trim().to_string()
-            });
+            return Err(format!(
+                "Realtime reconstruction stopped while warming up ({status})"
+            ));
         }
         if Instant::now() >= deadline {
-            File::create(phase_root.join("live-reconstruction.stop")).ok();
             child.kill().ok();
             child.wait().ok();
             return Err(
-                "Live reconstruction did not become ready within 45 seconds; choose Sensor frames or inspect live-reconstruction.log"
+                "Realtime reconstruction did not become ready within 45 seconds; inspect live-reconstruction.log"
                     .to_string(),
             );
         }
@@ -511,6 +594,9 @@ fn wait_for_live_reconstruction_ready(
 }
 
 fn append_sensor_args(command: &mut Command, settings: &CaptureSettings) {
+    if settings.sensor_kind == "kinect_v2" {
+        return;
+    }
     command
         .arg("--rgb-quality")
         .arg(settings.rgb_jpeg_quality.to_string());
@@ -518,9 +604,6 @@ fn append_sensor_args(command: &mut Command, settings: &CaptureSettings) {
         command
             .arg("--max-rgb-dimension")
             .arg(settings.max_rgb_dimension.to_string());
-    }
-    if settings.sensor_kind == "kinect_v2" {
-        return;
     }
     command
         .arg("--sensor")
@@ -564,12 +647,11 @@ fn parse_available_sensors(output: &std::process::Output) -> Vec<AvailableSensor
         .unwrap_or_default()
 }
 
-fn read_child_stderr(child: &mut Child) -> String {
-    let mut message = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        stderr.read_to_string(&mut message).ok();
-    }
-    message.trim().to_string()
+fn read_sensor_log(phase_root: &Path) -> String {
+    fs::read_to_string(phase_root.join("sensor.log"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn indexed_frame_count(phase_root: &Path) -> u32 {
@@ -582,80 +664,6 @@ fn indexed_frame_count(phase_root: &Path) -> u32 {
                 .count() as u32
         })
         .unwrap_or(0)
-}
-
-fn load_phase_preview(phase_root: &Path) -> Result<Vec<PreviewPoint>, String> {
-    let manifest: crate::models::PhaseManifest = serde_json::from_reader(
-        File::open(phase_root.join("phase.json")).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    if manifest.camera.fx <= 0.0 || manifest.camera.fy <= 0.0 {
-        return Err("The sensor frame has invalid camera calibration".to_string());
-    }
-
-    let index =
-        fs::read_to_string(phase_root.join("frames.csv")).map_err(|error| error.to_string())?;
-    let latest = index
-        .lines()
-        .skip(1)
-        .filter(|line| !line.trim().is_empty())
-        .last()
-        .ok_or_else(|| "The capture has not produced a frame yet".to_string())?;
-    let columns: Vec<&str> = latest.split(',').collect();
-    if columns.len() < 4 {
-        return Err("The sensor frame index is invalid".to_string());
-    }
-    let depth = fs::read(phase_root.join(columns[2])).map_err(|error| error.to_string())?;
-    let color = fs::read(phase_root.join(columns[3])).map_err(|error| error.to_string())?;
-    let width = manifest.camera.width as usize;
-    let height = manifest.camera.height as usize;
-    let pixel_count = width * height;
-    if depth.len() != pixel_count * 2 || color.len() != pixel_count * 3 {
-        return Err("The latest sensor frame is incomplete".to_string());
-    }
-
-    let mut preview = Vec::with_capacity(pixel_count / 16);
-    let flip_x = manifest
-        .sensor
-        .as_ref()
-        .map(|sensor| sensor.kind == "kinect_v2")
-        .unwrap_or(true);
-    for y in (0..height).step_by(4) {
-        for x in (0..width).step_by(4) {
-            let pixel = y * width + x;
-            let depth_mm = u16::from_le_bytes([depth[pixel * 2], depth[pixel * 2 + 1]]);
-            if depth_mm == 0 {
-                continue;
-            }
-            let z = depth_mm as f64 / manifest.camera.depth_scale;
-            if z > manifest.camera.max_depth_m {
-                continue;
-            }
-            let point_x = (x as f64 - manifest.camera.cx) * z / manifest.camera.fx;
-            let point_y = (y as f64 - manifest.camera.cy) * z / manifest.camera.fy;
-            let color_offset = pixel * 3;
-            preview.push(PreviewPoint {
-                // Capture-time Fusion poses are useful diagnostics, but are not stable
-                // enough to drive the operator preview. Keep this view camera-relative;
-                // the validated offline registration owns final frame placement.
-                position: [
-                    if flip_x {
-                        -point_x as f32
-                    } else {
-                        point_x as f32
-                    },
-                    -point_y as f32,
-                    -z as f32,
-                ],
-                color: [
-                    color[color_offset],
-                    color[color_offset + 1],
-                    color[color_offset + 2],
-                ],
-            });
-        }
-    }
-    Ok(preview)
 }
 
 fn reconstruction_progress(project_root: &Path) -> Option<ReconstructionProgress> {
@@ -672,87 +680,145 @@ fn live_worker_status(root: &Path) -> Option<LiveWorkerStatus> {
     serde_json::from_reader(File::open(path).ok()?).ok()
 }
 
-fn live_reconstruction_status(root: &Path) -> Option<LiveReconstructionStatus> {
-    let path = root.join("live-reconstruction.json");
-    let modified = fs::metadata(&path).ok()?.modified().ok()?;
-    if modified.elapsed().ok()? > Duration::from_secs(3) {
-        return None;
-    }
-    serde_json::from_reader(File::open(path).ok()?).ok()
-}
-
-fn live_reconstruction_packet(root: &Path, name: &str, magic: &[u8; 4], after_frame: u32) -> Vec<u8> {
-    let mut file = match File::open(root.join(name)) {
-        Ok(file) => file,
-        Err(_) => return Vec::new(),
-    };
-    let mut header = [0_u8; 8];
-    if file.read_exact(&mut header).is_err() || &header[0..4] != magic {
-        return Vec::new();
-    }
-    let frame_count = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    if frame_count == after_frame {
-        return Vec::new();
-    }
-    let mut bytes = Vec::with_capacity(
-        file.metadata()
-            .ok()
-            .and_then(|metadata| usize::try_from(metadata.len()).ok())
-            .unwrap_or(8),
-    );
-    bytes.extend_from_slice(&header);
-    if file.read_to_end(&mut bytes).is_err() {
-        return Vec::new();
-    }
-    bytes
-}
-
-fn read_live_preview_stream(
+fn read_realtime_engine_stream(
     stdout: std::process::ChildStdout,
-    latest: Arc<Mutex<Option<LivePreviewFrame>>>,
+    latest: Arc<Mutex<RealtimeEngineSnapshot>>,
+    mode: String,
 ) {
-    let mut reader = BufReader::new(stdout);
-    loop {
-        let mut header = [0_u8; 24];
-        if reader.read_exact(&mut header).is_err() {
-            break;
+    const HEADER_SIZE: usize = 24;
+    const MAX_PAYLOAD_SIZE: usize = 128 * 1024 * 1024;
+    let result = (|| -> Result<(), String> {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut header = [0_u8; HEADER_SIZE];
+            match reader.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(format!("Could not read realtime engine output: {error}")),
+            }
+            if &header[0..8] != b"SCANENG1" {
+                return Err("Realtime engine emitted an unknown protocol".to_string());
+            }
+            let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
+            let kind = u16::from_le_bytes(header[10..12].try_into().unwrap());
+            let payload_size =
+                u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+            if version != 1 || payload_size > MAX_PAYLOAD_SIZE {
+                return Err("Realtime engine emitted an unsupported message".to_string());
+            }
+            let mut payload = vec![0_u8; payload_size];
+            reader
+                .read_exact(&mut payload)
+                .map_err(|error| format!("Realtime engine message was truncated: {error}"))?;
+
+            let mut snapshot = latest
+                .lock()
+                .map_err(|_| "Realtime engine state is unavailable".to_string())?;
+            snapshot.updated = Some(Instant::now());
+            match kind {
+                1 => {
+                    let message: RealtimeEngineStatusMessage = serde_json::from_slice(&payload)
+                        .map_err(|error| format!("Realtime engine status is invalid: {error}"))?;
+                    snapshot.status = LiveReconstructionStatus {
+                        active: message.active,
+                        mode: mode.clone(),
+                        tracking: message.state == "tracking",
+                        tracking_status: if message.detail.is_empty() {
+                            message.state
+                        } else {
+                            message.detail
+                        },
+                        processed_frames: message.processed_frames,
+                        integrated_frames: message.integrated_frames,
+                        rejected_frames: message.rejected_frames,
+                        point_count: message.point_count,
+                        triangle_count: message.triangle_count,
+                        backend: message.backend,
+                        tracking_fps: message.tracking_fps,
+                        source_drops: message.source_drops,
+                        tracking_queue_drops: message.tracking_queue_drops,
+                        mapping_drops: message.mapping_drops,
+                        overlap: message.overlap,
+                        depth_rmse_mm: message.depth_rmse_mm,
+                    };
+                }
+                2 => {
+                    if payload.len() < 24 || &payload[0..4] != b"K2P1" {
+                        return Err("Realtime point packet has an invalid header".to_string());
+                    }
+                    let frame_count = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                    let point_count =
+                        u32::from_le_bytes(payload[20..24].try_into().unwrap()) as usize;
+                    let expected = 24_usize
+                        .checked_add(point_count.saturating_mul(15))
+                        .ok_or_else(|| "Realtime point packet is too large".to_string())?;
+                    if point_count > 150_000 || payload.len() != expected {
+                        return Err("Realtime point packet is incomplete".to_string());
+                    }
+                    snapshot.status.point_count = point_count as u64;
+                    snapshot.points = Some(LiveGeometryFrame {
+                        frame_count,
+                        packet: Arc::new(payload),
+                    });
+                }
+                3 => {
+                    if payload.len() < 16 || &payload[0..4] != b"K2M2" {
+                        return Err("Realtime mesh packet has an invalid header".to_string());
+                    }
+                    let frame_count = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                    let vertex_count =
+                        u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+                    let index_count =
+                        u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+                    let expected = 16_usize
+                        .checked_add(vertex_count.saturating_mul(15))
+                        .and_then(|size| size.checked_add(index_count.saturating_mul(4)))
+                        .ok_or_else(|| "Realtime mesh packet is too large".to_string())?;
+                    if vertex_count > 500_000
+                        || index_count > 450_000
+                        || index_count % 3 != 0
+                        || payload.len() != expected
+                    {
+                        return Err("Realtime mesh packet is incomplete".to_string());
+                    }
+                    snapshot.status.triangle_count = (index_count / 3) as u64;
+                    snapshot.mesh = Some(LiveGeometryFrame {
+                        frame_count,
+                        packet: Arc::new(payload),
+                    });
+                }
+                _ => return Err("Realtime engine emitted an unknown message kind".to_string()),
+            }
         }
-        if &header[0..4] != b"K2P1" {
-            break;
-        }
-        let frame_count = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let stream_fps = f32::from_le_bytes(header[16..20].try_into().unwrap());
-        let count = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
-        if count > 100_000 {
-            break;
-        }
-        let mut bytes = vec![0_u8; count * 15];
-        if reader.read_exact(&mut bytes).is_err() {
-            break;
-        }
-        // Keep the worker's compact binary representation intact. Converting
-        // every live frame into nested PreviewPoint objects here made the later
-        // JSON IPC response several times larger and limited the viewer to only
-        // a few updates per second even while the sensor held 30 fps.
-        let mut packet = Vec::with_capacity(header.len() + bytes.len());
-        packet.extend_from_slice(&header);
-        packet.extend_from_slice(&bytes);
-        if let Ok(mut slot) = latest.lock() {
-            *slot = Some(LivePreviewFrame {
-                updated: Instant::now(),
-                frame_count,
-                stream_fps,
-                point_count: count,
-                packet: Arc::new(packet),
-            });
+    })();
+
+    if let Ok(mut snapshot) = latest.lock() {
+        snapshot.status.active = false;
+        if let Err(error) = result {
+            snapshot.status.tracking = false;
+            snapshot.status.tracking_status = error.clone();
+            snapshot.error = Some(error);
         }
     }
 }
 
-fn live_preview_snapshot(state: &AppState) -> Option<LivePreviewFrame> {
-    let active = state.active_live_preview.lock().ok()?;
-    let frame = active.as_ref()?.latest.lock().ok()?.clone()?;
-    (frame.updated.elapsed() <= Duration::from_secs(2)).then_some(frame)
+fn realtime_packet(
+    snapshot: &Arc<Mutex<RealtimeEngineSnapshot>>,
+    mesh: bool,
+    after_frame: u32,
+) -> Vec<u8> {
+    let Ok(snapshot) = snapshot.lock() else {
+        return Vec::new();
+    };
+    let geometry = if mesh {
+        snapshot.mesh.as_ref()
+    } else {
+        snapshot.points.as_ref()
+    };
+    match geometry {
+        Some(frame) if frame.frame_count != after_frame => frame.packet.as_ref().clone(),
+        _ => Vec::new(),
+    }
 }
 
 #[tauri::command]
@@ -764,25 +830,10 @@ pub async fn live_preview_frame(
         .active_capture
         .lock()
         .ok()
-        .and_then(|active| active.as_ref().map(|capture| capture.phase_root.clone()));
-    if let Some(root) = capture_root {
-        let body = tauri::async_runtime::spawn_blocking(move || {
-            live_reconstruction_packet(
-                &root,
-                "live-reconstruction.points",
-                b"K2P1",
-                after_frame,
-            )
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-        return Ok(tauri::ipc::Response::new(body));
-    }
-    let frame = live_preview_snapshot(state.inner());
-    let body = match frame {
-        Some(frame) if frame.frame_count != after_frame => frame.packet.as_ref().clone(),
-        _ => Vec::new(),
-    };
+        .and_then(|active| active.as_ref().map(|capture| Arc::clone(&capture.realtime)));
+    let body = capture_root
+        .map(|snapshot| realtime_packet(&snapshot, false, after_frame))
+        .unwrap_or_default();
     Ok(tauri::ipc::Response::new(body))
 }
 
@@ -795,127 +846,26 @@ pub async fn live_reconstruction_mesh(
         .active_capture
         .lock()
         .ok()
-        .and_then(|active| active.as_ref().map(|capture| capture.phase_root.clone()));
-    let body = if let Some(root) = capture_root {
-        tauri::async_runtime::spawn_blocking(move || {
-            live_reconstruction_packet(
-                &root,
-                "live-reconstruction.mesh",
-                b"K2M2",
-                after_frame,
-            )
-        })
-        .await
-        .map_err(|error| error.to_string())?
+        .and_then(|active| active.as_ref().map(|capture| Arc::clone(&capture.realtime)));
+    let body = if let Some(snapshot) = capture_root {
+        realtime_packet(&snapshot, true, after_frame)
     } else {
         Vec::new()
     };
     Ok(tauri::ipc::Response::new(body))
 }
 
-fn ensure_live_preview(
-    app: &AppHandle,
-    state: &AppState,
-    settings: &CaptureSettings,
-) -> Result<PathBuf, String> {
-    let desired_key = sensor_key(settings);
-    let mut active = state
-        .active_live_preview
-        .lock()
-        .map_err(|_| "Sensor preview state is unavailable".to_string())?;
-
-    if let Some(preview) = active.as_mut() {
-        if preview.sensor_key == desired_key {
-            match preview
-                .child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-            {
-                None => return Ok(preview.root.clone()),
-                Some(status) => {
-                    let detail = read_child_stderr(&mut preview.child);
-                    *active = None;
-                    if !status.success() && !detail.is_empty() {
-                        return Err(detail);
-                    }
-                }
-            }
-        } else if let Some(mut previous) = active.take() {
-            File::create(previous.root.join("stop.flag")).ok();
-            previous.child.kill().ok();
-            previous.child.wait().ok();
-        }
-    }
-
-    let worker = sensor_worker(app, settings)?;
-    let root = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
-        .join("live-preview");
-    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-    for relative in [
-        "stop.flag",
-        "live.json",
-        "latest.points",
-        "frames.csv",
-        "phase.json",
-    ] {
-        fs::remove_file(root.join(relative)).ok();
-    }
-    let mut command = worker_command(&worker);
-    command
-        .arg("--preview")
-        .arg(&root)
-        .arg("--fps")
-        .arg("30")
-        .arg("--max-depth")
-        .arg(settings.max_depth_m.to_string());
-    append_sensor_args(&mut command, settings);
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "Could not start live {} preview: {error}",
-                sensor_name(settings)
-            )
-        })?;
-    let latest = Arc::new(Mutex::new(None));
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Could not open the live sensor preview stream".to_string())?;
-    let reader_state = Arc::clone(&latest);
-    thread::spawn(move || read_live_preview_stream(stdout, reader_state));
-    *active = Some(ActiveLivePreview {
-        child,
-        root: root.clone(),
-        sensor_key: desired_key,
-        latest,
-    });
-    Ok(root)
-}
-
 fn load_project_preview(project_root: &Path) -> Result<Vec<PreviewPoint>, String> {
     let project = storage::read_project(project_root)?;
-    if project.processing_status == "complete" {
-        let output = project_root.join("outputs").join("preview.json");
-        if output.exists() {
-            return serde_json::from_reader(File::open(output).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string());
-        }
-    }
-
-    for phase in project.phases.iter().rev() {
-        let phase_root = project_root.join("phases").join(&phase.id);
-        if indexed_frame_count(&phase_root) > 0 {
-            if let Ok(preview) = load_phase_preview(&phase_root) {
-                return Ok(preview);
-            }
-        }
+    let outputs = project_root.join("outputs");
+    let path = if project.processing_status == "processing" {
+        outputs.join("build-preview.json")
+    } else {
+        outputs.join("preview.json")
+    };
+    if path.is_file() {
+        return serde_json::from_reader(File::open(path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string());
     }
     Ok(Vec::new())
 }
@@ -931,37 +881,18 @@ pub async fn available_sensors(
         .lock()
         .map(|project| project.settings.clone())
         .unwrap_or_default();
-    let preview_active = state
-        .active_live_preview
-        .lock()
-        .map(|preview| preview.is_some())
-        .unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let mut sensors = Vec::new();
 
-        if preview_active {
-            sensors.push(AvailableSensor {
-                id: if saved.sensor_id.is_empty() {
-                    format!("{}:default", saved.sensor_kind)
-                } else {
-                    saved.sensor_id.clone()
-                },
-                kind: saved.sensor_kind.clone(),
-                name: sensor_name(&saved).to_string(),
-                connection: saved.sensor_connection.clone(),
-                address: saved.sensor_address.clone(),
-                serial: String::new(),
-                supports_imu: saved.sensor_kind != "kinect_v2",
-            });
-        }
-
-        // The Kinect v2 SDK has no passive enumeration API: its old --probe
-        // path opens the camera, turns on the light, and starts its streams.
+        // The Kinect v2 SDK has no passive enumeration API: probing opens the
+        // camera, turns on its light, and starts its streams.
         // Advertise installed capture support without touching the hardware;
-        // the camera is opened only after the user explicitly selects it.
-        if !sensors.iter().any(|sensor| sensor.kind == "kinect_v2")
-            && first_existing(storage::candidate_kinect_worker_paths(resources.as_deref()))
-                .is_some()
+        // the camera is opened only when recording starts.
+        if first_sensor_worker(
+            storage::candidate_kinect_worker_paths(resources.as_deref()),
+            "kinect_v2",
+        )
+        .is_some()
         {
             sensors.push(AvailableSensor {
                 id: "kinect_v2:default".to_string(),
@@ -974,14 +905,18 @@ pub async fn available_sensors(
             });
         }
 
-        if let Some(worker) = first_existing(storage::candidate_modern_sensor_worker_paths(
-            resources.as_deref(),
-        )) {
+        if let Some(worker) = first_modern_sensor_worker(
+            storage::candidate_modern_sensor_worker_paths(resources.as_deref()),
+        ) {
+            let supports_femto = worker_capabilities(&worker)
+                .iter()
+                .any(|capability| capability == "femto_mega");
             if let Ok(output) = worker_command(&worker).arg("--list").output() {
                 sensors.extend(parse_available_sensors(&output));
             }
 
-            if saved.sensor_kind == "femto_mega"
+            if supports_femto
+                && saved.sensor_kind == "femto_mega"
                 && saved.sensor_connection == "network"
                 && !saved.sensor_address.is_empty()
                 && !sensors.iter().any(|sensor| {
@@ -990,28 +925,19 @@ pub async fn available_sensors(
                         && sensor.address == saved.sensor_address
                 })
             {
-                let mut command = worker_command(&worker);
-                command.arg("--probe");
-                append_sensor_args(&mut command, &saved);
-                if command
-                    .output()
-                    .map(|output| output.status.success())
-                    .unwrap_or(false)
-                {
-                    sensors.push(AvailableSensor {
-                        id: if saved.sensor_id.is_empty() {
-                            format!("femto_mega:network:{}", saved.sensor_address)
-                        } else {
-                            saved.sensor_id.clone()
-                        },
-                        kind: "femto_mega".to_string(),
-                        name: "Orbbec Femto Mega".to_string(),
-                        connection: "network".to_string(),
-                        address: saved.sensor_address.clone(),
-                        serial: String::new(),
-                        supports_imu: true,
-                    });
-                }
+                sensors.push(AvailableSensor {
+                    id: if saved.sensor_id.is_empty() {
+                        format!("femto_mega:network:{}", saved.sensor_address)
+                    } else {
+                        saved.sensor_id.clone()
+                    },
+                    kind: "femto_mega".to_string(),
+                    name: "Orbbec Femto Mega (configured)".to_string(),
+                    connection: "network".to_string(),
+                    address: saved.sensor_address.clone(),
+                    serial: String::new(),
+                    supports_imu: true,
+                });
             }
         }
 
@@ -1047,13 +973,10 @@ pub async fn runtime_info(
         .map(|project| project.settings.clone())
         .unwrap_or_default();
     let runtime = tauri::async_runtime::spawn_blocking(move || {
-        let sensor_worker = if settings.sensor_kind == "kinect_v2" {
-            first_existing(storage::candidate_kinect_worker_paths(resources.as_deref()))
-        } else {
-            first_existing(storage::candidate_modern_sensor_worker_paths(
-                resources.as_deref(),
-            ))
-        };
+        let sensor_capabilities = installed_sensor_capabilities(resources.as_deref());
+        let sensor_worker_available = sensor_capabilities
+            .iter()
+            .any(|capability| capability == &settings.sensor_kind);
         let reconstruction_worker_available = first_existing(
             storage::candidate_reconstruction_worker_paths(resources.as_deref()),
         )
@@ -1063,7 +986,6 @@ pub async fn runtime_info(
         let (splat_worker_available, splat_status) = match splat_worker {
             Some(worker) => {
                 let mut command = worker_command(&worker);
-                configure_media_tools(&mut command, resources.as_deref());
                 command.arg("diagnostics");
                 match command.output() {
                     Ok(output) => {
@@ -1111,83 +1033,37 @@ pub async fn runtime_info(
                 "Not installed; run npm run prepare:splat".to_string(),
             ),
         };
-        let ffmpeg = first_existing(storage::candidate_ffmpeg_paths(resources.as_deref()))
-            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
-        let mut ffmpeg_command = worker_command(&ffmpeg);
-        configure_media_tools(&mut ffmpeg_command, resources.as_deref());
-        let ffmpeg_available = ffmpeg_command
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        let colmap = first_existing(storage::candidate_colmap_paths(resources.as_deref()))
-            .unwrap_or_else(|| PathBuf::from("colmap"));
-        let mut colmap_command = worker_command(&colmap);
-        configure_media_tools(&mut colmap_command, resources.as_deref());
-        let colmap_available = colmap_command
-            .arg("-h")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-
-        let (sensor_connected, sensor_status) = match &sensor_worker {
-            Some(worker) => {
-                let mut command = worker_command(worker);
-                command.arg("--probe");
-                append_sensor_args(&mut command, &settings);
-                match command.output() {
-                    Ok(output) if output.status.success() => (
-                        true,
-                        format!("{} connected and streaming", sensor_name(&settings)),
-                    ),
-                    Ok(output) => {
-                        let detail = output_message(&output);
-                        (
-                            false,
-                            if detail.is_empty() {
-                                format!("{} could not be opened", sensor_name(&settings))
-                            } else {
-                                detail
-                            },
-                        )
-                    }
-                    Err(error) => (false, format!("Could not start sensor support: {error}")),
-                }
-            }
-            None => (
-                false,
-                format!(
-                    "{} capture support is missing from this app build",
-                    sensor_name(&settings)
-                ),
-            ),
+        let sensor_status = if sensor_worker_available {
+            format!(
+                "{} capture support ready; the camera opens when recording starts",
+                sensor_name(&settings)
+            )
+        } else {
+            format!(
+                "{} capture support is missing from this app build",
+                sensor_name(&settings)
+            )
         };
 
         RuntimeInfo {
             platform: std::env::consts::OS.to_string(),
-            sensor_worker_available: sensor_worker.is_some(),
-            sensor_connected,
+            sensor_capabilities,
+            sensor_worker_available,
             sensor_status,
             reconstruction_worker_available,
             splat_worker_available,
             splat_status,
-            ffmpeg_available,
-            colmap_available,
         }
     })
     .await
     .unwrap_or_else(|error| RuntimeInfo {
         platform: std::env::consts::OS.to_string(),
+        sensor_capabilities: Vec::new(),
         sensor_worker_available: false,
-        sensor_connected: false,
         sensor_status: format!("Sensor connection check failed: {error}"),
         reconstruction_worker_available: false,
         splat_worker_available: false,
         splat_status: "Splat runtime detection failed".to_string(),
-        ffmpeg_available: false,
-        colmap_available: false,
     });
     Ok(runtime)
 }
@@ -1251,11 +1127,7 @@ pub fn update_project_settings(
     settings.capture_fps = settings.capture_fps.clamp(1, 30);
     settings.max_depth_m = settings.max_depth_m.clamp(0.5, 8.0);
     settings.voxel_size_mm = settings.voxel_size_mm.clamp(1, 40);
-    if settings.environment != "indoor" && settings.environment != "outdoor_low_light" {
-        return Err("Unknown capture environment".to_string());
-    }
     validate_sensor_settings(&mut settings)?;
-    let sensor_changed = sensor_key(&project.settings) != sensor_key(&settings);
     project.settings = settings;
     storage::write_project(&project)?;
     write_sensor_preference(&app, &project.settings)?;
@@ -1263,11 +1135,6 @@ pub fn update_project_settings(
         .project
         .lock()
         .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
-    if sensor_changed {
-        // Close the previous device before a later, explicitly requested status
-        // refresh can open the newly selected one.
-        terminate_live_preview(state.inner());
-    }
     Ok(project)
 }
 
@@ -1279,7 +1146,6 @@ pub fn start_sensor_phase(
     state: State<'_, AppState>,
 ) -> Result<ProjectSummary, String> {
     validate_sensor_settings(&mut settings)?;
-    terminate_live_preview(state.inner());
     let mut active = state
         .active_capture
         .lock()
@@ -1311,10 +1177,6 @@ pub fn start_sensor_phase(
     project.processing_backend = None;
     project.processing_duration_seconds = None;
     project.artifacts = crate::models::ArtifactCatalog::default();
-    project.confidence_score = None;
-    project.confidence_label = None;
-    project.confidence_detail = None;
-    project.frames_used = None;
     let phase_id = Uuid::new_v4().to_string();
     let phase_name = format!(
         "{} phase {}",
@@ -1327,20 +1189,21 @@ pub fn start_sensor_phase(
     // PyInstaller's one-file Open3D runtime can take several seconds to unpack
     // on a cold launch. Warm it completely before opening the sensor so the
     // first captured frames can already contribute to the visible map.
-    let mut live_reconstruction = start_live_reconstruction(&app, &phase_root, &project.settings)?;
-    if let Some(live_child) = live_reconstruction.as_mut() {
-        if let Err(error) = wait_for_live_reconstruction_ready(
+    let (live_child, mut live_input, realtime) =
+        start_realtime_engine(&app, &phase_root, &project.settings)?;
+    let mut live_reconstruction = Some(live_child);
+    if let Err(error) = wait_for_realtime_engine_ready(
+        live_reconstruction.as_mut().unwrap(),
+        &realtime,
+        Duration::from_secs(45),
+    ) {
+        drop(live_input);
+        stop_live_reconstruction_child(
             &phase_root,
-            live_child,
-            Duration::from_secs(45),
-        ) {
-            stop_live_reconstruction_child(
-                &phase_root,
-                &mut live_reconstruction,
-                Duration::from_secs(2),
-            );
-            return Err(error);
-        }
+            &mut live_reconstruction,
+            Duration::from_secs(2),
+        );
+        return Err(error);
     }
 
     let mut command = worker_command(&worker);
@@ -1354,16 +1217,30 @@ pub fn start_sensor_phase(
         .arg("--fps")
         .arg(project.settings.capture_fps.to_string())
         .arg("--max-depth")
-        .arg(project.settings.max_depth_m.to_string());
+        .arg(project.settings.max_depth_m.to_string())
+        .arg("--stream-rgbd");
     append_sensor_args(&mut command, &project.settings);
+    let sensor_log = match File::create(phase_root.join("sensor.log")) {
+        Ok(log) => log,
+        Err(error) => {
+            drop(live_input);
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
+            return Err(format!("Could not create the sensor log: {error}"));
+        }
+    };
     let mut child = match command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(sensor_log))
         .spawn()
     {
         Ok(child) => child,
         Err(error) => {
+            drop(live_input);
             stop_live_reconstruction_child(
                 &phase_root,
                 &mut live_reconstruction,
@@ -1379,23 +1256,39 @@ pub fn start_sensor_phase(
     let manifest_path = phase_root.join("phase.json");
     let startup_deadline = Instant::now() + Duration::from_secs(12);
     while !manifest_path.exists() {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            let detail = read_child_stderr(&mut child);
-            stop_live_reconstruction_child(
-                &phase_root,
-                &mut live_reconstruction,
-                Duration::from_secs(2),
-            );
-            return Err(if detail.is_empty() {
-                format!("Sensor capture stopped during startup ({status})")
-            } else {
-                detail
-            });
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let detail = read_sensor_log(&phase_root);
+                drop(live_input);
+                stop_live_reconstruction_child(
+                    &phase_root,
+                    &mut live_reconstruction,
+                    Duration::from_secs(2),
+                );
+                return Err(if detail.is_empty() {
+                    format!("Sensor capture stopped during startup ({status})")
+                } else {
+                    detail
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                child.kill().ok();
+                child.wait().ok();
+                drop(live_input);
+                stop_live_reconstruction_child(
+                    &phase_root,
+                    &mut live_reconstruction,
+                    Duration::from_secs(2),
+                );
+                return Err(format!("Could not inspect sensor startup: {error}"));
+            }
         }
         if Instant::now() >= startup_deadline {
             child.kill().ok();
             child.wait().ok();
-            let detail = read_child_stderr(&mut child);
+            let detail = read_sensor_log(&phase_root);
+            drop(live_input);
             stop_live_reconstruction_child(
                 &phase_root,
                 &mut live_reconstruction,
@@ -1413,6 +1306,26 @@ pub fn start_sensor_phase(
         thread::sleep(Duration::from_millis(50));
     }
 
+    let sensor_output = match child.stdout.take() {
+        Some(output) => output,
+        None => {
+            child.kill().ok();
+            child.wait().ok();
+            drop(live_input);
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
+            return Err("Could not open the RGB-D sensor stream".to_string());
+        }
+    };
+    let sensor_relay = thread::spawn(move || {
+        let mut source = BufReader::new(sensor_output);
+        std::io::copy(&mut source, &mut live_input).ok();
+        live_input.flush().ok();
+    });
+
     let is_reference = project.phases.is_empty();
     project.phases.push(crate::models::PhaseSummary {
         id: phase_id.clone(),
@@ -1427,23 +1340,28 @@ pub fn start_sensor_phase(
             "Capture overlapping geometry".to_string()
         },
     });
-    storage::write_project(&project)?;
-    *state
-        .project
-        .lock()
-        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
-    *active = Some(ActiveCapture {
+    let pending_capture = ActiveCapture {
         child,
+        sensor_relay: Some(sensor_relay),
         live_reconstruction,
+        realtime,
         project_root,
         phase_root,
         phase_id,
-    });
+    };
+    let mut project_state = state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?;
+    storage::write_project(&project)?;
+    *project_state = project.clone();
+    drop(project_state);
+    *active = Some(pending_capture);
     Ok(project)
 }
 
 #[tauri::command]
-pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<CaptureStatus, String> {
+pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, String> {
     let mut active_snapshot = None;
     let ended_capture = {
         let mut active = state
@@ -1458,7 +1376,11 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             {
                 Some(status) => active.take().map(|capture| (capture, status)),
                 None => {
-                    active_snapshot = Some((capture.phase_root.clone(), capture.phase_id.clone()));
+                    active_snapshot = Some((
+                        capture.phase_root.clone(),
+                        capture.phase_id.clone(),
+                        Arc::clone(&capture.realtime),
+                    ));
                     None
                 }
             }
@@ -1473,11 +1395,14 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
         .clone();
 
     if let Some((mut capture, status)) = ended_capture {
+        drain_sensor_relay(&mut capture, Duration::from_secs(1));
         drain_live_reconstruction(&mut capture, Duration::from_secs(1));
         stop_live_reconstruction(&mut capture, Duration::from_secs(2));
-        let detail = read_child_stderr(&mut capture.child);
+        drain_sensor_relay(&mut capture, Duration::from_secs(1));
+        let detail = read_sensor_log(&capture.phase_root);
         let frame_count = indexed_frame_count(&capture.phase_root);
-        let completed = status.success() && frame_count > 0;
+        let clean_stop = status.success();
+        let completed = frame_count > 0;
         if let Some(phase) = project
             .phases
             .iter_mut()
@@ -1487,8 +1412,10 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             phase.duration_seconds =
                 (frame_count / project.settings.capture_fps.max(1)).max(u32::from(frame_count > 0));
             phase.status = if completed { "complete" } else { "failed" }.to_string();
-            phase.overlap_hint = if completed {
+            phase.overlap_hint = if completed && clean_stop {
                 "Capture ended; ready for alignment".to_string()
+            } else if completed {
+                "Sensor stream ended unexpectedly; indexed frames were retained".to_string()
             } else {
                 "Sensor stream ended unexpectedly".to_string()
             };
@@ -1527,9 +1454,23 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             live_integrated_frame_count: 0,
             live_rejected_frame_count: 0,
             live_triangle_count: 0,
+            tracking_fps: 0.0,
+            source_drop_count: 0,
+            tracking_queue_drop_count: 0,
+            mapping_drop_count: 0,
+            tracking_overlap: 0.0,
+            depth_rmse_mm: None,
             live_reconstruction_backend: None,
             reconstruction,
-            error: (!completed).then_some(if detail.is_empty() {
+            error: (!clean_stop || !completed).then_some(if completed {
+                if detail.is_empty() {
+                    format!(
+                        "The sensor stream ended unexpectedly; {frame_count} indexed frames were retained"
+                    )
+                } else {
+                    format!("{detail} · {frame_count} indexed frames were retained")
+                }
+            } else if detail.is_empty() {
                 "The sensor capture stopped before a usable phase was completed".to_string()
             } else {
                 detail
@@ -1537,8 +1478,19 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
         });
     }
 
-    if let Some((phase_root, phase_id)) = active_snapshot {
-        let frame_count = indexed_frame_count(&phase_root);
+    if let Some((phase_root, phase_id, realtime)) = active_snapshot {
+        let live = live_worker_status(&phase_root);
+        let frame_count = live
+            .as_ref()
+            .map(|status| status.frame_count)
+            .or_else(|| {
+                project
+                    .phases
+                    .iter()
+                    .find(|phase| phase.id == phase_id)
+                    .map(|phase| phase.frame_count)
+            })
+            .unwrap_or(0);
         if let Some(phase) = project.phases.iter_mut().find(|phase| phase.id == phase_id) {
             phase.frame_count = frame_count;
             phase.duration_seconds = frame_count / project.settings.capture_fps.max(1);
@@ -1547,13 +1499,16 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             .project
             .lock()
             .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
-        let live = live_worker_status(&phase_root);
-        let live_reconstruction = live_reconstruction_status(&phase_root);
-        let preview = if live_reconstruction.is_some() {
-            Vec::new()
-        } else {
-            load_phase_preview(&phase_root).unwrap_or_default()
-        };
+        let (live_reconstruction, live_error) = realtime
+            .lock()
+            .map(|snapshot| (Some(snapshot.status.clone()), snapshot.error.clone()))
+            .unwrap_or_else(|_| {
+                (
+                    None,
+                    Some("Realtime reconstruction state is unavailable".to_string()),
+                )
+            });
+        let preview = Vec::new();
         let total_frame_count = project.phases.iter().map(|phase| phase.frame_count).sum();
         let reconstruction = reconstruction_progress(Path::new(&project.path));
         let selected_sensor_name = live
@@ -1606,7 +1561,7 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             live_reconstruction_active: live_reconstruction
                 .as_ref()
                 .map(|status| status.active)
-                .unwrap_or(project.settings.live_reconstruction != "off"),
+                .unwrap_or(false),
             live_reconstruction_mode: live_reconstruction
                 .as_ref()
                 .map(|status| status.mode.clone())
@@ -1627,11 +1582,34 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
                 .as_ref()
                 .map(|status| status.triangle_count)
                 .unwrap_or(0),
+            tracking_fps: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking_fps)
+                .unwrap_or(0.0),
+            source_drop_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.source_drops)
+                .unwrap_or(0),
+            tracking_queue_drop_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking_queue_drops)
+                .unwrap_or(0),
+            mapping_drop_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.mapping_drops)
+                .unwrap_or(0),
+            tracking_overlap: live_reconstruction
+                .as_ref()
+                .map(|status| status.overlap)
+                .unwrap_or(0.0),
+            depth_rmse_mm: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.depth_rmse_mm),
             live_reconstruction_backend: live_reconstruction
                 .as_ref()
                 .map(|status| status.backend.clone()),
             reconstruction,
-            error: None,
+            error: live_error,
         });
     }
 
@@ -1669,81 +1647,51 @@ pub fn capture_status(app: AppHandle, state: State<'_, AppState>) -> Result<Capt
             live_integrated_frame_count: 0,
             live_rejected_frame_count: 0,
             live_triangle_count: 0,
+            tracking_fps: 0.0,
+            source_drop_count: 0,
+            tracking_queue_drop_count: 0,
+            mapping_drop_count: 0,
+            tracking_overlap: 0.0,
+            depth_rmse_mm: None,
             live_reconstruction_backend: None,
             reconstruction: reconstruction_progress(&project_root),
             error: None,
         });
     }
-    let live_result = ensure_live_preview(&app, state.inner(), &project.settings);
-    let live_error = live_result.as_ref().err().cloned();
-    let worker_status = live_result
-        .as_ref()
-        .ok()
-        .and_then(|root| live_worker_status(root));
-    let live = live_preview_snapshot(state.inner());
-    // Live point data travels through live_preview_frame as a compact binary
-    // response. Keep capture_status lightweight so status and point-cloud
-    // refreshes cannot block one another on JSON serialization.
-    let preview = if live.is_some() {
-        Vec::new()
-    } else {
-        load_project_preview(&project_root).unwrap_or_default()
-    };
-    let preview_point_count = live
-        .as_ref()
-        .map(|frame| frame.point_count as u64)
-        .unwrap_or(preview.len() as u64);
+    let preview = load_project_preview(&project_root).unwrap_or_default();
     let total_frame_count = project.phases.iter().map(|phase| phase.frame_count).sum();
-    let frame_count = live.as_ref().map(|frame| frame.frame_count).unwrap_or(0);
-    let selected_sensor_name = worker_status
-        .as_ref()
-        .map(|status| status.sensor_name.trim())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| sensor_name(&project.settings).to_string());
+    let selected_sensor_name = sensor_name(&project.settings).to_string();
     Ok(CaptureStatus {
         project: project.clone(),
-        preview_point_count,
+        preview_point_count: preview.len() as u64,
         preview,
         capturing: false,
-        sensor_connected: live.is_some(),
+        sensor_connected: false,
         sensor_paused: false,
-        sensor_status: live
-            .as_ref()
-            .map(|frame| {
-                format!(
-                    "{} streaming at {:.1} fps",
-                    selected_sensor_name, frame.stream_fps
-                )
-            })
-            .or_else(|| live_error.clone())
-            .unwrap_or_else(|| format!("Opening the {} stream", selected_sensor_name)),
+        sensor_status: format!("{} opens when capture starts", selected_sensor_name),
         sensor_name: selected_sensor_name,
-        frame_count,
+        frame_count: 0,
         total_frame_count,
-        stream_fps: live.as_ref().map(|frame| frame.stream_fps).unwrap_or(0.0),
+        stream_fps: 0.0,
         tracking: false,
-        tracking_status: worker_status
-            .as_ref()
-            .map(|status| status.tracking_status.clone())
-            .unwrap_or_else(|| "30 Hz live depth preview".to_string()),
-        imu_active: worker_status
-            .as_ref()
-            .map(|status| status.imu_active)
-            .unwrap_or(false),
-        imu_rate_hz: worker_status
-            .as_ref()
-            .map(|status| status.imu_rate_hz)
-            .unwrap_or(0.0),
+        tracking_status: "Ready to capture".to_string(),
+        imu_active: false,
+        imu_rate_hz: 0.0,
         live_reconstruction_active: false,
         live_reconstruction_mode: project.settings.live_reconstruction.clone(),
         live_processed_frame_count: 0,
         live_integrated_frame_count: 0,
         live_rejected_frame_count: 0,
         live_triangle_count: 0,
+        tracking_fps: 0.0,
+        source_drop_count: 0,
+        tracking_queue_drop_count: 0,
+        mapping_drop_count: 0,
+        tracking_overlap: 0.0,
+        depth_rmse_mm: None,
         live_reconstruction_backend: None,
         reconstruction: reconstruction_progress(&project_root),
-        error: live_error,
+        error: None,
     })
 }
 
@@ -1817,144 +1765,6 @@ pub fn remove_capture(
     Ok(project)
 }
 
-fn supported_photo(path: &Path) -> bool {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp"
-            )
-        })
-}
-
-#[tauri::command]
-pub fn import_media_source(
-    project_path: String,
-    kind: String,
-    paths: Vec<String>,
-    state: State<'_, AppState>,
-) -> Result<ProjectSummary, String> {
-    if !matches!(kind.as_str(), "photos" | "video") {
-        return Err("Media kind must be photos or video".to_string());
-    }
-    if paths.is_empty() {
-        return Err("Choose photos or a video to import".to_string());
-    }
-    let root = PathBuf::from(project_path);
-    let mut selected = Vec::new();
-    for raw in paths {
-        let path = PathBuf::from(raw);
-        if path.is_dir() && kind == "photos" {
-            for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
-                let entry = entry.map_err(|error| error.to_string())?;
-                if entry
-                    .file_type()
-                    .map_err(|error| error.to_string())?
-                    .is_file()
-                    && supported_photo(&entry.path())
-                {
-                    selected.push(entry.path());
-                }
-            }
-        } else if path.is_file() {
-            selected.push(path);
-        }
-    }
-    if kind == "photos" {
-        selected.retain(|path| supported_photo(path));
-    } else if selected.len() != 1 {
-        return Err("Choose one video at a time".to_string());
-    }
-    selected.sort();
-    if selected.is_empty() {
-        return Err("No supported media files were selected".to_string());
-    }
-
-    let id = Uuid::new_v4().to_string();
-    let relative_root = PathBuf::from("sources").join(&id);
-    let originals_root = root.join(&relative_root).join("originals");
-    fs::create_dir_all(&originals_root).map_err(|error| error.to_string())?;
-    let mut originals = Vec::new();
-    for (index, source) in selected.iter().enumerate() {
-        let original_name = source
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("media");
-        let destination_name = format!("{index:05}-{original_name}");
-        fs::copy(source, originals_root.join(&destination_name))
-            .map_err(|error| format!("Could not copy {}: {error}", source.display()))?;
-        originals.push(format!("originals/{destination_name}"));
-    }
-    let mut project = storage::read_project(&root)?;
-    project.media_sources.push(MediaSource {
-        id: id.clone(),
-        kind: kind.clone(),
-        name: if kind == "video" {
-            selected[0]
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("Imported video")
-                .to_string()
-        } else {
-            format!("Photo set {}", project.media_sources.len() + 1)
-        },
-        created_at: Utc::now().to_rfc3339(),
-        path: relative_root.to_string_lossy().replace('\\', "/"),
-        originals,
-        status: "ready".to_string(),
-        image_count: if kind == "photos" {
-            selected.len() as u32
-        } else {
-            0
-        },
-        metric: false,
-        quality: None,
-    });
-    project.artifacts.gaussian_splat = None;
-    storage::write_project(&project)?;
-    *state
-        .project
-        .lock()
-        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
-    Ok(project)
-}
-
-#[tauri::command]
-pub fn remove_media_source(
-    project_path: String,
-    source_id: String,
-    state: State<'_, AppState>,
-) -> Result<ProjectSummary, String> {
-    let root = PathBuf::from(project_path);
-    let mut project = storage::read_project(&root)?;
-    if project.active_job.is_some() {
-        return Err("Cancel the active artifact job before removing media".to_string());
-    }
-    let index = project
-        .media_sources
-        .iter()
-        .position(|source| source.id == source_id)
-        .ok_or_else(|| "The media source no longer exists".to_string())?;
-    let sources_root = root.join("sources");
-    let source_root = sources_root.join(&source_id);
-    if source_root.parent() != Some(sources_root.as_path()) {
-        return Err("Refusing an invalid media-source path".to_string());
-    }
-    if source_root.exists() {
-        fs::remove_dir_all(&source_root)
-            .map_err(|error| format!("Could not remove media source: {error}"))?;
-    }
-    project.media_sources.remove(index);
-    project.artifacts.gaussian_splat = None;
-    storage::write_project(&project)?;
-    *state
-        .project
-        .lock()
-        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
-    Ok(project)
-}
-
 #[tauri::command]
 pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSummary, String> {
     let capture = state
@@ -1966,35 +1776,49 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
     let project_state = Arc::clone(&state.project);
     tauri::async_runtime::spawn_blocking(move || {
         let mut capture = capture;
-        File::create(capture.phase_root.join("stop.flag")).map_err(|error| error.to_string())?;
+        let mut stop_error = File::create(capture.phase_root.join("stop.flag"))
+            .err()
+            .map(|error| format!("Could not request a clean sensor stop: {error}"));
         let deadline = Instant::now() + Duration::from_secs(15);
-        let status = loop {
-            if let Some(status) = capture
-                .child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-            {
-                break status;
+        let status = if stop_error.is_some() {
+            capture.child.kill().ok();
+            capture.child.wait().ok()
+        } else {
+            loop {
+                match capture.child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(80));
+                    }
+                    Ok(None) => {
+                        stop_error = Some(
+                            "Sensor capture did not flush within 15 seconds and was terminated"
+                                .to_string(),
+                        );
+                        capture.child.kill().ok();
+                        break capture.child.wait().ok();
+                    }
+                    Err(error) => {
+                        stop_error = Some(format!("Could not inspect the sensor process: {error}"));
+                        capture.child.kill().ok();
+                        break capture.child.wait().ok();
+                    }
+                }
             }
-            if Instant::now() >= deadline {
-                capture.child.kill().map_err(|error| error.to_string())?;
-                break capture.child.wait().map_err(|error| error.to_string())?;
-            }
-            thread::sleep(Duration::from_millis(80));
         };
+        drain_sensor_relay(&mut capture, Duration::from_secs(3));
         drain_live_reconstruction(&mut capture, Duration::from_secs(3));
         stop_live_reconstruction(&mut capture, Duration::from_secs(5));
+        drain_sensor_relay(&mut capture, Duration::from_secs(1));
 
         let manifest_path = capture.phase_root.join("phase.json");
-        let capture_summary = if manifest_path.exists() {
-            let manifest: crate::models::PhaseManifest = serde_json::from_reader(
-                File::open(&manifest_path).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
-            (manifest.frame_count, manifest.duration_seconds)
-        } else {
-            (0, 0)
-        };
+        let capture_summary = File::open(&manifest_path)
+            .ok()
+            .and_then(|file| {
+                serde_json::from_reader::<_, crate::models::PhaseManifest>(file).ok()
+            })
+            .map(|manifest| (manifest.frame_count, manifest.duration_seconds))
+            .unwrap_or((0, 0));
         let mut project = storage::read_project(&capture.project_root)?;
         let frame_count = capture_summary
             .0
@@ -2002,7 +1826,12 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
         let duration_seconds = capture_summary.1.max(
             (frame_count / project.settings.capture_fps.max(1)).max(u32::from(frame_count > 0)),
         );
-        let completed = status.success() && frame_count > 0;
+        let clean_stop = stop_error.is_none()
+            && status.as_ref().is_some_and(|status| status.success());
+        // A CSV row is flushed only after both frame payloads are durable. Keep
+        // those indexed frames reconstructable even if process shutdown itself
+        // was forced or reported an error.
+        let completed = frame_count > 0;
         let phase_count = project.phases.len();
         if let Some(phase) = project
             .phases
@@ -2016,8 +1845,12 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
             } else {
                 "failed".to_string()
             };
-            phase.overlap_hint = if !completed {
+            phase.overlap_hint = if frame_count == 0 {
                 "No usable sensor frames were saved".to_string()
+            } else if let Some(error) = &stop_error {
+                format!("Recovered {frame_count} indexed frames · {error}")
+            } else if !clean_stop {
+                "Sensor capture ended unexpectedly; archived frames were retained".to_string()
             } else if phase_count == 1 {
                 "Reference phase".to_string()
             } else {
@@ -2026,101 +1859,6 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
         }
         fs::remove_file(capture.phase_root.join("stop.flag")).ok();
         storage::write_project(&project)?;
-        *project_state
-            .lock()
-            .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
-        Ok(project)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-fn run_worker(project_path: &Path, resource_root: Option<&Path>) -> Result<(), String> {
-    let worker = first_existing(storage::candidate_reconstruction_worker_paths(
-        resource_root,
-    ))
-    .ok_or_else(|| {
-        "Point-cloud reconstruction support is missing from this app build".to_string()
-    })?;
-    let output = worker_command(&worker)
-        .arg("reconstruct")
-        .arg(project_path)
-        .arg("--engine")
-        .arg("auto")
-        .output()
-        .map_err(|error| format!("Could not start point-cloud reconstruction: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail = output_message(&output);
-    Err(if detail.is_empty() {
-        format!("Point-cloud reconstruction failed ({})", output.status)
-    } else {
-        detail
-    })
-}
-
-#[tauri::command]
-pub async fn reconstruct_project(
-    app: AppHandle,
-    project_path: String,
-    settings: CaptureSettings,
-    state: State<'_, AppState>,
-) -> Result<ProjectSummary, String> {
-    terminate_live_preview(state.inner());
-    let root = PathBuf::from(project_path);
-    let mut project = storage::read_project(&root)?;
-    project.settings = settings;
-    project.settings.voxel_size_mm = project.settings.voxel_size_mm.clamp(1, 40);
-    project.processing_status = "processing".to_string();
-    project.processing_error = None;
-    project.point_count = None;
-    project.output_path = None;
-    project.mesh_triangle_count = None;
-    project.mesh_output_path = None;
-    project.camera_frame_count = None;
-    project.confidence_score = None;
-    project.confidence_label = None;
-    project.confidence_detail = None;
-    project.frames_used = None;
-    project.processing_backend = None;
-    project.processing_duration_seconds = None;
-    fs::remove_file(root.join("outputs").join("progress.json")).ok();
-    fs::remove_file(root.join("outputs").join("build-preview.json")).ok();
-    storage::write_project(&project)?;
-    *state
-        .project
-        .lock()
-        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
-
-    // Publish the processing state before yielding to the worker thread. This
-    // prevents a fast status poll from restarting the sensor preview in the
-    // small gap between stopping the sensor and starting reconstruction.
-    let project_state = Arc::clone(&state.project);
-    let resources = resource_root(&app);
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = run_worker(&root, resources.as_deref()) {
-            let mut failed = storage::read_project(&root).unwrap_or_else(|_| project.clone());
-            failed.processing_status = "failed".to_string();
-            failed.processing_error = Some(error.clone());
-            failed.point_count = None;
-            failed.output_path = None;
-            failed.mesh_triangle_count = None;
-            failed.mesh_output_path = None;
-            failed.camera_frame_count = None;
-            failed.confidence_score = None;
-            failed.confidence_label = None;
-            failed.confidence_detail = None;
-            failed.frames_used = None;
-            failed.processing_backend = None;
-            failed.processing_duration_seconds = None;
-            storage::write_project(&failed)?;
-            *project_state
-                .lock()
-                .map_err(|_| "Project state is unavailable".to_string())? = failed;
-            return Err(error);
-        }
-        let project = storage::read_project(&root)?;
         *project_state
             .lock()
             .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
@@ -2369,22 +2107,6 @@ pub async fn load_preview_mesh_geometry(project_path: String) -> Result<Response
 pub async fn load_preview_mesh_texture(project_path: String) -> Result<Response, String> {
     tauri::async_runtime::spawn_blocking(move || {
         load_preview_mesh_file(&project_path, "room-texture.png")
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub async fn load_camera_frames(project_path: String) -> Result<Vec<CameraFrame>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let path = PathBuf::from(project_path)
-            .join("outputs")
-            .join("camera-poses.json");
-        if !path.is_file() {
-            return Ok(Vec::new());
-        }
-        serde_json::from_reader(File::open(path).map_err(|error| error.to_string())?)
-            .map_err(|error| format!("Could not read reconstructed camera poses: {error}"))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2904,233 +2626,14 @@ pub fn export_gaussian_splat(
     Ok(destination.to_string_lossy().into_owned())
 }
 
-fn transformed_position(position: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
-    let [x_angle, y_angle, z_angle] = transform.rotation.map(f32::to_radians);
-    let (sx, cx) = (x_angle * 0.5).sin_cos();
-    let (sy, cy) = (y_angle * 0.5).sin_cos();
-    let (sz, cz) = (z_angle * 0.5).sin_cos();
-    let qx = sx * cy * cz + cx * sy * sz;
-    let qy = cx * sy * cz - sx * cy * sz;
-    let qz = cx * cy * sz + sx * sy * cz;
-    let qw = cx * cy * cz - sx * sy * sz;
-    let [x, y, z] = [
-        position[0] * transform.scale[0],
-        position[1] * transform.scale[1],
-        position[2] * transform.scale[2],
-    ];
-    let tx = 2.0 * (qy * z - qz * y);
-    let ty = 2.0 * (qz * x - qx * z);
-    let tz = 2.0 * (qx * y - qy * x);
-    [
-        x + qw * tx + (qy * tz - qz * ty) + transform.position[0],
-        y + qw * ty + (qz * tx - qx * tz) + transform.position[1],
-        z + qw * tz + (qx * ty - qy * tx) + transform.position[2],
-    ]
-}
-
-fn transformed_direction(direction: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
-    let origin = transformed_position([0.0, 0.0, 0.0], transform);
-    let endpoint = transformed_position(direction, transform);
-    [
-        endpoint[0] - origin[0],
-        endpoint[1] - origin[1],
-        endpoint[2] - origin[2],
-    ]
-}
-
-fn transformed_normal(normal: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
-    // Normals use the inverse transpose of the scale before the same rotation
-    // as positions. transformed_direction applies scale once, so pre-dividing
-    // by scale squared produces R * inverse(S) here.
-    let adjusted = std::array::from_fn(|axis| {
-        let scale = transform.scale[axis];
-        if scale.abs() > f32::EPSILON {
-            normal[axis] / (scale * scale)
-        } else {
-            normal[axis]
-        }
-    });
-    let transformed = transformed_direction(adjusted, transform);
-    let length = transformed.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if length > f32::EPSILON {
-        transformed.map(|value| value / length)
-    } else {
-        transformed
-    }
-}
-
-fn transform_camera_frame(frame: &mut CameraFrame, transform: &CloudTransform) {
-    let origin = transformed_position(
-        [frame.matrix[3], frame.matrix[7], frame.matrix[11]],
-        transform,
-    );
-    for column in 0..3 {
-        let direction = transformed_direction(
-            [
-                frame.matrix[column],
-                frame.matrix[4 + column],
-                frame.matrix[8 + column],
-            ],
-            transform,
-        );
-        frame.matrix[column] = direction[0];
-        frame.matrix[4 + column] = direction[1];
-        frame.matrix[8 + column] = direction[2];
-    }
-    frame.matrix[3] = origin[0];
-    frame.matrix[7] = origin[1];
-    frame.matrix[11] = origin[2];
-}
-
-fn transformed_obj(source: &str, transform: &CloudTransform) -> Result<String, String> {
-    let mut output = String::with_capacity(source.len());
-    let reverse_winding = transform.scale.iter().product::<f32>() < 0.0;
-    for line in source.lines() {
-        if let Some(vertex) = line.strip_prefix("v ") {
-            let values = vertex
-                .split_whitespace()
-                .take(3)
-                .map(str::parse::<f32>)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| "The generated OBJ contains an invalid vertex".to_string())?;
-            if values.len() != 3 {
-                return Err("The generated OBJ contains an incomplete vertex".to_string());
-            }
-            let position = transformed_position([values[0], values[1], values[2]], transform);
-            output.push_str(&format!(
-                "v {:.7} {:.7} {:.7}\n",
-                position[0], position[1], position[2]
-            ));
-        } else if let Some(normal) = line.strip_prefix("vn ") {
-            let values = normal
-                .split_whitespace()
-                .take(3)
-                .map(str::parse::<f32>)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| "The generated OBJ contains an invalid normal".to_string())?;
-            if values.len() != 3 {
-                return Err("The generated OBJ contains an incomplete normal".to_string());
-            }
-            let normal = transformed_normal([values[0], values[1], values[2]], transform);
-            output.push_str(&format!(
-                "vn {:.7} {:.7} {:.7}\n",
-                normal[0], normal[1], normal[2]
-            ));
-        } else if reverse_winding && line.starts_with("f ") {
-            let vertices = line[2..].split_whitespace().collect::<Vec<_>>();
-            if vertices.len() == 3 {
-                output.push_str(&format!(
-                    "f {} {} {}\n",
-                    vertices[0], vertices[2], vertices[1]
-                ));
-            } else {
-                output.push_str(line);
-                output.push('\n');
-            }
-        } else {
-            output.push_str(line);
-            output.push('\n');
-        }
-    }
-    Ok(output)
-}
-
-#[tauri::command]
-pub fn apply_cloud_transform(
-    project_path: String,
-    transform: CloudTransform,
-) -> Result<Vec<PreviewPoint>, String> {
-    let root = PathBuf::from(project_path);
-    let project = storage::read_project(&root)?;
-    if project.processing_status != "complete" {
-        return Err(
-            "Build the point cloud before applying its orientation to the export".to_string(),
-        );
-    }
-    let output_root = root.join("outputs");
-    let ply_path = output_root.join("room-cloud.ply");
-    let backup_path = output_root.join("room-cloud.untransformed.ply");
-    if !backup_path.exists() {
-        fs::copy(&ply_path, &backup_path).map_err(|error| error.to_string())?;
-    }
-
-    let mut bytes = fs::read(&ply_path).map_err(|error| error.to_string())?;
-    let marker = b"end_header\n";
-    let payload_start = bytes
-        .windows(marker.len())
-        .position(|window| window == marker)
-        .map(|position| position + marker.len())
-        .ok_or_else(|| "The generated PLY header is invalid".to_string())?;
-    for vertex in bytes[payload_start..].chunks_exact_mut(15) {
-        let position = [
-            f32::from_le_bytes(vertex[0..4].try_into().unwrap()),
-            f32::from_le_bytes(vertex[4..8].try_into().unwrap()),
-            f32::from_le_bytes(vertex[8..12].try_into().unwrap()),
-        ];
-        let transformed = transformed_position(position, &transform);
-        vertex[0..4].copy_from_slice(&transformed[0].to_le_bytes());
-        vertex[4..8].copy_from_slice(&transformed[1].to_le_bytes());
-        vertex[8..12].copy_from_slice(&transformed[2].to_le_bytes());
-    }
-    let temporary = output_root.join("room-cloud.ply.tmp");
-    File::create(&temporary)
-        .and_then(|mut file| file.write_all(&bytes))
-        .map_err(|error| error.to_string())?;
-    fs::remove_file(&ply_path).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, &ply_path).map_err(|error| error.to_string())?;
-
-    let preview_path = output_root.join("preview.json");
-    let mut preview: Vec<PreviewPoint> =
-        serde_json::from_reader(File::open(&preview_path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-    for point in &mut preview {
-        point.position = transformed_position(point.position, &transform);
-    }
-    storage::write_json(&preview_path, &preview)?;
-
-    let camera_path = output_root.join("camera-poses.json");
-    if camera_path.is_file() {
-        let camera_backup = output_root.join("camera-poses.untransformed.json");
-        if !camera_backup.exists() {
-            fs::copy(&camera_path, &camera_backup).map_err(|error| error.to_string())?;
-        }
-        let mut frames: Vec<CameraFrame> =
-            serde_json::from_reader(File::open(&camera_path).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
-        for frame in &mut frames {
-            transform_camera_frame(frame, &transform);
-        }
-        storage::write_json(&camera_path, &frames)?;
-    }
-
-    let mesh_path = output_root.join("room-mesh.obj");
-    if mesh_path.is_file() {
-        let mesh_backup = output_root.join("room-mesh.untransformed.obj");
-        if !mesh_backup.exists() {
-            fs::copy(&mesh_path, &mesh_backup).map_err(|error| error.to_string())?;
-        }
-        let transformed = transformed_obj(
-            &fs::read_to_string(&mesh_path).map_err(|error| error.to_string())?,
-            &transform,
-        )?;
-        let temporary_mesh = output_root.join("room-mesh.obj.tmp");
-        File::create(&temporary_mesh)
-            .and_then(|mut file| file.write_all(transformed.as_bytes()))
-            .map_err(|error| error.to_string())?;
-        fs::remove_file(&mesh_path).map_err(|error| error.to_string())?;
-        fs::rename(&temporary_mesh, &mesh_path).map_err(|error| error.to_string())?;
-    }
-    Ok(preview)
-}
 
 #[cfg(test)]
 mod tests {
     use super::{
         compact_splat_preview, convert_3dgs_ply_to_splat, normalize_project, pack_preview_mesh,
-        transformed_normal, transformed_position, unity_compatible_ply, valid_packed_preview_mesh,
-        validate_sensor_settings,
+        unity_compatible_ply, valid_packed_preview_mesh, validate_sensor_settings,
     };
-    use crate::models::{CaptureSettings, CloudTransform, ProjectSummary};
+    use crate::models::{CaptureSettings, ProjectSummary};
     use std::fs;
 
     #[test]
@@ -3264,33 +2767,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_transform_applies_axis_flip_before_translation() {
-        let transform = CloudTransform {
-            position: [0.5, -1.0, 2.0],
-            rotation: [0.0, 0.0, 0.0],
-            scale: [-1.0, 1.0, 1.0],
-        };
-        assert_eq!(
-            transformed_position([1.0, 2.0, 3.0], &transform),
-            [-0.5, 1.0, 5.0]
-        );
-    }
-
-    #[test]
-    fn mesh_normals_use_inverse_transpose_scale() {
-        let transform = CloudTransform {
-            position: [4.0, 5.0, 6.0],
-            rotation: [0.0, 0.0, 0.0],
-            scale: [2.0, 1.0, 0.5],
-        };
-        let normal = transformed_normal([1.0, 0.0, 1.0], &transform);
-        let length = (0.5_f32 * 0.5 + 2.0 * 2.0).sqrt();
-        assert!((normal[0] - 0.5 / length).abs() < 1e-6);
-        assert_eq!(normal[1], 0.0);
-        assert!((normal[2] - 2.0 / length).abs() < 1e-6);
-    }
-
-    #[test]
     fn unity_export_flips_only_x_and_preserves_rgb() {
         let header = concat!(
             "ply\n",
@@ -3340,36 +2816,6 @@ mod tests {
             .contains("comment Unity-ready coordinates: X axis flipped"));
         assert_eq!(vertices[0], ([-1.25, 2.5, -3.75], [10, 20, 30]));
         assert_eq!(vertices[1], ([4.5, 5.75, 6.0], [40, 50, 60]));
-    }
-
-    #[test]
-    fn legacy_cloud_transform_defaults_to_unit_scale() {
-        let transform: CloudTransform =
-            serde_json::from_str(r#"{"position":[0,0,0],"rotation":[0,0,0]}"#).unwrap();
-        assert_eq!(transform.scale, [1.0, 1.0, 1.0]);
-    }
-
-    #[test]
-    fn legacy_capture_settings_default_to_narrow_unbinned_depth() {
-        let settings: CaptureSettings = serde_json::from_str(
-            r#"{
-                "captureFps": 10,
-                "maxDepthM": 4.2,
-                "voxelSizeMm": 15,
-                "environment": "indoor",
-                "sensorKind": "azure_kinect",
-                "sensorId": "",
-                "sensorConnection": "usb",
-                "sensorAddress": "",
-                "useImu": true
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(settings.depth_field_of_view, "narrow");
-        assert!(!settings.depth_binned);
-        assert_eq!(settings.rgb_jpeg_quality, 92);
-        assert_eq!(settings.max_rgb_dimension, 0);
-        assert_eq!(settings.live_reconstruction, "points");
     }
 
     #[test]

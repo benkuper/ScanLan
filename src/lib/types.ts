@@ -1,17 +1,15 @@
-export type EnvironmentProfile = 'indoor' | 'outdoor_low_light';
 export type PhaseStatus = 'ready' | 'capturing' | 'complete' | 'failed';
 export type ProcessingStatus = 'idle' | 'processing' | 'complete' | 'failed';
 export type SensorKind = 'kinect_v2' | 'azure_kinect' | 'femto_mega';
 export type SensorConnection = 'usb' | 'network';
 export type DepthFieldOfView = 'narrow' | 'wide';
 export type MeshViewMode = 'surface' | 'surface-wireframe' | 'wireframe' | 'shaded';
-export type LiveReconstructionMode = 'off' | 'points' | 'mesh';
+export type LiveReconstructionMode = 'points' | 'mesh';
 
 export interface CaptureSettings {
   captureFps: number;
   maxDepthM: number;
   voxelSizeMm: number;
-  environment: EnvironmentProfile;
   sensorKind: SensorKind;
   sensorId: string;
   sensorConnection: SensorConnection;
@@ -25,29 +23,7 @@ export interface CaptureSettings {
   liveReconstruction: LiveReconstructionMode;
 }
 
-export type MediaSourceKind = 'photos' | 'video';
 export type ArtifactStatus = 'ready' | 'building' | 'stale' | 'failed';
-
-export interface MediaSourceQuality {
-  registeredImages: number;
-  totalImages: number;
-  reprojectionError?: number;
-  disconnectedComponents: number;
-  detail: string;
-}
-
-export interface MediaSource {
-  id: string;
-  kind: MediaSourceKind;
-  name: string;
-  createdAt: string;
-  path: string;
-  originals: string[];
-  status: string;
-  imageCount: number;
-  metric: boolean;
-  quality: MediaSourceQuality | null;
-}
 
 export interface ArtifactSummary {
   path: string;
@@ -91,7 +67,6 @@ export interface ProjectSummary {
   path: string;
   createdAt: string;
   phases: PhaseSummary[];
-  mediaSources: MediaSource[];
   artifacts: ArtifactCatalog;
   activeJob: string | null;
   settings: CaptureSettings;
@@ -112,14 +87,12 @@ export interface ProjectSummary {
 
 export interface RuntimeInfo {
   platform: string;
+  sensorCapabilities: SensorKind[];
   sensorWorkerAvailable: boolean;
-  sensorConnected: boolean;
   sensorStatus: string;
   reconstructionWorkerAvailable: boolean;
   splatWorkerAvailable: boolean;
   splatStatus: string;
-  ffmpegAvailable: boolean;
-  colmapAvailable: boolean;
 }
 
 export type ArtifactTarget = 'pointCloud' | 'texturedMesh' | 'gaussianSplat';
@@ -128,9 +101,7 @@ export type ArtifactJobStatus = 'queued' | 'running' | 'cancelling' | 'cancelled
 export interface ArtifactJob {
   id: string;
   projectPath: string;
-  pipeline: 'rgbd_reconstruction' | 'media_gaussian';
   targets: ArtifactTarget[];
-  sourceIds: string[];
   stage: string;
   detail: string;
   progress: number;
@@ -174,6 +145,12 @@ export interface CaptureStatus {
   liveIntegratedFrameCount: number;
   liveRejectedFrameCount: number;
   liveTriangleCount: number;
+  trackingFps: number;
+  sourceDropCount: number;
+  trackingQueueDropCount: number;
+  mappingDropCount: number;
+  trackingOverlap: number;
+  depthRmseMm?: number;
   liveReconstructionBackend?: string;
   reconstruction?: ReconstructionProgress;
   error?: string;
@@ -194,12 +171,6 @@ export interface ReconstructionProgress {
   stageTimingsSeconds?: Record<string, number>;
 }
 
-export interface CloudTransform {
-  position: [number, number, number];
-  rotation: [number, number, number];
-  scale: [number, number, number];
-}
-
 export interface PreviewPoint {
   position: [number, number, number];
   color: [number, number, number];
@@ -218,17 +189,4 @@ export interface PreviewMesh {
   colors?: Uint8Array;
   indices: Uint32Array;
   texture?: Uint8Array;
-}
-
-export interface CameraFrame {
-  phaseName: string;
-  phaseId: string;
-  frameIndex: number;
-  timestampUs: number;
-  /** Row-major camera-to-viewer transform. */
-  matrix: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number];
-  aspect: number;
-  fovYDegrees: number;
-  imageYUp: boolean;
-  textureFrame: boolean;
 }

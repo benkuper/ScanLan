@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scanlan-worker"
 version = "0.1.0"
-description = "Offline phased RGB-D registration and point-cloud export for ScanLan"
+description = "Realtime and production RGB-D reconstruction engine for ScanLan"
 license = "GPL-3.0-only"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26,<3", "Pillow>=10.4,<12"]

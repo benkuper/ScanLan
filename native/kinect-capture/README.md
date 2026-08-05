@@ -1,32 +1,28 @@
 # Kinect v2 capture worker
 
-This small Windows-only executable keeps the legacy Kinect SDK outside the Tauri process. It records synchronized depth and color frames, maps color into depth-camera coordinates, and writes the phase format consumed by `worker/scanlan`.
+`kinect2-capture-worker.exe` is the Windows-only Kinect v2 backend. It owns Kinect SDK 2.0 and Kinect Fusion outside the Tauri process, captures synchronized depth/color, uses the SDK coordinate mapper to align color exactly into depth geometry, streams full-rate RGB-D with validated Fusion poses, and archives schema-3 frames asynchronously.
 
 ## Build
 
-Install Kinect for Windows SDK 2.0 and Visual Studio 2022 with C++ desktop support, then run from a Developer PowerShell:
+Install Kinect for Windows SDK 2.0 and Visual Studio 2022 C++ desktop tools:
 
 ```powershell
 cmake -S native/kinect-capture -B build/kinect-capture -A x64
 cmake --build build/kinect-capture --config Release
 ```
 
-If the SDK installer did not define `KINECTSDK20_DIR`, pass `-DKINECT_SDK_ROOT="C:/Program Files/Microsoft SDKs/Kinect/v2.0_1409"`.
+If needed, pass `-DKINECT_SDK_ROOT="C:/Program Files/Microsoft SDKs/Kinect/v2.0_1409"`.
 
-The application build bundles the resulting executable and discovers it automatically. No worker-path environment variable is needed.
+Without the SDK, CMake builds an unavailable-backend stub so the rest of ScanLan still packages cleanly.
 
-## Connection check
-
-```powershell
-legacy-capture-worker.exe --probe
-```
-
-The command succeeds only after the sensor opens and delivers synchronized depth and color frames.
-
-## Standalone use
+## Check and capture
 
 ```powershell
-legacy-capture-worker.exe --phase C:\Scans\project\phases\phase-id --id phase-id --name "North wall" --fps 10 --max-depth 4.2
+kinect2-capture-worker.exe --capabilities
+kinect2-capture-worker.exe --probe
+kinect2-capture-worker.exe --phase C:\Scans\Room\phases\take-1 --id take-1 --name "Room take 1" --fps 10 --max-depth 4.2 --stream-rgbd
 ```
 
-Create an empty `stop.flag` inside the phase directory to end capture cleanly.
+`--capabilities` reports whether Kinect SDK support was compiled without opening the camera. The unavailable-backend stub returns an empty array.
+
+Create `stop.flag` in the phase directory to flush and stop. With `--stream-rgbd`, stdout is binary `SCANRGBD` v1 and must be piped directly to the reconstruction engine; diagnostics use stderr.

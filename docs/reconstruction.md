@@ -1,0 +1,82 @@
+# Reconstruction pipeline
+
+All representations share one quality-gated RGB-D trajectory. A visually attractive splat is not allowed to hide a broken metric path.
+
+## Realtime pass
+
+1. Validate and decode `SCANRGBD` frames.
+2. Remove isolated depth returns without smoothing across supported edges.
+3. Build persistent tensor or CPU RGB-D representations.
+4. Estimate odometry, optionally initialized by the calibrated gyro delta.
+5. Reproject metric depth and reject candidates with weak overlap, too few correspondences, high RMSE, or impossible motion.
+6. On loss, test recent accepted anchors through the same gates.
+7. Select keyframes by translation, rotation, and elapsed time.
+8. Integrate selected frames into a weighted TSDF.
+9. Publish bounded point snapshots at roughly 3 Hz and optional mesh snapshots at 1 Hz.
+
+Kinect Fusion poses enter at step 4 but still pass ScanLan’s finite, rigid, physical-motion, overlap, and metric depth-residual checks.
+
+Azure Kinect uses 2048×1536 RGB beside every 30 fps depth mode and 3840×2160 RGB beside the 15 fps wide/full mode; these are the highest synchronized combinations supported by the device. The archive rate remains independent, so high-resolution source RGB is retained only for selected production keyframes while tracking receives every aligned depth-rate frame.
+
+## Production trajectory
+
+For each take, the final pass prefers a complete validated live trajectory. If it is unavailable, it reruns RGB-D odometry from the archived frames. It then:
+
+- selects quality-spaced keyframes;
+- divides the trajectory into short overlapping fragments;
+- registers adjacent fragments with colored/geometric refinement;
+- retrieves a bounded set of nonlocal candidates;
+- accepts loop closures only after strict fitness, overlap, RMSE, color, and correction gates;
+- optimizes the fragment pose graph with uncertain loop edges;
+- rejects the optimized graph if its correction exceeds global safety limits;
+- interpolates rigid corrections smoothly over all camera poses.
+
+Separate takes are registered through global features followed by quality-gated colored ICP. An ambiguous take fails visibly instead of being fused at an arbitrary transform.
+
+## Point cloud
+
+Normal room-scale settings use weighted TSDF fusion. Fine spacing uses a memory-bounded voxel/surfel path so the GPU does not allocate a room-sized dense volume. The result is filtered, downsampled at the requested metric spacing, colored, and saved as binary PLY.
+
+## Triangle mesh
+
+The mesh is extracted from the same final CUDA/CPU TSDF used by the point output, so a combined point+mesh build does not fuse the room twice. Geometry uses every accepted depth keyframe; only atlas texturing is capped to 24 well-spaced calibrated RGB views. The surface is cleaned, simplified to a bounded triangle budget, welded, and indexed. Azure/Femto texturing uses calibrated native RGB whenever its bounded encoder produced the frame; a missing native image switches that frame to depth-aligned RGB with depth-camera calibration. Kinect always uses the SDK’s exact depth-aligned color rather than a hard-coded approximation of unavailable reusable color calibration:
+
+- project geometry through depth and RGB calibration;
+- reject occluded samples using metric depth;
+- compensate exposure between views;
+- weight by visibility and viewing angle;
+- bilinearly sample the frame’s calibrated RGB source;
+- pack padded triangle charts while sharing blended colors across common edges.
+
+Outputs are `room-mesh.obj`, `room-mesh.mtl`, and `room-texture.png`.
+
+## 2D Gaussian surface
+
+The splat target uses tangent-aligned 2D Gaussian discs rather than unconstrained volumetric blobs. Initial seeds come from the same metric keyframes and include local normals, anisotropic pixel footprints, and depth masks. Native Azure/Femto lens distortion is removed from RGB, reprojected depth, and masks before optimization so every training ray matches the pinhole 2DGS rasterizer. Training combines photometric, SSIM, robust expected-depth, normal, and Gaussian-distortion terms with bounded camera-pose refinement.
+
+For a 12 GB GPU, the canonical builder retains up to 600 views using camera-position, direction, roll, time, and take-boundary coverage, then projects metric depth and undistorts RGB directly onto a 720 px pinhole grid. Compact integer images remain in pinned host memory behind a four-frame LRU; shuffled views are scheduled in cache-local blocks and only the active view is transferred to CUDA. The trainer enforces a two-million-Gaussian hard ceiling at this VRAM tier. Densification stops before a single growth cycle could cross that ceiling, and checkpoints are exported atomically.
+
+The exported PLY is interoperable with 3DGS tooling by flattening the third scale axis. `room-splat.transform.json` records display conversion separately. This is the production surface-splat path; the conventional mesh remains the production triangle representation.
+
+## Failure policy
+
+- Queue pressure drops stale work instead of increasing latency.
+- Invalid tracking freezes fusion and increments rejection counters.
+- A broken journal falls back to offline odometry.
+- A failed loop-graph optimization falls back to the previously validated trajectory.
+- CUDA operation failure can fall back to the CPU Open3D path for point/mesh reconstruction.
+- 2DGS requires CUDA and reports a missing runtime instead of silently changing algorithms.
+- Raw schema-3 capture data is never deleted by reconstruction cancellation.
+
+## Benchmark gate
+
+Before changing thresholds, record a fixed suite with a short closed loop, blank walls, thin objects, reflective surfaces, rapid rotation, and one deliberate relocalization. Track:
+
+- accepted/rejected frames and relocalization time;
+- trajectory ATE/RPE when reference motion exists;
+- depth reprojection RMSE and overlap;
+- mesh accuracy, completeness, duplicate surfaces, and holes;
+- held-out RGB PSNR/SSIM and metric depth error for 2DGS;
+- tracking fps, extraction latency, queue drops, peak VRAM, and wall time.
+
+Production acceptance is metric first: no representation passes if its trajectory or depth residual fails, regardless of appearance quality.

@@ -110,13 +110,14 @@ IntegrationCallback = Callable[[int, bool], None]
 FallbackCallback = Callable[[str], None]
 
 
-def _legacy_tsdf(
+def _cpu_tsdf(
     o3d: Any,
     entries: Sequence[TsdfEntry],
     voxel_size_m: float,
     sdf_trunc_m: float,
     on_integrated: IntegrationCallback | None,
     already_reported: int = 0,
+    extract_mesh: bool = False,
 ) -> Any:
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=voxel_size_m,
@@ -151,7 +152,8 @@ def _legacy_tsdf(
         volume.integrate(rgbd, intrinsic, extrinsic)
         if on_integrated:
             on_integrated(entry_index, entry_index < already_reported)
-    return volume.extract_point_cloud()
+    cloud = volume.extract_point_cloud()
+    return (cloud, volume.extract_triangle_mesh()) if extract_mesh else cloud
 
 
 def _tensor_tsdf(
@@ -161,11 +163,12 @@ def _tensor_tsdf(
     sdf_trunc_m: float,
     backend: ComputeBackend,
     on_integrated: IntegrationCallback | None,
+    extract_mesh: bool = False,
 ) -> Any:
     assert backend.device is not None
     host = o3d.core.Device("CPU:0")
     # UInt16 weights and colors use the optimized Open3D kernels while keeping
-    # a 50k-block room volume comfortably inside a 16 GB GPU.
+    # a 50k-block room volume within the 12 GB laptop-GPU operating profile.
     volume = o3d.t.geometry.VoxelBlockGrid(
         attr_names=("tsdf", "weight", "color"),
         attr_dtypes=(
@@ -173,7 +176,7 @@ def _tensor_tsdf(
             o3d.core.Dtype.UInt16,
             o3d.core.Dtype.UInt16,
         ),
-        attr_channels=((1), (1), (3)),
+        attr_channels=((1,), (1,), (3,)),
         voxel_size=voxel_size_m,
         block_resolution=16,
         block_count=50_000,
@@ -216,7 +219,11 @@ def _tensor_tsdf(
         if on_integrated:
             on_integrated(entry_index, False)
     o3d.core.cuda.synchronize(backend.device)
-    return volume.extract_point_cloud(weight_threshold=1.0).cpu().to_legacy()
+    cloud = volume.extract_point_cloud(weight_threshold=1.0).cpu().to_legacy()
+    if not extract_mesh:
+        return cloud
+    mesh = volume.extract_triangle_mesh(weight_threshold=1.0).cpu().to_legacy()
+    return cloud, mesh
 
 
 def integrate_tsdf(
@@ -227,14 +234,17 @@ def integrate_tsdf(
     backend: ComputeBackend,
     on_integrated: IntegrationCallback | None = None,
     on_fallback: FallbackCallback | None = None,
+    *,
+    extract_mesh: bool = False,
 ) -> Any:
     if not backend.uses_cuda:
-        return _legacy_tsdf(
+        return _cpu_tsdf(
             o3d,
             entries,
             voxel_size_m,
             sdf_trunc_m,
             on_integrated,
+            extract_mesh=extract_mesh,
         )
     reported = 0
 
@@ -252,21 +262,23 @@ def integrate_tsdf(
             sdf_trunc_m,
             backend,
             track_reported,
+            extract_mesh=extract_mesh,
         )
     except RuntimeError as error:
         if on_fallback:
             on_fallback(str(error).splitlines()[0])
-        return _legacy_tsdf(
+        return _cpu_tsdf(
             o3d,
             entries,
             voxel_size_m,
             sdf_trunc_m,
             on_integrated,
             already_reported=reported,
+            extract_mesh=extract_mesh,
         )
 
 
-def _legacy_surfel_merge(
+def _cpu_surfel_merge(
     o3d: Any,
     entries: Sequence[TsdfEntry],
     voxel_size_m: float,
@@ -418,7 +430,7 @@ def merge_surfel_cloud(
 ) -> Any:
     """Build a fine-spaced cloud on CUDA, with the original CPU path as fallback."""
     if not backend.uses_cuda:
-        return _legacy_surfel_merge(o3d, entries, voxel_size_m, on_merged)
+        return _cpu_surfel_merge(o3d, entries, voxel_size_m, on_merged)
     reported = 0
 
     def track_reported(index: int, repeated: bool) -> None:
@@ -434,7 +446,7 @@ def merge_surfel_cloud(
     except RuntimeError as error:
         if on_fallback:
             on_fallback(str(error).splitlines()[0])
-        return _legacy_surfel_merge(
+        return _cpu_surfel_merge(
             o3d,
             entries,
             voxel_size_m,

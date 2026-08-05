@@ -14,7 +14,8 @@ import numpy as np
 from .calibration import project_rgb, world_from_depth_opencv
 from .io import (
     PhaseData,
-    effective_rgb_camera,
+    frame_rgb_camera,
+    frame_rgb_from_depth,
     load_color,
     load_depth,
     load_source_rgb,
@@ -32,7 +33,7 @@ MAX_MESH_TRIANGLES = int(os.environ.get("SCANLAN_MAX_MESH_TRIANGLES", "600000"))
 MAX_MESH_TRIANGLES = min(2_000_000, max(50_000, MAX_MESH_TRIANGLES))
 MAX_CHART_SIZE = 12
 CHART_PADDING = 2
-MESH_CACHE_VERSION = "fused-tsdf-hybrid-decimation-v1"
+MESH_CACHE_VERSION = "all-keyframe-shared-tsdf-v2"
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,7 @@ def _display_matrix(frame: PosedFrame) -> np.ndarray:
 
 
 def _camera_payload(frame: PosedFrame, textured: bool) -> dict[str, Any]:
-    camera = effective_rgb_camera(frame.source)
+    camera = frame_rgb_camera(frame.source.frames[frame.frame_index], frame.source)
     return {
         "phaseName": frame.phase_name,
         "phaseId": frame.phase_id,
@@ -251,66 +252,14 @@ def _weld_depth_meshes(
     return _remove_unreferenced_vertices(vertices.astype(np.float32), triangles)
 
 
-def _open3d_fused_mesh(
-    frames: list[PosedFrame],
-    voxel_size_m: float,
+def _prepare_fused_mesh(
+    o3d: Any,
+    mesh: Any,
+    mesh_voxel: float,
     progress: Callable[..., None] | None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    import open3d as o3d
+    """Clean and bound a legacy Open3D mesh extracted from any TSDF backend."""
 
-    mesh_voxel = max(float(voxel_size_m), MIN_MESH_VOXEL_SIZE)
-    volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=mesh_voxel,
-        sdf_trunc=max(mesh_voxel * 4.0, 0.03),
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor,
-    )
-    intrinsic_cache: dict[str, Any] = {}
-    for index, frame in enumerate(frames, start=1):
-        phase = frame.source
-        phase_key = str(phase.root)
-        intrinsic = intrinsic_cache.get(phase_key)
-        if intrinsic is None:
-            camera = phase.camera
-            intrinsic = o3d.camera.PinholeCameraIntrinsic(
-                camera.width,
-                camera.height,
-                camera.fx,
-                camera.fy,
-                camera.cx,
-                camera.cy,
-            )
-            intrinsic_cache[phase_key] = intrinsic
-        camera = phase.camera
-        depth = np.ascontiguousarray(load_depth(phase.frames[frame.frame_index], camera))
-        # Open3D requires an RGBD image even for a geometry-only TSDF.
-        color = np.ascontiguousarray(load_color(phase.frames[frame.frame_index], camera))
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            o3d.geometry.Image(color),
-            o3d.geometry.Image(depth),
-            depth_scale=camera.depth_scale,
-            depth_trunc=camera.max_depth_m,
-            convert_rgb_to_intensity=False,
-        )
-        world_from_camera = world_from_depth_opencv(frame.camera_to_global, frame.image_y_up)
-        volume.integrate(rgbd, intrinsic, np.linalg.inv(world_from_camera))
-        if progress:
-            progress(
-                "Meshing",
-                f"Fused depth keyframe {index} of {len(frames)}",
-                0,
-                None,
-                0.25 * index / len(frames),
-            )
-
-    if progress:
-        progress(
-            "Meshing",
-            "Extracting the fused TSDF surface",
-            0,
-            None,
-            0.28,
-        )
-    mesh = volume.extract_triangle_mesh()
     raw_triangle_count = len(mesh.triangles)
     if len(mesh.triangles) > MAX_MESH_TRIANGLES:
         # QEM directly on a multi-million-triangle marching-cubes mesh is the
@@ -379,6 +328,68 @@ def _open3d_fused_mesh(
     return vertices, triangles
 
 
+def _open3d_fused_mesh(
+    frames: list[PosedFrame],
+    voxel_size_m: float,
+    progress: Callable[..., None] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    import open3d as o3d
+
+    mesh_voxel = max(float(voxel_size_m), MIN_MESH_VOXEL_SIZE)
+    volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=mesh_voxel,
+        sdf_trunc=max(mesh_voxel * 4.0, 0.03),
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor,
+    )
+    intrinsic_cache: dict[str, Any] = {}
+    for index, frame in enumerate(frames, start=1):
+        phase = frame.source
+        phase_key = str(phase.root)
+        intrinsic = intrinsic_cache.get(phase_key)
+        if intrinsic is None:
+            camera = phase.camera
+            intrinsic = o3d.camera.PinholeCameraIntrinsic(
+                camera.width,
+                camera.height,
+                camera.fx,
+                camera.fy,
+                camera.cx,
+                camera.cy,
+            )
+            intrinsic_cache[phase_key] = intrinsic
+        camera = phase.camera
+        depth = np.ascontiguousarray(load_depth(phase.frames[frame.frame_index], camera))
+        # Open3D requires an RGBD image even for a geometry-only TSDF.
+        color = np.ascontiguousarray(load_color(phase.frames[frame.frame_index], camera))
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(color),
+            o3d.geometry.Image(depth),
+            depth_scale=camera.depth_scale,
+            depth_trunc=camera.max_depth_m,
+            convert_rgb_to_intensity=False,
+        )
+        world_from_camera = world_from_depth_opencv(frame.camera_to_global, frame.image_y_up)
+        volume.integrate(rgbd, intrinsic, np.linalg.inv(world_from_camera))
+        if progress:
+            progress(
+                "Meshing",
+                f"Fused depth keyframe {index} of {len(frames)}",
+                0,
+                None,
+                0.25 * index / len(frames),
+            )
+
+    if progress:
+        progress(
+            "Meshing",
+            "Extracting the fused TSDF surface",
+            0,
+            None,
+            0.28,
+        )
+    return _prepare_fused_mesh(o3d, volume.extract_triangle_mesh(), mesh_voxel, progress)
+
+
 def _fused_mesh(
     frames: list[PosedFrame],
     voxel_size_m: float,
@@ -426,8 +437,9 @@ def _bilinear_rgb(image: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray
 
 
 def _load_texture_image(frame: PosedFrame) -> np.ndarray:
-    image = load_source_rgb(frame.source.frames[frame.frame_index], frame.source)
-    camera = effective_rgb_camera(frame.source)
+    source_frame = frame.source.frames[frame.frame_index]
+    image = load_source_rgb(source_frame, frame.source)
+    camera = frame_rgb_camera(source_frame, frame.source)
     if image.shape[:2] == (camera.height, camera.width):
         return image
     from PIL import Image
@@ -477,10 +489,12 @@ def _sample_surface_colors(
     ):
         phase = frame.source
         camera = phase.camera
+        source_frame = phase.frames[frame.frame_index]
         image = _load_texture_image(frame)
-        depth_m = load_depth(phase.frames[frame.frame_index], camera).astype(np.float32)
+        depth_m = load_depth(source_frame, camera).astype(np.float32)
         depth_m /= camera.depth_scale
-        rgb_camera = effective_rgb_camera(phase)
+        rgb_camera = frame_rgb_camera(source_frame, phase)
+        rgb_from_depth = frame_rgb_from_depth(source_frame, phase)
         world_from_camera = world_from_depth_opencv(frame.camera_to_global, frame.image_y_up)
         camera_from_world = np.linalg.inv(world_from_camera)
         camera_center = world_from_camera[:3, 3]
@@ -516,7 +530,7 @@ def _sample_surface_colors(
             )
             residual = np.abs(observed - z)
 
-            rgb_points = camera_points @ phase.rgb_from_depth[:3, :3].T + phase.rgb_from_depth[:3, 3]
+            rgb_points = camera_points @ rgb_from_depth[:3, :3].T + rgb_from_depth[:3, 3]
             rgb_u, rgb_v, rgb_z = project_rgb(rgb_points, rgb_camera)
             in_rgb = (
                 in_depth
@@ -718,7 +732,9 @@ def _bake_triangle_atlas(
             if len(frame_triangles):
                 image = _load_texture_image(frame)
                 phase = frame.source
-                rgb_camera = effective_rgb_camera(phase)
+                source_frame = phase.frames[frame.frame_index]
+                rgb_camera = frame_rgb_camera(source_frame, phase)
+                rgb_from_depth = frame_rgb_from_depth(source_frame, phase)
                 world_from_camera = world_from_depth_opencv(
                     frame.camera_to_global,
                     frame.image_y_up,
@@ -753,8 +769,8 @@ def _bake_triangle_atlas(
                             + camera_from_world[:3, 3]
                         )
                         rgb_points = (
-                            camera_points @ phase.rgb_from_depth[:3, :3].T
-                            + phase.rgb_from_depth[:3, 3]
+                            camera_points @ rgb_from_depth[:3, :3].T
+                            + rgb_from_depth[:3, 3]
                         )
                         rgb_u, rgb_v, rgb_z = project_rgb(rgb_points, rgb_camera)
                         valid = (
@@ -777,7 +793,7 @@ def _bake_triangle_atlas(
             if progress:
                 progress(
                     "Texturing",
-                    f"Baked native RGB detail from keyframe {frame_index + 1} of {len(frames)}",
+                    f"Baked calibrated RGB detail from keyframe {frame_index + 1} of {len(frames)}",
                     0,
                     None,
                     0.75 + 0.20 * (frame_index + 1) / len(frames),
@@ -929,35 +945,71 @@ def build_mesh_artifacts(
     frames: list[PosedFrame],
     progress: Callable[..., None] | None = None,
     voxel_size_m: float = 0.015,
+    prebuilt_mesh: Any | None = None,
+    prebuilt_mesh_method: str | None = None,
 ) -> dict[str, bool | int | float | str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    selected = _select_texture_frames(frames)
-    selected_keys = {(frame.phase_id, frame.frame_index) for frame in selected}
+    texture_frames = _select_texture_frames(frames)
+    selected_keys = {(frame.phase_id, frame.frame_index) for frame in texture_frames}
     write_json(
         output_dir / "camera-poses.json",
         [_camera_payload(frame, (frame.phase_id, frame.frame_index) in selected_keys) for frame in frames],
     )
-    if not selected:
+    if not frames or not texture_frames:
         return {"cameraFrameCount": 0, "meshVertexCount": 0, "meshTriangleCount": 0}
 
     if progress:
         progress(
             "Meshing",
-            f"Fusing one continuous surface from {len(selected)} RGB-D keyframes",
+            f"Preparing one continuous surface from all {len(frames)} accepted depth keyframes",
             0,
             None,
             0.0,
         )
     mesh_voxel_size = max(float(voxel_size_m), MIN_MESH_VOXEL_SIZE)
-    cache_path = _mesh_cache_path(output_dir, selected, mesh_voxel_size)
+    cache_path = _mesh_cache_path(output_dir, frames, mesh_voxel_size)
     cached_mesh = _read_mesh_cache(cache_path)
     mesh_cache_hit = cached_mesh is not None
     if cached_mesh is None:
-        vertices, triangles, fusion_method = _fused_mesh(
-            selected,
-            voxel_size_m,
-            progress,
-        )
+        if prebuilt_mesh is not None:
+            try:
+                import open3d as o3d
+
+                if progress:
+                    progress(
+                        "Meshing",
+                        "Reusing the final reconstruction TSDF instead of fusing depth twice",
+                        0,
+                        None,
+                        0.28,
+                    )
+                vertices, triangles = _prepare_fused_mesh(
+                    o3d,
+                    prebuilt_mesh,
+                    mesh_voxel_size,
+                    progress,
+                )
+                fusion_method = prebuilt_mesh_method or "shared_tsdf"
+            except Exception as error:
+                if progress:
+                    progress(
+                        "Meshing",
+                        f"Shared TSDF surface unavailable; rebuilding geometry · {str(error).splitlines()[0]}",
+                        0,
+                        None,
+                        0.0,
+                    )
+                vertices, triangles, fusion_method = _fused_mesh(
+                    frames,
+                    voxel_size_m,
+                    progress,
+                )
+        else:
+            vertices, triangles, fusion_method = _fused_mesh(
+                frames,
+                voxel_size_m,
+                progress,
+            )
         _write_mesh_cache(cache_path, vertices, triangles, fusion_method)
     else:
         vertices, triangles, fusion_method = cached_mesh
@@ -981,7 +1033,7 @@ def build_mesh_artifacts(
         vertices,
         normals,
         triangles,
-        selected,
+        texture_frames,
         mesh_voxel_size,
         progress,
     )
@@ -989,12 +1041,12 @@ def build_mesh_artifacts(
         vertex_colors,
         triangles,
         vertices=vertices,
-        frames=selected,
+        frames=texture_frames,
         triangle_frames=triangle_frames,
         exposure_gains=exposure_gains,
         progress=progress,
     )
-    display_axes = np.asarray(selected[0].display_axes, dtype=np.float64)
+    display_axes = np.asarray(texture_frames[0].display_axes, dtype=np.float64)
     display_vertices = (vertices * display_axes).astype(np.float32)
     display_triangles = triangles.copy()
     display_uvs = uvs
@@ -1035,7 +1087,7 @@ def build_mesh_artifacts(
         )
     return {
         "cameraFrameCount": len(frames),
-        "textureFrameCount": len(selected),
+        "textureFrameCount": len(texture_frames),
         "meshVertexCount": vertex_count,
         "meshRenderVertexCount": render_vertex_count,
         "meshTextureVertexCount": triangle_count * 3,

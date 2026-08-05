@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import unittest
 
-import torch
+try:
+    import torch
 
-from scanlan_splat.pose import (
-    POSE_ROTATION_PARAMETER_LIMIT,
-    POSE_TRANSLATION_LIMIT_M,
-    constrain_pose_offsets_,
-    pose_correction_statistics,
-    pose_delta_matrix,
-    pose_regularization,
-)
+    from scanlan_splat.pose import (
+        POSE_ROTATION_PARAMETER_LIMIT,
+        POSE_TRANSLATION_LIMIT_M,
+        constrain_pose_offsets_,
+        pose_correction_statistics,
+        pose_delta_matrix,
+        pose_regularization,
+    )
+except ModuleNotFoundError:
+    torch = None
 
 
+@unittest.skipIf(torch is None, "PyTorch is not installed")
 class PoseRefinementTests(unittest.TestCase):
     def test_zero_offsets_are_identity_corrections(self) -> None:
         corrections = pose_delta_matrix(torch.zeros((2, 9), dtype=torch.float32))

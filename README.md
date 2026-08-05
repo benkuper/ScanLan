@@ -1,142 +1,161 @@
 # ScanLan
 
-ScanLan continuously previews a depth stream, records room-scale RGB-D captures in phases, and reconstructs them into a colored PLY point cloud plus an RGB-reprojected textured mesh. It supports Kinect v2, Azure Kinect DK, and Orbbec Femto Mega over USB or Ethernet.
+ScanLan is a Windows-first, realtime RGB-D reconstruction application for Kinect v2, Azure Kinect DK, and Orbbec Femto Mega. A capture can become three production outputs from one calibrated trajectory:
 
-## Current workflow
+- a metric colored point cloud (`PLY`);
+- a textured triangle mesh (`OBJ` + `MTL` + `PNG`);
+- a metric depth-aware 2D Gaussian surface (`3DGS-compatible PLY`).
 
-- Sensor discovery is manual: select **Capture profile → Available sensor → Scan sensors** when you are ready to connect. No hardware probes run in the background.
-- The preferred physical device is saved by serial number but is not opened at launch. If it is absent, scan and choose another supported sensor; a Femto Mega can also be added directly by network IP.
-- Kinect v2 is listed when its capture support is installed without probing or opening the camera. Its light and streams start only after Kinect v2 is explicitly selected.
-- Live depth/color points remain visible even when a phase is not being recorded. During capture, **Sensor frames**, **Live points**, and **Live mesh** modes choose between the raw camera view and an incrementally fused Open3D map.
-- Kinect v2 live fusion consumes Kinect Fusion poses. Azure Kinect and Femto Mega use incremental RGB-D odometry with their calibrated IMU rotation prior and prefer the bundled CUDA Open3D backend when available.
-- If continuity is lost, live fusion freezes and asks the operator to return to the last reconstructed surface. Gap frames are recorded but marked rejected in `live-frame-selection.csv`; the offline build automatically excludes them and resumes from frames accepted after tracking recovers.
-- Reconstruction reports its current stage, percent complete, point count, and estimated time remaining.
-- The viewer supports point size, opacity, color display, manual translation/rotation, and click-assisted floor alignment.
-- A chosen viewer pose can be applied to the exported PLY; the original is retained as `room-cloud.untransformed.ply`.
-- Reconstructed keyframe cameras can be overlaid as phase-colored frustums and trajectory lines in the result viewer.
-- Mesh export writes an OBJ/MTL/PNG bundle whose UVs reproject geometry into captured RGB images instead of reducing texture to vertex colors.
-- Export PLY opens a native Save As window and writes a Unity-ready copy with its X axis corrected; the project PLY remains unchanged.
+The application intentionally supports one workflow only: **Capture → Reconstruct → Inspect & export**. There is no image/video import path, alternate preview camera, browser capture mode, project migration layer, or compatibility pipeline. Project and capture manifests must use schema 3.
 
-There is no demo point cloud and no browser/mock capture path in the production app.
+## Design
 
-## Architecture
-
-```text
-Svelte / Three.js UI
-        | Tauri commands
-Rust session manager -------- project.json + phase folders
-        |                              |
-        +-- legacy-capture-worker.exe       +-- scanlan-worker.exe
-        |   Kinect v2 SDK + Fusion         Open3D / NumPy
-        +-- rgbd-capture-worker.exe        IMU-aided odometry + TSDF
-        |   Azure Kinect / Orbbec SDK
-        |                              |
-        +------------------------------+-- outputs/room-cloud.ply
-                                       +-- outputs/room-mesh.obj + .mtl + texture.png
-                                       +-- outputs/camera-poses.json
+```mermaid
+flowchart TD
+    Camera["RGB-D camera"] --> Capture["Native capture worker"]
+    Capture -->|"full sensor rate · SCANRGBD v1"| Tracker["Realtime tracker"]
+    Capture -->|"bounded archive queue"| Archive["Schema 3 capture"]
+    Tracker --> Live["In-memory points / mesh"]
+    Tracker --> Journal["Quality + pose journal"]
+    Archive --> Final["Production reconstruction"]
+    Journal --> Final
+    Final --> Outputs["Points · mesh · 2DGS"]
 ```
 
-Each native worker maps color into the active depth-camera view and writes the same sensor-neutral archive. IMU measurements are rotated into depth-camera coordinates before being saved. The final offline pass estimates the trajectory, aligns separate phases, produces the cleaned point cloud, and TSDF-fuses posed depth keyframes into one indexed surface. Native RGB from every visible texture view is exposure-, angle-, and occlusion-weighted into padded UV charts so neighboring faces retain matching edge colors.
+The sensor thread never waits for disk, JPEG compression, the UI, or TSDF extraction. Its stream and archive writers are bounded and latest-wins. If downstream work falls behind, stale frames are dropped, sequence gaps are counted, and latency stays bounded.
 
-## Supported sensors
+Realtime processing uses three independent stages:
 
-- **Kinect v2:** USB 3, Kinect for Windows SDK 2.0. This backend remains available but is optional when building for another sensor.
-- **Azure Kinect DK:** USB 3, Azure Kinect Sensor SDK 1.4.x. Supports narrow/wide depth FOV with unbinned or 2×2-binned capture, color-to-depth calibration, and the accelerometer/gyro.
-- **Orbbec Femto Mega:** USB or network, Orbbec SDK v2. Supports the same narrow/wide and unbinned/2×2-binned depth modes. The app automatically detects versioned installations under `C:\Program Files\OrbbecSDK*`; alternatively set `ORBBEC_SDK_ROOT`. Network mode accepts `IP` or `IP:PORT` and defaults to port 8090.
+1. decode and edge-aware depth-speckle rejection;
+2. persistent RGB-D odometry with an optional calibrated gyro prior, physical motion limits, metric overlap/RMSE gates, and recent-anchor relocalization;
+3. weighted TSDF integration with asynchronous point extraction and an optional 1 Hz mesh.
 
-Choose a discovered device in **Capture profile → Available sensor**, or choose **Orbbec Femto Mega · Network IP…** and enter `IP` or `IP:PORT`. The choice persists across projects and restarts. For Azure Kinect and Femto Mega, leave **Use IMU to aid tracking** enabled unless diagnosing an IMU problem. IMU input supplies a rotation prior; RGB-D odometry is always retried without that prior if it cannot converge.
+The compact `tracking.jsonl` journal feeds accepted live poses into the production pass. Explicit tracking rejections are excluded from reconstruction. The final pass then refines short trajectory fragments, verifies nonlocal loop candidates, globally optimizes a pose graph, registers separate takes, and rebuilds the selected outputs from archived calibrated RGB-D data.
 
-For Azure Kinect and Femto Mega, **Depth field of view** and **Depth binning** select NFOV/WFOV and unbinned/2×2-binned operation. The resulting modes are 640×576 at 30 fps, 320×288 at 30 fps, 1024×1024 at 15 fps, and 512×512 at 30 fps, respectively. **Maximum depth** can be set from 1.5 m through 8.0 m; samples beyond the selected limit are discarded.
+See [architecture](docs/architecture.md), [archive format](docs/scan-format.md), and [reconstruction details](docs/reconstruction.md).
 
-## One-line debug workflow
+## Camera support
 
-Install the SDK for at least one supported camera, Visual Studio C++ desktop tools, stable Rust/MSVC, Node.js 20+, and Python 3.10-3.12. Then connect the selected sensor.
+| Camera | Connection | Tracking pose/input | Notes |
+|---|---|---|---|
+| Kinect v2 | USB 3 | Kinect Fusion pose, validated again by ScanLan | Kinect for Windows SDK 2.0 |
+| Azure Kinect DK | USB 3 | RGB-D odometry + calibrated gyro prior | Azure Kinect Sensor SDK 1.4.x |
+| Orbbec Femto Mega | USB or Ethernet | RGB-D odometry + calibrated gyro prior | Orbbec SDK v2; network default port 8090 |
 
-After the initial `npm install`, everyday iteration is one command:
+Azure Kinect and Femto Mega expose these depth profiles:
+
+| FOV | Sampling | Depth size | Sensor rate |
+|---|---|---:|---:|
+| Narrow | Full | 640×576 | 30 fps |
+| Narrow | 2×2 binned | 320×288 | 30 fps |
+| Wide | Full | 1024×1024 | 15 fps |
+| Wide | 2×2 binned | 512×512 | 30 fps |
+
+Azure Kinect pairs 30 fps depth with its highest compatible 2048×1536 RGB mode. The 15 fps wide/full profile records 3840×2160 RGB. This avoids the unsupported 30 fps + 4K configuration while preserving maximum texture detail at each sensor rate.
+
+The archive rate is independent of the sensor/tracking rate. For example, a 10 fps archive still tracks a 30 fps camera stream.
+
+## Windows setup
+
+Install:
+
+- Visual Studio 2022 with **Desktop development with C++** and CMake;
+- Rust stable with the MSVC target;
+- Node.js 20 or newer;
+- Python 3.10–3.12 for the reconstruction worker;
+- the SDK for at least one supported camera.
+
+Then:
 
 ```powershell
+npm install
+npm run prepare:runtime
 npm run debug
 ```
 
-That command builds stale native/Python helpers, starts Tauri and Vite hot reload, bundles available camera runtimes beside their workers, and connects to the selected sensor. Running it a second time detects the active debug session instead of opening a duplicate.
+`prepare:runtime` builds both native capture executables. A camera SDK that is not installed produces a small unavailable-backend stub; it does not prevent other cameras from building. The command also packages the Open3D reconstruction worker.
 
-To build and launch the optimized app without creating an installer:
+For an optimized local build:
 
 ```powershell
 npm run release
 ```
 
-The capture and Open3D reconstruction workers are already release-built in both workflows, so release mode primarily optimizes the Tauri shell and serves the production frontend bundle. It is useful for checking end-to-end responsiveness without debug and hot-reload overhead.
+For the regular NSIS installer:
 
-## Reconstruction acceleration
+```powershell
+npm run tauri -- build
+```
 
-Reconstruction automatically uses a CUDA-enabled Open3D worker when one is bundled and falls back to the OpenMP CPU pipeline when CUDA is absent or an individual GPU operation is unavailable. The processing status shows the selected backend, and `outputs/result.json` records the backend, total processing time, and per-stage timings.
+## RTX 5080 / 12 GB setup
 
-Unchanged phases are cached under each scan's `outputs/cache` directory. Rebuilding the same scan reuses validated camera tracking, selected keyframes, and local phase fusion. The cache is derived data, is fingerprinted from the phase inputs and reconstruction settings, and is invalidated automatically when those inputs change.
-
-The stock Windows Open3D wheel is CPU-only. On an NVIDIA system, install CUDA Toolkit 12.8 or newer and then build the project-local CUDA worker:
+The stock Windows Open3D wheel is CPU-only. For Blackwell CUDA tracking and fusion, install CUDA Toolkit 12.8+ (CUDA 13.x is recommended), then build the project-local Open3D 0.19 wheel:
 
 ```powershell
 npm run prepare:runtime
 npm run prepare:cuda
 ```
 
-`prepare:cuda` builds Open3D 0.19 for the installed GPU architecture, places its wheel under `build/open3d-cuda-wheel`, and repackages `scanlan-worker.exe`. Subsequent `npm run debug` and `npm run release` commands discover that wheel automatically. Set `SCANLAN_DEVICE=cpu` before launching to force the CPU path while diagnosing a CUDA problem.
+The build targets compute capability 12.0 and repackages `scanlan-worker.exe`. Set `SCANLAN_DEVICE=cpu` before launching to diagnose the CPU path.
 
-For the quickest CPU build, use 10–15 mm point spacing. With CUDA, settings below 10 mm use a streaming GPU voxel map so fine-cloud fusion remains accelerated without allocating a room-scale TSDF. The legacy CPU fallback is still substantially slower at fine spacing. One millimetre is supported for maximum detail, but produces much larger clouds and takes longer to process and export.
-
-To create the Windows installer:
-
-```powershell
-npm run tauri -- build
-```
-
-### Optional Gaussian-splat runtime
-
-Gaussian splats use a separate Python 3.11/CUDA environment so CPU-only installations retain the existing capture, point-cloud, and mesh features without carrying PyTorch/gsplat dependencies.
+Depth-aware 2D Gaussian reconstruction is an isolated CUDA runtime. It requires Python 3.11 and builds gsplat for the installed GPU:
 
 ```powershell
 npm run prepare:splat
-```
-
-This command also downloads checksum-pinned, project-local FFmpeg and CUDA COLMAP runtimes; no global `PATH` setup is required. To prepare or validate only the photo/video tools, run `npm run prepare:media`.
-
-RGB-D reconstruction automatically prefers CUDA-enabled Open3D. Splat training requires CUDA and uses gsplat mixed precision, fused optimization, packed rasterization, and Splatfacto-style adaptive densification. The pinned PyTorch 2.12 CUDA 13 runtime supports the RTX 50-series/Blackwell path. Photo/video sources are extracted with FFmpeg, registered with CUDA COLMAP, trained into canonical 3DGS PLY, and displayed in the app's Splat preview mode.
-
-The regular installer stays CPU-friendly and omits this large optional environment. The complete CUDA runtime is too large for a reliable single-file NSIS installer, so the full build is packaged as a portable ZIP instead. To build it, run:
-
-```powershell
 npm run package:splat
 ```
 
-Extract `build/ScanLan-splat-portable.zip` and start `ScanLan.exe`; the splat worker, FFmpeg, and COLMAP are discovered beside the app without global installation.
+The result is `build/ScanLan-splat-portable.zip`. The 12 GB profile selects up to 600 pose-coverage-balanced views, builds their canonical pinhole RGB-D data directly at 720 px, keeps a four-frame pinned-host LRU, groups shuffled training views into cache-local blocks, transfers compact integer RGB-D buffers for only the active view, and hard-bounds adaptive growth at two million Gaussians. It does not preload an entire scan into VRAM or repeatedly decode native 2K/4K frames.
 
-## Capture guidance
+Recommended starting profile on the specified laptop:
 
-- Watch the tracking status. If it changes to searching/lost, return to the last textured area until it locks again.
-- Do not continue through a tracking warning: the displayed map is intentionally frozen, and those intervening frames are excluded from the clean offline input.
-- Move slowly and keep useful geometry inside the configured reliable depth range.
-- Start each additional phase while looking at textured geometry from an earlier phase.
-- Prefer corners, furniture, rocks, or marker boards over blank walls and flat ground.
-- Outdoors, scan at night, deep twilight, or in shade; direct sunlight can overwhelm infrared depth.
-- One millimetre is the minimum supported reconstruction spacing. Settings below 10 mm use memory-bounded surfel merging instead of a room-scale TSDF.
+- narrow/full depth at 30 fps for normal indoor scans;
+- 10–15 fps archive rate;
+- 8–12 mm fusion voxels for rooms, 5–8 mm for smaller objects;
+- live points while maximizing tracking headroom, or the 1 Hz live mesh when desired;
+- 30,000 2DGS iterations, increasing only after the trajectory and mesh are clean.
+
+## Capture practice
+
+- Move steadily and retain roughly 40–70% of the previous view.
+- When tracking searches, return to the last well-textured surface instead of continuing into unknown space.
+- Revisit the start before stopping; this gives the production pass a strong loop-closure opportunity.
+- Use corners, furniture, rocks, or temporary texture/marker boards around blank walls.
+- Keep reflective glass and direct sunlight out of the depth camera when possible.
+- Start a new take while viewing geometry already captured in the previous take.
+
+## Deterministic replay
+
+The reconstruction worker exposes the same versioned RGB-D protocol used by physical cameras:
+
+```powershell
+scanlan-worker.exe replay C:\Scans\Room\phases\<phase-id>
+scanlan-worker.exe realtime --session C:\Temp\scanlan-replay --mode mesh --voxel-size 0.01
+```
+
+`replay` emits archived raw RGB-D frames, including frames rejected by the original live run, so tracker changes can be evaluated from identical input. Unit tests cover binary framing, truncation, queue overload, pose round-trips, quality gates, relocalization, and engine geometry messages.
 
 ## Verification
 
 ```powershell
 npm run check
-cargo check --manifest-path src-tauri/Cargo.toml
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
 .\build\worker-venv\Scripts\python.exe -m unittest discover -s worker\tests -v
+.\splat-worker\.venv\Scripts\python.exe -m unittest discover -s splat-worker\tests -v
 ```
 
-Project layout:
+Native capture workers must also be compiled on Windows against their vendor SDKs; portable header tests cannot validate those SDK calls.
 
-- `src/` - Svelte application
-- `src-tauri/` - Rust state, storage, and worker orchestration
-- `native/kinect-capture/` - Kinect SDK v2 and Kinect Fusion worker
-- `native/modern-capture/` - Azure Kinect and Orbbec Femto Mega worker
-- `worker/` - Open3D/NumPy reconstruction
-- `splat-worker/` - isolated CUDA gsplat runtime, ScanLan depth-aware trainer, and media registration
-- `docs/scan-format.md` - scan archive format
+## Repository layout
 
-Licensed under the [GNU General Public License v3.0](LICENSE).
+- `src/` — focused Svelte UI and GPU viewer
+- `src-tauri/` — project state, process supervision, artifact jobs, and exports
+- `native/common/` — versioned stream, bounded archive, JPEG, and gyro utilities
+- `native/kinect-capture/` — Kinect v2 + Kinect Fusion capture
+- `native/modern-capture/` — Azure Kinect and Femto Mega capture
+- `worker/` — realtime and final Open3D/NumPy reconstruction
+- `splat-worker/` — isolated CUDA 2DGS trainer
+- `scripts/` — Windows build and packaging entry points
+
+Licensed under [GPL-3.0-only](LICENSE).

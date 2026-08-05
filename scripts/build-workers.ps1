@@ -92,13 +92,14 @@ if ($CudaWheel) {
       Select-Object -ExpandProperty FullName
   }
   $CudaRuntimeBin = $CudaRoots |
-    ForEach-Object { Join-Path $_ "bin/x64" } |
-    Where-Object { Test-Path (Join-Path $_ "cudart64_13.dll") } |
+    ForEach-Object { @((Join-Path $_ "bin/x64"), (Join-Path $_ "bin")) } |
+    Where-Object { @(Get-ChildItem -LiteralPath $_ -Filter "cudart64_*.dll" -File -ErrorAction SilentlyContinue).Count -gt 0 } |
     Select-Object -First 1
   if (-not $CudaRuntimeBin) {
-    throw "A CUDA wheel is present, but its CUDA 13 runtime DLL directory was not found."
+    throw "A CUDA wheel is present, but its CUDA 12/13 runtime DLL directory was not found."
   }
-  # CUDA 13 installs redistributable DLLs below bin/x64. Put it first so
+  # CUDA toolkits place redistributable DLLs below bin or bin/x64. Put the
+  # matching directory first so both CUDA 12.8 and CUDA 13 wheels package cleanly.
   # Open3D can load CUDA and PyInstaller can discover and embed dependencies.
   $env:PATH = $CudaRuntimeBin + [IO.Path]::PathSeparator + $env:PATH
 }
@@ -186,7 +187,7 @@ if ($NeedsWorkerBuild) {
   Write-Host "Reconstruction worker is up to date."
 }
 
-$KinectExe = Join-Path $KinectBuild "Release/legacy-capture-worker.exe"
+$KinectExe = Join-Path $KinectBuild "Release/kinect2-capture-worker.exe"
 $ModernCaptureExe = Join-Path $ModernCaptureBuild "Release/rgbd-capture-worker.exe"
 Write-Host "Kinect worker: $KinectExe"
 Write-Host "Azure Kinect / Femto Mega worker: $ModernCaptureExe"

@@ -19,6 +19,7 @@ class SplatSeedTests(unittest.TestCase):
 
         self.assertEqual(flat_cells, [(0, 0, 32, 32)])
         self.assertGreater(len(detailed_cells), len(flat_cells))
+        self.assertEqual(len(detailed_cells), len(set(detailed_cells)))
 
     def test_quadtree_does_not_bridge_depth_mask_boundaries(self) -> None:
         image = np.full((32, 32, 3), 128, dtype=np.uint8)

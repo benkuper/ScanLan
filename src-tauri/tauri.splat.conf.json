@@ -2,12 +2,10 @@
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
     "resources": {
-      "../build/kinect-capture/Release": "legacy",
+      "../build/kinect-capture/Release": "kinect2",
       "../build/modern-capture/Release": "modern",
       "../worker/dist/scanlan-worker.exe": "scanlan-worker.exe",
-      "../splat-worker/dist/scanlan-splat": "splat-runtime",
-      "../media-tools/ffmpeg": "media-tools/ffmpeg",
-      "../media-tools/colmap": "media-tools/colmap"
+      "../splat-worker/dist/scanlan-splat": "splat-runtime"
     }
   }
 }

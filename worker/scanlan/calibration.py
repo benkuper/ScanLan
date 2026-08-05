@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from .io import PhaseData, RgbCameraModel
+from .io import (
+    FrameRecord,
+    PhaseData,
+    RgbCameraModel,
+    frame_rgb_camera,
+    frame_rgb_from_depth,
+)
 
 
 def distort_normalized(
@@ -10,16 +16,119 @@ def distort_normalized(
     y: np.ndarray,
     camera: RgbCameraModel,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if camera.model in {"pinhole", "none"} or not camera.distortion:
+    if camera.model in {"pinhole", "none"}:
         return x, y
-    coefficients = (*camera.distortion, 0.0, 0.0, 0.0, 0.0, 0.0)
-    k1, k2, p1, p2, k3 = coefficients[:5]
+    if camera.model == "brown_conrady":
+        if not camera.distortion:
+            return x, y
+        coefficients = (*camera.distortion, 0.0, 0.0, 0.0, 0.0, 0.0)
+        k1, k2, p1, p2, k3 = coefficients[:5]
+        denominator = None
+    elif camera.model == "opencv_rational":
+        if len(camera.distortion) != 8:
+            raise ValueError("OpenCV rational calibration requires eight coefficients")
+        k1, k2, p1, p2, k3, k4, k5, k6 = camera.distortion
+        r2 = x * x + y * y
+        denominator = 1.0 + k4 * r2 + k5 * r2 * r2 + k6 * r2 * r2 * r2
+    else:
+        raise ValueError(f"Unsupported RGB lens model: {camera.model}")
     r2 = x * x + y * y
-    radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+    numerator = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+    radial = numerator if denominator is None else np.divide(
+        numerator,
+        denominator,
+        out=np.full_like(numerator, np.nan),
+        where=np.abs(denominator) > 1e-12,
+    )
     return (
         x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
         y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y,
     )
+
+
+def scaled_pinhole_camera(
+    camera: RgbCameraModel,
+    max_dimension: int,
+) -> RgbCameraModel:
+    if max_dimension <= 0:
+        raise ValueError("Pinhole output dimension must be positive")
+    scale = min(1.0, max_dimension / max(camera.width, camera.height))
+    width = max(1, round(camera.width * scale))
+    height = max(1, round(camera.height * scale))
+    scale_x = width / camera.width
+    scale_y = height / camera.height
+    return RgbCameraModel(
+        width,
+        height,
+        camera.fx * scale_x,
+        camera.fy * scale_y,
+        (camera.cx + 0.5) * scale_x - 0.5,
+        (camera.cy + 0.5) * scale_y - 0.5,
+        "pinhole",
+        (),
+    )
+
+
+def undistort_rgb_to_pinhole(
+    image: np.ndarray,
+    source_camera: RgbCameraModel,
+    target_camera: RgbCameraModel,
+    *,
+    tile_rows: int = 128,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resample calibrated RGB directly onto a target pinhole ray grid."""
+    image = np.asarray(image, dtype=np.uint8)
+    if image.shape != (source_camera.height, source_camera.width, 3):
+        raise ValueError("RGB dimensions must match their source calibration")
+    if target_camera.model != "pinhole" or target_camera.distortion:
+        raise ValueError("Undistortion output must use a pinhole camera")
+    if tile_rows <= 0:
+        raise ValueError("Undistortion tile size must be positive")
+    if source_camera == target_camera:
+        return image.copy(), np.ones(image.shape[:2], dtype=bool)
+
+    output_image = np.zeros(
+        (target_camera.height, target_camera.width, 3), dtype=np.uint8
+    )
+    output_valid = np.zeros((target_camera.height, target_camera.width), dtype=bool)
+    target_x = np.arange(target_camera.width, dtype=np.float32)[None, :]
+    normalized_x = (target_x - target_camera.cx) / target_camera.fx
+    for top in range(0, target_camera.height, tile_rows):
+        bottom = min(target_camera.height, top + tile_rows)
+        target_y = np.arange(top, bottom, dtype=np.float32)[:, None]
+        normalized_y = (target_y - target_camera.cy) / target_camera.fy
+        source_x, source_y = distort_normalized(
+            normalized_x, normalized_y, source_camera
+        )
+        source_u = source_camera.fx * source_x + source_camera.cx
+        source_v = source_camera.fy * source_y + source_camera.cy
+        valid = (
+            np.isfinite(source_u)
+            & np.isfinite(source_v)
+            & (source_u >= 0.0)
+            & (source_u <= source_camera.width - 1)
+            & (source_v >= 0.0)
+            & (source_v <= source_camera.height - 1)
+        )
+        safe_u = np.where(valid, source_u, 0.0)
+        safe_v = np.where(valid, source_v, 0.0)
+        x0 = np.floor(safe_u).astype(np.int32)
+        y0 = np.floor(safe_v).astype(np.int32)
+        x1 = np.minimum(x0 + 1, source_camera.width - 1)
+        y1 = np.minimum(y0 + 1, source_camera.height - 1)
+        wx = (safe_u - x0).astype(np.float32)
+        wy = (safe_v - y0).astype(np.float32)
+        sampled = (
+            image[y0, x0].astype(np.float32) * ((1.0 - wx) * (1.0 - wy))[..., None]
+            + image[y0, x1].astype(np.float32) * (wx * (1.0 - wy))[..., None]
+            + image[y1, x0].astype(np.float32) * ((1.0 - wx) * wy)[..., None]
+            + image[y1, x1].astype(np.float32) * (wx * wy)[..., None]
+        )
+        output_image[top:bottom][valid] = np.clip(
+            np.rint(sampled[valid]), 0, 255
+        ).astype(np.uint8)
+        output_valid[top:bottom] = valid
+    return output_image, output_valid
 
 
 def project_rgb(
@@ -55,40 +164,55 @@ def depth_camera_points(
 def rgb_depth_zbuffer(
     depth: np.ndarray,
     phase: PhaseData,
+    frame: FrameRecord | None = None,
+    output_camera: RgbCameraModel | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Reproject a depth image into the native RGB camera with nearest-depth collision handling."""
-    from .io import effective_rgb_camera
-
-    rgb_camera = effective_rgb_camera(phase)
+    """Reproject depth to RGB rays with nearest-depth collision handling."""
+    rgb_camera = frame_rgb_camera(frame, phase) if frame is not None else phase.rgb_camera
+    projection_camera = output_camera or rgb_camera
+    rgb_from_depth = frame_rgb_from_depth(frame, phase) if frame is not None else phase.rgb_from_depth
     depth_points, depth_valid, _ = depth_camera_points(depth, phase)
-    rgb_points = (phase.rgb_from_depth @ depth_points.T).T[:, :3]
-    u, v, z = project_rgb(rgb_points, rgb_camera)
-    ui = np.rint(u).astype(np.int64)
-    vi = np.rint(v).astype(np.int64)
+    rgb_points = (rgb_from_depth @ depth_points.T).T[:, :3]
+    source_u, source_v, z = project_rgb(rgb_points, rgb_camera)
+    u, v, _ = project_rgb(rgb_points, projection_camera)
+    finite_projection = np.isfinite(u) & np.isfinite(v)
+    ui = np.rint(np.where(finite_projection, u, 0.0)).astype(np.int64)
+    vi = np.rint(np.where(finite_projection, v, 0.0)).astype(np.int64)
     projected = (
         (z > 0.0)
-        & np.isfinite(u)
-        & np.isfinite(v)
+        & finite_projection
         & (ui >= 0)
-        & (ui < rgb_camera.width)
+        & (ui < projection_camera.width)
         & (vi >= 0)
-        & (vi < rgb_camera.height)
+        & (vi < projection_camera.height)
     )
-    zbuffer = np.full(rgb_camera.width * rgb_camera.height, np.inf, dtype=np.float64)
-    flat = vi[projected] * rgb_camera.width + ui[projected]
+    zbuffer = np.full(
+        projection_camera.width * projection_camera.height,
+        np.inf,
+        dtype=np.float64,
+    )
+    flat = vi[projected] * projection_camera.width + ui[projected]
     np.minimum.at(zbuffer, flat, z[projected])
-    zbuffer = zbuffer.reshape(rgb_camera.height, rgb_camera.width)
+    zbuffer = zbuffer.reshape(projection_camera.height, projection_camera.width)
     zbuffer[~np.isfinite(zbuffer)] = 0.0
 
     uv_map = np.full((*depth.shape, 2), np.nan, dtype=np.float32)
     visibility = np.zeros(depth.shape, dtype=bool)
     valid_indices = np.flatnonzero(depth_valid)
-    uv_map.reshape(-1, 2)[valid_indices, 0] = u.astype(np.float32)
-    uv_map.reshape(-1, 2)[valid_indices, 1] = v.astype(np.float32)
+    uv_map.reshape(-1, 2)[valid_indices, 0] = source_u.astype(np.float32)
+    uv_map.reshape(-1, 2)[valid_indices, 1] = source_v.astype(np.float32)
     accepted = np.zeros(len(z), dtype=bool)
     accepted[projected] = (
         np.abs(z[projected] - zbuffer[vi[projected], ui[projected]])
         <= np.maximum(0.015, z[projected] * 0.006)
+    )
+    accepted &= (
+        np.isfinite(source_u)
+        & np.isfinite(source_v)
+        & (source_u >= 0.0)
+        & (source_u <= rgb_camera.width - 1)
+        & (source_v >= 0.0)
+        & (source_v <= rgb_camera.height - 1)
     )
     visibility.reshape(-1)[valid_indices] = accepted
     return zbuffer.astype(np.float32), uv_map, visibility

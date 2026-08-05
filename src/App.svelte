@@ -1,10 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { open, save } from '@tauri-apps/plugin-dialog';
-  import * as THREE from 'three';
+  import { save } from '@tauri-apps/plugin-dialog';
   import PointCloudPreview from './lib/components/PointCloudPreview.svelte';
   import {
-    applyCloudTransform,
     artifactJobStatus,
     availableSensors,
     cancelArtifactJob,
@@ -15,16 +13,13 @@
     exportGaussianSplat,
     exportPly,
     exportTexturedMesh,
-    importMediaSource,
     latestArtifactJob,
-    loadCameraFrames,
     loadGaussianSplat,
     loadLivePreviewFrame,
     loadLiveReconstructionMesh,
     loadPreview,
     loadPreviewMesh,
     removeCapture,
-    removeMediaSource,
     resumeArtifactJob,
     runtimeInfo,
     startArtifactJob,
@@ -36,2017 +31,953 @@
     ArtifactJob,
     ArtifactTarget,
     AvailableSensor,
-    CameraFrame,
     CaptureSettings,
     CaptureStatus,
-    CloudTransform,
     DepthFieldOfView,
+    LiveReconstructionMode,
     MeshViewMode,
     PackedPreviewFrame,
     PreviewMesh,
     PreviewPoint,
     ProjectSummary,
-    ReconstructionProgress,
-    RuntimeInfo
+    RuntimeInfo,
+    SensorKind
   } from './lib/types';
+
+  type Workspace = 'capture' | 'reconstruct' | 'inspect';
+  type RenderMode = 'points' | 'mesh' | 'splat';
 
   let project: ProjectSummary | null = null;
   let sensor: CaptureStatus | null = null;
-  let reconstruction: ReconstructionProgress | null = null;
-  let activeJob: ArtifactJob | null = null;
   let runtime: RuntimeInfo | null = null;
-  let sensorChoices: AvailableSensor[] = [];
-  let selectedSensorOption = '';
-  let discoveryInFlight = false;
-  let sensorSessionEnabled = false;
-  let previewPoints: PreviewPoint[] = [];
-  let previewMesh: PreviewMesh | null = null;
-  let previewSplat: Uint8Array | null = null;
-  let splatPreviewError = '';
-  let splatPreviewLoading = false;
-  let previewAssetLoading: 'points' | 'mesh' | 'splat' | null = null;
-  let splatPreviewInFlight = false;
-  let lastSplatPreviewPoll = 0;
-  let lastSplatPreviewSignature = '';
-  let liveSplatUpdatedAt: number | null = null;
-  let packedPreviewFrame: PackedPreviewFrame | null = null;
-  let cameraFrames: CameraFrame[] = [];
-  let busy = false;
-  let connecting = false;
-  let initializationError = '';
-  let statusTimer: number | undefined;
-  let previewTimer: number | undefined;
-  let settingsSaveTimer: number | undefined;
-  let statusInFlight = false;
-  let previewInFlight = false;
-  let lastPreviewFrame = 0;
-  let lastPreviewArrival = 0;
-  let previewFps = 0;
-  let lastLiveMeshFrame = 0;
-  let lastLiveMeshPoll = 0;
-  let lastStatusPoll = 0;
-  let message = 'Select Scan sensors when you are ready to connect a depth sensor.';
-  type WorkspaceMode = 'device' | 'capture' | 'media' | 'process' | 'render' | 'export';
-  const workflowModes: { id: WorkspaceMode; step: string; label: string; description: string }[] = [
-    { id: 'device', step: '01', label: 'Input device', description: 'Connect & calibrate' },
-    { id: 'capture', step: '02', label: 'Capture', description: 'Record RGB-D phases' },
-    { id: 'media', step: '03', label: 'Media', description: 'Review all inputs' },
-    { id: 'process', step: '04', label: 'Process', description: 'Build 3D artifacts' },
-    { id: 'render', step: '05', label: 'Edit', description: 'Inspect & adjust' },
-    { id: 'export', step: '06', label: 'Export', description: 'Choose deliverables' }
-  ];
-  let workspaceMode: WorkspaceMode = 'device';
-  let viewMode: 'live' | 'preview' = 'live';
-  let previewRenderMode: 'points' | 'mesh' | 'splat' = 'points';
+  let sensors: AvailableSensor[] = [];
+  let activeJob: ArtifactJob | null = null;
+  let workspace: Workspace = 'capture';
+  let renderMode: RenderMode = 'points';
   let meshViewMode: MeshViewMode = 'surface';
-  let lightDirection: [number, number, number] = [0.45, 0.8, 0.35];
-  let lightEditMode = false;
+
+  let previewPoints: PreviewPoint[] = [];
+  let packedPreviewFrame: PackedPreviewFrame | null = null;
+  let previewMesh: PreviewMesh | null = null;
+  let liveMesh: PreviewMesh | null = null;
+  let previewSplat: Uint8Array | null = null;
+  let assetLoading: RenderMode | null = null;
+
   let buildPointCloud = true;
   let buildTexturedMesh = true;
   let buildGaussianSplat = false;
   let splatIterations = 30_000;
-  let sourceMode: 'rgbd' | 'media' = 'rgbd';
-  let selectedMediaSourceIds: string[] = [];
 
-  let pointSize = 0.034;
-  let pointOpacity = 0.92;
-  let showColors = true;
-  let showCameraFrames = false;
-  let floorPickMode = false;
-  let editMode = false;
-  let anchorPickMode = false;
-  let gizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
-  let gizmoAnchor: [number, number, number] | null = null;
-  let cloudTransform: CloudTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
-  const identityTransform: CloudTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
-  let loadedResultPreviewSignature = '';
-  let resultPreviewRequest: { signature: string; promise: Promise<void> } | null = null;
+  let busy = false;
+  let discovering = false;
+  let statusInFlight = false;
+  let geometryInFlight = false;
+  let resultInFlight = false;
+  let message = 'Initializing the RGB-D engine…';
+  let fatalError = '';
+  let statusTimer: number | undefined;
+  let settingsTimer: number | undefined;
+  let settingsRevision = 0;
+  let selectingSensor = false;
+  let lastPreviewFrame = 0;
+  let lastMeshFrame = 0;
+  let lastBuildPreviewAt = 0;
+  let completedJobId = '';
 
-  const transformStorageKey = (projectId: string) => `scanlan-cloud-transform:${projectId}`;
-  const sourceModeStorageKey = (projectId: string) => `scanlan-source-mode:${projectId}`;
-  const workspaceModeStorageKey = (projectId: string) => `scanlan-workspace-mode:${projectId}`;
-  const visualizationStorageKey = 'scanlan-visualization-preferences';
+  let capturing = false;
+  let processing = false;
+  let completedCaptures = 0;
+  let totalFrames = 0;
+  let readyArtifacts = 0;
+  let viewerRenderMode: RenderMode = 'points';
+  let viewerMesh: PreviewMesh | null = null;
+  let viewerPackedFrame: PackedPreviewFrame | null = null;
+  let currentSensorKey = '';
 
-  function loadVisualizationPreferences() {
-    const stored = localStorage.getItem(visualizationStorageKey);
-    if (!stored) return;
-    try {
-      const value = JSON.parse(stored) as Partial<{
-        pointSize: number;
-        pointOpacity: number;
-        showColors: boolean;
-        showCameraFrames: boolean;
-        previewRenderMode: 'points' | 'mesh' | 'splat';
-        meshViewMode: MeshViewMode;
-        lightDirection: [number, number, number];
-        gizmoMode: 'translate' | 'rotate' | 'scale';
-      }>;
-      if (typeof value.pointSize === 'number') pointSize = value.pointSize;
-      if (typeof value.pointOpacity === 'number') pointOpacity = value.pointOpacity;
-      if (typeof value.showColors === 'boolean') showColors = value.showColors;
-      if (typeof value.showCameraFrames === 'boolean') showCameraFrames = value.showCameraFrames;
-      if (value.previewRenderMode === 'points' || value.previewRenderMode === 'mesh' || value.previewRenderMode === 'splat') {
-        previewRenderMode = value.previewRenderMode;
-      }
-      if (value.meshViewMode === 'surface' || value.meshViewMode === 'surface-wireframe' || value.meshViewMode === 'wireframe' || value.meshViewMode === 'shaded') {
-        meshViewMode = value.meshViewMode;
-      }
-      if (Array.isArray(value.lightDirection) && value.lightDirection.length === 3 && value.lightDirection.every((component) => typeof component === 'number' && Number.isFinite(component))) {
-        const [x, y, z] = value.lightDirection;
-        if (Math.hypot(x, y, z) > 0.0001) lightDirection = [x, y, z];
-      }
-      if (value.gizmoMode === 'translate' || value.gizmoMode === 'rotate' || value.gizmoMode === 'scale') {
-        gizmoMode = value.gizmoMode;
-      }
-    } catch {
-      localStorage.removeItem(visualizationStorageKey);
-    }
+  $: capturing = Boolean(sensor?.capturing);
+  $: processing = Boolean(activeJob && ['queued', 'running', 'cancelling'].includes(activeJob.status));
+  $: completedCaptures = project?.phases.filter((capture) => capture.status === 'complete').length ?? 0;
+  $: totalFrames = project?.phases.reduce((sum, capture) => sum + capture.frameCount, 0) ?? 0;
+  $: readyArtifacts = project
+    ? Object.values(project.artifacts).filter((artifact) => artifact && !artifact.stale && artifact.status === 'ready').length
+    : 0;
+  $: viewerRenderMode = capturing
+    ? project?.settings.liveReconstruction === 'mesh' ? 'mesh' : 'points'
+    : renderMode;
+  $: viewerMesh = capturing ? liveMesh : previewMesh;
+  $: viewerPackedFrame = capturing ? packedPreviewFrame : null;
+  $: currentSensorKey = project ? configuredSensorKey(project.settings) : '';
+
+  function errorText(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 
-  function persistVisualizationPreferences() {
-    localStorage.setItem(visualizationStorageKey, JSON.stringify({ pointSize, pointOpacity, showColors, showCameraFrames, previewRenderMode, meshViewMode, lightDirection, gizmoMode }));
+  function formatCount(value: number | undefined): string {
+    if (!value) return '0';
+    return new Intl.NumberFormat('en', { notation: value >= 100_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value);
   }
 
-  const scheduleVisualizationSave = () => queueMicrotask(persistVisualizationPreferences);
-  const scheduleProjectSettingsSave = () => queueMicrotask(queueProjectSettingsSave);
-
-  function setGizmoMode(mode: 'translate' | 'rotate' | 'scale') {
-    gizmoMode = mode;
-    lightEditMode = false;
-    anchorPickMode = false;
-    persistVisualizationPreferences();
+  function formatDuration(seconds: number | undefined): string {
+    if (!seconds) return '0s';
+    const minutes = Math.floor(seconds / 60);
+    const remainder = Math.round(seconds % 60);
+    return minutes ? `${minutes}m ${remainder}s` : `${remainder}s`;
   }
 
-  function isTextEntryTarget(target: EventTarget | null) {
-    if (!(target instanceof HTMLElement)) return false;
-    return target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName);
+  function artifactReady(target: ArtifactTarget): boolean {
+    const artifact = project?.artifacts[target];
+    return Boolean(artifact && artifact.status === 'ready' && !artifact.stale);
   }
 
-  function handlePreviewShortcut(event: KeyboardEvent) {
-    if (viewMode !== 'preview' || event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey) return;
-
-    if (event.key === 'Escape') {
-      if (!editMode && !lightEditMode) return;
-      event.preventDefault();
-      editMode = false;
-      lightEditMode = false;
-      anchorPickMode = false;
-      return;
-    }
-
-    if (!canEdit || event.repeat || isTextEntryTarget(event.target)) return;
-    const mode = {
-      w: 'translate',
-      e: 'rotate',
-      r: 'scale'
-    }[event.key.toLowerCase()] as 'translate' | 'rotate' | 'scale' | undefined;
-    if (!mode) return;
-
-    event.preventDefault();
-    floorPickMode = false;
-    editMode = true;
-    setGizmoMode(mode);
+  function inputValue(event: Event): string {
+    return (event.currentTarget as HTMLInputElement | HTMLSelectElement).value;
   }
 
-  function setPreviewRenderMode(mode: 'points' | 'mesh' | 'splat') {
-    previewRenderMode = mode;
-    if (mode !== 'mesh') lightEditMode = false;
-    if (mode === 'splat') {
-      floorPickMode = false;
-      anchorPickMode = false;
-      editMode = false;
-    }
-    persistVisualizationPreferences();
+  function inputChecked(event: Event): boolean {
+    return (event.currentTarget as HTMLInputElement).checked;
   }
 
-  function setMeshViewMode(mode: MeshViewMode) {
-    meshViewMode = mode;
-    if (mode !== 'shaded') lightEditMode = false;
-    persistVisualizationPreferences();
-  }
-
-  function updateLightDirection(axis: number, value: number) {
-    if (!Number.isFinite(value)) return;
-    const next = [...lightDirection] as [number, number, number];
-    next[axis] = value;
-    if (Math.hypot(...next) < 0.0001) return;
-    lightDirection = next;
-    scheduleVisualizationSave();
-  }
-
-  function handleLightDirectionChanged(direction: [number, number, number]) {
-    lightDirection = direction.map((component) => Number(component.toFixed(4))) as [number, number, number];
-    scheduleVisualizationSave();
-  }
-
-  function resetLightDirection() {
-    lightDirection = [0.45, 0.8, 0.35];
-    persistVisualizationPreferences();
-  }
-
-  function toggleLightEdit() {
-    lightEditMode = !lightEditMode;
-    editMode = false;
-    floorPickMode = false;
-    anchorPickMode = false;
-    message = lightEditMode ? 'Drag the light gizmo to change the shaded mesh lighting.' : 'Light direction updated.';
-  }
-
-  async function selectSplatPreview() {
-    const artifact = project?.artifacts.gaussianSplat;
-    if (previewSplat) {
-      setPreviewRenderMode('splat');
-      return;
-    }
-    if (processing || !project || !artifact || artifact.stale) {
-      message = processing && activeBuildIncludesSplat
-        ? splatPreviewError || (gaussianTrainingStage
-          ? 'Gaussian training is active. Waiting for the trainer to publish its first live snapshot.'
-          : 'The Gaussian preview becomes available when the build reaches its training stage.')
-        : splatPreviewLoading
-        ? 'The compact Gaussian preview is still decoding and uploading to the GPU.'
-        : splatPreviewError || (artifact?.stale
-        ? 'The Gaussian splat is stale. Train it again before previewing.'
-        : artifact
-          ? 'The Gaussian splat could not be loaded. Rebuild it and try again.'
-          : 'No Gaussian splat artifact exists yet. Choose Gaussian splat below, then select Train Gaussian splat.');
-      return;
-    }
-    setPreviewRenderMode('splat');
-    previewAssetLoading = 'splat';
-    splatPreviewLoading = true;
-    splatPreviewError = '';
-    message = 'Loading the optimized Gaussian preview…';
-    try {
-      const nextSplat = await loadGaussianSplat(project.path);
-      previewSplat = nextSplat;
-      lastSplatPreviewSignature = splatPreviewSignature(nextSplat);
-    } catch (error) {
-      splatPreviewError = error instanceof Error ? error.message : String(error);
-      message = splatPreviewError;
-    } finally {
-      splatPreviewLoading = false;
-      if (previewAssetLoading === 'splat') previewAssetLoading = null;
-    }
-  }
-
-  async function selectMeshPreview() {
-    if (previewMesh) {
-      setPreviewRenderMode('mesh');
-      return;
-    }
-    if (!project?.meshOutputPath || previewAssetLoading === 'mesh') return;
-    setPreviewRenderMode('mesh');
-    previewAssetLoading = 'mesh';
-    message = 'Loading the optimized mesh preview…';
-    try {
-      previewMesh = await loadPreviewMesh(project.path);
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      if (previewAssetLoading === 'mesh') previewAssetLoading = null;
-    }
-  }
-
-  function setSourceMode(mode: 'rgbd' | 'media') {
-    sourceMode = mode;
-    if (project) localStorage.setItem(sourceModeStorageKey(project.id), mode);
-    if (mode === 'media') {
-      buildPointCloud = false;
-      buildTexturedMesh = false;
-      buildGaussianSplat = true;
-      message = 'Photos / video selected. Gaussian splat training is enabled.';
-    }
-    if (viewMode === 'preview' && !processing) void refreshResultPreview();
-  }
-
-  function storeWorkspaceMode(mode: WorkspaceMode) {
-    workspaceMode = mode;
-    if (project) localStorage.setItem(workspaceModeStorageKey(project.id), mode);
-  }
-
-  async function selectWorkspaceMode(mode: WorkspaceMode) {
-    if (capturing && mode !== 'capture') {
-      message = 'Stop the active capture phase before changing workspace.';
-      return;
-    }
-    if (processing && mode !== 'process' && mode !== 'render') {
-      message = 'While a build is running, use Process for job progress or Edit for the live 3D result.';
-      return;
-    }
-
-    storeWorkspaceMode(mode);
-    if (mode === 'device' || mode === 'capture') {
-      if (mode === 'capture') setSourceMode('rgbd');
-      await showView('live');
-    } else if (mode === 'media') {
-      setSourceMode('media');
-    } else if (mode === 'process') {
-      if (completedPhases === 0 && hasMediaSources) setSourceMode('media');
-      else if (!hasMediaSources && completedPhases > 0) setSourceMode('rgbd');
-    } else if (mode === 'render' && processing) {
-      viewMode = 'preview';
-      if (previewSplat) previewRenderMode = 'splat';
-      message = previewSplat
-        ? 'Showing the latest Gaussian snapshot published by the active trainer.'
-        : 'Edit is following the active build. The Gaussian view will appear as soon as the trainer publishes its first snapshot.';
-    } else if (project?.processingStatus === 'complete') {
-      await showView('preview');
-    } else {
-      message = mode === 'export'
-        ? 'Build at least one artifact before exporting.'
-        : 'Build an artifact first, then return here to inspect it.';
-    }
-  }
-
-  function workflowBadge(mode: WorkspaceMode) {
-    if (!project) return '';
-    if (mode === 'device') return sensor?.sensorConnected ? 'Connected' : sensorSessionEnabled ? 'Needs attention' : 'Not connected';
-    if (mode === 'capture') return `${completedPhases} phase${completedPhases === 1 ? '' : 's'}`;
-    if (mode === 'media') {
-      const mediaItemCount = completedPhases + project.mediaSources.length;
-      return `${mediaItemCount} item${mediaItemCount === 1 ? '' : 's'}`;
-    }
-    if (mode === 'process') return processing ? `${Math.round(overallBuildProgress * 100)}%` : canBuildArtifacts ? 'Ready' : 'Needs input';
-    if (mode === 'render') {
-      if (processing) return previewSplat ? `${Math.floor(previewSplat.byteLength / 32).toLocaleString()} live` : previewPoints.length > 0 ? 'Live points' : 'Waiting';
-      return artifactCount > 0 ? `${artifactCount} view${artifactCount === 1 ? '' : 's'}` : 'No model';
-    }
-    return exportCount > 0 ? `${exportCount} ready` : 'No output';
-  }
-
-  function pointCloudCenter(source: PreviewPoint[]): [number, number, number] {
-    if (source.length === 0) return [0, 0, 0];
-    const minimum = [...source[0].position];
-    const maximum = [...source[0].position];
-    for (let index = 1; index < source.length; index += 1) {
-      const position = source[index].position;
-      for (let axis = 0; axis < 3; axis += 1) {
-        minimum[axis] = Math.min(minimum[axis], position[axis]);
-        maximum[axis] = Math.max(maximum[axis], position[axis]);
-      }
-    }
-    return [
-      (minimum[0] + maximum[0]) / 2,
-      (minimum[1] + maximum[1]) / 2,
-      (minimum[2] + maximum[2]) / 2
-    ];
-  }
-
-  function isPoint(value: unknown): value is [number, number, number] {
-    return Array.isArray(value) && value.length === 3 && value.every((entry) => typeof entry === 'number' && Number.isFinite(entry));
-  }
-
-  async function saveProjectSettingsNow(path: string, settings: CaptureSettings) {
-    try {
-      const saved = await updateProjectSettings(path, settings);
-      if (project?.id === saved.id) project = saved;
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  function queueProjectSettingsSave() {
+  function updateSetting<K extends keyof CaptureSettings>(key: K, value: CaptureSettings[K]): void {
     if (!project || capturing || processing) return;
-    const path = project.path;
-    const settings = { ...project.settings };
-    if (settingsSaveTimer !== undefined) window.clearTimeout(settingsSaveTimer);
-    settingsSaveTimer = window.setTimeout(() => {
-      settingsSaveTimer = undefined;
-      void saveProjectSettingsNow(path, settings);
-    }, 120);
+    project = { ...project, settings: { ...project.settings, [key]: value } };
+    settingsRevision += 1;
+    const revision = settingsRevision;
+    if (settingsTimer) window.clearTimeout(settingsTimer);
+    settingsTimer = window.setTimeout(() => {
+      settingsTimer = undefined;
+      void persistSettings(revision);
+    }, 250);
   }
 
-  function setCaptureFps(fps: number) {
-    if (!project) return;
-    project = { ...project, settings: { ...project.settings, captureFps: fps } };
-    queueProjectSettingsSave();
+  async function persistSettings(revision = settingsRevision, refreshRuntime = false): Promise<boolean> {
+    if (!project || capturing || processing) return false;
+    const snapshot = project;
+    try {
+      const saved = await updateProjectSettings(snapshot.path, snapshot.settings);
+      if (revision === settingsRevision) {
+        project = saved;
+        if (refreshRuntime) runtime = await runtimeInfo().catch(() => runtime);
+      }
+      return true;
+    } catch (error) {
+      message = errorText(error);
+      return false;
+    }
   }
 
-  function setLiveReconstruction(liveReconstruction: 'off' | 'points' | 'mesh') {
-    if (!project) return;
-    project = { ...project, settings: { ...project.settings, liveReconstruction } };
-    queueProjectSettingsSave();
+  function sensorKey(candidate: AvailableSensor): string {
+    return [candidate.kind, candidate.id, candidate.connection, candidate.address].join('|');
   }
 
-  function setDepthFieldOfView(depthFieldOfView: DepthFieldOfView) {
-    if (!project) return;
-    project = { ...project, settings: { ...project.settings, depthFieldOfView } };
-    queueProjectSettingsSave();
+  function configuredSensorKey(settings: CaptureSettings): string {
+    return [settings.sensorKind, settings.sensorId, settings.sensorConnection, settings.sensorAddress].join('|');
   }
 
-  function setDepthBinned(depthBinned: boolean) {
-    if (!project) return;
-    project = { ...project, settings: { ...project.settings, depthBinned } };
-    queueProjectSettingsSave();
-  }
-
-  const networkFemtoOption = '__network_femto__';
-
-  function configuredSensorOption(settings: CaptureSettings) {
-    if (settings.sensorConnection === 'network') return networkFemtoOption;
-    return settings.sensorId || `${settings.sensorKind}:default`;
-  }
-
-  function sensorOptionLabel(choice: AvailableSensor) {
-    const connection = choice.connection === 'network' ? choice.address || 'Network' : 'USB';
-    const identity = choice.serial ? ` · ${choice.serial}` : '';
-    return `${choice.name} · ${connection}${identity}`;
-  }
-
-  function applySensorChoice(choice: AvailableSensor) {
-    if (!project) return false;
-    const useImu = choice.supportsImu ? project.settings.useImu || project.settings.sensorKind === 'kinect_v2' : false;
-    const next = {
+  function settingsForSensor(candidate: AvailableSensor): CaptureSettings {
+    if (!project) throw new Error('No active project');
+    const changingFamily = project.settings.sensorKind !== candidate.kind;
+    return {
       ...project.settings,
-      sensorId: choice.id,
-      sensorKind: choice.kind,
-      sensorConnection: choice.connection,
-      sensorAddress: choice.address,
-      useImu
+      sensorKind: candidate.kind,
+      sensorId: candidate.id,
+      sensorConnection: candidate.connection,
+      sensorAddress: candidate.address,
+      useImu: candidate.supportsImu && (changingFamily ? true : project.settings.useImu)
     };
-    const changed = next.sensorId !== project.settings.sensorId
-      || next.sensorKind !== project.settings.sensorKind
-      || next.sensorConnection !== project.settings.sensorConnection
-      || next.sensorAddress !== project.settings.sensorAddress
-      || next.useImu !== project.settings.useImu;
-    project = { ...project, settings: next };
-    selectedSensorOption = choice.id;
-    return changed;
   }
 
-  function resetPackedPreview() {
-    packedPreviewFrame = null;
-    lastPreviewFrame = 0;
-    lastPreviewArrival = 0;
-    previewFps = 0;
-    lastLiveMeshFrame = 0;
-    lastLiveMeshPoll = 0;
-  }
-
-  async function scanSensors() {
-    if (!project || discoveryInFlight || capturing || processing) return;
-    discoveryInFlight = true;
-    sensorSessionEnabled = false;
-    resetPackedPreview();
-    connecting = false;
-    message = 'Scanning for connected depth sensors…';
-    try {
-      const choices = await availableSensors();
-      sensorChoices = choices;
-      const settings = project.settings;
-      let preferred = choices.find((choice) => choice.id === settings.sensorId);
-      if (!preferred) {
-        preferred = choices.find((choice) => choice.kind === settings.sensorKind
-          && choice.connection === settings.sensorConnection
-          && (choice.connection !== 'network' || choice.address === settings.sensorAddress));
-      }
-      if (preferred) {
-        const path = project.path;
-        if (applySensorChoice(preferred)) await saveProjectSettingsNow(path, { ...project.settings });
-        sensorSessionEnabled = true;
-        connecting = true;
-        message = `Opening ${selectedSensorName}…`;
-        await refreshSensorStatus();
-      } else {
-        selectedSensorOption = configuredSensorOption(settings);
-        sensor = null;
-        previewPoints = [];
-        message = choices.length > 0
-          ? 'Sensors found. Choose one from the list to connect.'
-          : 'No supported sensor was found. Check its power and cable, then scan again.';
-      }
-    } catch (error) {
-      sensor = null;
-      previewPoints = [];
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      discoveryInFlight = false;
-    }
-  }
-
-  async function sensorDeviceChanged() {
-    if (!project) return;
-    if (selectedSensorOption === networkFemtoOption) {
-      const address = project.settings.sensorConnection === 'network' ? project.settings.sensorAddress : '';
-      project = {
-        ...project,
-        settings: {
-          ...project.settings,
-          sensorId: address ? `femto_mega:network:${address}` : 'femto_mega:network',
-          sensorKind: 'femto_mega',
-          sensorConnection: 'network',
-          sensorAddress: address,
-          useImu: true
-        }
-      };
-    } else {
-      const choice = sensorChoices.find((candidate) => candidate.id === selectedSensorOption);
-      if (!choice) return;
-      applySensorChoice(choice);
-    }
-    connecting = true;
-    sensorSessionEnabled = true;
-    sensor = null;
-    previewPoints = [];
-    resetPackedPreview();
-    await saveProjectSettingsNow(project.path, { ...project.settings });
-    if (project.settings.sensorConnection !== 'network' || project.settings.sensorAddress) {
-      void refreshSensorStatus();
-    } else {
-      sensorSessionEnabled = false;
-      connecting = false;
-      message = 'Enter the camera IP address, then select Scan sensors.';
-    }
-  }
-
-  function sensorAddressChanged() {
-    if (!project) return;
-    const address = project.settings.sensorAddress.trim();
-    project = {
-      ...project,
-      settings: {
-        ...project.settings,
-        sensorId: address ? `femto_mega:network:${address}` : 'femto_mega:network',
-        sensorAddress: address
-      }
+  function settingsForSensorKind(kind: SensorKind): CaptureSettings {
+    if (!project) throw new Error('No active project');
+    if (project.settings.sensorKind === kind) return project.settings;
+    return {
+      ...project.settings,
+      sensorKind: kind,
+      sensorId: '',
+      sensorConnection: 'usb',
+      sensorAddress: '',
+      useImu: kind !== 'kinect_v2'
     };
-    selectedSensorOption = networkFemtoOption;
-    sensorSessionEnabled = false;
-    connecting = false;
-    sensor = null;
-    previewPoints = [];
-    resetPackedPreview();
-    queueProjectSettingsSave();
-    message = address
-      ? 'Camera address saved. Select Scan sensors to probe it.'
-      : 'Enter the camera IP address, then select Scan sensors.';
   }
 
-  function loadTransform(projectId: string) {
-    const stored = localStorage.getItem(transformStorageKey(projectId));
-    cloudTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
-    gizmoAnchor = null;
-    anchorPickMode = false;
-    if (!stored) return;
+  async function commitSensorSettings(settings: CaptureSettings): Promise<boolean> {
+    if (!project || capturing || processing || selectingSensor) return false;
+    selectingSensor = true;
+    settingsRevision += 1;
+    const revision = settingsRevision;
+    if (settingsTimer) window.clearTimeout(settingsTimer);
+    settingsTimer = undefined;
+    project = { ...project, settings };
     try {
-      const parsed = JSON.parse(stored) as Partial<CloudTransform> & { gizmoAnchor?: unknown };
-      cloudTransform = {
-        position: parsed.position ?? [0, 0, 0],
-        rotation: parsed.rotation ?? [0, 0, 0],
-        scale: parsed.scale ?? [1, 1, 1]
-      };
-      gizmoAnchor = isPoint(parsed.gizmoAnchor) ? [...parsed.gizmoAnchor] : null;
-    } catch {
-      localStorage.removeItem(transformStorageKey(projectId));
+      return await persistSettings(revision, true);
+    } finally {
+      selectingSensor = false;
     }
   }
 
-  function persistTransform() {
-    if (project) {
-      localStorage.setItem(transformStorageKey(project.id), JSON.stringify({ ...cloudTransform, gizmoAnchor }));
-    }
-  }
-
-  $: capturing = sensor?.capturing ?? Boolean(project?.phases.some((phase) => phase.status === 'capturing'));
-  $: jobRunning = Boolean(activeJob && ['queued', 'running', 'cancelling'].includes(activeJob.status));
-  $: jobAwaitingDecision = Boolean(activeJob?.resumable && ['failed', 'cancelled'].includes(activeJob.status));
-  $: processing = project?.processingStatus === 'processing' || jobRunning;
-  $: statusMessage = jobAwaitingDecision
-    ? activeJob?.stage === 'interrupted'
-      ? 'Build interrupted. Resume from its checkpoint or cancel it.'
-      : 'Build stopped. Resume from its checkpoint or cancel it.'
-    : message;
-  $: activeBuildIncludesSplat = Boolean(processing && activeJob?.targets.includes('gaussianSplat'));
-  $: gaussianTrainingStage = Boolean(activeBuildIncludesSplat && activeJob && stageKey(activeJob.stage) === 'splat');
-  $: liveSplatCount = previewSplat ? Math.floor(previewSplat.byteLength / 32) : 0;
-  $: liveSplatState = previewSplat
-    ? 'ready'
-    : splatPreviewError
-      ? 'error'
-      : splatPreviewInFlight
-        ? 'loading'
-        : gaussianTrainingStage
-          ? 'waiting'
-          : 'pending';
-  $: selectedSensorName = project?.settings.sensorKind === 'azure_kinect'
-    ? 'Azure Kinect DK'
-    : project?.settings.sensorKind === 'femto_mega'
-      ? 'Orbbec Femto Mega'
-      : 'Kinect v2';
-  $: canEdit = viewMode === 'preview' && previewRenderMode !== 'splat' && project?.processingStatus === 'complete' && previewPoints.length > 0;
-  $: viewerTransform = viewMode === 'preview' ? cloudTransform : identityTransform;
-  $: effectiveGizmoAnchor = gizmoAnchor ?? pointCloudCenter(previewPoints);
-  $: completedPhases = project?.phases.filter((phase) => phase.status === 'complete').length ?? 0;
-  $: hasMediaSources = (project?.mediaSources.length ?? 0) > 0;
-  $: canBuildArtifacts = sourceMode === 'rgbd' ? completedPhases > 0 : selectedMediaSourceIds.length > 0;
-  $: artifactCount = project
-    ? [project.artifacts.pointCloud, project.artifacts.texturedMesh, project.artifacts.gaussianSplat].filter((artifact) => artifact && !artifact.stale).length
-    : 0;
-  $: exportCount = project
-    ? Number(project.processingStatus === 'complete' && Boolean(project.outputPath))
-      + Number(Boolean(project.meshOutputPath))
-      + Number(Boolean(project.artifacts.gaussianSplat && !project.artifacts.gaussianSplat.stale))
-    : 0;
-  $: workspaceTitle = workspaceMode === 'device'
-    ? `${selectedSensorName} input`
-    : workspaceMode === 'capture'
-      ? capturing ? `Recording ${project?.phases.at(-1)?.name ?? 'capture phase'}` : 'Live capture view'
-      : workspaceMode === 'media'
-        ? 'Recorded & imported media'
-        : workspaceMode === 'process'
-          ? processing ? 'Building 3D artifacts' : 'Artifact build plan'
-          : workspaceMode === 'render'
-            ? previewRenderMode === 'splat' ? 'Gaussian splat viewer' : previewRenderMode === 'mesh' ? 'Textured mesh viewer' : 'Point cloud viewer'
-            : 'Export preview';
-  $: workspaceKicker = workspaceMode === 'device'
-    ? 'INPUT DEVICE MONITOR'
-    : workspaceMode === 'capture'
-      ? capturing ? 'CAPTURE IN PROGRESS' : 'CAPTURE WORKSPACE'
-      : workspaceMode === 'media'
-        ? 'PROJECT MEDIA LIBRARY'
-        : workspaceMode === 'process'
-          ? processing ? 'PROCESSING NOW' : 'PROCESSING SETUP'
-          : workspaceMode === 'render'
-            ? processing ? 'LIVE BUILD EDITOR' : 'EDIT WORKSPACE'
-            : 'EXPORT WORKSPACE';
-  $: totalFrames = sensor?.totalFrameCount ?? project?.phases.reduce((sum, phase) => sum + phase.frameCount, 0) ?? 0;
-  $: displayedPointCount = processing
-    ? reconstruction?.pointCount ?? previewPoints.length
-    : viewMode === 'preview'
-      ? project?.pointCount
-      : capturing
-        ? previewPoints.length
-        : sensorSessionEnabled && sensor?.sensorConnected
-          ? packedPreviewFrame?.pointCount ?? previewPoints.length
-          : previewPoints.length;
-
-  const formatDuration = (seconds: number) => {
-    const minutes = Math.floor(seconds / 60);
-    const remaining = seconds % 60;
-    return `${minutes}:${remaining.toString().padStart(2, '0')}`;
-  };
-
-  const formatCount = (value?: number) => {
-    if (value === undefined) return '—';
-    return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 }).format(value);
-  };
-
-  const formatSnapshotTime = (value: number | null) => value == null
-    ? 'Not published yet'
-    : new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(value);
-
-  function splatPreviewSignature(bytes: Uint8Array) {
-    let hash = 2166136261;
-    const stride = Math.max(1, Math.floor(bytes.byteLength / 97));
-    for (let index = 0; index < bytes.byteLength; index += stride) {
-      hash = Math.imul(hash ^ bytes[index], 16777619);
-    }
-    hash = Math.imul(hash ^ (bytes.at(-1) ?? 0), 16777619);
-    return `${bytes.byteLength}:${hash >>> 0}`;
-  }
-
-  const formatEta = (seconds?: number) => {
-    if (seconds === undefined) return 'Estimating…';
-    if (seconds < 60) return `about ${seconds}s left`;
-    return `about ${Math.ceil(seconds / 60)} min left`;
-  };
-
-  const formatEtaValue = (seconds?: number | null) => {
-    if (seconds == null) return 'Calculating';
-    if (seconds <= 0) return 'Finishing';
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    const remainder = seconds % 60;
-    return remainder > 0 && minutes < 10 ? `${minutes}m ${remainder}s` : `${Math.ceil(seconds / 60)}m`;
-  };
-
-  type StageDefinition = { key: string; label: string; weight: number };
-  const rgbdBaseStages: StageDefinition[] = [
-    { key: 'prepare', label: 'Preparing inputs', weight: 0.05 },
-    { key: 'track', label: 'Tracking cameras', weight: 0.13 },
-    { key: 'trajectory', label: 'Optimizing trajectory', weight: 0.12 },
-    { key: 'fuse', label: 'Fusing keyframes', weight: 0.08 },
-    { key: 'cloud', label: 'Building point cloud', weight: 0.24 }
-  ];
-  const mediaStages: StageDefinition[] = [
-    { key: 'prepare', label: 'Preparing media', weight: 0.05 },
-    { key: 'filter', label: 'Selecting sharp frames', weight: 0.05 },
-    { key: 'feature', label: 'Extracting GPU features', weight: 0.08 },
-    { key: 'match', label: 'Matching camera views', weight: 0.12 },
-    { key: 'map', label: 'Solving camera poses', weight: 0.15 },
-    { key: 'splat', label: 'Training Gaussian splat', weight: 0.5 },
-    { key: 'publish', label: 'Publishing splat', weight: 0.05 }
-  ];
-
-  function stageKey(value: string) {
-    const stage = value.toLowerCase().replaceAll('_', ' ');
-    if (stage.includes('complete') || stage.includes('export') || stage.includes('publish')) return 'publish';
-    if (stage.includes('splat') && (stage.includes('train') || stage.includes('initial'))) return 'splat';
-    if (stage.includes('mesh') || stage.includes('textur')) return 'mesh';
-    if (stage.includes('preparing splat') || stage.includes('posed frame')) return 'dataset';
-    if (stage.includes('mapping') || stage.includes('registration')) return 'map';
-    if (stage.includes('matching')) return 'match';
-    if (stage.includes('feature')) return 'feature';
-    if (stage.includes('filter')) return 'filter';
-    if (stage.includes('building') || stage.includes('cleaning cloud')) return 'cloud';
-    if (stage.includes('fusing') || stage.includes('previewing') || stage.includes('loading cache')) return 'fuse';
-    if (stage.includes('stabiliz') || stage.includes('aligning')) return 'trajectory';
-    if (stage.includes('tracking') || stage.includes('placing') || stage.includes('keyframe')) return 'track';
-    return 'prepare';
-  }
-
-  function stagesFor(job: ArtifactJob | null) {
-    if (job?.pipeline === 'media_gaussian') return mediaStages;
-    const stages = [...rgbdBaseStages];
-    const wantsMesh = job?.targets.includes('texturedMesh') ?? buildTexturedMesh;
-    const wantsSplat = job?.targets.includes('gaussianSplat') ?? buildGaussianSplat;
-    if (wantsSplat) stages.push({ key: 'dataset', label: 'Preparing posed frames', weight: 0.08 });
-    if (wantsMesh) stages.push({ key: 'mesh', label: 'Texturing mesh', weight: 0.2 });
-    if (wantsSplat) stages.push({ key: 'splat', label: 'Training Gaussian splat', weight: 0.55 });
-    stages.push({ key: 'publish', label: 'Publishing artifacts', weight: 0.05 });
-    return stages;
-  }
-
-  function stageFeedback(job: ArtifactJob | null, progress: ReconstructionProgress | null) {
-    const stages = stagesFor(job);
-    const key = stageKey(job?.stage || progress?.stage || 'preparing');
-    const found = stages.findIndex((stage) => stage.key === key);
-    const index = found < 0 ? 0 : found;
-    return { label: stages[index].label, current: index + 1, total: stages.length };
-  }
-
-  function weightedOverallProgress(job: ArtifactJob | null, progress: ReconstructionProgress | null) {
-    if (!job) return Math.max(0, Math.min(1, progress?.progress ?? 0));
-    const stages = stagesFor(job);
-    const key = stageKey(job.stage || progress?.stage || 'preparing');
-    const index = Math.max(0, stages.findIndex((stage) => stage.key === key));
-    const totalWeight = stages.reduce((sum, stage) => sum + stage.weight, 0);
-    const completedWeight = stages.slice(0, index).reduce((sum, stage) => sum + stage.weight, 0);
-    const phaseProgress = job.stageProgress ?? progress?.stageProgress ?? 0;
-    const fraction = key === 'publish' && job.stage.toLowerCase().includes('complete') ? 1 : phaseProgress;
-    return Math.max(0, Math.min(1, (completedWeight + stages[index].weight * fraction) / totalWeight));
-  }
-
-  function estimateOverallEta(job: ArtifactJob | null, progress: number) {
-    if (!job) return null;
-    if (progress >= 0.995) return 0;
-    const started = Date.parse(job.startedAt ?? job.createdAt);
-    const elapsed = Number.isFinite(started) ? Math.max(0, (Date.now() - started) / 1000) : 0;
-    if (elapsed < 2 || progress < 0.02) return null;
-    return Math.max(1, Math.round(elapsed * (1 - progress) / progress));
-  }
-
-  $: buildStage = stageFeedback(activeJob, reconstruction);
-  $: overallBuildProgress = weightedOverallProgress(activeJob, reconstruction);
-  $: currentStageProgress = Math.max(0, Math.min(1, activeJob?.stageProgress ?? reconstruction?.stageProgress ?? 0));
-  $: buildDetail = activeJob?.detail?.trim() || reconstruction?.detail || 'Preparing the next artifact stage';
-  $: buildBackend = activeJob?.computeBackend || reconstruction?.computeBackend || (activeJob?.stage.includes('splat') ? 'CUDA AMP / gsplat' : 'GPU preferred');
-  $: totalBuildEta = activeJob ? estimateOverallEta(activeJob, overallBuildProgress) : reconstruction?.etaSeconds;
-  $: currentStageEta = activeJob?.stageEtaSeconds ?? reconstruction?.stageEtaSeconds;
-
-  const confidenceClass = (score?: number) => score === undefined ? '' : score >= 80 ? 'high' : score >= 60 ? 'medium' : 'low';
-
-  async function refreshResultPreview() {
+  async function chooseSensor(event: Event): Promise<void> {
     if (!project) return;
-    const requestedProjectPath = project.path;
-    const splatArtifact = project.artifacts.gaussianSplat;
-    const signature = JSON.stringify([
-      requestedProjectPath,
-      project.outputPath,
-      project.meshOutputPath,
-      project.artifacts.pointCloud?.updatedAt,
-      project.artifacts.texturedMesh?.updatedAt,
-      splatArtifact?.updatedAt
-    ]);
-    if (signature === loadedResultPreviewSignature) return;
-    if (resultPreviewRequest?.signature === signature) return resultPreviewRequest.promise;
-
-    const request = (async () => {
-      const preferMediaSplat = sourceMode === 'media' && Boolean(splatArtifact && !splatArtifact.stale);
-      if (preferMediaSplat && previewRenderMode !== 'splat') {
-        setPreviewRenderMode('splat');
-      } else if (previewRenderMode === 'mesh' && !project.meshOutputPath) {
-        setPreviewRenderMode(splatArtifact && !splatArtifact.stale ? 'splat' : 'points');
-      } else if (previewRenderMode === 'splat' && (!splatArtifact || splatArtifact.stale)) {
-        setPreviewRenderMode(project.meshOutputPath ? 'mesh' : 'points');
-      }
-      const shouldLoadMesh = !preferMediaSplat && Boolean(project.meshOutputPath) && previewRenderMode === 'mesh';
-      const shouldLoadSplat = Boolean(splatArtifact && !splatArtifact.stale)
-        && (preferMediaSplat || previewRenderMode === 'splat');
-      const requestedAsset = shouldLoadMesh ? 'mesh' : shouldLoadSplat ? 'splat' : 'points';
-      previewAssetLoading = requestedAsset;
-      splatPreviewLoading = shouldLoadSplat;
-      let nextSplatError = '';
-      const [nextPoints, nextCameraFrames, nextMesh, nextSplat] = await Promise.all([
-        preferMediaSplat ? Promise.resolve([]) : loadPreview(project.path).catch(() => []),
-        preferMediaSplat ? Promise.resolve([]) : loadCameraFrames(project.path).catch(() => []),
-        shouldLoadMesh ? loadPreviewMesh(project.path).catch(() => null) : Promise.resolve(previewMesh),
-        shouldLoadSplat
-          ? loadGaussianSplat(project.path).catch((error: unknown) => {
-              nextSplatError = error instanceof Error ? error.message : String(error);
-              return null;
-            })
-          : Promise.resolve(null)
-      ]);
-      if (project?.path !== requestedProjectPath) {
-        splatPreviewLoading = false;
-        if (previewAssetLoading === requestedAsset) previewAssetLoading = null;
-        return;
-      }
-      previewPoints = nextPoints;
-      if (nextPoints.length === 0) resetPackedPreview();
-      cameraFrames = nextCameraFrames;
-      previewMesh = nextMesh;
-      previewSplat = nextSplat;
-      lastSplatPreviewSignature = nextSplat ? splatPreviewSignature(nextSplat) : '';
-      splatPreviewError = nextSplatError;
-      splatPreviewLoading = false;
-      if (previewAssetLoading === requestedAsset) previewAssetLoading = null;
-      if (preferMediaSplat && nextSplat) {
-        setPreviewRenderMode('splat');
-      } else if (shouldLoadMesh && !nextMesh) {
-        setPreviewRenderMode(nextSplat ? 'splat' : 'points');
-      } else if (shouldLoadSplat && previewRenderMode === 'splat' && !nextSplat) {
-        setPreviewRenderMode(nextMesh ? 'mesh' : 'points');
-      } else if (nextPoints.length === 0 && nextSplat) {
-        setPreviewRenderMode('splat');
-      }
-      const loadedEverything = (!shouldLoadMesh || Boolean(nextMesh)) && (!shouldLoadSplat || Boolean(nextSplat));
-      if (loadedEverything) loadedResultPreviewSignature = signature;
-    })();
-    resultPreviewRequest = { signature, promise: request };
-    try {
-      await request;
-    } finally {
-      if (resultPreviewRequest?.promise === request) resultPreviewRequest = null;
+    const candidate = sensors.find((item) => sensorKey(item) === inputValue(event));
+    if (!candidate) return;
+    if (await commitSensorSettings(settingsForSensor(candidate))) {
+      message = `${candidate.name} selected. ${runtime?.sensorStatus ?? ''}`.trim();
     }
   }
 
-  async function refreshProcessingSplatPreview(job: ArtifactJob) {
-    if (!project || job.status !== 'running' || stageKey(job.stage) !== 'splat' || splatPreviewInFlight) return;
-    const now = performance.now();
-    if (now - lastSplatPreviewPoll < 2000) return;
-    lastSplatPreviewPoll = now;
-    splatPreviewInFlight = true;
+  async function chooseSensorKind(event: Event): Promise<void> {
+    const kind = inputValue(event) as SensorKind;
+    if (await commitSensorSettings(settingsForSensorKind(kind))) {
+      message = runtime?.sensorStatus ?? 'Capture source updated.';
+    }
+  }
+
+  async function selectSupportedFallback(): Promise<string | null> {
+    if (!project || !runtime || runtime.sensorWorkerAvailable) return null;
+    const candidate = sensors.find((item) => runtime?.sensorCapabilities.includes(item.kind));
+    if (candidate) {
+      return await commitSensorSettings(settingsForSensor(candidate)) ? candidate.name : null;
+    }
+    const kind = runtime.sensorCapabilities[0];
+    if (!kind) return null;
+    return await commitSensorSettings(settingsForSensorKind(kind))
+      ? kind.replaceAll('_', ' ')
+      : null;
+  }
+
+  async function discoverSensors(): Promise<void> {
+    if (discovering || capturing || processing) return;
+    discovering = true;
+    message = 'Refreshing RGB-D capture sources…';
     try {
-      const nextSplat = await loadGaussianSplat(project.path);
-      if (nextSplat.byteLength >= 32) {
-        const signature = splatPreviewSignature(nextSplat);
-        if (signature !== lastSplatPreviewSignature) {
-          previewSplat = nextSplat;
-          lastSplatPreviewSignature = signature;
-          liveSplatUpdatedAt = Date.now();
-        }
-        previewRenderMode = 'splat';
-        splatPreviewError = '';
-      }
+      [sensors, runtime] = await Promise.all([availableSensors(), runtimeInfo()]);
+      const fallback = await selectSupportedFallback();
+      message = fallback
+        ? `${fallback} selected because the previous camera backend is not installed.`
+        : sensors.length
+          ? `${sensors.length} RGB-D source${sensors.length === 1 ? '' : 's'} available.`
+          : runtime.sensorStatus;
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      splatPreviewError = detail.includes('has not published its first live splat preview') || detail.includes('still being published')
-        ? ''
-        : detail;
+      message = errorText(error);
     } finally {
-      splatPreviewInFlight = false;
+      discovering = false;
     }
   }
 
-  async function refreshSensorStatus() {
-    if (!project || statusInFlight || (!sensorSessionEnabled && !capturing && !processing)) return;
-    const now = performance.now();
-    const minimumInterval = processing ? 250 : 100;
-    if (now - lastStatusPoll < minimumInterval) return;
-    lastStatusPoll = now;
-    statusInFlight = true;
-    try {
-      const status = await captureStatus();
-      const localSettings = project.settings;
-      project = { ...status.project, settings: status.capturing || processing ? status.project.settings : localSettings };
-      sensor = status;
-      reconstruction = status.reconstruction ?? null;
-      connecting = !status.sensorConnected && !status.sensorPaused && !status.error;
-
-      if (status.capturing) {
-        if (workspaceMode !== 'capture') storeWorkspaceMode('capture');
-        viewMode = 'live';
-        if (status.preview.length > 0) previewPoints = status.preview;
-        if (status.liveReconstructionActive) {
-          message = status.tracking
-            ? `Live ${status.liveReconstructionMode === 'mesh' ? 'mesh' : 'point'} reconstruction · ${status.liveIntegratedFrameCount} keyframes fused${status.liveRejectedFrameCount ? ` · ${status.liveRejectedFrameCount} rejected` : ''}`
-            : status.liveIntegratedFrameCount > 0
-              ? status.trackingStatus
-              : 'Initializing live reconstruction from the first valid RGB-D frame…';
-        } else {
-          message = `Capturing frame ${status.frameCount} · ${status.streamFps.toFixed(1)} saved fps · final placement happens during build`;
-        }
-      } else if (processing && status.preview.length > 0) {
-        previewPoints = status.preview;
-      } else if (viewMode === 'live' && status.preview.length > 0) {
-        previewPoints = status.preview;
-      }
-
-      if (status.error) {
-        message = `${status.error} Select Scan sensors to retry.`;
-        if (!status.capturing && !processing) {
-          sensorSessionEnabled = false;
-          connecting = false;
-        }
-      }
-      else if (!status.sensorConnected && !processing) message = status.sensorStatus;
-      else if (processing && reconstruction && !activeJob) {
-        message = `${reconstruction.stage}: ${reconstruction.detail}`;
-      } else if (!status.capturing && status.sensorConnected && viewMode === 'live') {
-        message = `Live ${status.sensorName} preview · ${status.previewPointCount.toLocaleString()} visible points · ${status.streamFps.toFixed(1)} sensor fps${previewFps > 0 ? ` · ${previewFps.toFixed(1)} preview fps` : ''}`;
-      }
-      if (activeJob && ['queued', 'running', 'cancelling'].includes(activeJob.status)) {
-        try {
-          const updatedJob = await artifactJobStatus(project.path, activeJob.id);
-          activeJob = updatedJob;
-          reconstruction = {
-            stage: updatedJob.stage,
-            detail: updatedJob.iteration != null
-              ? `CUDA splat iteration ${updatedJob.iteration.toLocaleString()} of ${(updatedJob.totalIterations ?? 0).toLocaleString()}${updatedJob.loss != null ? ` · loss ${updatedJob.loss.toFixed(4)}` : ''}`
-              : updatedJob.detail?.trim() || status.reconstruction?.detail || updatedJob.stage.replaceAll('_', ' '),
-            progress: updatedJob.progress,
-            processedUnits: updatedJob.iteration ?? Math.round(updatedJob.progress * 1000),
-            totalUnits: updatedJob.totalIterations ?? 1000,
-            etaSeconds: updatedJob.etaSeconds ?? undefined,
-            stageProgress: updatedJob.stageProgress ?? status.reconstruction?.stageProgress,
-            stageEtaSeconds: updatedJob.stageEtaSeconds ?? status.reconstruction?.stageEtaSeconds,
-            elapsedSeconds: updatedJob.elapsedSeconds ?? status.reconstruction?.elapsedSeconds,
-            computeBackend: updatedJob.computeBackend ?? (updatedJob.stage.includes('splat') ? 'CUDA AMP / gsplat' : status.reconstruction?.computeBackend)
-          };
-          await refreshProcessingSplatPreview(updatedJob);
-          if (['complete', 'failed', 'cancelled'].includes(updatedJob.status)) {
-            project = await currentProject();
-            activeJob = updatedJob.resumable ? updatedJob : null;
-            if (updatedJob.status === 'complete') {
-              storeWorkspaceMode('render');
-              viewMode = 'preview';
-              if (project.artifacts.pointCloud || project.artifacts.texturedMesh || project.artifacts.gaussianSplat) {
-                await refreshResultPreview();
-              }
-              if (updatedJob.pipeline === 'media_gaussian' && previewSplat) setPreviewRenderMode('splat');
-              message = `Artifact job complete${project.processingBackend ? ` · ${project.processingBackend}` : ''}${project.artifacts.gaussianSplat ? ' · Gaussian PLY ready' : ''}.`;
-            } else {
-              message = updatedJob.error ?? `Artifact job ${updatedJob.status}.`;
-            }
-          }
-        } catch (error) {
-          message = `Artifact status: ${error instanceof Error ? error.message : String(error)}`;
-        }
-      }
-    } catch (error) {
-      sensor = sensor ? { ...sensor, sensorConnected: false, sensorStatus: String(error) } : null;
-      message = error instanceof Error ? error.message : String(error);
-      connecting = false;
-      if (!capturing && !processing) sensorSessionEnabled = false;
-    } finally {
-      statusInFlight = false;
-    }
-  }
-
-  function decodeLivePreviewFrame(buffer: ArrayBuffer): PackedPreviewFrame | null {
+  function parsePointPacket(buffer: ArrayBuffer): PackedPreviewFrame | null {
     if (buffer.byteLength < 24) return null;
+    const bytes = new Uint8Array(buffer);
+    if (new TextDecoder().decode(bytes.subarray(0, 4)) !== 'K2P1') return null;
     const view = new DataView(buffer);
-    if (view.getUint8(0) !== 0x4b || view.getUint8(1) !== 0x32
-      || view.getUint8(2) !== 0x50 || view.getUint8(3) !== 0x31) return null;
     const frameCount = view.getUint32(4, true);
     const pointCount = view.getUint32(20, true);
-    if (pointCount > 100_000 || buffer.byteLength !== 24 + pointCount * 15) return null;
+    if (pointCount > 150_000 || buffer.byteLength !== 24 + pointCount * 15) return null;
     const positions = new Float32Array(pointCount * 3);
     const colors = new Uint8Array(pointCount * 3);
     for (let point = 0, source = 24, target = 0; point < pointCount; point += 1, source += 15, target += 3) {
       positions[target] = view.getFloat32(source, true);
       positions[target + 1] = view.getFloat32(source + 4, true);
       positions[target + 2] = view.getFloat32(source + 8, true);
-      colors[target] = view.getUint8(source + 12);
-      colors[target + 1] = view.getUint8(source + 13);
-      colors[target + 2] = view.getUint8(source + 14);
+      colors[target] = bytes[source + 12];
+      colors[target + 1] = bytes[source + 13];
+      colors[target + 2] = bytes[source + 14];
     }
     return { frameCount, pointCount, positions, colors };
   }
 
-  async function refreshLivePreview() {
-    if (!project || previewInFlight || !sensorSessionEnabled || processing || viewMode !== 'live') return;
-    if (capturing && !sensor?.liveReconstructionActive) return;
-    previewInFlight = true;
+  async function pollLiveGeometry(): Promise<void> {
+    if (!project || !capturing || geometryInFlight) return;
+    geometryInFlight = true;
     try {
-      const packet = await loadLivePreviewFrame(lastPreviewFrame);
-      const frame = decodeLivePreviewFrame(packet);
-      const now = performance.now();
-      if (frame && frame.frameCount !== lastPreviewFrame) {
-        lastPreviewFrame = frame.frameCount;
-        packedPreviewFrame = frame;
-        if (lastPreviewArrival > 0) {
-          const instantFps = Math.min(60, 1000 / Math.max(1, now - lastPreviewArrival));
-          previewFps = previewFps > 0 ? previewFps * 0.8 + instantFps * 0.2 : instantFps;
-        }
-        lastPreviewArrival = now;
+      const packet = parsePointPacket(await loadLivePreviewFrame(lastPreviewFrame));
+      if (packet && packet.frameCount > lastPreviewFrame) {
+        packedPreviewFrame = packet;
+        lastPreviewFrame = packet.frameCount;
       }
-      if (capturing && sensor?.liveReconstructionMode === 'mesh' && now - lastLiveMeshPoll >= 450) {
-        lastLiveMeshPoll = now;
-        const update = await loadLiveReconstructionMesh(lastLiveMeshFrame);
-        if (update && update.frameCount !== lastLiveMeshFrame) {
-          lastLiveMeshFrame = update.frameCount;
-          previewMesh = update.mesh;
+      if (project.settings.liveReconstruction === 'mesh') {
+        const result = await loadLiveReconstructionMesh(lastMeshFrame);
+        if (result && result.frameCount > lastMeshFrame) {
+          liveMesh = result.mesh;
+          lastMeshFrame = result.frameCount;
         }
       }
-    } catch {
-      // capture_status owns connection errors and the user-facing message.
-    } finally {
-      previewInFlight = false;
-    }
-  }
-
-  async function showView(mode: 'live' | 'preview') {
-    viewMode = mode;
-    if (mode === 'live') {
-      floorPickMode = false;
-      editMode = false;
-    }
-    if (mode === 'preview') await refreshResultPreview();
-    else await refreshSensorStatus();
-  }
-
-  async function newProject() {
-    busy = true;
-    message = 'Creating a clean scan project…';
-    try {
-      if (settingsSaveTimer !== undefined) {
-        window.clearTimeout(settingsSaveTimer);
-        settingsSaveTimer = undefined;
-      }
-      if (project && !capturing && !processing) {
-        await saveProjectSettingsNow(project.path, { ...project.settings });
-      }
-      project = await createProject();
-      storeWorkspaceMode('device');
-      cloudTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
-      floorPickMode = false;
-      editMode = false;
-      previewPoints = [];
-      resetPackedPreview();
-      cameraFrames = [];
-      previewMesh = null;
-      previewSplat = null;
-      splatPreviewError = '';
-      splatPreviewLoading = false;
-      viewMode = 'live';
-      message = 'Project created. Begin with a slow reference phase.';
     } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
+      message = `Live geometry: ${errorText(error)}`;
     } finally {
-      busy = false;
+      geometryInFlight = false;
     }
   }
 
-  async function captureAction() {
-    if (!project) return;
+  async function loadBuildPreview(): Promise<void> {
+    if (!project || !processing || resultInFlight || performance.now() - lastBuildPreviewAt < 1200) return;
+    lastBuildPreviewAt = performance.now();
+    resultInFlight = true;
+    try {
+      if (activeJob?.stage.includes('splat')) {
+        const next = await loadGaussianSplat(project.path).catch(() => null);
+        if (next?.byteLength) {
+          previewSplat = next;
+          renderMode = 'splat';
+        }
+      } else {
+        const next = await loadPreview(project.path).catch(() => []);
+        if (next.length) {
+          previewPoints = next;
+          renderMode = 'points';
+        }
+      }
+    } finally {
+      resultInFlight = false;
+    }
+  }
+
+  async function loadResult(mode: RenderMode, force = false): Promise<void> {
+    if (!project || resultInFlight) return;
+    renderMode = mode;
+    if (!force) {
+      if (mode === 'points' && previewPoints.length) return;
+      if (mode === 'mesh' && previewMesh) return;
+      if (mode === 'splat' && previewSplat) return;
+    }
+    if (!artifactReady(mode === 'points' ? 'pointCloud' : mode === 'mesh' ? 'texturedMesh' : 'gaussianSplat')) return;
+    resultInFlight = true;
+    assetLoading = mode;
+    try {
+      if (mode === 'points') previewPoints = await loadPreview(project.path);
+      else if (mode === 'mesh') previewMesh = await loadPreviewMesh(project.path);
+      else previewSplat = await loadGaussianSplat(project.path);
+    } catch (error) {
+      message = errorText(error);
+    } finally {
+      assetLoading = null;
+      resultInFlight = false;
+    }
+  }
+
+  async function refreshCompletedJob(job: ArtifactJob): Promise<void> {
+    if (!project || completedJobId === job.id) return;
+    completedJobId = job.id;
+    project = await currentProject();
+    message = `Reconstruction complete${job.computeBackend ? ` · ${job.computeBackend}` : ''}.`;
+    workspace = 'inspect';
+    if (job.targets.includes('gaussianSplat')) await loadResult('splat', true);
+    else if (job.targets.includes('texturedMesh')) await loadResult('mesh', true);
+    else await loadResult('points', true);
+  }
+
+  async function pollStatus(forceCapture = false): Promise<void> {
+    if (statusInFlight || !project) return;
+    statusInFlight = true;
+    try {
+      const wasCapturing = capturing;
+      if (forceCapture || wasCapturing) {
+        const next = await captureStatus();
+        sensor = next;
+        project = next.project;
+        if (next.error) message = next.error;
+        if (next.capturing) await pollLiveGeometry();
+        else if (wasCapturing && !next.error) {
+          message = next.frameCount
+            ? `Capture saved · ${next.frameCount.toLocaleString()} archived frames.`
+            : 'Capture stopped without usable archived frames.';
+        }
+      }
+
+      if (activeJob && ['queued', 'running', 'cancelling'].includes(activeJob.status)) {
+        activeJob = await artifactJobStatus(project.path, activeJob.id);
+        if (activeJob.status === 'complete') await refreshCompletedJob(activeJob);
+        else if (activeJob.status === 'failed') message = activeJob.error ?? 'Reconstruction failed.';
+        else await loadBuildPreview();
+      }
+    } catch (error) {
+      message = errorText(error);
+    } finally {
+      statusInFlight = false;
+    }
+  }
+
+  async function captureAction(): Promise<void> {
+    if (!project || busy || processing) return;
     busy = true;
     try {
       if (capturing) {
-        message = 'Finishing the phase and closing its frame index…';
+        message = 'Finishing the archive and draining reconstruction queues…';
         project = await stopSensorPhase();
-        const latestPhase = project.phases.at(-1);
-        message = latestPhase?.status === 'complete'
-          ? `Phase saved with ${latestPhase.frameCount} RGB-D frames.`
-          : 'No usable frames were saved. Check tracking and capture for a few seconds.';
       } else {
-        if (!sensor?.sensorConnected) {
-          message = sensor?.sensorStatus ?? `${selectedSensorName} is not streaming.`;
-          return;
-        }
-        previewPoints = [];
-        previewMesh = null;
-        resetPackedPreview();
-        storeWorkspaceMode('capture');
-        setSourceMode('rgbd');
-        viewMode = 'live';
-        message = project.settings.liveReconstruction === 'off'
-          ? `Starting ${selectedSensorName} capture…`
-          : `Warming ${project.settings.liveReconstruction === 'mesh' ? 'live mesh' : 'live point'} reconstruction before recording…`;
+        if (settingsTimer) window.clearTimeout(settingsTimer);
+        settingsTimer = undefined;
+        packedPreviewFrame = null;
+        liveMesh = null;
+        lastPreviewFrame = 0;
+        lastMeshFrame = 0;
+        message = `Warming realtime ${project.settings.liveReconstruction === 'mesh' ? 'mesh' : 'point'} reconstruction…`;
         project = await startSensorPhase(project.path, project.settings);
       }
+      await pollStatus(true);
     } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
+      message = errorText(error);
     } finally {
       busy = false;
-      void refreshSensorStatus();
     }
   }
 
-  async function removeCaptureAction(phaseId: string, phaseName: string) {
-    if (!window.confirm(`Permanently remove "${phaseName}" and invalidate the current reconstruction?`)) return;
+  async function removeCaptureAction(id: string, name: string): Promise<void> {
+    if (busy || processing || capturing || !window.confirm(`Delete ${name} and invalidate all reconstructed outputs?`)) return;
     busy = true;
     try {
-      project = await removeCapture(phaseId);
-      viewMode = 'live';
-      floorPickMode = false;
-      editMode = false;
+      project = await removeCapture(id);
       previewPoints = [];
-      cameraFrames = [];
       previewMesh = null;
       previewSplat = null;
-      message = `${phaseName} removed. Rebuild when the remaining captures are ready.`;
-      await refreshSensorStatus();
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      busy = false;
-    }
-  }
-
-  function toggleMediaSource(sourceId: string) {
-    selectedMediaSourceIds = selectedMediaSourceIds.includes(sourceId)
-      ? selectedMediaSourceIds.filter((value) => value !== sourceId)
-      : [...selectedMediaSourceIds, sourceId];
-  }
-
-  async function importPhotosAction() {
-    if (!project) return;
-    const selected = await open({ title: 'Import a photo folder', directory: true, multiple: false });
-    if (!selected || Array.isArray(selected)) return;
-    busy = true;
-    try {
-      project = await importMediaSource(project.path, 'photos', [selected]);
-      previewSplat = null;
-      splatPreviewError = '';
-      selectedMediaSourceIds = project.mediaSources.map((source) => source.id);
-      setSourceMode('media');
-      storeWorkspaceMode('media');
-      message = 'Photo folder copied into the project. Ready for GPU COLMAP registration and splat training.';
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function importVideoAction() {
-    if (!project) return;
-    const selected = await open({
-      title: 'Import a video',
-      multiple: false,
-      filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'mkv', 'avi', 'm4v', 'webm'] }]
-    });
-    if (!selected || Array.isArray(selected)) return;
-    busy = true;
-    try {
-      project = await importMediaSource(project.path, 'video', [selected]);
-      previewSplat = null;
-      splatPreviewError = '';
-      selectedMediaSourceIds = project.mediaSources.map((source) => source.id);
-      setSourceMode('media');
-      storeWorkspaceMode('media');
-      message = 'Video copied into the project. FFmpeg will filter frames before GPU COLMAP registration.';
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function removeMediaSourceAction(sourceId: string, name: string) {
-    if (!project || !window.confirm(`Permanently remove media source "${name}"?`)) return;
-    busy = true;
-    try {
-      project = await removeMediaSource(project.path, sourceId);
-      selectedMediaSourceIds = selectedMediaSourceIds.filter((value) => value !== sourceId);
-      previewSplat = null;
-      splatPreviewError = '';
-      if (previewRenderMode === 'splat') setPreviewRenderMode(previewMesh ? 'mesh' : 'points');
-      message = `${name} removed.`;
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function processCloud() {
-    if (!project || busy) return;
-    if (activeJob && ['queued', 'running', 'cancelling'].includes(activeJob.status)) {
-      try {
-        activeJob = await cancelArtifactJob(project.path, activeJob.id);
-        message = 'Cancelling artifact workers and saving any splat checkpoint…';
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error);
-      }
-      return;
-    }
-    if (jobAwaitingDecision) {
-      await resumeInterruptedJob();
-      return;
-    }
-    if (activeJob && ['failed', 'cancelled', 'complete'].includes(activeJob.status)) activeJob = null;
-    if (!canBuildArtifacts) return;
-    const targets: ArtifactTarget[] = sourceMode === 'media'
-      ? ['gaussianSplat']
-      : [
-          ...(buildPointCloud ? ['pointCloud' as const] : []),
-          ...(buildTexturedMesh ? ['texturedMesh' as const] : []),
-          ...(buildGaussianSplat ? ['gaussianSplat' as const] : [])
-        ];
-    if (targets.length === 0) {
-      message = 'Choose at least one artifact to build.';
-      return;
-    }
-    if (targets.includes('gaussianSplat') && !runtime?.splatWorkerAvailable) {
-      message = runtime?.splatStatus ?? 'Install the optional splat runtime first with npm run prepare:splat.';
-      return;
-    }
-    if (sourceMode === 'media' && (!runtime?.ffmpegAvailable || !runtime?.colmapAvailable)) {
-      message = 'Photo/video builds require the bundled FFmpeg and CUDA COLMAP tools. Run npm run prepare:media and restart debug mode.';
-      return;
-    }
-    storeWorkspaceMode('process');
-    if (settingsSaveTimer !== undefined) {
-      window.clearTimeout(settingsSaveTimer);
-      settingsSaveTimer = undefined;
-    }
-    try {
-      project = await updateProjectSettings(project.path, { ...project.settings });
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-      return;
-    }
-    busy = true;
-    reconstruction = null;
-    editMode = false;
-    if (targets.includes('gaussianSplat')) {
-      previewSplat = null;
-      lastSplatPreviewPoll = 0;
-      lastSplatPreviewSignature = '';
-      liveSplatUpdatedAt = null;
-      splatPreviewError = '';
-    }
-    project = {
-      ...project,
-      processingStatus: 'processing',
-      processingError: undefined
-    };
-    message = sourceMode === 'media'
-      ? 'Starting GPU media registration and splat training…'
-      : 'Starting GPU-preferred RGB-D artifact build…';
-    try {
-      activeJob = await startArtifactJob(
-        project.path,
-        sourceMode === 'media' ? 'media_gaussian' : 'rgbd_reconstruction',
-        targets,
-        sourceMode === 'media' ? selectedMediaSourceIds : [],
-        splatIterations
-      );
-      project = { ...project, activeJob: activeJob.id, processingStatus: 'processing' };
-    } catch (error) {
-      const failure = error instanceof Error ? error.message : String(error);
-      try {
-        project = await currentProject();
-      } catch {
-        project = { ...project, processingStatus: 'failed', processingError: failure };
-      }
-      message = failure;
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function resumeInterruptedJob() {
-    if (!project || !activeJob || !jobAwaitingDecision || busy) return;
-    const jobId = activeJob.id;
-    busy = true;
-    try {
-      storeWorkspaceMode('process');
-      lastSplatPreviewPoll = 0;
-      splatPreviewError = '';
-      activeJob = await resumeArtifactJob(project.path, jobId);
-      project = { ...project, processingStatus: 'processing', processingError: undefined, activeJob: activeJob.id };
-      message = 'Resuming CUDA splat training from its matching checkpoint…';
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function discardInterruptedJob() {
-    if (!project || !activeJob || !jobAwaitingDecision || busy) return;
-    if (!window.confirm('Cancel this interrupted build and delete its saved checkpoint? Finished artifacts will stay safe.')) return;
-    const jobId = activeJob.id;
-    busy = true;
-    try {
-      await discardArtifactJob(project.path, jobId);
       activeJob = null;
-      reconstruction = null;
-      previewSplat = null;
-      lastSplatPreviewSignature = '';
-      liveSplatUpdatedAt = null;
-      splatPreviewError = '';
-      project = await currentProject();
-      message = 'Interrupted build cancelled. You can configure and start a new build.';
+      message = `${name} deleted. Existing reconstruction outputs were invalidated.`;
     } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
+      message = errorText(error);
     } finally {
       busy = false;
     }
   }
 
-  function setFloorTransform(transform: CloudTransform) {
-    cloudTransform = transform;
-    floorPickMode = false;
-    persistTransform();
-  }
-
-  function handleGizmoTransform(transform: CloudTransform) {
-    cloudTransform = transform;
-  }
-
-  function commitGizmoTransform() {
-    persistTransform();
-    message = `${gizmoMode === 'translate' ? 'Position' : gizmoMode === 'rotate' ? 'Rotation' : 'Scale'} updated with the edit gizmo.`;
-  }
-
-  function toggleAnchorPick() {
-    anchorPickMode = !anchorPickMode;
-    lightEditMode = false;
-    floorPickMode = false;
-    if (anchorPickMode) message = 'Click a point on the mesh to place the gizmo anchor.';
-  }
-
-  function setGizmoAnchor(anchor: [number, number, number]) {
-    gizmoAnchor = [...anchor];
-    lightEditMode = false;
-    anchorPickMode = false;
-    editMode = true;
-    persistTransform();
-    message = 'Gizmo anchor placed on the mesh.';
-  }
-
-  function updateGizmoAnchor(axis: number, value: number) {
-    if (!Number.isFinite(value)) return;
-    const next = [...effectiveGizmoAnchor] as [number, number, number];
-    next[axis] = value;
-    gizmoAnchor = next;
-    persistTransform();
-  }
-
-  function centerGizmoAnchor() {
-    gizmoAnchor = null;
-    anchorPickMode = false;
-    persistTransform();
-    message = 'Gizmo anchor centered on the mesh bounds.';
-  }
-
-  function applyWorldRotation(axis: 'X' | 'Y' | 'Z', degrees: number, label: string) {
-    const unit = axis === 'X'
-      ? new THREE.Vector3(1, 0, 0)
-      : axis === 'Y'
-        ? new THREE.Vector3(0, 1, 0)
-        : new THREE.Vector3(0, 0, 1);
-    const current = new THREE.Quaternion().setFromEuler(new THREE.Euler(
-      THREE.MathUtils.degToRad(cloudTransform.rotation[0]),
-      THREE.MathUtils.degToRad(cloudTransform.rotation[1]),
-      THREE.MathUtils.degToRad(cloudTransform.rotation[2]),
-      'XYZ'
-    ));
-    const rotated = new THREE.Quaternion()
-      .setFromAxisAngle(unit, THREE.MathUtils.degToRad(degrees))
-      .multiply(current);
-    const euler = new THREE.Euler().setFromQuaternion(rotated, 'XYZ');
-    cloudTransform = {
-      ...cloudTransform,
-      rotation: [
-        THREE.MathUtils.radToDeg(euler.x),
-        THREE.MathUtils.radToDeg(euler.y),
-        THREE.MathUtils.radToDeg(euler.z)
-      ]
-    };
-    persistTransform();
-    message = label;
-  }
-
-  function flipAxis(axis: 'X' | 'Y' | 'Z') {
-    const axisIndex = axis === 'X' ? 0 : axis === 'Y' ? 1 : 2;
-    const scale = [...cloudTransform.scale] as [number, number, number];
-    scale[axisIndex] *= -1;
-    cloudTransform = { ...cloudTransform, scale };
-    persistTransform();
-    message = `${axis} axis direction flipped.`;
-  }
-
-  function alignRoomAxes() {
-    if (previewPoints.length < 30) {
-      message = 'Not enough reconstructed points to estimate the room axes.';
+  async function startBuild(resume = false): Promise<void> {
+    if (!project || busy || capturing) return;
+    if (resume && activeJob) {
+      busy = true;
+      try {
+        activeJob = await resumeArtifactJob(project.path, activeJob.id);
+        workspace = 'reconstruct';
+        message = 'Resuming the saved 2D Gaussian checkpoint…';
+      } catch (error) {
+        message = errorText(error);
+      } finally {
+        busy = false;
+      }
       return;
     }
-    const quaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(
-      THREE.MathUtils.degToRad(cloudTransform.rotation[0]),
-      THREE.MathUtils.degToRad(cloudTransform.rotation[1]),
-      THREE.MathUtils.degToRad(cloudTransform.rotation[2]),
-      'XYZ'
-    ));
-    const stride = Math.max(1, Math.floor(previewPoints.length / 20_000));
-    const projected: Array<[number, number]> = [];
-    for (let index = 0; index < previewPoints.length; index += stride) {
-      const value = new THREE.Vector3()
-        .fromArray(previewPoints[index].position)
-        .multiply(new THREE.Vector3().fromArray(cloudTransform.scale))
-        .applyQuaternion(quaternion);
-      projected.push([value.x, value.z]);
+    const targets: ArtifactTarget[] = [];
+    if (buildPointCloud) targets.push('pointCloud');
+    if (buildTexturedMesh) targets.push('texturedMesh');
+    if (buildGaussianSplat) targets.push('gaussianSplat');
+    if (!targets.length) {
+      message = 'Choose at least one reconstruction output.';
+      return;
     }
-    const meanX = projected.reduce((sum, point) => sum + point[0], 0) / projected.length;
-    const meanZ = projected.reduce((sum, point) => sum + point[1], 0) / projected.length;
-    let covarianceXX = 0;
-    let covarianceXZ = 0;
-    let covarianceZZ = 0;
-    for (const [x, z] of projected) {
-      const dx = x - meanX;
-      const dz = z - meanZ;
-      covarianceXX += dx * dx;
-      covarianceXZ += dx * dz;
-      covarianceZZ += dz * dz;
-    }
-    const principalAngle = 0.5 * Math.atan2(2 * covarianceXZ, covarianceXX - covarianceZZ);
-    const rightAngle = Math.PI / 2;
-    const targetAngle = Math.round(principalAngle / rightAngle) * rightAngle;
-    const correctionDegrees = THREE.MathUtils.radToDeg(targetAngle - principalAngle);
-    applyWorldRotation('Y', correctionDegrees, `Room axes aligned by ${Math.abs(correctionDegrees).toFixed(1)} degrees.`);
-  }
-
-  function resetTransform() {
-    cloudTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
-    gizmoAnchor = null;
-    anchorPickMode = false;
-    if (project) localStorage.removeItem(transformStorageKey(project.id));
-    message = 'Point-cloud orientation reset.';
-  }
-
-  async function applyTransformToExport() {
-    if (!project || project.processingStatus !== 'complete') return;
     busy = true;
     try {
-      previewPoints = await applyCloudTransform(project.path, cloudTransform);
-      cameraFrames = await loadCameraFrames(project.path);
-      previewMesh = project.meshOutputPath ? await loadPreviewMesh(project.path) : null;
-      cloudTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
-      gizmoAnchor = null;
-      anchorPickMode = false;
-      localStorage.removeItem(transformStorageKey(project.id));
-      viewMode = 'preview';
-      editMode = false;
-      message = 'Orientation applied to the point cloud, textured mesh, and camera poses. Untransformed geometry backups were kept.';
+      completedJobId = '';
+      activeJob = await startArtifactJob(project.path, targets, splatIterations);
+      workspace = 'reconstruct';
+      message = 'Started quality-gated RGB-D reconstruction.';
     } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
+      message = errorText(error);
     } finally {
       busy = false;
     }
   }
 
-  async function exportPlyAction() {
-    if (!project || project.processingStatus !== 'complete') return;
+  async function cancelBuild(): Promise<void> {
+    if (!project || !activeJob || !processing) return;
+    try {
+      activeJob = await cancelArtifactJob(project.path, activeJob.id);
+      message = 'Cancelling workers and saving the Gaussian checkpoint when available…';
+    } catch (error) {
+      message = errorText(error);
+    }
+  }
+
+  async function discardBuild(): Promise<void> {
+    if (!project || !activeJob || processing || !window.confirm('Discard this interrupted job and its saved checkpoint? Finished artifacts remain untouched.')) return;
+    try {
+      activeJob = await discardArtifactJob(project.path, activeJob.id);
+      activeJob = null;
+      project = await currentProject();
+      message = 'Interrupted job discarded.';
+    } catch (error) {
+      message = errorText(error);
+    }
+  }
+
+  async function newProjectAction(): Promise<void> {
+    if (capturing || processing) return;
+    if (project && (project.phases.length || readyArtifacts) && !window.confirm('Start a new RGB-D scan? The current project remains on disk.')) return;
     busy = true;
     try {
-      const destinationPath = await save({
-        title: 'Export Unity-ready PLY',
-        defaultPath: 'room-cloud-unity.ply',
-        filters: [{ name: 'PLY point cloud', extensions: ['ply'] }]
-      });
-      if (!destinationPath) return;
-      const savedPath = await exportPly(project.path, destinationPath);
-      message = `Unity-ready PLY saved to ${savedPath}. The X axis was corrected for Unity.`;
+      project = await createProject();
+      sensor = null;
+      activeJob = null;
+      previewPoints = [];
+      previewMesh = null;
+      previewSplat = null;
+      packedPreviewFrame = null;
+      liveMesh = null;
+      workspace = 'capture';
+      message = 'New RGB-D scan ready.';
+      await discoverSensors();
     } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
+      message = errorText(error);
     } finally {
       busy = false;
     }
   }
 
-  async function exportTexturedMeshAction() {
-    if (!project || project.processingStatus !== 'complete' || !project.meshOutputPath) return;
-    busy = true;
+  async function exportPointCloud(): Promise<void> {
+    if (!project || !artifactReady('pointCloud')) return;
+    const destination = await save({ title: 'Export metric point cloud', defaultPath: 'scan-cloud.ply', filters: [{ name: 'PLY point cloud', extensions: ['ply'] }] });
+    if (!destination) return;
     try {
-      const destinationPath = await save({
-        title: 'Export textured OBJ bundle',
-        defaultPath: 'room-mesh.obj',
-        filters: [{ name: 'Wavefront textured mesh', extensions: ['obj'] }]
-      });
-      if (!destinationPath) return;
-      const savedPath = await exportTexturedMesh(project.path, destinationPath);
-      message = `Textured OBJ, MTL, and RGB texture saved beside ${savedPath}.`;
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      busy = false;
-    }
+      message = `Point cloud exported to ${await exportPly(project.path, destination)}.`;
+    } catch (error) { message = errorText(error); }
   }
 
-  async function exportGaussianSplatAction() {
-    if (!project?.artifacts.gaussianSplat || project.artifacts.gaussianSplat.stale) return;
-    busy = true;
+  async function exportMesh(): Promise<void> {
+    if (!project || !artifactReady('texturedMesh')) return;
+    const destination = await save({ title: 'Export textured mesh bundle', defaultPath: 'scan-mesh.obj', filters: [{ name: 'Wavefront OBJ', extensions: ['obj'] }] });
+    if (!destination) return;
     try {
-      const destinationPath = await save({
-        title: 'Export canonical Gaussian splat',
-        defaultPath: 'room-splat.ply',
-        filters: [{ name: '3D Gaussian splat PLY', extensions: ['ply'] }]
-      });
-      if (!destinationPath) return;
-      const savedPath = await exportGaussianSplat(project.path, destinationPath);
-      message = `Gaussian PLY and coordinate sidecars saved to ${savedPath}.`;
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    } finally {
-      busy = false;
-    }
+      message = `OBJ, MTL, and texture exported beside ${await exportTexturedMesh(project.path, destination)}.`;
+    } catch (error) { message = errorText(error); }
+  }
+
+  async function exportSplat(): Promise<void> {
+    if (!project || !artifactReady('gaussianSplat')) return;
+    const destination = await save({ title: 'Export metric 2D Gaussian surface', defaultPath: 'scan-2dgs.ply', filters: [{ name: 'Gaussian PLY', extensions: ['ply'] }] });
+    if (!destination) return;
+    try {
+      message = `Gaussian surface and coordinate sidecars exported to ${await exportGaussianSplat(project.path, destination)}.`;
+    } catch (error) { message = errorText(error); }
   }
 
   onMount(() => {
-    // Remove the old global transform once. It used to rotate every project and
-    // even the raw sensor feed, which could make a new live view appear inverted.
-    localStorage.removeItem('scanlan-cloud-transform');
-    loadVisualizationPreferences();
     void (async () => {
       try {
         project = await currentProject();
-        runtime = await runtimeInfo().catch(() => null);
-        loadTransform(project.id);
-        selectedSensorOption = configuredSensorOption(project.settings);
-        selectedMediaSourceIds = project.mediaSources.map((source) => source.id);
-        const savedSourceMode = localStorage.getItem(sourceModeStorageKey(project.id));
-        if (
-          (savedSourceMode === 'media' && project.mediaSources.length > 0) ||
-          (!savedSourceMode && project.mediaSources.length > 0 && (
-            !project.artifacts.gaussianSplat ||
-            !project.artifacts.gaussianSplat.metric ||
-            project.phases.length === 0
-          ))
-        ) setSourceMode('media');
-        else if (savedSourceMode === 'rgbd' && project.phases.length > 0) setSourceMode('rgbd');
-        if (project.activeJob) {
-          activeJob = await artifactJobStatus(project.path, project.activeJob).catch(() => null);
-        } else {
-          const latestJob = await latestArtifactJob(project.path).catch(() => null);
-          activeJob = latestJob?.resumable ? latestJob : null;
+        [runtime, sensors] = await Promise.all([
+          runtimeInfo().catch(() => null),
+          availableSensors().catch(() => [])
+        ]);
+        const fallback = await selectSupportedFallback();
+        sensor = await captureStatus().catch(() => null);
+        if (project.activeJob || project.processingStatus === 'processing' || project.processingStatus === 'failed') {
+          activeJob = await latestArtifactJob(project.path).catch(() => null);
+          if (activeJob && ['queued', 'running', 'cancelling'].includes(activeJob.status)) workspace = 'reconstruct';
         }
-        const recoveredJob = Boolean(activeJob?.resumable && ['failed', 'cancelled'].includes(activeJob.status));
-        if (recoveredJob) setSourceMode(activeJob?.pipeline === 'media_gaussian' ? 'media' : 'rgbd');
-        const savedWorkspaceMode = localStorage.getItem(workspaceModeStorageKey(project.id));
-        const validSavedMode = workflowModes.some((mode) => mode.id === savedWorkspaceMode)
-          ? savedWorkspaceMode as WorkspaceMode
-          : null;
-        if (recoveredJob || project.processingStatus === 'processing' || (activeJob && ['queued', 'running', 'cancelling'].includes(activeJob.status))) {
-          workspaceMode = 'process';
-          viewMode = 'preview';
-        } else if (validSavedMode) {
-          workspaceMode = validSavedMode;
-        } else if (project.processingStatus === 'complete') {
-          workspaceMode = 'render';
-        } else if (project.mediaSources.length > 0 && project.phases.length === 0) {
-          workspaceMode = 'media';
+        if (!capturing && readyArtifacts) {
+          workspace = 'inspect';
+          if (artifactReady('texturedMesh')) await loadResult('mesh');
+          else if (artifactReady('pointCloud')) await loadResult('points');
+          else if (artifactReady('gaussianSplat')) await loadResult('splat');
         }
-        if ((workspaceMode === 'render' || workspaceMode === 'export') && project.processingStatus === 'complete') {
-          viewMode = 'preview';
-          await refreshResultPreview();
-        }
-        if (project.processingStatus === 'failed') {
-          message = project.processingError ?? 'The last reconstruction failed; captured phases are still available.';
-        } else {
-          message = 'Sensor discovery is manual. Select Scan sensors when you are ready to connect.';
-        }
+        message = fallback
+          ? `${fallback} selected because the previous camera backend is not installed.`
+          : runtime?.sensorStatus ?? 'RGB-D workspace ready.';
+        statusTimer = window.setInterval(() => void pollStatus(), 300);
       } catch (error) {
-        initializationError = error instanceof Error ? error.message : String(error);
-        message = initializationError;
-        connecting = false;
-      } finally {
-        if (statusTimer === undefined) statusTimer = window.setInterval(() => void refreshSensorStatus(), 100);
-        if (previewTimer === undefined) previewTimer = window.setInterval(() => void refreshLivePreview(), 25);
+        fatalError = errorText(error);
+        message = fatalError;
       }
     })();
   });
 
   onDestroy(() => {
-    if (statusTimer !== undefined) window.clearInterval(statusTimer);
-    if (previewTimer !== undefined) window.clearInterval(previewTimer);
-    if (settingsSaveTimer !== undefined) window.clearTimeout(settingsSaveTimer);
+    if (statusTimer) window.clearInterval(statusTimer);
+    if (settingsTimer) window.clearTimeout(settingsTimer);
   });
 </script>
 
-<svelte:head><title>ScanLan</title></svelte:head>
-<svelte:window on:keydown={handlePreviewShortcut} />
+<svelte:head><title>ScanLan · RGB-D Reconstruction</title></svelte:head>
 
-<main class:processing-workspace={processing} class="app-shell">
+<div class="app-shell">
   <header class="topbar">
-    <div class="brand">
-      <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
-      <div><h1>ScanLan</h1><p>Spatial capture workspace</p></div>
+    <div class="brand"><span class="brand-mark">SL</span><div><strong>ScanLan</strong><small>Realtime RGB-D reconstruction</small></div></div>
+    <div class="project-title"><span>ACTIVE SCAN</span><strong>{project?.name ?? 'Loading…'}</strong></div>
+    <div class="runtime-state">
+      <span class:ready={Boolean(runtime?.sensorWorkerAvailable)}><i></i>Capture</span>
+      <span class:ready={Boolean(runtime?.reconstructionWorkerAvailable)}><i></i>Reconstruct</span>
+      <span class:ready={Boolean(runtime?.splatWorkerAvailable)}><i></i>2DGS CUDA</span>
     </div>
-    {#if project}
-      <div class="project-crumb"><span>ACTIVE PROJECT</span><strong>{project.name}</strong><small title={project.path}>{project.path}</small></div>
-    {/if}
-    <div class="top-actions">
-      <div class="runtime-pill" class:connected={!processing && sensor?.sensorConnected} class:paused={processing || sensor?.sensorPaused} title={processing ? 'Sensor preview remains paused until the artifact job is fully published' : sensor?.sensorStatus}>
-        <span></span>
-        <div><small>SENSOR</small><strong>{processing ? 'Paused for build' : discoveryInFlight ? 'Scanning…' : connecting ? 'Connecting…' : sensor?.sensorConnected ? 'Connected' : 'Not connected'}</strong></div>
-      </div>
-      <button class="button ghost" on:click={newProject} disabled={busy || capturing || processing}>New project</button>
-    </div>
+    <button class="ghost compact" on:click={newProjectAction} disabled={busy || capturing || processing}>New scan</button>
   </header>
 
-  {#if project}
-    <nav class="workflow-nav" aria-label="Scan workflow">
-      {#each workflowModes as mode}
-        <button
-          class:active={workspaceMode === mode.id}
-          class:complete={(mode.id === 'capture' && completedPhases > 0) || (mode.id === 'media' && hasMediaSources) || ((mode.id === 'render' || mode.id === 'export') && artifactCount > 0)}
-          aria-current={workspaceMode === mode.id ? 'step' : undefined}
-          on:click={() => void selectWorkspaceMode(mode.id)}
-        >
-          <span class="workflow-step">{mode.step}</span>
-          <span class="workflow-copy"><strong>{mode.label}</strong><small>{mode.description}</small></span>
-          <span class="workflow-badge">{workflowBadge(mode.id)}</span>
-        </button>
-      {/each}
-    </nav>
+  <nav class="workflow" aria-label="Workflow">
+    <button class:active={workspace === 'capture'} class:done={completedCaptures > 0} on:click={() => workspace = 'capture'}>
+      <span>01</span><div><strong>Capture</strong><small>{capturing ? 'Recording now' : `${completedCaptures} take${completedCaptures === 1 ? '' : 's'}`}</small></div>
+    </button>
+    <button class:active={workspace === 'reconstruct'} class:done={readyArtifacts > 0} on:click={() => workspace = 'reconstruct'} disabled={capturing}>
+      <span>02</span><div><strong>Reconstruct</strong><small>{processing ? activeJob?.stage.replaceAll('_', ' ') : 'Points · mesh · 2DGS'}</small></div>
+    </button>
+    <button class:active={workspace === 'inspect'} class:done={readyArtifacts > 0} on:click={() => workspace = 'inspect'} disabled={capturing || (!processing && readyArtifacts === 0)}>
+      <span>03</span><div><strong>Inspect & export</strong><small>{readyArtifacts ? `${readyArtifacts} output${readyArtifacts === 1 ? '' : 's'} ready` : 'No output yet'}</small></div>
+    </button>
+  </nav>
 
-    <section class="workspace">
-      <aside class="context-panel panel">
-        <div class="panel-heading">
-          <div class="eyebrow">{workspaceMode === 'device' ? 'SETUP' : workspaceMode === 'capture' ? 'SESSION' : workspaceMode === 'media' ? 'INPUT LIBRARY' : workspaceMode === 'process' ? 'BUILD INPUT' : workspaceMode === 'render' ? 'AVAILABLE VIEWS' : 'DELIVERABLES'}</div>
-          <h2>{workspaceMode === 'device' ? 'Device readiness' : workspaceMode === 'capture' ? 'Capture phases' : workspaceMode === 'media' ? 'Media overview' : workspaceMode === 'process' ? 'Choose source' : workspaceMode === 'render' ? processing ? 'Current build result' : 'Current model' : 'Ready to export'}</h2>
+  <main>
+    <section class="viewport">
+      <PointCloudPreview
+        points={capturing ? [] : previewPoints}
+        packedFrame={viewerPackedFrame}
+        processing={processing}
+        live={capturing}
+        pointSize={0.026}
+        opacity={0.95}
+        showColors={true}
+        renderMode={viewerRenderMode}
+        mesh={viewerMesh}
+        splatBytes={capturing ? null : previewSplat}
+        {meshViewMode}
+        assetLoading={assetLoading}
+      />
+
+      {#if capturing && sensor}
+        <div class="live-metrics">
+          <div><span>Tracking</span><strong class:good={sensor.tracking}>{sensor.tracking ? 'LOCKED' : 'SEARCHING'}</strong></div>
+          <div><span>Tracker</span><strong>{sensor.trackingFps.toFixed(1)} fps</strong></div>
+          <div><span>Keyframes</span><strong>{sensor.liveIntegratedFrameCount}</strong></div>
+          <div><span>Overlap</span><strong>{Math.round(sensor.trackingOverlap * 100)}%</strong></div>
+          <div><span>Depth error</span><strong>{sensor.depthRmseMm ? `${sensor.depthRmseMm.toFixed(1)} mm` : '—'}</strong></div>
+          <div><span>Queue drops</span><strong>{sensor.trackingQueueDropCount + sensor.mappingDropCount}</strong></div>
         </div>
+      {/if}
 
-        {#if workspaceMode === 'device'}
-          <div class:connected={sensor?.sensorConnected} class="connection-card">
-            <span class="connection-icon">{sensor?.sensorConnected ? '✓' : '1'}</span>
-            <div><small>{sensor?.sensorConnected ? 'INPUT ONLINE' : 'ACTION REQUIRED'}</small><strong>{sensor?.sensorConnected ? sensor.sensorName : 'Connect a depth sensor'}</strong><p>{sensor?.sensorConnected ? `${sensor.streamFps.toFixed(1)} fps stream available` : 'Scan USB devices or enter the network camera address.'}</p></div>
-          </div>
-          <div class="checklist">
-            <div class:ready={runtime?.sensorWorkerAvailable}><span>01</span><div><strong>Capture runtime</strong><small>{runtime?.sensorWorkerAvailable ? 'Available' : 'Unavailable'}</small></div></div>
-            <div class:ready={sensorChoices.length > 0 || sensor?.sensorConnected}><span>02</span><div><strong>Device discovered</strong><small>{sensorChoices.length > 0 || sensor?.sensorConnected ? 'Sensor found' : 'Scan required'}</small></div></div>
-            <div class:ready={sensor?.sensorConnected}><span>03</span><div><strong>Live stream</strong><small>{sensor?.sensorConnected ? 'Ready to capture' : 'Waiting for input'}</small></div></div>
-          </div>
-          <div class="context-note"><strong>What belongs here</strong><p>Device selection, network address, depth mode, and tracking hardware. Capture quality controls live in the next workspace.</p></div>
-
-        {:else if workspaceMode === 'capture'}
-          <div class="phase-list">
-            {#if project.phases.length === 0}
-              <div class="empty-state compact"><span>01</span><strong>No RGB-D phases yet</strong><p>Connect the sensor, then record a slow pass with overlapping views.</p></div>
-            {:else}
-              {#each project.phases as phase, index}
-                <article class:active={phase.status === 'capturing'} class="phase-card">
-                  <div class="phase-index">{String(index + 1).padStart(2, '0')}</div>
-                  <div class="phase-copy"><strong>{phase.name}</strong><span>{phase.frameCount} frames · {formatDuration(phase.durationSeconds)}</span><small><i></i>{phase.overlapHint}</small></div>
-                  <div class="phase-actions">
-                    <div class:capturing={phase.status === 'capturing'} class:failed={phase.status === 'failed'} class="phase-status">{phase.status === 'capturing' ? '●' : phase.status === 'failed' ? '!' : '✓'}</div>
-                    {#if phase.status !== 'capturing'}<button class="remove-phase" title={`Remove ${phase.name}`} disabled={busy || processing} on:click={() => removeCaptureAction(phase.id, phase.name)}>×</button>{/if}
-                  </div>
-                </article>
-              {/each}
-            {/if}
-          </div>
-          <button class:stopping={capturing} class="button primary context-primary" on:click={captureAction} disabled={busy || processing || (!capturing && !sensor?.sensorConnected)}><span class="record-dot"></span>{capturing ? 'Stop & save phase' : project.phases.length ? 'Record another phase' : 'Start first phase'}</button>
-          <div class="scan-stats">
-            <div><span>Saved frames</span><strong>{totalFrames.toLocaleString()}</strong></div>
-            <div><span>Current phase</span><strong>{capturing ? sensor?.frameCount ?? 0 : '—'}</strong></div>
-            <div><span>{capturing && sensor?.liveReconstructionMode === 'mesh' ? 'Live triangles' : 'Live points'}</span><strong>{formatCount(capturing && sensor?.liveReconstructionMode === 'mesh' ? sensor.liveTriangleCount : packedPreviewFrame?.pointCount ?? previewPoints.length)}</strong></div>
-            <div><span>Tracking</span><strong class:warning={capturing && sensor?.liveReconstructionActive && !sensor?.tracking}>{capturing ? sensor?.tracking ? 'Locked' : 'Searching' : 'Standby'}</strong></div>
-          </div>
-          {#if capturing && sensor?.liveReconstructionActive}<div class="context-note"><strong>Live fusion selection</strong><p>{sensor.liveIntegratedFrameCount} keyframes fused · {sensor.liveRejectedFrameCount} tracking-gap frames excluded from offline reconstruction.</p></div>{/if}
-          <div class="context-note accent"><strong>Capture guidance</strong><p>Move slowly, keep textured surfaces in view, and overlap each phase with the previous one.</p></div>
-
-        {:else if workspaceMode === 'media'}
-          <div class="summary-stack">
-            <div><span>RGB-D recordings</span><strong>{completedPhases}</strong><small>{totalFrames.toLocaleString()} saved depth + color frames</small></div>
-            <div><span>Imported sources</span><strong>{project.mediaSources.length}</strong><small>{project.mediaSources.reduce((sum, source) => sum + source.imageCount, 0).toLocaleString()} photos / extracted frames</small></div>
-            <div><span>Selected imports</span><strong>{selectedMediaSourceIds.length}</strong><small>Included in the media pipeline</small></div>
-          </div>
-          <div class="context-note"><strong>Two source types</strong><p>RGB-D recordings use calibrated depth reconstruction. Imported photos and video use camera registration and Gaussian training.</p></div>
-          <button class="button secondary full" on:click={() => void selectWorkspaceMode('process')} disabled={completedPhases === 0 && !hasMediaSources}>Configure processing →</button>
-
-        {:else if workspaceMode === 'process'}
-          <div class="source-choice">
-            <button class:active={sourceMode === 'rgbd'} on:click={() => setSourceMode('rgbd')} disabled={processing || completedPhases === 0}>
-              <span class="source-mark">D</span><div><strong>RGB-D captures</strong><small>{completedPhases} completed phases · {totalFrames.toLocaleString()} frames</small></div><i>{sourceMode === 'rgbd' ? 'Selected' : completedPhases ? 'Use' : 'Empty'}</i>
-            </button>
-            <button class:active={sourceMode === 'media'} on:click={() => setSourceMode('media')} disabled={processing || !hasMediaSources}>
-              <span class="source-mark media">M</span><div><strong>Photos / video</strong><small>{selectedMediaSourceIds.length} of {project.mediaSources.length} sources selected</small></div><i>{sourceMode === 'media' ? 'Selected' : hasMediaSources ? 'Use' : 'Empty'}</i>
-            </button>
-          </div>
-          {#if sourceMode === 'media' && hasMediaSources}
-            <div class="mini-source-list">
-              <span>INCLUDED SOURCES</span>
-              {#each project.mediaSources as source}
-                <label><input type="checkbox" checked={selectedMediaSourceIds.includes(source.id)} on:change={() => toggleMediaSource(source.id)} disabled={processing} /><div><strong>{source.name}</strong><small>{source.kind === 'video' ? 'Video' : `${source.imageCount} photos`}</small></div></label>
-              {/each}
-            </div>
-          {/if}
-          <div class="context-note"><strong>Source determines the pipeline</strong><p>{sourceMode === 'media' ? 'Media runs frame filtering, GPU camera registration, then Gaussian training.' : 'RGB-D uses calibrated depth, camera tracking, fusion, and optional texturing.'}</p></div>
-
-        {:else if workspaceMode === 'render'}
-          <div class="artifact-list">
-            <div class:live={processing && previewPoints.length > 0} class:ready={previewPoints.length > 0 || Boolean(project.artifacts.pointCloud && !project.artifacts.pointCloud.stale)}><span class="artifact-icon">P</span><div><strong>Point cloud</strong><small>{processing && previewPoints.length > 0 ? `${formatCount(previewPoints.length)} live reconstruction points` : project.artifacts.pointCloud ? project.artifacts.pointCloud.stale ? 'Rebuild required' : `${formatCount(project.pointCount)} points` : 'Not built'}</small></div></div>
-            <div class:ready={Boolean(project.artifacts.texturedMesh && !project.artifacts.texturedMesh.stale)}><span class="artifact-icon">M</span><div><strong>Textured mesh</strong><small>{project.artifacts.texturedMesh ? project.artifacts.texturedMesh.stale ? 'Rebuild required' : `${formatCount(project.meshTriangleCount)} triangles` : 'Not built'}</small></div></div>
-            <div class:live={processing && Boolean(previewSplat)} class:ready={Boolean(previewSplat) || Boolean(project.artifacts.gaussianSplat && !project.artifacts.gaussianSplat.stale)}><span class="artifact-icon">G</span><div><strong>Gaussian splat</strong><small>{processing ? previewSplat ? `${formatCount(liveSplatCount)} live Gaussians · ${formatSnapshotTime(liveSplatUpdatedAt)}` : gaussianTrainingStage ? 'Waiting for the first training snapshot' : activeBuildIncludesSplat ? 'Available when Gaussian training starts' : 'Not part of this build' : project.artifacts.gaussianSplat ? project.artifacts.gaussianSplat.stale ? 'Rebuild required' : project.artifacts.gaussianSplat.metric ? 'Metric scale' : 'Arbitrary scale' : 'Not built'}</small></div></div>
-          </div>
-          {#if processing}
-            <div class="context-note accent"><strong>Live build view</strong><p>Orbit, zoom, and switch between available geometry while the job continues. Model-orientation tools unlock after publishing finishes.</p></div>
-          {:else}
-            <div class="context-note accent"><strong>Viewer vs. saved model</strong><p>Edit controls are non-destructive. Use “Apply pose to exports” only when the saved coordinate system should change.</p></div>
-          {/if}
-          <button class="button secondary full" on:click={() => void selectWorkspaceMode('export')} disabled={processing || artifactCount === 0}>Continue to export →</button>
-
-        {:else}
-          <div class="delivery-summary"><strong>{exportCount}</strong><span>formats ready</span><p>Each export is created as a new copy. Project artifacts remain in place.</p></div>
-          <div class="artifact-list compact-list">
-            <div class:ready={Boolean(project.artifacts.gaussianSplat && !project.artifacts.gaussianSplat.stale)}><span class="artifact-icon">G</span><div><strong>Gaussian PLY</strong><small>{project.artifacts.gaussianSplat && !project.artifacts.gaussianSplat.stale ? 'Ready' : 'Unavailable'}</small></div></div>
-            <div class:ready={Boolean(project.meshOutputPath)}><span class="artifact-icon">O</span><div><strong>Textured OBJ</strong><small>{project.meshOutputPath ? 'Ready' : 'Unavailable'}</small></div></div>
-            <div class:ready={project.processingStatus === 'complete' && Boolean(project.outputPath)}><span class="artifact-icon">P</span><div><strong>Unity PLY</strong><small>{project.processingStatus === 'complete' && project.outputPath ? 'Ready' : 'Unavailable'}</small></div></div>
-          </div>
-          <div class="context-note"><strong>Coordinate note</strong><p>The Unity PLY corrects the X axis in the exported copy. Other source artifacts stay unchanged.</p></div>
-        {/if}
-
-        <div class="project-footer"><span>PROJECT</span><strong>{project.name}</strong><small title={project.path}>{project.path}</small></div>
-      </aside>
-
-      <section class="main-stage">
-        <div class="stage-header">
-          <div><div class="eyebrow">{workspaceKicker}</div><h2>{workspaceTitle}</h2></div>
-          <div class="metrics">
-            {#if workspaceMode === 'device'}
-              <div><span>Stream</span><strong>{sensor?.sensorConnected ? `${sensor.streamFps.toFixed(1)} fps` : 'Offline'}</strong></div>
-              <div><span>Preview</span><strong>{previewFps > 0 ? `${previewFps.toFixed(1)} fps` : '—'}</strong></div>
-              <div><span>Visible</span><strong>{formatCount(packedPreviewFrame?.pointCount ?? previewPoints.length)}</strong></div>
-            {:else if workspaceMode === 'capture'}
-              <div><span>Phase frames</span><strong>{capturing ? (sensor?.frameCount ?? 0).toLocaleString() : '—'}</strong></div>
-              <div><span>Total saved</span><strong>{totalFrames.toLocaleString()}</strong></div>
-              <div><span>Tracking</span><strong>{capturing ? sensor?.tracking ? 'Locked' : 'Searching' : 'Standby'}</strong></div>
-            {:else if workspaceMode === 'media'}
-              <div><span>Recordings</span><strong>{completedPhases}</strong></div>
-              <div><span>Imports</span><strong>{project.mediaSources.length}</strong></div>
-              <div><span>Images</span><strong>{formatCount(project.mediaSources.reduce((sum, source) => sum + source.imageCount, 0))}</strong></div>
-            {:else if workspaceMode === 'process'}
-              {#if processing}
-                <div><span>Stage</span><strong>{buildStage.label}</strong></div>
-                <div><span>Live preview</span><strong>{previewSplat ? `${formatCount(previewSplat.byteLength / 32)} splats` : `${formatCount(previewPoints.length)} points`}</strong></div>
-                <div><span>Overall</span><strong>{Math.round(overallBuildProgress * 100)}%</strong></div>
-              {:else}
-                <div><span>Input</span><strong>{sourceMode === 'media' ? 'Media' : 'RGB-D'}</strong></div>
-                <div><span>Outputs</span><strong>{sourceMode === 'media' ? 1 : Number(buildPointCloud) + Number(buildTexturedMesh) + Number(buildGaussianSplat)}</strong></div>
-                <div><span>Compute</span><strong>{sourceMode === 'media' || buildGaussianSplat ? 'CUDA' : 'GPU preferred'}</strong></div>
-              {/if}
-            {:else if workspaceMode === 'render' && processing}
-              <div><span>Displayed</span><strong>{previewRenderMode === 'splat' && previewSplat ? 'Live Gaussian' : previewRenderMode === 'mesh' && previewMesh ? 'Mesh' : 'Live points'}</strong></div>
-              <div><span>Gaussian</span><strong>{liveSplatState === 'ready' ? `${formatCount(liveSplatCount)} splats` : liveSplatState === 'loading' ? 'Checking…' : liveSplatState === 'error' ? 'Update error' : gaussianTrainingStage ? 'Waiting…' : activeBuildIncludesSplat ? 'Not started' : 'Not requested'}</strong></div>
-              <div><span>Snapshot</span><strong>{formatSnapshotTime(liveSplatUpdatedAt)}</strong></div>
-            {:else}
-              <div><span>Points</span><strong>{formatCount(project.pointCount)}</strong></div>
-              <div><span>Triangles</span><strong>{formatCount(project.meshTriangleCount)}</strong></div>
-              <div title={project.confidenceDetail ?? 'Available after a successful build'}><span>Confidence</span><strong class={`confidence ${confidenceClass(project.confidenceScore)}`}>{project.confidenceScore !== undefined ? `${project.confidenceScore}%` : '—'}</strong></div>
-            {/if}
-          </div>
+      {#if processing && activeJob}
+        <div class="job-overlay">
+          <div><span>{activeJob.stage.replaceAll('_', ' ')}</span><strong>{Math.round(activeJob.progress * 100)}%</strong></div>
+          <div class="progress"><i style={`width:${Math.round(activeJob.progress * 100)}%`}></i></div>
+          <p>{activeJob.detail}</p>
         </div>
-
-        {#if workspaceMode === 'media'}
-          <div class="media-workspace panel-inset">
-            <div class="media-hero">
-              <div><span>PROJECT MEDIA</span><h3>Recorded captures and imported media</h3><p>Review every source in one place before choosing a reconstruction pipeline.</p></div>
-              <div class="media-import-actions"><button class="button secondary" on:click={importPhotosAction} disabled={busy || processing}>+ Photo folder</button><button class="button secondary" on:click={importVideoAction} disabled={busy || processing}>+ Video file</button></div>
-            </div>
-            {#if project.phases.length === 0 && project.mediaSources.length === 0}
-              <div class="empty-state media-empty"><span>M</span><strong>No imported media</strong><p>Add a folder of overlapping photos or a steady video orbit to train a Gaussian splat.</p></div>
-            {:else}
-              {#if project.phases.length > 0}
-                <div class="media-section-heading"><div><span>RGB-D RECORDINGS</span><small>All completed phases are used together</small></div><strong>{project.phases.length}</strong></div>
-                <div class="media-grid">
-                  {#each project.phases as phase, index}
-                    <article class="media-source-card recorded-source">
-                      <div class="source-select"><span>{phase.status === 'complete' ? 'Ready for RGB-D reconstruction' : phase.status}</span></div>
-                      <div class="media-type-icon">D</div>
-                      <div class="media-source-copy"><small>RGB-D PHASE {String(index + 1).padStart(2, '0')}</small><strong title={phase.name}>{phase.name}</strong><p>{phase.frameCount.toLocaleString()} frames · {formatDuration(phase.durationSeconds)}</p></div>
-                      <div class="media-quality"><span>{phase.overlapHint}</span><small>Depth, color, calibration, and motion samples</small></div>
-                      <button class="remove-source" on:click={() => removeCaptureAction(phase.id, phase.name)} disabled={busy || processing || phase.status === 'capturing'}>Remove</button>
-                    </article>
-                  {/each}
-                </div>
-              {/if}
-              {#if project.mediaSources.length > 0}
-                <div class="media-section-heading"><div><span>IMPORTED PHOTOS &amp; VIDEO</span><small>Select sources for Gaussian training</small></div><strong>{project.mediaSources.length}</strong></div>
-                <div class="media-grid">
-                  {#each project.mediaSources as source}
-                    <article class:selected={selectedMediaSourceIds.includes(source.id)} class="media-source-card">
-                      <label class="source-select"><input type="checkbox" checked={selectedMediaSourceIds.includes(source.id)} on:change={() => toggleMediaSource(source.id)} disabled={processing} /><span>{selectedMediaSourceIds.includes(source.id) ? 'Included in next build' : 'Excluded from build'}</span></label>
-                      <div class="media-type-icon">{source.kind === 'video' ? '▶' : '▦'}</div>
-                      <div class="media-source-copy"><small>{source.kind === 'video' ? 'VIDEO SOURCE' : 'PHOTO SET'}</small><strong title={source.name}>{source.name}</strong><p>{source.kind === 'video' ? 'Frames extracted during processing' : `${source.imageCount.toLocaleString()} images`} · {source.status}</p></div>
-                      <div class="media-quality"><span>{source.quality?.registeredImages ?? 0}/{source.quality?.totalImages ?? source.imageCount} registered</span><small>{source.quality?.detail ?? 'Ready for registration'}</small></div>
-                      <button class="remove-source" on:click={() => removeMediaSourceAction(source.id, source.name)} disabled={busy || processing}>Remove</button>
-                    </article>
-                  {/each}
-                </div>
-              {/if}
-            {/if}
-          </div>
-        {:else if workspaceMode === 'process' && !processing}
-          <div class="process-workspace panel-inset">
-            <div class="process-plan-heading"><span>BUILD PLAN</span><h3>{sourceMode === 'media' ? 'Media to Gaussian splat' : 'RGB-D reconstruction'}</h3><p>{sourceMode === 'media' ? `${selectedMediaSourceIds.length} selected media sources will be registered and trained.` : `${completedPhases} capture phases and ${totalFrames.toLocaleString()} saved frames will be reconstructed.`}</p></div>
-            <div class="pipeline-flow">
-              {#each sourceMode === 'media' ? mediaStages : stagesFor(null) as stage, index}
-                <div><span>{String(index + 1).padStart(2, '0')}</span><strong>{stage.label}</strong></div>
-              {/each}
-            </div>
-            <div class="build-output-summary">
-              <span>PLANNED OUTPUTS</span>
-              <div>
-                {#if sourceMode === 'media'}<strong>Gaussian splat</strong>{/if}
-                {#if sourceMode === 'rgbd' && buildPointCloud}<strong>Point cloud</strong>{/if}
-                {#if sourceMode === 'rgbd' && buildTexturedMesh}<strong>Textured mesh</strong>{/if}
-                {#if sourceMode === 'rgbd' && buildGaussianSplat}<strong>Gaussian splat</strong>{/if}
-                {#if sourceMode === 'rgbd' && !buildPointCloud && !buildTexturedMesh && !buildGaussianSplat}<small>No outputs selected. Choose one in Processing controls.</small>{/if}
-              </div>
-            </div>
-          </div>
-        {:else}
-          <div class="viewer-wrap">
-            <PointCloudPreview
-              points={previewPoints}
-              packedFrame={viewMode === 'live' && sensorSessionEnabled && sensor?.sensorConnected ? packedPreviewFrame : null}
-              {processing}
-              live={capturing || ((workspaceMode === 'device' || workspaceMode === 'capture') && Boolean(sensor?.sensorConnected))}
-              {pointSize}
-              opacity={pointOpacity}
-              {showColors}
-              {meshViewMode}
-              {lightDirection}
-              lightEditMode={lightEditMode && workspaceMode === 'render' && previewRenderMode === 'mesh' && meshViewMode === 'shaded'}
-              renderMode={processing ? workspaceMode === 'render' ? previewRenderMode === 'splat' && previewSplat ? 'splat' : previewRenderMode === 'mesh' && previewMesh ? 'mesh' : 'points' : previewSplat ? 'splat' : 'points' : viewMode === 'preview' ? previewRenderMode : capturing && sensor?.liveReconstructionMode === 'mesh' && previewMesh ? 'mesh' : 'points'}
-              mesh={previewMesh}
-              splatBytes={previewSplat}
-              assetLoading={previewAssetLoading === previewRenderMode ? previewAssetLoading : null}
-              {cameraFrames}
-              showCameraFrames={showCameraFrames && workspaceMode === 'render' && !processing}
-              floorPickMode={floorPickMode && workspaceMode === 'render' && !processing}
-              anchorPickMode={anchorPickMode && canEdit}
-              cloudTransform={viewerTransform}
-              gizmoAnchor={effectiveGizmoAnchor}
-              editMode={editMode && canEdit && !anchorPickMode}
-              {gizmoMode}
-              onFloorDetected={setFloorTransform}
-              onFloorMessage={(value) => message = value}
-              onAnchorPicked={setGizmoAnchor}
-              onTransformChanged={handleGizmoTransform}
-              onTransformCommitted={commitGizmoTransform}
-              onLightDirectionChanged={handleLightDirectionChanged}
-            />
-            {#if capturing && sensor?.liveReconstructionActive && sensor.liveProcessedFrameCount > 0 && !sensor.tracking}
-              <div class="tracking-lost-overlay"><span>TRACKING LOST</span><strong>Return to the last reconstructed area</strong><p>The map is frozen. Frames captured during this gap are being rejected until continuity is recovered.</p></div>
-            {/if}
-            {#if workspaceMode === 'render' && processing && previewPoints.length === 0 && !previewMesh && !previewSplat}
-              <div class="viewer-empty live-wait"><span>WAITING FOR LIVE GEOMETRY</span><strong>The build is still preparing its first 3D preview</strong><button class="button secondary" on:click={() => void selectWorkspaceMode('process')}>View job progress</button></div>
-            {:else if (workspaceMode === 'render' || workspaceMode === 'export') && artifactCount === 0 && previewPoints.length === 0 && !previewMesh && !previewSplat}
-              <div class="viewer-empty"><span>NO MODEL YET</span><strong>Build an artifact to unlock this workspace</strong><button class="button secondary" on:click={() => void selectWorkspaceMode('process')}>Open Processing</button></div>
-            {/if}
-          </div>
-        {/if}
-
-        <div class:with-progress={processing} class="status-strip">
-          {#if processing}
-            <div class="job-feedback">
-              <div class="job-heading"><span class="status-light busy"></span><div><span class="job-kicker">{activeJob?.pipeline === 'media_gaussian' ? 'MEDIA SPLAT JOB' : 'RGB-D ARTIFACT JOB'}</span><strong>{buildStage.label}</strong></div><span class="job-stage-count">Stage {buildStage.current} / {buildStage.total}</span></div>
-              <div class="job-detail" title={buildDetail}>{buildDetail}</div>
-              <div class="job-progress-grid"><span>Overall</span><div class="progress-track overall"><i style={`width: ${Math.max(2, overallBuildProgress * 100)}%`}></i></div><strong>{Math.round(overallBuildProgress * 100)}%</strong><span>Stage</span><div class="progress-track stage"><i style={`width: ${Math.max(2, currentStageProgress * 100)}%`}></i></div><strong>{Math.round(currentStageProgress * 100)}%</strong></div>
-              <div class="job-backend">{buildBackend}</div>
-            </div>
-            <div class="job-timing"><span>Estimated left</span><strong>{formatEtaValue(totalBuildEta)}</strong><small>{currentStageEta != null ? `${formatEtaValue(currentStageEta)} this stage` : reconstruction?.elapsedSeconds != null ? `${reconstruction.elapsedSeconds}s elapsed` : 'Measuring throughput'}</small></div>
-            <div class="job-actions">
-              <button class="button secondary" on:click={() => void selectWorkspaceMode(workspaceMode === 'render' ? 'process' : 'render')}>{workspaceMode === 'render' ? 'Job details' : 'Open live Edit'}</button>
-              <button class="button process cancel-job" on:click={processCloud} disabled={busy || !activeJob}>{activeJob?.status === 'cancelling' ? 'Cancelling…' : 'Cancel job'}</button>
-            </div>
-          {:else}
-            <div class="status-copy"><div class="status-message"><span class:busy={busy} class="status-light"></span><div><small>STATUS</small><strong>{statusMessage}</strong></div></div></div>
-            {#if jobAwaitingDecision}
-              <div class="recovery-actions">
-                <button class="button secondary" on:click={discardInterruptedJob} disabled={busy}>Cancel build</button>
-                <button class="button process strong" on:click={resumeInterruptedJob} disabled={busy}>Resume build</button>
-              </div>
-            {:else if workspaceMode === 'device'}
-              <button class="button secondary" disabled={busy || discoveryInFlight} on:click={() => void scanSensors()}>{discoveryInFlight ? 'Scanning…' : sensor?.sensorConnected ? 'Rescan devices' : 'Scan for devices'}</button>
-            {:else if workspaceMode === 'capture'}
-              <button class:stopping={capturing} class="button primary" on:click={captureAction} disabled={busy || (!capturing && !sensor?.sensorConnected)}><span class="record-dot"></span>{capturing ? 'Stop capture' : 'Start capture'}</button>
-            {:else if workspaceMode === 'media'}
-              <button class="button secondary" on:click={() => void selectWorkspaceMode('process')} disabled={completedPhases === 0 && !hasMediaSources}>Configure processing →</button>
-            {:else if workspaceMode === 'process'}
-              <button class="button process strong" on:click={processCloud} disabled={busy || (!activeJob?.resumable && !canBuildArtifacts)}>{activeJob?.resumable && ['failed', 'cancelled'].includes(activeJob.status) && activeJob.pipeline === (sourceMode === 'media' ? 'media_gaussian' : 'rgbd_reconstruction') ? 'Resume splat' : sourceMode === 'media' ? 'Train Gaussian splat' : 'Build artifacts'}</button>
-            {:else if workspaceMode === 'render'}
-              <button class="button secondary" on:click={() => void selectWorkspaceMode('export')} disabled={artifactCount === 0}>Open Export →</button>
-            {/if}
-          {/if}
-        </div>
-      </section>
-
-      <aside class="settings panel">
-        <div class="panel-heading control-heading"><div><div class="eyebrow">CONTROLS</div><h2>{workspaceMode === 'device' ? 'Input device' : workspaceMode === 'capture' ? 'Capture settings' : workspaceMode === 'media' ? 'Import settings' : workspaceMode === 'process' ? 'Processing' : workspaceMode === 'render' ? processing ? 'Live preview & edit' : 'Edit model' : 'Export formats'}</h2></div><span class="mode-chip">{workflowModes.find((mode) => mode.id === workspaceMode)?.step}</span></div>
-        <p class="panel-intro">{workspaceMode === 'device' ? 'Only hardware and sensor-stream controls are shown.' : workspaceMode === 'capture' ? 'These settings apply to the next RGB-D phase.' : workspaceMode === 'media' ? 'Add or remove recorded media for this project.' : workspaceMode === 'process' ? 'Choose what the selected input should become.' : workspaceMode === 'render' ? processing ? 'Inspect live build geometry now. Saved-model edits unlock when publishing finishes.' : 'Choose a view and adjust the finished model without changing the source data.' : 'Save new copies in the format your next tool needs.'}</p>
-
-        {#if workspaceMode === 'device'}
-          <div class="section-divider first-section"><span>Connection</span></div>
-          <div class="setting-group"><div class="label-row"><label for="sensor-device">Input sensor</label><button class="refresh-sensors" disabled={busy || processing || discoveryInFlight} on:click={() => void scanSensors()}>{discoveryInFlight ? 'Scanning…' : 'Scan again'}</button></div><select id="sensor-device" disabled={busy || processing || discoveryInFlight} bind:value={selectedSensorOption} on:change={sensorDeviceChanged}>{#if selectedSensorOption && selectedSensorOption !== networkFemtoOption && !sensorChoices.some((choice) => choice.id === selectedSensorOption)}<option value={selectedSensorOption}>{selectedSensorName} · unavailable</option>{/if}{#each sensorChoices as choice}<option value={choice.id}>{sensorOptionLabel(choice)}</option>{/each}<option value={networkFemtoOption}>Orbbec Femto Mega · Network IP…</option></select></div>
-          {#if project.settings.sensorKind === 'femto_mega' && project.settings.sensorConnection === 'network'}<div class="setting-group"><label for="sensor-address">Camera IP address</label><input id="sensor-address" class="text-input" disabled={busy || processing} type="text" inputmode="decimal" placeholder="192.168.1.10 or IP:port" bind:value={project.settings.sensorAddress} on:change={sensorAddressChanged} /></div>{/if}
-          {#if project.settings.sensorKind !== 'kinect_v2'}
-            <div class="section-divider"><span>Depth stream</span></div>
-            <div class="setting-group"><label for="depth-fov">Field of view</label><div class="segmented two-options" id="depth-fov"><button disabled={busy || processing} class:active={project.settings.depthFieldOfView === 'narrow'} on:click={() => setDepthFieldOfView('narrow')}>Narrow</button><button disabled={busy || processing} class:active={project.settings.depthFieldOfView === 'wide'} on:click={() => setDepthFieldOfView('wide')}>Wide</button></div></div>
-            <div class="setting-group"><label for="depth-binning">Resolution mode</label><div class="segmented two-options" id="depth-binning"><button disabled={busy || processing} class:active={!project.settings.depthBinned} on:click={() => setDepthBinned(false)}>Full detail</button><button disabled={busy || processing} class:active={project.settings.depthBinned} on:click={() => setDepthBinned(true)}>2×2 binned</button></div><p class="setting-note">{project.settings.depthFieldOfView === 'wide' ? project.settings.depthBinned ? '512×512 at 30 fps' : '1024×1024 at 15 fps' : project.settings.depthBinned ? '320×288 at 30 fps' : '640×576 at 30 fps'}</p></div>
-            <label class="toggle-row"><input disabled={busy || processing} type="checkbox" bind:checked={project.settings.useImu} on:change={scheduleProjectSettingsSave} /><span><strong>IMU tracking aid</strong><small>Seed offline camera motion</small></span></label>
-          {/if}
-
-        {:else if workspaceMode === 'capture'}
-          <div class="section-divider first-section"><span>Scene</span></div>
-          <div class="setting-group"><label for="live-reconstruction">Capture view</label><div class="segmented" id="live-reconstruction"><button disabled={busy || capturing || processing} class:active={project.settings.liveReconstruction === 'off'} on:click={() => setLiveReconstruction('off')}>Sensor frames</button><button disabled={busy || capturing || processing} class:active={project.settings.liveReconstruction === 'points'} on:click={() => setLiveReconstruction('points')}>Live points</button><button disabled={busy || capturing || processing} class:active={project.settings.liveReconstruction === 'mesh'} on:click={() => setLiveReconstruction('mesh')}>Live mesh</button></div><p class="setting-note">Live fusion uses a 10 mm or coarser working volume. The final Build still reruns full-quality global optimization.</p></div>
-          <div class="setting-group"><label for="environment">Lighting environment</label><select id="environment" disabled={busy || capturing || processing} bind:value={project.settings.environment} on:change={scheduleProjectSettingsSave}><option value="indoor">Indoor / controlled light</option><option value="outdoor_low_light">Outdoor / night / sunset</option></select></div>
-          <div class="setting-group range-group"><div class="label-row"><label for="depth">Maximum capture depth</label><output>{project.settings.maxDepthM.toFixed(1)} m</output></div><input id="depth" disabled={busy || capturing || processing} type="range" min="1.5" max="8" step="0.1" bind:value={project.settings.maxDepthM} on:input={scheduleProjectSettingsSave} /><div class="range-labels"><span>Near · 1.5 m</span><span>Far · 8.0 m</span></div></div>
-          <div class="section-divider"><span>Saved data</span></div>
-          <div class="setting-group"><label for="fps">Saved-frame rate</label><div class="segmented" id="fps">{#each [5, 10, 15] as fps}<button disabled={busy || capturing || processing} class:active={project.settings.captureFps === fps} on:click={() => setCaptureFps(fps)}>{fps} fps</button>{/each}</div><p class="setting-note">Sensor preview remains live; this controls only frames written to disk.</p></div>
-          <div class="capture-ready-card"><span>{sensor?.sensorConnected ? 'READY TO RECORD' : 'DEVICE REQUIRED'}</span><strong>{sensor?.sensorConnected ? selectedSensorName : 'Return to Input device'}</strong><small>{sensor?.sensorConnected ? 'Settings lock while a phase is recording.' : 'Connect a sensor before starting a phase.'}</small><button class:stopping={capturing} class="button primary full" on:click={captureAction} disabled={busy || processing || (!capturing && !sensor?.sensorConnected)}><span class="record-dot"></span>{capturing ? 'Stop & save phase' : 'Start capture phase'}</button></div>
-
-        {:else if workspaceMode === 'media'}
-          <div class="section-divider first-section"><span>Add input</span></div>
-          <button class="import-option" on:click={importPhotosAction} disabled={busy || processing}><span>▦</span><div><strong>Import photo folder</strong><small>Overlapping JPG or PNG images</small></div><i>Choose…</i></button>
-          <button class="import-option" on:click={importVideoAction} disabled={busy || processing}><span>▶</span><div><strong>Import video file</strong><small>MP4, MOV, MKV, AVI, M4V, WebM</small></div><i>Choose…</i></button>
-          <div class="section-divider"><span>Tool readiness</span></div>
-          <div class="runtime-list"><div class:ready={runtime?.ffmpegAvailable}><span></span><div><strong>FFmpeg</strong><small>{runtime?.ffmpegAvailable ? 'Ready for video frames' : 'Missing media runtime'}</small></div></div><div class:ready={runtime?.colmapAvailable}><span></span><div><strong>COLMAP GPU</strong><small>{runtime?.colmapAvailable ? 'Ready for registration' : 'Missing registration runtime'}</small></div></div><div class:ready={runtime?.splatWorkerAvailable}><span></span><div><strong>Gaussian trainer</strong><small>{runtime?.splatWorkerAvailable ? 'CUDA runtime ready' : 'Optional runtime missing'}</small></div></div></div>
-
-        {:else if workspaceMode === 'process'}
-          {#if sourceMode === 'rgbd'}
-            <div class="section-divider first-section"><span>Reconstruction resolution</span></div>
-            <div class="setting-group range-group"><div class="label-row"><label for="voxel">Output point spacing</label><output>{project.settings.voxelSizeMm} mm</output></div><input id="voxel" disabled={busy || processing} type="range" min="1" max="40" step="1" bind:value={project.settings.voxelSizeMm} on:input={scheduleProjectSettingsSave} /><div class="range-labels"><span>Fine · more points</span><span>Coarse · lighter</span></div><p class="setting-note important-note">Reconstruction only — this does not change the frames you recorded.</p></div>
-          {/if}
-          <div class="section-divider" class:first-section={sourceMode === 'media'}><span>Output artifacts</span></div>
-          {#if sourceMode === 'media'}
-            <div class="locked-target"><span>G</span><div><strong>Gaussian splat</strong><small>Required output for photos / video</small></div><i>LOCKED</i></div>
-          {:else}
-            <div class="artifact-targets">
-              <label class="target-option"><input type="checkbox" bind:checked={buildPointCloud} disabled={processing} /><span>P</span><div><strong>Point cloud</strong><small>Colored PLY · fast</small></div></label>
-              <label class="target-option"><input type="checkbox" bind:checked={buildTexturedMesh} disabled={processing} /><span>M</span><div><strong>Textured mesh</strong><small>OBJ + MTL + PNG</small></div></label>
-              <label class="target-option"><input type="checkbox" bind:checked={buildGaussianSplat} disabled={processing} /><span>G</span><div><strong>Gaussian splat</strong><small>Canonical PLY · CUDA</small></div></label>
-            </div>
-          {/if}
-          {#if buildGaussianSplat || sourceMode === 'media'}
-            <div class="section-divider"><span>Gaussian quality</span></div>
-            <div class="setting-group range-group"><div class="label-row"><label for="splat-iterations">Training iterations</label><output>{splatIterations.toLocaleString()}</output></div><input id="splat-iterations" type="range" min="5000" max="60000" step="5000" bind:value={splatIterations} disabled={processing} /><div class="range-labels"><span>Faster</span><span>Higher quality</span></div></div>
-            <p class:splat-ready={runtime?.splatWorkerAvailable} class="runtime-diagnostic">{runtime?.splatStatus ?? 'Checking optional CUDA runtime…'}{runtime?.splatWorkerAvailable ? ' · mixed precision ready' : ''}</p>
-          {/if}
-          {#if sourceMode === 'media'}<p class="setting-note readiness-line"><span class:ready={runtime?.ffmpegAvailable}>FFmpeg</span><span class:ready={runtime?.colmapAvailable}>COLMAP GPU</span><span class:ready={runtime?.splatWorkerAvailable}>CUDA trainer</span></p>{/if}
-          {#if jobAwaitingDecision}
-            <div class="build-recovery-actions">
-              <button class="button secondary full" on:click={discardInterruptedJob} disabled={busy}>Cancel interrupted build</button>
-              <button class="button process strong full" on:click={resumeInterruptedJob} disabled={busy}>Resume build</button>
-            </div>
-          {:else}
-            <button class="button process strong full build-button" on:click={processCloud} disabled={busy || capturing || (!processing && !canBuildArtifacts)}>{processing ? 'Cancel build' : sourceMode === 'media' ? 'Train Gaussian splat' : 'Build selected artifacts'}</button>
-          {/if}
-
-        {:else if workspaceMode === 'render'}
-          {#if processing && activeBuildIncludesSplat}
-            <div class="section-divider first-section"><span>Live training output</span></div>
-            <div class:ready={liveSplatState === 'ready'} class:error={liveSplatState === 'error'} class="live-splat-card">
-              <div class="live-splat-heading"><span class:busy={liveSplatState === 'loading' || liveSplatState === 'waiting'}></span><div><small>GAUSSIAN SNAPSHOT</small><strong>{liveSplatState === 'ready' ? 'Live Gaussian available' : liveSplatState === 'loading' ? 'Checking for a snapshot' : liveSplatState === 'error' ? 'Preview update failed' : gaussianTrainingStage ? 'Training is running' : 'Waiting for Gaussian stage'}</strong></div></div>
-              <p>{liveSplatState === 'ready' ? 'The viewer follows the latest published training snapshot and updates when a new one arrives.' : liveSplatState === 'error' ? splatPreviewError : gaussianTrainingStage ? 'The first snapshot appears after the trainer completes its initial optimization step.' : 'Registration and dataset preparation must finish before live Gaussians can be shown.'}</p>
-              <div class="live-splat-meta"><span>{liveSplatState === 'ready' ? `${formatCount(liveSplatCount)} Gaussians` : buildStage.label}</span><span>{formatSnapshotTime(liveSplatUpdatedAt)}</span></div>
-            </div>
-          {/if}
-          <div class="section-divider" class:first-section={!processing || !activeBuildIncludesSplat}><span>Display</span></div>
-          <div class="setting-group"><label for="preview-rendering">Show available geometry as</label><div class="segmented renderer-options" id="preview-rendering"><button disabled={previewPoints.length === 0} class:active={previewRenderMode === 'points'} on:click={() => setPreviewRenderMode('points')}>Points</button><button disabled={!previewMesh && !project.meshOutputPath} class:active={previewRenderMode === 'mesh'} on:click={() => void selectMeshPreview()}>Mesh</button><button aria-disabled={!previewSplat && !project.artifacts.gaussianSplat} title={!previewSplat && !project.artifacts.gaussianSplat ? processing && activeBuildIncludesSplat ? 'Waiting for a live Gaussian snapshot' : 'Train a Gaussian splat to enable this view' : 'Show the Gaussian splat'} class:active={previewRenderMode === 'splat'} on:click={() => void selectSplatPreview()}>Gaussian</button></div>{#if !previewMesh && !previewSplat && !project.meshOutputPath && !project.artifacts.gaussianSplat}<p class="setting-note">{processing && activeBuildIncludesSplat ? 'Points remain available until the first Gaussian snapshot is published.' : 'Only point display is available for the current model.'}</p>{/if}</div>
-          {#if previewRenderMode === 'mesh'}
-            <div class="setting-group"><label for="mesh-view-mode">Mesh view</label><div class="segmented mesh-view-options" id="mesh-view-mode"><button class:active={meshViewMode === 'surface'} on:click={() => setMeshViewMode('surface')}>Mesh</button><button class:active={meshViewMode === 'surface-wireframe'} on:click={() => setMeshViewMode('surface-wireframe')}>Mesh + wire</button><button class:active={meshViewMode === 'wireframe'} on:click={() => setMeshViewMode('wireframe')}>Wireframe</button><button class:active={meshViewMode === 'shaded'} on:click={() => setMeshViewMode('shaded')}>Shaded</button></div></div>
-            {#if meshViewMode === 'shaded'}
-              <div class="light-editor"><div class="label-row"><span>Light direction</span><button on:click={resetLightDirection}>Reset</button></div><p class="setting-note">Vector from the model toward the light.</p><div class="light-direction-grid">{#each ['X', 'Y', 'Z'] as axis, index}<label><span>{axis}</span><input aria-label={`Light direction ${axis}`} type="number" step="0.05" value={lightDirection[index]} on:input={(event) => updateLightDirection(index, Number(event.currentTarget.value))} /></label>{/each}</div><button class:active={lightEditMode} class="tool-button light-gizmo-button" disabled={!previewMesh} on:click={toggleLightEdit}>{lightEditMode ? 'Finish light gizmo' : 'Edit direction with gizmo'}</button></div>
-            {/if}
-          {/if}
-          {#if previewRenderMode === 'points'}<div class="setting-group range-group"><div class="label-row"><label for="point-size">Point size</label><output>{pointSize.toFixed(3)}</output></div><input id="point-size" type="range" min="0.005" max="0.08" step="0.003" bind:value={pointSize} on:input={scheduleVisualizationSave} /></div>{/if}
-          <div class="setting-group range-group"><div class="label-row"><label for="opacity">Opacity</label><output>{Math.round(pointOpacity * 100)}%</output></div><input id="opacity" type="range" min="0.1" max="1" step="0.05" bind:value={pointOpacity} on:input={scheduleVisualizationSave} /></div>
-          <label class="toggle-row"><input type="checkbox" bind:checked={showColors} on:change={scheduleVisualizationSave} /><span><strong>Captured colors</strong><small>Show RGB data on the model</small></span></label>
-          <label class="toggle-row"><input type="checkbox" disabled={processing || cameraFrames.length === 0} bind:checked={showCameraFrames} on:change={scheduleVisualizationSave} /><span><strong>Capture cameras</strong><small>{processing ? 'Available after the build finishes' : cameraFrames.length ? `${cameraFrames.length} registered views` : 'No camera poses available'}</small></span></label>
-          <div class="section-divider"><span>Model orientation</span></div>
-          {#if processing}<p class="setting-note edit-lock-note">View controls stay active during training. Orientation and saved-model edits unlock after artifacts are published.</p>{/if}
-          <button class:active={editMode} class="tool-button" disabled={!canEdit} on:click={() => { editMode = !editMode; lightEditMode = false; floorPickMode = false; anchorPickMode = false; }}>{editMode ? 'Exit transform gizmo' : 'Transform with gizmo'}</button>
-          {#if editMode && canEdit}<div class="gizmo-modes"><button class:active={gizmoMode === 'translate'} on:click={() => setGizmoMode('translate')}>Move · W</button><button class:active={gizmoMode === 'rotate'} on:click={() => setGizmoMode('rotate')}>Rotate · E</button><button class:active={gizmoMode === 'scale'} on:click={() => setGizmoMode('scale')}>Scale · R</button></div>{/if}
-          {#if canEdit}<div class="anchor-editor"><div class="label-row"><span>Gizmo anchor</span><button on:click={centerGizmoAnchor}>Center</button></div><div class="anchor-grid">{#each ['X', 'Y', 'Z'] as axis, index}<label><span>{axis}</span><input type="number" step="0.05" value={effectiveGizmoAnchor[index]} on:input={(event) => updateGizmoAnchor(index, Number(event.currentTarget.value))} /></label>{/each}</div><button class:active={anchorPickMode} class="tool-button anchor-pick" on:click={toggleAnchorPick}>{anchorPickMode ? 'Cancel anchor pick' : 'Pick anchor on model'}</button></div>{/if}
-          <button class:active={floorPickMode} class="tool-button orientation-action" disabled={!canEdit} on:click={() => { floorPickMode = !floorPickMode; editMode = false; lightEditMode = false; anchorPickMode = false; }}>{floorPickMode ? 'Cancel floor pick' : 'Pick floor point'}</button>
-          <button class="tool-button orientation-action" disabled={!canEdit} on:click={alignRoomAxes}>Align room axes</button>
-          <div class="axis-actions"><button disabled={!canEdit} on:click={() => flipAxis('X')}>Flip X</button><button disabled={!canEdit} on:click={() => flipAxis('Y')}>Flip Y</button><button disabled={!canEdit} on:click={() => flipAxis('Z')}>Flip Z</button></div>
-          <button class="tool-button subtle" on:click={resetTransform} disabled={!canEdit}>Reset viewer pose</button>
-
-        {:else}
-          <div class="export-warning"><span>EXPORTS ARE COPIES</span><p>Choose a format below. The project’s working artifacts will not be replaced.</p></div>
-          <div class:stale={project.artifacts.gaussianSplat?.stale} class="export-card"><span>GAUSSIAN SPLAT</span><strong>Canonical 3DGS PLY</strong><small>{project.artifacts.gaussianSplat ? project.artifacts.gaussianSplat.metric ? 'Metric scale · coordinate sidecars included' : 'Arbitrary scale · coordinate sidecars included' : 'Build a Gaussian splat to enable'}</small><button class="tool-button export-ply" on:click={exportGaussianSplatAction} disabled={busy || !project.artifacts.gaussianSplat || project.artifacts.gaussianSplat.stale}>Export Gaussian PLY…</button></div>
-          <div class="export-card"><span>TEXTURED SURFACE</span><strong>OBJ + MTL + PNG</strong><small>{project.meshOutputPath ? `${formatCount(project.meshTriangleCount)} textured triangles` : 'Build a textured mesh to enable'}</small><button class="tool-button export-ply" on:click={exportTexturedMeshAction} disabled={busy || project.processingStatus !== 'complete' || !project.meshOutputPath}>Export OBJ bundle…</button></div>
-          <div class="export-card"><span>COLORED POINTS</span><strong>Unity-ready PLY</strong><small>{project.outputPath ? `${formatCount(project.pointCount)} points · X-axis corrected copy` : 'Build a point cloud to enable'}</small><button class="tool-button export-ply" on:click={exportPlyAction} disabled={busy || project.processingStatus !== 'complete' || !project.outputPath}>Export Unity PLY…</button></div>
-          <div class="section-divider"><span>Coordinate system</span></div>
-          <button class="tool-button export-transform" on:click={applyTransformToExport} disabled={busy || project.processingStatus !== 'complete'}>Apply current pose to model exports</button>
-          <p class="setting-note">This bakes the viewer pose into the point cloud, mesh, and camera coordinates. Backups are retained.</p>
-        {/if}
-      </aside>
+      {/if}
     </section>
-  {:else if initializationError}
-    <div class="loading">{initializationError}</div>
-  {:else}
-    <div class="loading">Preparing scanner workspace…</div>
-  {/if}
-</main>
+
+    <aside>
+      {#if !project}
+        <section class="panel"><div class="spinner"></div><h2>Starting ScanLan</h2><p>{message}</p></section>
+      {:else if workspace === 'capture'}
+        <section class="panel panel-heading">
+          <div><span>RGB-D SOURCE</span><h2>{capturing ? sensor?.sensorName ?? 'Capturing' : 'Camera & live fusion'}</h2></div>
+          <button class="icon-button" on:click={discoverSensors} disabled={discovering || selectingSensor || capturing || processing} title="Refresh cameras">↻</button>
+        </section>
+
+        <section class="panel settings">
+          <label>Capture source
+            <select value={currentSensorKey} on:change={chooseSensor} disabled={capturing || processing || discovering || selectingSensor}>
+              {#if !sensors.some((item) => sensorKey(item) === currentSensorKey)}
+                <option value={currentSensorKey}>{project.settings.sensorKind.replaceAll('_', ' ')} · configured</option>
+              {/if}
+              {#each sensors as candidate}
+                <option value={sensorKey(candidate)}>{candidate.name}{candidate.connection === 'network' ? ` · ${candidate.address}` : ''}</option>
+              {/each}
+            </select>
+          </label>
+          <div class="setting-grid">
+            <label>Camera family
+              <select value={project.settings.sensorKind} on:change={chooseSensorKind} disabled={capturing || processing || selectingSensor}>
+                <option value="kinect_v2">Kinect v2</option>
+                <option value="azure_kinect">Azure Kinect DK</option>
+                <option value="femto_mega">Femto Mega</option>
+              </select>
+            </label>
+            <label>Realtime view
+              <select value={project.settings.liveReconstruction} on:change={(event) => updateSetting('liveReconstruction', inputValue(event) as LiveReconstructionMode)} disabled={capturing || processing}>
+                <option value="points">Points · fastest</option>
+                <option value="mesh">Mesh · 1 Hz</option>
+              </select>
+            </label>
+            <label>Archive rate
+              <select value={project.settings.captureFps} on:change={(event) => updateSetting('captureFps', Number(inputValue(event)))} disabled={capturing || processing}>
+                <option value={5}>5 fps</option><option value={10}>10 fps</option><option value={15}>15 fps</option><option value={30}>30 fps</option>
+              </select>
+            </label>
+            <label>Depth limit
+              <div class="unit-input"><input type="number" min="0.8" max="8" step="0.1" value={project.settings.maxDepthM} on:change={(event) => updateSetting('maxDepthM', Number(inputValue(event)))} disabled={capturing || processing}/><span>m</span></div>
+            </label>
+            <label>Fusion voxel
+              <div class="unit-input"><input type="number" min="3" max="40" step="1" value={project.settings.voxelSizeMm} on:change={(event) => updateSetting('voxelSizeMm', Number(inputValue(event)))} disabled={capturing || processing}/><span>mm</span></div>
+            </label>
+            {#if project.settings.sensorKind !== 'kinect_v2'}
+              <label>Depth FOV
+                <select value={project.settings.depthFieldOfView} on:change={(event) => updateSetting('depthFieldOfView', inputValue(event) as DepthFieldOfView)} disabled={capturing || processing}>
+                  <option value="narrow">Narrow</option><option value="wide">Wide</option>
+                </select>
+              </label>
+              <label>Depth sampling
+                <select value={project.settings.depthBinned ? 'binned' : 'full'} on:change={(event) => updateSetting('depthBinned', inputValue(event) === 'binned')} disabled={capturing || processing}>
+                  <option value="full">Full resolution</option><option value="binned">2×2 binned · faster</option>
+                </select>
+              </label>
+            {/if}
+          </div>
+          {#if project.settings.sensorKind === 'femto_mega'}
+            <label>Connection
+              <select value={project.settings.sensorConnection} on:change={(event) => updateSetting('sensorConnection', inputValue(event) as 'usb' | 'network')} disabled={capturing || processing}>
+                <option value="usb">USB</option><option value="network">Network</option>
+              </select>
+            </label>
+            {#if project.settings.sensorConnection === 'network'}
+              <label>Camera address<input value={project.settings.sensorAddress} placeholder="192.168.1.10" on:change={(event) => updateSetting('sensorAddress', inputValue(event))} disabled={capturing || processing}/></label>
+            {/if}
+          {/if}
+          <label class="toggle"><input type="checkbox" checked={project.settings.useImu} on:change={(event) => updateSetting('useImu', inputChecked(event))} disabled={capturing || processing || project.settings.sensorKind === 'kinect_v2'}/><span></span><div><strong>IMU motion prior</strong><small>Improves fast-rotation initialization</small></div></label>
+        </section>
+
+        {#if capturing && sensor}
+          <section class="panel tracking-card" class:warning={!sensor.tracking}>
+            <div class="tracking-title"><i></i><div><strong>{sensor.trackingStatus}</strong><small>{sensor.liveReconstructionBackend ?? 'Realtime engine'}</small></div></div>
+            <div class="mini-grid">
+              <div><span>Sensor</span><strong>{sensor.streamFps.toFixed(1)} fps</strong></div>
+              <div><span>Archived</span><strong>{sensor.frameCount}</strong></div>
+              <div><span>Rejected</span><strong>{sensor.liveRejectedFrameCount}</strong></div>
+              <div><span>Source drops</span><strong>{sensor.sourceDropCount}</strong></div>
+            </div>
+            <p>Move steadily, keep 40–70% of the previous view visible, and revisit the start before stopping.</p>
+          </section>
+        {/if}
+
+        <button class:stop={capturing} class="capture-button" on:click={captureAction} disabled={busy || selectingSensor || processing || (!capturing && runtime && !runtime.sensorWorkerAvailable)}>
+          <i></i><span>{capturing ? 'Stop & save take' : busy ? 'Starting engine…' : 'Start capture'}</span>
+        </button>
+
+        <section class="panel takes">
+          <div class="section-title"><span>RECORDED TAKES</span><strong>{totalFrames.toLocaleString()} frames</strong></div>
+          {#if project.phases.length === 0}
+            <p class="empty-copy">No RGB-D takes yet. Tracking runs at sensor rate; the archive rate only controls frames kept for the production pass.</p>
+          {:else}
+            {#each project.phases as capture, index}
+              <article>
+                <span class="take-number">{String(index + 1).padStart(2, '0')}</span>
+                <div><strong>{capture.name}</strong><small>{capture.frameCount.toLocaleString()} frames · {formatDuration(capture.durationSeconds)}</small></div>
+                <button on:click={() => removeCaptureAction(capture.id, capture.name)} disabled={busy || capturing || processing}>Delete</button>
+              </article>
+            {/each}
+          {/if}
+        </section>
+
+      {:else if workspace === 'reconstruct'}
+        <section class="panel panel-heading"><div><span>PRODUCTION PASS</span><h2>Reconstruction outputs</h2></div><strong class="take-total">{completedCaptures} take{completedCaptures === 1 ? '' : 's'}</strong></section>
+
+        <section class="panel target-list">
+          <label class:active={buildPointCloud}><input type="checkbox" bind:checked={buildPointCloud} disabled={processing}/><span class="target-icon">P</span><div><strong>Metric point cloud</strong><small>Filtered colored PLY · quickest</small></div><i>{artifactReady('pointCloud') ? 'READY' : ''}</i></label>
+          <label class:active={buildTexturedMesh}><input type="checkbox" bind:checked={buildTexturedMesh} disabled={processing}/><span class="target-icon">M</span><div><strong>Textured triangle mesh</strong><small>TSDF surface · OBJ/MTL/PNG</small></div><i>{artifactReady('texturedMesh') ? 'READY' : ''}</i></label>
+          <label class:active={buildGaussianSplat}><input type="checkbox" bind:checked={buildGaussianSplat} disabled={processing || !runtime?.splatWorkerAvailable}/><span class="target-icon">G</span><div><strong>2D Gaussian surface</strong><small>Depth-aware discs · metric PLY</small></div><i>{artifactReady('gaussianSplat') ? 'READY' : runtime?.splatWorkerAvailable ? '' : 'CUDA RUNTIME MISSING'}</i></label>
+          {#if buildGaussianSplat}
+            <label class="iterations"><span>Training iterations</span><input type="range" min="5000" max="60000" step="5000" bind:value={splatIterations} disabled={processing}/><strong>{Number(splatIterations).toLocaleString()}</strong></label>
+          {/if}
+        </section>
+
+        <section class="panel pipeline-note">
+          <strong>One trajectory, three representations</strong>
+          <p>All outputs share the same quality-gated RGB-D poses. The final pass stabilizes the trajectory, fuses a weighted TSDF, and only then builds the selected representations.</p>
+          <div><span>Source</span><strong>{totalFrames.toLocaleString()} archived frames</strong></div>
+          <div><span>Compute</span><strong>{runtime?.reconstructionWorkerAvailable ? 'CUDA preferred' : 'Runtime missing'}</strong></div>
+        </section>
+
+        {#if activeJob}
+          <section class="panel job-card" class:error={activeJob.status === 'failed'}>
+            <div class="section-title"><span>{activeJob.status.toUpperCase()}</span><strong>{Math.round(activeJob.progress * 100)}%</strong></div>
+            <h3>{activeJob.stage.replaceAll('_', ' ')}</h3>
+            <p>{activeJob.error ?? activeJob.detail}</p>
+            <div class="progress"><i style={`width:${Math.round(activeJob.progress * 100)}%`}></i></div>
+            <div class="job-meta"><span>{activeJob.computeBackend ?? 'Waiting for worker'}</span><span>{activeJob.etaSeconds ? `~${formatDuration(activeJob.etaSeconds)}` : ''}</span></div>
+            {#if processing}
+              <button class="ghost full" on:click={cancelBuild}>Cancel safely</button>
+            {:else if activeJob.resumable && ['failed', 'cancelled'].includes(activeJob.status)}
+              <div class="button-row"><button class="primary" on:click={() => startBuild(true)}>Resume checkpoint</button><button class="ghost" on:click={discardBuild}>Discard</button></div>
+            {/if}
+          </section>
+        {/if}
+
+        <button class="primary full build-button" on:click={() => startBuild(false)} disabled={busy || processing || completedCaptures === 0 || (!buildPointCloud && !buildTexturedMesh && !buildGaussianSplat)}>{processing ? 'Reconstruction running…' : readyArtifacts ? 'Rebuild selected outputs' : 'Build selected outputs'}</button>
+
+      {:else}
+        <section class="panel panel-heading"><div><span>RESULT</span><h2>Inspect & export</h2></div><strong class="take-total">{readyArtifacts} ready</strong></section>
+        <section class="panel view-switcher">
+          <button class:active={renderMode === 'points'} disabled={!artifactReady('pointCloud')} on:click={() => loadResult('points')}><span>P</span><div><strong>Points</strong><small>{formatCount(project.pointCount)}</small></div></button>
+          <button class:active={renderMode === 'mesh'} disabled={!artifactReady('texturedMesh')} on:click={() => loadResult('mesh')}><span>M</span><div><strong>Mesh</strong><small>{formatCount(project.meshTriangleCount)} tris</small></div></button>
+          <button class:active={renderMode === 'splat'} disabled={!artifactReady('gaussianSplat')} on:click={() => loadResult('splat')}><span>G</span><div><strong>2DGS</strong><small>Metric surface</small></div></button>
+        </section>
+        {#if renderMode === 'mesh'}
+          <section class="panel settings"><label>Mesh display<select bind:value={meshViewMode}><option value="surface">Textured</option><option value="surface-wireframe">Texture + wire</option><option value="wireframe">Wireframe</option><option value="shaded">Shaded</option></select></label></section>
+        {/if}
+        <section class="panel result-stats">
+          <div><span>Points</span><strong>{formatCount(project.pointCount)}</strong></div>
+          <div><span>Triangles</span><strong>{formatCount(project.meshTriangleCount)}</strong></div>
+          <div><span>Frames used</span><strong>{project.framesUsed ?? '—'}</strong></div>
+          <div><span>Confidence</span><strong>{project.confidenceLabel ?? '—'}</strong></div>
+          <p>{project.confidenceDetail ?? 'Build an output to see trajectory and coverage quality.'}</p>
+        </section>
+        <section class="panel export-list">
+          <button on:click={exportPointCloud} disabled={!artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>Metric colored vertices</small></div><i>Export…</i></button>
+          <button on:click={exportMesh} disabled={!artifactReady('texturedMesh')}><span>M</span><div><strong>Textured OBJ bundle</strong><small>OBJ + MTL + PNG</small></div><i>Export…</i></button>
+          <button on:click={exportSplat} disabled={!artifactReady('gaussianSplat')}><span>G</span><div><strong>2D Gaussian PLY</strong><small>Canonical metric splat + sidecars</small></div><i>Export…</i></button>
+        </section>
+      {/if}
+    </aside>
+  </main>
+
+  <footer class:error={Boolean(fatalError)}>
+    <span class="status-dot" class:busy={busy || capturing || processing}></span>
+    <strong>{capturing ? 'LIVE' : processing ? 'BUILDING' : fatalError ? 'ERROR' : 'READY'}</strong>
+    <p>{message}</p>
+    {#if sensor?.imuActive}<span class="footer-metric">IMU {sensor.imuRateHz.toFixed(0)} Hz</span>{/if}
+    {#if sensor?.liveReconstructionBackend}<span class="footer-metric">{sensor.liveReconstructionBackend}</span>{/if}
+  </footer>
+</div>
+
+<style>
+  :global(*) { box-sizing: border-box; }
+  :global(html, body, #app) { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+  :global(body) { background: #071019; color: #dce9ee; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  :global(button), :global(input), :global(select) { font: inherit; }
+  :global(button) { color: inherit; }
+
+  .app-shell { --panel: #0c1823; --panel-soft: #101f2b; --line: rgba(155, 199, 215, 0.13); --muted: #78909d; --cyan: #63c7e7; --mint: #62d6ba; --amber: #efb366; display: grid; grid-template-rows: 68px 68px minmax(0, 1fr) 38px; width: 100%; height: 100%; background: radial-gradient(circle at 45% -20%, rgba(40, 112, 139, .15), transparent 42%), #071019; }
+  .topbar { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(220px, 1fr) auto auto; align-items: center; gap: 24px; padding: 0 24px; border-bottom: 1px solid var(--line); background: rgba(7, 16, 25, .9); }
+  .brand, .project-title, .runtime-state, .panel-heading, .tracking-title, .section-title, .job-meta, .button-row { display: flex; align-items: center; }
+  .brand { gap: 11px; }
+  .brand-mark { display: grid; place-items: center; width: 35px; height: 35px; border: 1px solid rgba(99,199,231,.45); border-radius: 10px; background: linear-gradient(145deg, rgba(99,199,231,.18), rgba(98,214,186,.06)); color: #80d7ef; font-size: 12px; font-weight: 850; letter-spacing: .06em; }
+  .brand div, .project-title { display: grid; gap: 2px; }
+  .brand strong { font-size: 16px; letter-spacing: .01em; }
+  .brand small, .project-title span { color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+  .project-title strong { max-width: 360px; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+  .runtime-state { gap: 8px; }
+  .runtime-state span { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: #708590; font-size: 10px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; }
+  .runtime-state span i { width: 6px; height: 6px; border-radius: 50%; background: #53636b; }
+  .runtime-state span.ready { color: #a8c4cf; }
+  .runtime-state span.ready i { background: var(--mint); box-shadow: 0 0 10px rgba(98,214,186,.5); }
+  button { border: 0; cursor: pointer; }
+  button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .43; }
+  .ghost { padding: 10px 13px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.02); color: #a9bfca; font-size: 12px; font-weight: 700; }
+  .ghost:hover:not(:disabled) { border-color: rgba(99,199,231,.38); background: rgba(99,199,231,.07); }
+  .ghost.compact { white-space: nowrap; }
+  .ghost.full, .primary.full { width: 100%; }
+  .primary { padding: 11px 15px; border-radius: 9px; background: linear-gradient(135deg, #3ba8cc, #42bda2); color: #041018; font-size: 12px; font-weight: 850; }
+
+  .workflow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; padding: 0 24px; border-bottom: 1px solid var(--line); background: #09131d; }
+  .workflow button { position: relative; display: flex; align-items: center; gap: 12px; padding: 0 18px; background: transparent; color: #708792; text-align: left; }
+  .workflow button::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: transparent; content: ''; }
+  .workflow button.active { color: #d6e7ed; background: rgba(99,199,231,.045); }
+  .workflow button.active::after { background: var(--cyan); box-shadow: 0 -3px 12px rgba(99,199,231,.28); }
+  .workflow button > span { color: #49606b; font-family: ui-monospace, monospace; font-size: 11px; font-weight: 800; }
+  .workflow button.done > span { color: var(--mint); }
+  .workflow button div { display: grid; gap: 3px; }
+  .workflow button strong { font-size: 12px; }
+  .workflow button small { color: #607783; font-size: 10px; }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 390px; min-height: 0; }
+  .viewport { position: relative; min-width: 0; min-height: 0; padding: 14px; border-right: 1px solid var(--line); }
+  .viewport :global(.viewer) { border-radius: 14px; }
+  aside { min-height: 0; padding: 14px; overflow-x: hidden; overflow-y: auto; background: #09131d; scrollbar-color: #263d49 transparent; }
+  .panel { margin-bottom: 12px; padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(150deg, rgba(17,34,46,.94), rgba(11,24,35,.94)); box-shadow: 0 12px 35px rgba(0,0,0,.08); }
+  .panel-heading { justify-content: space-between; gap: 12px; padding: 10px 3px 13px; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+  .panel-heading > div { display: grid; gap: 4px; }
+  .panel-heading span, .section-title span { color: var(--cyan); font-size: 9px; font-weight: 850; letter-spacing: .11em; }
+  h2, h3, p { margin: 0; }
+  h2 { font-size: 18px; letter-spacing: -.02em; }
+  h3 { margin: 8px 0 4px; font-size: 14px; text-transform: capitalize; }
+  .icon-button { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.025); color: var(--cyan); font-size: 18px; }
+
+  .settings { display: grid; gap: 13px; }
+  .settings label { display: grid; gap: 6px; color: #8ba2ad; font-size: 10px; font-weight: 720; letter-spacing: .03em; }
+  .setting-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 10px; }
+  select, input { width: 100%; min-width: 0; height: 36px; padding: 0 10px; outline: none; border: 1px solid rgba(147,193,211,.16); border-radius: 8px; background: #091722; color: #c8dce4; font-size: 11px; }
+  select:focus, input:focus { border-color: rgba(99,199,231,.55); box-shadow: 0 0 0 2px rgba(99,199,231,.08); }
+  .unit-input { position: relative; }
+  .unit-input input { padding-right: 35px; }
+  .unit-input span { position: absolute; top: 50%; right: 10px; color: #637b86; transform: translateY(-50%); }
+  .toggle { grid-template-columns: auto auto 1fr; align-items: center; cursor: pointer; }
+  .toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .toggle > span { position: relative; width: 34px; height: 19px; border-radius: 20px; background: #263945; transition: .2s; }
+  .toggle > span::after { position: absolute; top: 3px; left: 3px; width: 13px; height: 13px; border-radius: 50%; background: #8499a3; transition: .2s; content: ''; }
+  .toggle input:checked + span { background: rgba(98,214,186,.28); }
+  .toggle input:checked + span::after { left: 18px; background: var(--mint); }
+  .toggle div { display: grid; gap: 2px; }
+  .toggle strong { color: #bfd1d8; font-size: 11px; }
+  .toggle small { color: #657c87; font-size: 9px; font-weight: 500; }
+
+  .capture-button { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; height: 50px; margin-bottom: 12px; border-radius: 12px; background: linear-gradient(135deg, #49c7a9, #4bb5d3); color: #041119; font-size: 13px; font-weight: 900; box-shadow: 0 10px 30px rgba(56,176,169,.16); }
+  .capture-button i { width: 11px; height: 11px; border: 2px solid currentColor; border-radius: 50%; }
+  .capture-button.stop { background: linear-gradient(135deg, #e27867, #e9a159); color: #1c0b07; }
+  .capture-button.stop i { border-radius: 2px; background: currentColor; }
+  .tracking-card.warning { border-color: rgba(239,179,102,.3); }
+  .tracking-title { gap: 10px; }
+  .tracking-title > i { width: 9px; height: 9px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 12px rgba(98,214,186,.5); }
+  .tracking-card.warning .tracking-title > i { background: var(--amber); }
+  .tracking-title div { display: grid; gap: 3px; }
+  .tracking-title strong { font-size: 11px; }
+  .tracking-title small { color: var(--muted); font-size: 9px; }
+  .tracking-card > p, .empty-copy, .pipeline-note p, .job-card p, .result-stats p { margin-top: 11px; color: #708792; font-size: 10px; line-height: 1.55; }
+  .mini-grid, .result-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin-top: 12px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--line); }
+  .mini-grid div, .result-stats > div { display: grid; gap: 3px; padding: 9px; background: #0b1924; }
+  .mini-grid span, .result-stats span, .pipeline-note div span { color: #617985; font-size: 9px; }
+  .mini-grid strong, .result-stats strong, .pipeline-note div strong { font-size: 11px; }
+
+  .section-title { justify-content: space-between; }
+  .section-title > strong, .take-total { color: #8199a5; font-size: 10px; }
+  .takes article { display: grid; grid-template-columns: 28px 1fr auto; align-items: center; gap: 9px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+  .takes article:last-child { padding-bottom: 0; border-bottom: 0; }
+  .take-number { color: #4d6570; font-family: ui-monospace, monospace; font-size: 10px; }
+  .takes article div { display: grid; gap: 3px; }
+  .takes article strong { font-size: 11px; }
+  .takes article small { color: #6d8590; font-size: 9px; }
+  .takes article button { padding: 5px 7px; background: transparent; color: #997b7a; font-size: 9px; }
+
+  .target-list { display: grid; gap: 8px; }
+  .target-list > label { display: grid; grid-template-columns: auto 34px 1fr auto; align-items: center; gap: 9px; min-height: 58px; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: #0a1823; cursor: pointer; }
+  .target-list > label.active { border-color: rgba(99,199,231,.33); background: rgba(49,124,151,.09); }
+  .target-list > label > input[type=checkbox] { width: 14px; height: 14px; accent-color: var(--cyan); }
+  .target-icon, .view-switcher button > span, .export-list button > span { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 8px; background: rgba(99,199,231,.08); color: var(--cyan); font-size: 10px; font-weight: 900; }
+  .target-list label div { display: grid; gap: 3px; }
+  .target-list label div strong { font-size: 11px; }
+  .target-list label div small { color: #687f8a; font-size: 9px; }
+  .target-list label > i { max-width: 80px; color: var(--mint); font-size: 8px; font-style: normal; font-weight: 800; text-align: right; }
+  .target-list .iterations { grid-template-columns: auto 1fr auto; min-height: auto; }
+  .iterations input { height: 18px; padding: 0; accent-color: var(--cyan); }
+  .pipeline-note > strong { font-size: 12px; }
+  .pipeline-note div { display: flex; justify-content: space-between; padding-top: 9px; }
+  .job-card.error { border-color: rgba(226,120,103,.35); }
+  .progress { height: 5px; overflow: hidden; border-radius: 6px; background: #172a35; }
+  .progress i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--mint)); transition: width .25s linear; }
+  .job-card .progress { margin: 11px 0 8px; }
+  .job-meta { justify-content: space-between; gap: 8px; margin-bottom: 11px; color: #687f8a; font-size: 9px; }
+  .button-row { gap: 8px; }
+  .button-row button { flex: 1; }
+  .build-button { height: 47px; }
+
+  .view-switcher { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+  .view-switcher button { display: grid; justify-items: center; gap: 7px; padding: 10px 4px; border: 1px solid var(--line); border-radius: 9px; background: #0a1823; }
+  .view-switcher button.active { border-color: rgba(99,199,231,.4); background: rgba(99,199,231,.09); }
+  .view-switcher button div { display: grid; gap: 2px; text-align: center; }
+  .view-switcher button strong { font-size: 10px; }
+  .view-switcher button small { color: #687f8a; font-size: 8px; }
+  .result-stats { padding: 0; }
+  .result-stats p { grid-column: 1 / -1; margin: 0; padding: 10px; background: #0b1924; }
+  .export-list { display: grid; gap: 7px; }
+  .export-list button { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 9px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0a1823; text-align: left; }
+  .export-list button:hover:not(:disabled) { border-color: rgba(99,199,231,.36); }
+  .export-list button div { display: grid; gap: 3px; }
+  .export-list button strong { font-size: 10px; }
+  .export-list button small { color: #687f8a; font-size: 8px; }
+  .export-list button > i { color: var(--cyan); font-size: 9px; font-style: normal; }
+
+  .live-metrics { position: absolute; top: 26px; right: 26px; display: grid; grid-template-columns: repeat(3, minmax(80px, 1fr)); gap: 1px; overflow: hidden; border: 1px solid rgba(141,195,214,.16); border-radius: 9px; background: rgba(5,14,22,.72); box-shadow: 0 12px 35px rgba(0,0,0,.22); backdrop-filter: blur(12px); }
+  .live-metrics div { display: grid; gap: 3px; padding: 8px 10px; background: rgba(10,26,37,.78); }
+  .live-metrics span { color: #6f8792; font-size: 8px; text-transform: uppercase; }
+  .live-metrics strong { font-size: 10px; }
+  .live-metrics strong.good { color: var(--mint); }
+  .job-overlay { position: absolute; right: 26px; bottom: 26px; width: min(420px, calc(100% - 52px)); padding: 13px; border: 1px solid rgba(141,195,214,.17); border-radius: 10px; background: rgba(5,14,22,.82); backdrop-filter: blur(12px); }
+  .job-overlay > div:first-child { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 10px; text-transform: capitalize; }
+  .job-overlay p { margin-top: 8px; color: #78909c; font-size: 9px; }
+
+  footer { display: flex; align-items: center; gap: 8px; padding: 0 24px; border-top: 1px solid var(--line); background: #08121b; color: #758c97; font-size: 9px; }
+  footer strong { color: #9bb1bb; font-size: 9px; letter-spacing: .08em; }
+  footer p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  footer.error p { color: #d8988e; }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--mint); }
+  .status-dot.busy { background: var(--amber); animation: pulse 1s infinite; }
+  .footer-metric { padding-left: 12px; border-left: 1px solid var(--line); color: #607984; }
+  .spinner { width: 24px; height: 24px; margin-bottom: 12px; border: 2px solid rgba(99,199,231,.16); border-top-color: var(--cyan); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  @media (max-width: 1120px) {
+    main { grid-template-columns: minmax(0, 1fr) 340px; }
+    .topbar { grid-template-columns: auto 1fr auto; }
+    .project-title { display: none; }
+    .live-metrics { grid-template-columns: repeat(2, minmax(80px, 1fr)); }
+  }
+</style>

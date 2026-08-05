@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +23,18 @@ from .pose import (
 )
 
 
+FRAME_REUSE_PER_LOAD = 4
+
+
 def _write_json_atomic(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         for attempt in range(40):
             try:
                 os.replace(temporary, path)
@@ -40,10 +48,23 @@ def _write_json_atomic(path: Path, value: Any) -> None:
 
 
 def _write_checkpoint_atomic(path: Path, value: Any, save: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
         save(value, temporary)
-        os.replace(temporary, path)
+        # torch.save closes its own handle before returning. Flush the completed
+        # archive through the OS before publishing it so a reported resumable
+        # job never points at a rename that outran the checkpoint data.
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        for attempt in range(40):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.025)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -124,7 +145,7 @@ def _sh_preview_colors(sh0: Any) -> Any:
 
 
 def _preview_log_scales(log_scales: Any) -> Any:
-    """Flatten 2D discs only when exporting to the legacy 3DGS viewer format."""
+    """Flatten 2D discs when exporting to the interoperable 3DGS PLY format."""
     import torch
 
     scales = torch.exp(log_scales)
@@ -137,6 +158,31 @@ def _logit(value: Any) -> Any:
 
     value = torch.as_tensor(value).clamp(1e-4, 1 - 1e-4)
     return torch.log(value / (1 - value))
+
+
+def _training_limits(vram_gib: float) -> tuple[int, int]:
+    """Return image and Gaussian limits that leave headroom for CUDA kernels."""
+    if vram_gib <= 12.5:
+        return 720, 2_000_000
+    if vram_gib <= 16.5:
+        return 896, 3_000_000
+    return 1024, 4_000_000
+
+
+def _cache_local_frame_order(
+    frame_count: int,
+    epoch: int,
+    cache_size: int,
+) -> np.ndarray:
+    """Shuffle views globally, then reuse cache-sized blocks without changing exposure counts."""
+    if frame_count <= 0 or cache_size <= 0:
+        raise ValueError("Frame count and cache size must be positive")
+    shuffled = np.random.default_rng(epoch).permutation(frame_count)
+    blocks = [
+        np.tile(shuffled[start : start + cache_size], FRAME_REUSE_PER_LOAD)
+        for start in range(0, frame_count, cache_size)
+    ]
+    return np.concatenate(blocks)
 
 
 def _ssim(predicted: Any, target: Any) -> Any:
@@ -155,22 +201,37 @@ def _ssim(predicted: Any, target: Any) -> Any:
     return score.mean()
 
 
-def _frame_tensors(root: Path, frame: dict[str, Any], device: Any, max_dimension: int = 960) -> dict[str, Any]:
+def _frame_tensors(root: Path, frame: dict[str, Any], max_dimension: int) -> dict[str, Any]:
     import torch
 
     with Image.open(root / frame["image"]) as source:
         image = source.convert("RGB")
-        scale = min(1.0, max_dimension / max(image.size))
-        if scale < 1.0:
-            image = image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS)
-        rgb = torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).to(device) / 255.0
+        source_width, source_height = image.size
+        declared = frame["intrinsics"]
+        if (source_width, source_height) != (
+            int(declared["width"]),
+            int(declared["height"]),
+        ):
+            raise ValueError("Canonical RGB dimensions do not match their pinhole intrinsics")
+        requested_scale = min(1.0, max_dimension / max(image.size))
+        if requested_scale < 1.0:
+            image = image.resize(
+                (round(image.width * requested_scale), round(image.height * requested_scale)),
+                Image.Resampling.LANCZOS,
+            )
+        rgb = torch.from_numpy(np.asarray(image, dtype=np.uint8).copy())
+    scale_x = image.width / source_width
+    scale_y = image.height / source_height
     intrinsics = frame["intrinsics"]
     intrinsic = torch.tensor(
-        [[intrinsics["fx"] * scale, 0.0, intrinsics["cx"] * scale], [0.0, intrinsics["fy"] * scale, intrinsics["cy"] * scale], [0.0, 0.0, 1.0]],
+        [
+            [intrinsics["fx"] * scale_x, 0.0, (intrinsics["cx"] + 0.5) * scale_x - 0.5],
+            [0.0, intrinsics["fy"] * scale_y, (intrinsics["cy"] + 0.5) * scale_y - 0.5],
+            [0.0, 0.0, 1.0],
+        ],
         dtype=torch.float32,
-        device=device,
     )
-    world_from_camera = torch.tensor(frame["worldFromRgbCamera"], dtype=torch.float32, device=device).reshape(4, 4)
+    world_from_camera = torch.tensor(frame["worldFromRgbCamera"], dtype=torch.float32).reshape(4, 4)
     value: dict[str, Any] = {
         "rgb": rgb,
         "K": intrinsic,
@@ -182,12 +243,34 @@ def _frame_tensors(root: Path, frame: dict[str, Any], device: Any, max_dimension
     if frame.get("depth"):
         with Image.open(root / frame["depth"]) as source:
             depth_image = source.resize((image.width, image.height), Image.Resampling.NEAREST)
-            depth = torch.from_numpy(np.asarray(depth_image, dtype=np.float32).copy()).to(device) / 1000.0
+            depth = torch.from_numpy(np.asarray(depth_image, dtype=np.uint16).copy())
         with Image.open(root / frame["depthMask"]) as source:
             mask_image = source.resize((image.width, image.height), Image.Resampling.NEAREST)
-            mask = torch.from_numpy(np.asarray(mask_image, dtype=np.uint8).copy()).to(device) > 0
+            mask = torch.from_numpy(np.asarray(mask_image, dtype=np.uint8).copy())
         value.update(depth=depth, mask=mask)
+    for key, tensor in tuple(value.items()):
+        if isinstance(tensor, torch.Tensor):
+            value[key] = tensor.pin_memory()
     return value
+
+
+def _frame_to_device(frame: dict[str, Any], device: Any) -> dict[str, Any]:
+    import torch
+
+    result: dict[str, Any] = {}
+    for key, value in frame.items():
+        if not isinstance(value, torch.Tensor):
+            result[key] = value
+            continue
+        transferred = value.to(device, non_blocking=True)
+        if key == "rgb":
+            transferred = transferred.float().div_(255.0)
+        elif key == "depth":
+            transferred = transferred.float().div_(1000.0)
+        elif key == "mask":
+            transferred = transferred > 0
+        result[key] = transferred
+    return result
 
 
 def train_dataset(
@@ -204,6 +287,10 @@ def train_dataset(
     if not torch.cuda.is_available():
         raise RuntimeError("Gaussian training requires a CUDA-capable PyTorch runtime; current ScanLan features remain available on CPU")
     device = torch.device("cuda")
+    device_properties = torch.cuda.get_device_properties(device)
+    vram_gib = device_properties.total_memory / (1024**3)
+    training_dimension, maximum_gaussians = _training_limits(vram_gib)
+    host_cache_size = max(1, min(int(os.environ.get("SCANLAN_SPLAT_FRAME_CACHE", "4")), 16))
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -275,6 +362,11 @@ def train_dataset(
             raise RuntimeError("Splat checkpoint belongs to an incompatible trainer version; start a new job")
         parameter_values = checkpoint["parameters"]
         start_step = int(checkpoint["step"]) + 1
+    if len(parameter_values["means"]) > maximum_gaussians:
+        raise RuntimeError(
+            f"Splat checkpoint contains {len(parameter_values['means']):,} Gaussians, "
+            f"above this GPU's {maximum_gaussians:,} safety limit; start a new job"
+        )
     parameters = torch.nn.ParameterDict(
         {name: torch.nn.Parameter(value.to(device)) for name, value in parameter_values.items()}
     )
@@ -359,12 +451,16 @@ def train_dataset(
             torch.save,
         )
 
-    cached_frames: dict[int, dict[str, Any]] = {}
+    # RGB-D keyframes stay in a small pinned host-memory LRU. Keeping an entire
+    # capture resident on CUDA made VRAM usage grow with session duration and
+    # was the main source of 12 GB laptop-GPU failures.
+    cached_frames: OrderedDict[int, dict[str, Any]] = OrderedDict()
     started = time.perf_counter()
     last_live_preview_at = 0.0
     last_loss = 0.0
     frame_epoch = -1
     frame_order = np.arange(len(frames), dtype=np.int64)
+    densification_stopped_at: int | None = None
 
     def publish_live_preview() -> None:
         nonlocal last_live_preview_at
@@ -387,16 +483,28 @@ def train_dataset(
 
     for step in range(start_step, iterations):
         if (output_root / "cancel.flag").exists():
-            save_checkpoint(step)
+            save_checkpoint(step - 1)
             raise RuntimeError("Gaussian training cancelled; checkpoint saved")
-        next_epoch = step // len(frames)
+        next_epoch = step // (len(frames) * FRAME_REUSE_PER_LOAD)
         if next_epoch != frame_epoch:
             frame_epoch = next_epoch
-            frame_order = np.random.default_rng(frame_epoch).permutation(len(frames))
-        frame_index = int(frame_order[step % len(frames)])
+            frame_order = _cache_local_frame_order(
+                len(frames),
+                frame_epoch,
+                host_cache_size,
+            )
+        frame_index = int(frame_order[step % len(frame_order)])
         if frame_index not in cached_frames:
-            cached_frames[frame_index] = _frame_tensors(root, frames[frame_index], device)
-        frame = cached_frames[frame_index]
+            cached_frames[frame_index] = _frame_tensors(
+                root,
+                frames[frame_index],
+                training_dimension,
+            )
+            if len(cached_frames) > host_cache_size:
+                cached_frames.popitem(last=False)
+        else:
+            cached_frames.move_to_end(frame_index)
+        frame = _frame_to_device(cached_frames[frame_index], device)
         for optimizer in optimizers.values():
             optimizer.zero_grad(set_to_none=True)
         pose_active = pose_optimizer is not None and step >= pose_refine_start
@@ -473,13 +581,20 @@ def train_dataset(
         projected_gradient = info.get("gradient_2dgs")
         if projected_gradient is not None and projected_gradient.grad is not None:
             projected_gradient.grad.div_(gradient_scale)
-        for optimizer in optimizers.values():
-            scaler.step(optimizer)
-        if pose_active:
-            scaler.step(pose_optimizer)
-        scaler.update()
-        if pose_active:
-            constrain_pose_offsets_(pose_offsets)
+        # DefaultStrategy can at most double the set in one grow cycle. Stop
+        # before that worst case can cross the hardware profile's hard bound.
+        if (
+            densification_stopped_at is None
+            and len(parameters["means"]) >= maximum_gaussians // 2
+        ):
+            # DefaultStrategy treats refine_stop_iter as inclusive. Put the
+            # boundary behind the current step so a checkpoint resumed exactly
+            # on a refinement interval cannot schedule one final doubling.
+            strategy.refine_stop_iter = min(strategy.refine_stop_iter, step - 1)
+            densification_stopped_at = len(parameters["means"])
+        # gsplat topology updates consume the retained projection gradient and
+        # resize both parameters and optimizer state. They must run after
+        # backward but before optimizer.step(), as in the official 2DGS trainer.
         strategy.step_post_backward(
             parameters,
             optimizers,
@@ -488,6 +603,18 @@ def train_dataset(
             info,
             packed=True,
         )
+        if len(parameters["means"]) > maximum_gaussians:
+            raise RuntimeError(
+                f"Adaptive densification exceeded the {maximum_gaussians:,}-Gaussian "
+                "GPU safety limit"
+            )
+        for optimizer in optimizers.values():
+            scaler.step(optimizer)
+        if pose_active:
+            scaler.step(pose_optimizer)
+        scaler.update()
+        if pose_active:
+            constrain_pose_offsets_(pose_offsets)
         last_loss = float(loss.detach())
         if step % 20 == 0 or step + 1 == iterations:
             elapsed = time.perf_counter() - started
@@ -502,7 +629,7 @@ def train_dataset(
                 if pose_refinement_enabled
                 else 0.0
             )
-            _write_json_atomic(progress_path, {"stage": "splat_training", "detail": f"Optimized 2DGS iteration {step + 1:,} of {iterations:,} · loss {last_loss:.4f}", "progress": progress_start + (1.0 - progress_start) * stage_progress, "stageProgress": stage_progress, "iteration": step + 1, "totalIterations": iterations, "loss": last_loss, "rgbLoss": float(rgb_l1.detach()), "depthLoss": float(depth_value.detach()), "normalLoss": float(normal_value.detach()), "distortionLoss": float(distortion_value.detach()), "poseRegularizationLoss": float(pose_regularization_value.detach()), "maximumPoseTranslationMm": maximum_pose_translation_mm, "etaSeconds": eta, "stageEtaSeconds": eta, "elapsedSeconds": round(elapsed), "computeBackend": f"{torch.cuda.get_device_name(device)} · CUDA AMP / gsplat 2DGS"})
+            _write_json_atomic(progress_path, {"stage": "splat_training", "detail": f"Optimized 2DGS iteration {step + 1:,} of {iterations:,} · loss {last_loss:.4f} · {training_dimension}px · {len(parameters['means']):,} Gaussians", "progress": progress_start + (1.0 - progress_start) * stage_progress, "stageProgress": stage_progress, "iteration": step + 1, "totalIterations": iterations, "loss": last_loss, "rgbLoss": float(rgb_l1.detach()), "depthLoss": float(depth_value.detach()), "normalLoss": float(normal_value.detach()), "distortionLoss": float(distortion_value.detach()), "poseRegularizationLoss": float(pose_regularization_value.detach()), "maximumPoseTranslationMm": maximum_pose_translation_mm, "gaussianCount": len(parameters["means"]), "maximumGaussians": maximum_gaussians, "etaSeconds": eta, "stageEtaSeconds": eta, "elapsedSeconds": round(elapsed), "computeBackend": f"{torch.cuda.get_device_name(device)} · CUDA AMP / gsplat 2DGS"})
         preview_due = step == start_step or step + 1 == iterations or (
             step > 0
             and step % 250 == 0
@@ -577,7 +704,7 @@ def train_dataset(
         except importlib.metadata.PackageNotFoundError:
             versions[package] = "unavailable"
     versions["splatfactoReference"] = "gsplat 1.5.3 native 2DGS with Splatfacto densification"
-    training = {"iterations": iterations, "finalLoss": last_loss, "usesDepth": uses_depth, "device": torch.cuda.get_device_name(device), "precision": "CUDA AMP fp16 with TF32 matmul", "optimizer": "fused Adam", "representation": "2D Gaussian surface discs", "rasterization": "packed native gsplat 2DGS", "adaptiveStrategy": "gsplat DefaultStrategy with native 2DGS densification gradient and pruning", "gaussianCount": len(parameters["means"]), "sphericalHarmonicsDegree": 3, "rgbLoss": "L1+SSIM", "depthLoss": "masked robust Huber with annealed weight", "normalLoss": "rendered-normal/depth-normal consistency", "distortionLoss": "2DGS ray-splat distortion regularization", "frameSampling": "deterministically shuffled keyframe epochs", "poseRefinement": pose_statistics}
+    training = {"iterations": iterations, "finalLoss": last_loss, "usesDepth": uses_depth, "device": torch.cuda.get_device_name(device), "vramGiB": round(vram_gib, 2), "trainingMaxDimension": training_dimension, "hostFrameCache": host_cache_size, "frameReusePerLoad": FRAME_REUSE_PER_LOAD, "maximumGaussians": maximum_gaussians, "densificationStoppedAt": densification_stopped_at, "precision": "CUDA AMP fp16 with TF32 matmul", "optimizer": "fused Adam", "representation": "2D Gaussian surface discs", "rasterization": "packed native gsplat 2DGS", "adaptiveStrategy": "bounded gsplat DefaultStrategy with native 2DGS densification gradient and pruning", "gaussianCount": len(parameters["means"]), "sphericalHarmonicsDegree": 3, "rgbLoss": "L1+SSIM", "depthLoss": "masked robust Huber with annealed weight", "normalLoss": "rendered-normal/depth-normal consistency", "distortionLoss": "2DGS ray-splat distortion regularization", "frameSampling": "deterministically shuffled cache-local keyframe blocks", "poseRefinement": pose_statistics}
     write_splat_sidecars(output_root, dataset.get("fingerprint", ""), bool(dataset.get("metric")), versions, training)
     project_path = project_root / "project.json"
     project = json.loads(project_path.read_text(encoding="utf-8"))

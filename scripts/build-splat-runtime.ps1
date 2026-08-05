@@ -8,16 +8,7 @@ $RuntimeScripts = Join-Path $RuntimeRoot "Scripts"
 $SitePackages = Join-Path $RuntimeRoot "Lib/site-packages"
 $GsplatExtension = Join-Path $RuntimeRoot "Lib/site-packages/gsplat/csrc.pyd"
 $GsplatFeatureStamp = Join-Path $RuntimeRoot "Lib/site-packages/gsplat/scanlan-build.txt"
-$ExpectedGsplatFeatures = "2dgs-rgbd-v3"
-$MediaToolsScript = Join-Path $PSScriptRoot "prepare-media-tools.ps1"
-
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $MediaToolsScript
-if ($LASTEXITCODE -ne 0) { throw "Photo/video support tools could not be prepared." }
-$MediaToolPaths = @(
-  (Join-Path $ProjectRoot "media-tools/ffmpeg/bin"),
-  (Join-Path $ProjectRoot "media-tools/colmap/bin")
-) -join [IO.Path]::PathSeparator
-$env:PATH = $MediaToolPaths + [IO.Path]::PathSeparator + $env:PATH
+$GsplatFeatureSchema = "2dgs-rgbd-v3"
 
 if (-not (Test-Path -LiteralPath $Python)) {
   if (Get-Command py -ErrorAction SilentlyContinue) {
@@ -47,18 +38,20 @@ try {
   # Windows PowerShell promotes native stderr to NativeCommandError when the global
   # preference is Stop, so suppress it until the probe exit code has been captured.
   $ErrorActionPreference = "SilentlyContinue"
-  & $Python -c "import importlib.util, sys; found = importlib.util.find_spec('torch') is not None; sys.exit(1) if not found else None; import torch; sys.exit(0 if torch.__version__.startswith('2.12.0+cu130') and torch.cuda.is_available() else 1)" 2>$null
+  & $Python -c "import importlib.util, sys; found = importlib.util.find_spec('torch') is not None; sys.exit(1) if not found else None; import torch; sys.exit(0 if torch.__version__.startswith('2.12.1+cu130') and torch.cuda.is_available() else 1)" 2>$null
   $TorchReady = $LASTEXITCODE -eq 0
 } finally {
   $ErrorActionPreference = $PreviousErrorActionPreference
 }
 if (-not $TorchReady) {
-  & $Python -m pip install --upgrade --force-reinstall "torch==2.12.0" --index-url "https://download.pytorch.org/whl/cu130"
+  & $Python -m pip install --upgrade --force-reinstall "torch==2.12.1" --index-url "https://download.pytorch.org/whl/cu130"
   if ($LASTEXITCODE -ne 0) { throw "CUDA-enabled PyTorch could not be installed." }
 }
 & $Python -c "import torch; assert torch.cuda.is_available(), 'PyTorch cannot access CUDA'; print(torch.cuda.get_device_name(0))"
 if ($LASTEXITCODE -ne 0) { throw "The installed PyTorch runtime cannot access CUDA." }
 $CudaArchitecture = (& $Python -c "import torch; print('.'.join(map(str, torch.cuda.get_device_capability(0))))").Trim()
+$TorchBuild = (& $Python -c "import torch; print(torch.__version__)").Trim()
+$ExpectedGsplatFeatures = "$GsplatFeatureSchema;torch=$TorchBuild;arch=$CudaArchitecture"
 $env:TORCH_CUDA_ARCH_LIST = $CudaArchitecture
 & $Python -m pip install --upgrade "numpy==1.26.4" "Pillow==11.1.0" "ninja>=1.10" "jaxtyping" "rich>=12" "backports.tarfile" "pyinstaller==6.16.0"
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat support dependencies could not be installed." }
@@ -117,5 +110,3 @@ $PackagedWorker = Join-Path $PackageRoot "dist/scanlan-splat/scanlan-splat.exe"
 if ($LASTEXITCODE -ne 0) { throw "The packaged ScanLan splat runtime failed validation." }
 
 Write-Host "Splat runtime ready: $PackagedWorker"
-if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { Write-Warning "FFmpeg is missing; RGB-D splats work, but video import does not." }
-if (-not (Get-Command colmap -ErrorAction SilentlyContinue)) { Write-Warning "COLMAP is missing; RGB-D splats work, but photo/video registration does not." }

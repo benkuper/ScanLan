@@ -12,14 +12,78 @@ from PIL import Image
 from .calibration import (
     rgb_depth_zbuffer,
     robust_depth_mask,
+    scaled_pinhole_camera,
+    undistort_rgb_to_pinhole,
     world_from_depth_opencv,
     world_from_rgb_camera,
 )
-from .io import effective_rgb_camera, load_depth, load_source_rgb, save_binary_ply, write_json
-from .splat_seed import SEED_VERSION, GaussianSeeds, compact_seed_batches, seed_rgbd_gaussians
+from .io import (
+    frame_rgb_camera,
+    frame_rgb_from_depth,
+    frame_uses_native_rgb,
+    load_depth,
+    load_source_rgb,
+    save_binary_ply,
+    write_json,
+)
+from .splat_seed import (
+    MAX_INITIAL_GAUSSIANS,
+    SEED_VERSION,
+    GaussianSeeds,
+    compact_seed_batches,
+    seed_rgbd_gaussians,
+)
 
 if TYPE_CHECKING:
     from .mesh import PosedFrame
+
+
+DATASET_VERSION = "metric-rgbd-pinhole-720-v5"
+CANONICAL_MAX_DIMENSION = 720
+MAX_CANONICAL_FRAMES = 600
+
+
+def _select_training_frames(frames: list[PosedFrame]) -> list[PosedFrame]:
+    if len(frames) <= MAX_CANONICAL_FRAMES:
+        return frames
+    features: list[np.ndarray] = []
+    for index, frame in enumerate(frames):
+        pose = np.asarray(frame.camera_to_global, dtype=np.float64)
+        temporal = index / max(len(frames) - 1, 1)
+        features.append(
+            np.concatenate(
+                (
+                    pose[:3, 3] / 0.10,
+                    pose[:3, 2] * 2.0,
+                    pose[:3, 1],
+                    [temporal * 0.25],
+                )
+            )
+        )
+    feature_matrix = np.asarray(features)
+    required: set[int] = {0, len(frames) - 1}
+    for index in range(1, len(frames)):
+        if frames[index].phase_id != frames[index - 1].phase_id:
+            required.update((index - 1, index))
+    selected = np.zeros(len(frames), dtype=bool)
+    minimum_distance = np.full(len(frames), np.inf, dtype=np.float64)
+    for index in sorted(required):
+        selected[index] = True
+        difference = feature_matrix - feature_matrix[index]
+        minimum_distance = np.minimum(
+            minimum_distance,
+            np.einsum("ij,ij->i", difference, difference),
+        )
+    while int(selected.sum()) < MAX_CANONICAL_FRAMES:
+        minimum_distance[selected] = -1.0
+        next_index = int(np.argmax(minimum_distance))
+        selected[next_index] = True
+        difference = feature_matrix - feature_matrix[next_index]
+        minimum_distance = np.minimum(
+            minimum_distance,
+            np.einsum("ij,ij->i", difference, difference),
+        )
+    return [frame for index, frame in enumerate(frames) if selected[index]]
 
 
 def _hash_file(digest: Any, path: Path) -> None:
@@ -33,6 +97,7 @@ def _hash_file(digest: Any, path: Path) -> None:
 
 def dataset_fingerprint(frames: list[PosedFrame]) -> str:
     digest = hashlib.sha256()
+    digest.update(DATASET_VERSION.encode("ascii"))
     digest.update(SEED_VERSION.encode("ascii"))
     seen_phases: set[Path] = set()
     for frame in frames:
@@ -77,6 +142,7 @@ def build_posed_dataset(
     if not frames:
         raise ValueError("Optimized camera poses are required to build the canonical dataset")
     fingerprint = dataset_fingerprint(frames)
+    training_frames = _select_training_frames(frames)
     datasets_root = cache_root / "datasets"
     dataset_root = datasets_root / fingerprint
     manifest_path = dataset_root / "dataset.json"
@@ -95,9 +161,10 @@ def build_posed_dataset(
 
     records: list[dict[str, Any]] = []
     seed_batches: list[GaussianSeeds] = []
-    for output_index, frame in enumerate(frames):
+    for output_index, frame in enumerate(training_frames):
         source_frame = frame.source.frames[frame.frame_index]
-        rgb_camera = effective_rgb_camera(frame.source)
+        rgb_camera = frame_rgb_camera(source_frame, frame.source)
+        rgb_from_depth = frame_rgb_from_depth(source_frame, frame.source)
         image = load_source_rgb(source_frame, frame.source)
         if image.shape[:2] != (rgb_camera.height, rgb_camera.width):
             image = np.asarray(
@@ -105,8 +172,40 @@ def build_posed_dataset(
                 dtype=np.uint8,
             )
         depth = load_depth(source_frame, frame.source.camera)
-        depth_rgb, uv_map, visibility = rgb_depth_zbuffer(depth, frame.source)
+        dataset_camera = scaled_pinhole_camera(
+            rgb_camera,
+            CANONICAL_MAX_DIMENSION,
+        )
+        depth_rgb, uv_map, visibility = rgb_depth_zbuffer(
+            depth,
+            frame.source,
+            source_frame,
+            output_camera=dataset_camera,
+        )
         mask = robust_depth_mask(depth_rgb)
+        seeds = seed_rgbd_gaussians(
+            depth,
+            image,
+            uv_map,
+            visibility,
+            frame.source.camera,
+            world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
+        )
+        if len(seeds.points):
+            seed_batches.append(seeds)
+            if len(seed_batches) >= 8:
+                seed_batches[:] = [
+                    compact_seed_batches(
+                        seed_batches,
+                        limit=MAX_INITIAL_GAUSSIANS * 2,
+                    )
+                ]
+        image, rgb_valid = undistort_rgb_to_pinhole(
+            image,
+            rgb_camera,
+            dataset_camera,
+        )
+        mask &= rgb_valid
         stem = f"{output_index:06}"
         Image.fromarray(image).save(
             temporary / "images" / f"{stem}.jpg",
@@ -121,7 +220,7 @@ def build_posed_dataset(
         world_from_rgb = world_from_rgb_camera(
             frame.camera_to_global,
             frame.image_y_up,
-            frame.source.rgb_from_depth,
+            rgb_from_depth,
         )
         records.append(
             {
@@ -130,38 +229,32 @@ def build_posed_dataset(
                 "depthMask": f"masks/{stem}.png",
                 "worldFromRgbCamera": [round(float(value), 10) for value in world_from_rgb.reshape(-1)],
                 "intrinsics": {
-                    "width": rgb_camera.width,
-                    "height": rgb_camera.height,
-                    "fx": rgb_camera.fx,
-                    "fy": rgb_camera.fy,
-                    "cx": rgb_camera.cx,
-                    "cy": rgb_camera.cy,
-                    "model": rgb_camera.model,
-                    "distortion": list(rgb_camera.distortion),
+                    "width": dataset_camera.width,
+                    "height": dataset_camera.height,
+                    "fx": dataset_camera.fx,
+                    "fy": dataset_camera.fy,
+                    "cx": dataset_camera.cx,
+                    "cy": dataset_camera.cy,
+                    "model": "pinhole",
+                    "distortion": [],
                 },
-                "timestampUs": source_frame.rgb_timestamp_us or source_frame.timestamp_us,
+                "timestampUs": (
+                    source_frame.rgb_timestamp_us
+                    if frame_uses_native_rgb(source_frame) and source_frame.rgb_timestamp_us is not None
+                    else source_frame.timestamp_us
+                ),
                 "phaseId": frame.phase_id,
                 "frameIndex": source_frame.index,
                 "metric": True,
             }
         )
-        seeds = seed_rgbd_gaussians(
-            depth,
-            image,
-            uv_map,
-            visibility,
-            frame.source.camera,
-            world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
-        )
-        if len(seeds.points):
-            seed_batches.append(seeds)
         if progress:
             progress(
                 "Preparing splat data",
-                f"Reprojected native RGB depth {output_index + 1} of {len(frames)}",
+                f"Reprojected calibrated RGB depth {output_index + 1} of {len(training_frames)}",
                 0,
                 None,
-                (output_index + 1) / len(frames),
+                (output_index + 1) / len(training_frames),
             )
 
     seeds = compact_seed_batches(seed_batches)
@@ -174,7 +267,7 @@ def build_posed_dataset(
         quaternions=seeds.quaternions,
     )
     payload: dict[str, Any] = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "fingerprint": fingerprint,
         "coordinateConvention": {
             "handedness": "right",
@@ -184,6 +277,8 @@ def build_posed_dataset(
             "matrixStorage": "row-major",
         },
         "metric": True,
+        "sourceFrameCount": len(frames),
+        "trainingFrameCount": len(training_frames),
         "frames": records,
         "initialization": "initialization.ply",
         "initializationParameters": "initialization-2dgs.npz",

@@ -6,7 +6,12 @@ from pathlib import Path
 
 import numpy as np
 
-from scanlan_splat.train import _read_seed_parameters
+from scanlan_splat.train import (
+    FRAME_REUSE_PER_LOAD,
+    _cache_local_frame_order,
+    _read_seed_parameters,
+    _training_limits,
+)
 
 
 def _write_initialization(path: Path) -> None:
@@ -32,6 +37,24 @@ def _write_initialization(path: Path) -> None:
 
 
 class SeedParameterTests(unittest.TestCase):
+    def test_training_limits_leave_12_gib_kernel_headroom(self) -> None:
+        self.assertEqual(_training_limits(12.0), (720, 2_000_000))
+        self.assertEqual(_training_limits(16.0), (896, 3_000_000))
+        self.assertEqual(_training_limits(24.0), (1024, 4_000_000))
+
+    def test_frame_order_reuses_only_views_that_fit_the_host_cache(self) -> None:
+        order = _cache_local_frame_order(11, epoch=3, cache_size=4)
+
+        np.testing.assert_array_equal(
+            np.bincount(order, minlength=11),
+            np.full(11, FRAME_REUSE_PER_LOAD),
+        )
+        for start in range(0, len(order), 4 * FRAME_REUSE_PER_LOAD):
+            self.assertLessEqual(
+                len(np.unique(order[start : start + 4 * FRAME_REUSE_PER_LOAD])),
+                4,
+            )
+
     def test_rgbd_sidecar_supplies_surface_scales_and_rotations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

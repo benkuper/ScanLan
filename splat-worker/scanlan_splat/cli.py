@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
 from . import __version__
-from .dataset import prepare_media_dataset
 from .train import train_dataset
 
 
@@ -54,11 +52,6 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--dataset", type=Path, required=True)
     train.add_argument("--iterations", type=int, default=30_000)
     train.add_argument("--resume", action="store_true")
-    media = commands.add_parser("media")
-    media.add_argument("--project", type=Path, required=True)
-    media.add_argument("--source-id", action="append", default=[])
-    media.add_argument("--iterations", type=int, default=30_000)
-    media.add_argument("--resume", action="store_true")
     diagnostics = commands.add_parser("diagnostics")
     diagnostics.add_argument("--require-cuda", action="store_true")
     return root
@@ -74,18 +67,13 @@ def main(argv: list[str] | None = None) -> int:
             cuda_available = torch.cuda.is_available()
             if arguments.require_cuda and cuda_available:
                 _cuda_smoke_test()
-            print(json.dumps({"version": __version__, "cuda": cuda_available, "cudaSmokeTest": cuda_available and arguments.require_cuda, "device": torch.cuda.get_device_name(0) if cuda_available else None, "torch": torch.__version__, "gsplat": getattr(gsplat, "__version__", "unknown"), "ffmpeg": shutil.which("ffmpeg"), "colmap": shutil.which("colmap")}))
+            print(json.dumps({"version": __version__, "cuda": cuda_available, "cudaSmokeTest": cuda_available and arguments.require_cuda, "device": torch.cuda.get_device_name(0) if cuda_available else None, "torch": torch.__version__, "gsplat": getattr(gsplat, "__version__", "unknown")}))
             return 2 if arguments.require_cuda and not cuda_available else 0
-        if arguments.command == "media":
-            dataset = prepare_media_dataset(arguments.project.resolve(), arguments.source_id)
-        else:
-            dataset = arguments.dataset.resolve()
         result = train_dataset(
-            dataset,
+            arguments.dataset.resolve(),
             arguments.project.resolve(),
             max(1_000, min(arguments.iterations, 100_000)),
             arguments.resume,
-            progress_start=0.25 if arguments.command == "media" else 0.0,
         )
         print(json.dumps(result))
         return 0

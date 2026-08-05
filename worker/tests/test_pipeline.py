@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import csv
+import importlib.util
 import struct
 import tempfile
 import unittest
@@ -17,6 +18,9 @@ from scanlan.io import (
     FrameRecord,
     ImuSample,
     PhaseData,
+    RgbCameraModel,
+    frame_rgb_camera,
+    frame_rgb_from_depth,
     load_depth,
     load_source_rgb,
     read_phase,
@@ -34,6 +38,7 @@ from scanlan.compute import (
 from scanlan.open3d_engine import (
     PhaseAlignment,
     _apply_fragment_corrections,
+    _captured_poses,
     _display_points,
     _interpolate_rigid_transform,
     _prefer_alignment,
@@ -46,6 +51,74 @@ from scanlan.reconstruct import reconstruct_project
 
 
 class PipelineTests(unittest.TestCase):
+    def test_tracking_journal_filters_rejections_and_seeds_offline_poses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=3)
+            project = read_project(root)
+            phase_root = root / "phases" / project["phases"][0]["id"]
+            baseline = read_phase(phase_root)
+            sequences = [frame.source_sequence for frame in baseline.frames]
+            entries = []
+            for index, sequence in enumerate(sequences):
+                world_to_camera = np.eye(4)
+                world_to_camera[0, 3] = -0.1 * index
+                entries.append(
+                    {
+                        "schemaVersion": 1,
+                        "sequence": sequence,
+                        "accepted": index != 1,
+                        "overlap": 0.72,
+                        "depthRmseMm": 12.0,
+                        "worldToCamera": world_to_camera.reshape(-1).tolist() if index != 1 else None,
+                    }
+                )
+            (phase_root / "tracking.jsonl").write_text(
+                "".join(json.dumps(entry) + "\n" for entry in entries),
+                encoding="utf-8",
+            )
+
+            phase = read_phase(phase_root)
+            self.assertEqual(len(phase.frames), 2)
+            self.assertEqual(phase.tracking_rejected_sequences, frozenset({sequences[1]}))
+            captured = _captured_poses(phase)
+            self.assertIsNotNone(captured)
+            poses, _, detail = captured or ([], 0, "")
+            np.testing.assert_allclose(poses[0], np.eye(4), atol=1e-9)
+            self.assertAlmostEqual(float(poses[1][0, 3]), 0.2)
+            self.assertIn("realtime RGB-D", detail)
+
+            replay_phase = read_phase(phase_root, include_tracking_rejected=True)
+            self.assertEqual(len(replay_phase.frames), 3)
+
+    def test_kinect_fusion_trajectory_must_match_archived_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=2)
+            project = read_project(root)
+            phase_root = root / "phases" / project["phases"][0]["id"]
+            manifest_path = phase_root / "phase.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["poseSource"] = "kinect_fusion"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            csv_path = phase_root / "frames.csv"
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+                fieldnames = list(rows[0])
+            wrong_pose = np.eye(4)
+            wrong_pose[2, 3] = 0.10
+            for key, value in zip(
+                [f"m{row}{column}" for row in range(4) for column in range(4)],
+                wrong_pose.reshape(-1),
+                strict=True,
+            ):
+                rows[1][key] = str(value)
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            self.assertIsNone(_captured_poses(read_phase(phase_root)))
+
     def test_x_mirror_is_only_applied_for_kinect_v2(self) -> None:
         cloud = type("Cloud", (), {"points": np.asarray([[1.0, 2.0, 3.0]])})()
         np.testing.assert_array_equal(_display_points(cloud, False), [[1.0, -2.0, -3.0]])
@@ -186,7 +259,15 @@ class PipelineTests(unittest.TestCase):
             dataset_root = current.parent / pointer["path"]
             dataset = json.loads((dataset_root / "dataset.json").read_text(encoding="utf-8"))
             self.assertEqual(dataset["fingerprint"], result["datasetFingerprint"])
+            self.assertEqual(dataset["schemaVersion"], 3)
             self.assertEqual(len(dataset["frames"]), 2)
+            self.assertTrue(
+                all(
+                    frame["intrinsics"]["model"] == "pinhole"
+                    and frame["intrinsics"]["distortion"] == []
+                    for frame in dataset["frames"]
+                )
+            )
             self.assertTrue((dataset_root / "initialization.ply").exists())
 
     def test_depth_mesh_welding_merges_positions_and_duplicate_faces(self) -> None:
@@ -232,8 +313,9 @@ class PipelineTests(unittest.TestCase):
             checker = (((xx + yy) % 2) * 255).astype(np.uint8)
             np.repeat(checker[..., None], 3, axis=2).tofile(color_path)
             camera = CameraModel(8, 8, 4.0, 4.0, 3.5, 3.5, 1000.0, 4.0)
-            record = FrameRecord(0, 0, depth_path, color_path, None, None, np.eye(4))
-            phase = PhaseData(root, {}, camera, None, np.eye(4), [record], [])
+            record = FrameRecord(0, 0, 0, depth_path, color_path, None, None, np.eye(4))
+            rgb_camera = RgbCameraModel(8, 8, 4.0, 4.0, 3.5, 3.5, "brown_conrady", ())
+            phase = PhaseData(root, {}, camera, rgb_camera, np.eye(4), [record], [])
             frame = PosedFrame("test", "test", phase, 0, np.eye(4), (1.0, 1.0, 1.0), False)
             image_pixels = np.asarray([[0.0, 0.0], [6.0, 0.0], [0.0, 6.0]])
             z = np.full(3, 2.0)
@@ -271,6 +353,7 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(result["voxelSizeM"], 0.001)
 
+    @unittest.skipUnless(importlib.util.find_spec("open3d"), "Open3D is not installed")
     def test_open3d_local_phase_cache_is_reused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=4)
@@ -307,6 +390,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(first_points.shape, second_points.shape)
             self.assertTrue(any("Reused tracking" in value for value in second_messages))
 
+    @unittest.skipUnless(importlib.util.find_spec("open3d"), "Open3D is not installed")
     def test_tensor_tsdf_and_icp_run_on_tensor_api(self) -> None:
         import open3d as o3d
 
@@ -347,6 +431,7 @@ class PipelineTests(unittest.TestCase):
             self.assertGreater(refined.fitness, 0.9)
             self.assertAlmostEqual(refined.transformation[0, 3], 0.02, places=3)
 
+    @unittest.skipUnless(importlib.util.find_spec("open3d"), "Open3D is not installed")
     def test_tensor_surfel_merge_streams_into_unique_voxels(self) -> None:
         import open3d as o3d
 
@@ -432,12 +517,12 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(phase.imu_samples), 2)
             self.assertEqual(phase.imu_samples[0].kind, "gyro")
 
-    def test_legacy_aligned_rgb_uses_identity_native_rgb_fallback(self) -> None:
+    def test_aligned_color_recovers_a_missing_native_rgb_frame(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=1)
             project = read_project(root)
             phase = read_phase(root / "phases" / project["phases"][0]["id"])
-            self.assertIsNone(phase.rgb_camera)
+            self.assertEqual(phase.rgb_camera.width, phase.camera.width)
             np.testing.assert_array_equal(phase.rgb_from_depth, np.eye(4))
             image = load_source_rgb(phase.frames[0], phase)
             self.assertEqual(image.shape, (phase.camera.height, phase.camera.width, 3))
@@ -470,7 +555,7 @@ class PipelineTests(unittest.TestCase):
                     "distortion": [0, 0, 0, 0, 0],
                 },
                 rgbFromDepth=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-                sourceRgb={"format": "jpeg", "quality": 92, "nativeResolution": True},
+                sourceRgb={"format": "jpeg", "quality": 92, "nativeResolution": True, "droppedFrames": 0},
             )
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             rgb_root = phase_root / "rgb"
@@ -493,6 +578,19 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(phase.rgb_camera.width, 96)
             self.assertEqual(phase.frames[0].rgb_timestamp_us, 123456)
             self.assertEqual(load_source_rgb(phase.frames[0], phase).shape, (72, 96, 3))
+            (rgb_root / "000000.jpg").unlink()
+            fallback_camera = frame_rgb_camera(phase.frames[0], phase)
+            self.assertEqual((fallback_camera.width, fallback_camera.height), (48, 36))
+            np.testing.assert_array_equal(
+                frame_rgb_from_depth(phase.frames[0], phase),
+                np.eye(4),
+            )
+            fallback_depth, _, _ = rgb_depth_zbuffer(
+                load_depth(phase.frames[0], phase.camera),
+                phase,
+                phase.frames[0],
+            )
+            self.assertEqual(fallback_depth.shape, (36, 48))
 
     def test_gyro_prior_maps_previous_camera_into_current_camera(self) -> None:
         samples = [

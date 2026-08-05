@@ -30,10 +30,10 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "shortDescription": "Capture phased RGB-D scans and reconstruct them offline.",
-    "longDescription": "ScanLan records calibrated RGB-D phases from Kinect v2, Azure Kinect DK, or Orbbec Femto Mega and reconstructs a colored point cloud plus an RGB-reprojected textured mesh.",
+    "shortDescription": "Realtime RGB-D capture and production reconstruction.",
+    "longDescription": "ScanLan records calibrated RGB-D from Kinect v2, Azure Kinect DK, or Orbbec Femto Mega, tracks and fuses it in realtime, then builds metric point clouds, textured triangle meshes, and depth-aware 2D Gaussian surfaces.",
     "resources": {
-      "../build/kinect-capture/Release": "legacy",
+      "../build/kinect-capture/Release": "kinect2",
       "../build/modern-capture/Release": "modern",
       "../worker/dist/scanlan-worker.exe": "scanlan-worker.exe"
     }

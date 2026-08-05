@@ -133,7 +133,10 @@ def reconstruct_project(
     build_preview_path.unlink(missing_ok=True)
 
     try:
-        artifact_context: dict = {}
+        artifact_context: dict = {
+            "needs_mesh": "textured_mesh" in targets,
+            "mesh_voxel_size_m": max(voxel_size_m, 0.008),
+        }
         if selected_engine == "numpy":
             reporter.update(
                 "Preparing",
@@ -216,6 +219,8 @@ def reconstruct_project(
                 posed_frames,
                 reporter.update,
                 voxel_size_m=voxel_size_m,
+                prebuilt_mesh=artifact_context.get("fused_mesh"),
+                prebuilt_mesh_method=artifact_context.get("fused_mesh_method"),
             )
             if "textured_mesh" in targets
             else {
@@ -255,8 +260,7 @@ def reconstruct_project(
 
         project["processingStatus"] = "complete"
         project.pop("processingError", None)
-        project["schemaVersion"] = max(int(project.get("schemaVersion", 1)), 2)
-        project.setdefault("mediaSources", [])
+        project["schemaVersion"] = 3
         artifacts = project.setdefault("artifacts", {})
         updated_at = datetime.now(timezone.utc).isoformat()
         fingerprint = source_fingerprint

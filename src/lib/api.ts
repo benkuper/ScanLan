@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ArtifactJob, ArtifactTarget, AvailableSensor, CameraFrame, CaptureSettings, CaptureStatus, CloudTransform, MediaSourceKind, PreviewMesh, PreviewPoint, ProjectSummary, RuntimeInfo } from './types';
+import type { ArtifactJob, ArtifactTarget, AvailableSensor, CaptureSettings, CaptureStatus, PreviewMesh, PreviewPoint, ProjectSummary, RuntimeInfo } from './types';
 
 const inTauri = () => typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
 
@@ -89,7 +89,7 @@ export async function loadLiveReconstructionMesh(afterFrame: number): Promise<{ 
   const positionStart = 16;
   const colorStart = positionStart + vertexCount * 12;
   const indexStart = colorStart + vertexCount * 3;
-  if (vertexCount > 500_000 || indexCount > 300_000 || bytes.byteLength !== indexStart + indexCount * 4) {
+  if (vertexCount > 500_000 || indexCount > 450_000 || bytes.byteLength !== indexStart + indexCount * 4) {
     throw new Error('The live reconstruction mesh is incomplete.');
   }
   return {
@@ -102,25 +102,14 @@ export async function loadLiveReconstructionMesh(afterFrame: number): Promise<{ 
   };
 }
 
-export async function reconstructProject(
-  projectPath: string,
-  settings: CaptureSettings
-): Promise<ProjectSummary> {
-  requireDesktop();
-  return invoke<ProjectSummary>('reconstruct_project', { projectPath, settings });
-}
-
 export async function startArtifactJob(
   projectPath: string,
-  pipeline: 'rgbd_reconstruction' | 'media_gaussian',
   targets: ArtifactTarget[],
-  sourceIds: string[] = [],
-  iterations = 30_000,
-  resume = false
+  iterations = 30_000
 ): Promise<ArtifactJob> {
   requireDesktop();
   return invoke<ArtifactJob>('start_artifact_job', {
-    projectPath, pipeline, targets, sourceIds, iterations, resume
+    projectPath, targets, iterations
   });
 }
 
@@ -147,20 +136,6 @@ export async function discardArtifactJob(projectPath: string, jobId: string): Pr
 export async function resumeArtifactJob(projectPath: string, jobId: string): Promise<ArtifactJob> {
   requireDesktop();
   return invoke<ArtifactJob>('resume_artifact_job', { projectPath, jobId });
-}
-
-export async function importMediaSource(
-  projectPath: string,
-  kind: MediaSourceKind,
-  paths: string[]
-): Promise<ProjectSummary> {
-  requireDesktop();
-  return invoke<ProjectSummary>('import_media_source', { projectPath, kind, paths });
-}
-
-export async function removeMediaSource(projectPath: string, sourceId: string): Promise<ProjectSummary> {
-  requireDesktop();
-  return invoke<ProjectSummary>('remove_media_source', { projectPath, sourceId });
 }
 
 export async function loadPreview(projectPath: string): Promise<PreviewPoint[]> {
@@ -204,23 +179,10 @@ export async function loadPreviewMesh(projectPath: string): Promise<PreviewMesh>
   };
 }
 
-export async function loadCameraFrames(projectPath: string): Promise<CameraFrame[]> {
-  requireDesktop();
-  return invoke<CameraFrame[]>('load_camera_frames', { projectPath });
-}
-
 export async function loadGaussianSplat(projectPath: string): Promise<Uint8Array> {
   requireDesktop();
   const response = await invoke<ArrayBuffer | Uint8Array | number[]>('load_gaussian_splat', { projectPath });
   return normalizeBinary(response);
-}
-
-export async function applyCloudTransform(
-  projectPath: string,
-  transform: CloudTransform
-): Promise<PreviewPoint[]> {
-  requireDesktop();
-  return invoke<PreviewPoint[]>('apply_cloud_transform', { projectPath, transform });
 }
 
 export async function exportPly(projectPath: string, destinationPath: string): Promise<string> {

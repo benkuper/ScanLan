@@ -1,43 +1,60 @@
-# ScanLan archive format
+# Scan archive format — schema 3
 
-The project format is directory-based so interrupted captures remain recoverable and reconstruction can be rerun without the original sensor.
+Schema 3 is the only supported project and phase format. ScanLan does not migrate older projects.
 
 ```text
 scan-project/
-|-- project.json
-|-- phases/
-|   `-- <phase-id>/
-|       |-- phase.json
-|       |-- frames.csv
-|       |-- live-frame-selection.csv
-|       |-- depth/000000.u16
-|       |-- color/000000.rgb
-|       `-- rgb/000000.jpg
-|-- sources/
-|   `-- <source-id>/originals/
-`-- outputs/
-    |-- jobs/<job-id>.json
-    |-- cache/datasets/<fingerprint>/
-    |-- room-cloud.ply
-    |-- room-mesh.obj
-    |-- room-mesh.mtl
-    |-- room-texture.png
-    |-- room-splat.ply
-    |-- room-splat.transform.json
-    |-- splat-manifest.json
-    |-- camera-poses.json
-    |-- preview.json
-    `-- result.json
+├── project.json
+├── phases/
+│   └── <phase-id>/
+│       ├── phase.json
+│       ├── frames.csv
+│       ├── tracking.jsonl
+│       ├── imu.csv                 # when enabled
+│       ├── sensor.log
+│       ├── depth/000000.u16
+│       ├── color/000000.rgb
+│       └── rgb/000000.jpg
+└── outputs/
+    ├── jobs/<job-id>.json
+    ├── cache/local-phases/*.npz
+    ├── cache/datasets/<fingerprint>/
+    ├── room-cloud.ply
+    ├── room-mesh.obj
+    ├── room-mesh.mtl
+    ├── room-texture.png
+    ├── room-splat.ply
+    ├── room-splat.preview.splat
+    ├── room-splat.transform.json
+    ├── splat-manifest.json
+    ├── camera-poses.json
+    ├── preview.json
+    ├── result.json
+    └── progress.json
 ```
 
-## Project schema 2
+## Project manifest
 
-Project schema 2 adds media sources, independent artifact records, and the durable active-job identifier. Legacy `outputPath`, `meshOutputPath`, and processing fields remain populated.
+`project.json` contains the project identity, capture settings, phase summaries, independent artifact records, current job, and reconstruction diagnostics. Required capture settings are:
 
 ```json
 {
-  "schemaVersion": 2,
-  "mediaSources": [],
+  "schemaVersion": 3,
+  "settings": {
+    "captureFps": 10,
+    "maxDepthM": 4.2,
+    "voxelSizeMm": 10,
+    "sensorKind": "femto_mega",
+    "sensorId": "femto_mega:usb:serial",
+    "sensorConnection": "usb",
+    "sensorAddress": "",
+    "useImu": true,
+    "depthFieldOfView": "narrow",
+    "depthBinned": false,
+    "rgbJpegQuality": 92,
+    "maxRgbDimension": 0,
+    "liveReconstruction": "points"
+  },
   "artifacts": {
     "pointCloud": null,
     "texturedMesh": null,
@@ -47,147 +64,89 @@ Project schema 2 adds media sources, independent artifact records, and the durab
 }
 ```
 
-Each artifact records its source fingerprint, metric/arbitrary scale, freshness, and last update. Rebuilding one artifact does not delete unrelated artifacts. Schema-1 projects migrate additively when opened.
+An artifact records its relative path, status, source fingerprint, update time, metric flag, and staleness. Rebuilding one representation does not remove another.
 
-## Depth and aligned color
+## Phase manifest
 
-`depth/*.u16` contains `width × height` unsigned 16-bit little-endian samples in row-major order. Values are millimetres. Zero means invalid or outside the configured reliable range.
+Every `phase.json` requires:
 
-`color/*.rgb` contains `width × height × 3` bytes in row-major RGB order. Color has already been sampled into depth-camera pixel coordinates, so color and depth have identical dimensions. This aligned RGB remains the authoritative input for odometry, TSDF fusion, and live preview.
+- schema version, identity, timestamps, frame count, and duration;
+- sensor identity and connection;
+- depth intrinsics, scale, reliable range, FOV, and binning;
+- calibrated RGB intrinsics, distortion coefficients, and dimensions for that sensor’s archived RGB source;
+- a row-major 4×4 `rgbFromDepth` calibration;
+- calibrated-RGB storage format, quality, resolution policy, and drop count;
+- optional calibrated IMU metadata.
 
-The camera manifest also records `depth_field_of_view` (`narrow` or `wide`) and `depth_binned` so the selected Azure Kinect/Femto Mega depth mode can be reproduced.
-
-## Native RGB and phase schema 3
-
-Schema-version 3 captures additionally contain `rgb/*.jpg`. These are synchronized source-camera images at native resolution by default. JPEG encoding runs on a bounded background queue; an RGB queue drop does not invalidate the corresponding depth/aligned-RGB frame.
-
-The phase manifest records the stored RGB camera model and the explicit transform from depth-camera coordinates into RGB-camera coordinates:
-
-```json
-{
-  "schemaVersion": 3,
-  "rgbCamera": {
-    "width": 3840,
-    "height": 2160,
-    "fx": 1900.0,
-    "fy": 1900.0,
-    "cx": 1920.0,
-    "cy": 1080.0,
-    "model": "brown_conrady",
-    "distortion": [0, 0, 0, 0, 0]
-  },
-  "rgbFromDepth": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-  "sourceRgb": {
-    "format": "jpeg",
-    "quality": 92,
-    "nativeResolution": true,
-    "droppedFrames": 0
-  }
-}
-```
-
-`rgbFromDepth` is a row-major 4×4 transform. Old archives omit all three members and continue to use aligned `color_path` with identity calibration.
+Depth and RGB timestamps are device microseconds. All metric transforms use metres.
+RGB calibration is fail-closed: `pinhole` carries no coefficients,
+`brown_conrady` carries `[k1,k2,p1,p2,k3]`, and `opencv_rational` carries
+`[k1,k2,p1,p2,k3,k4,k5,k6]`. Azure Kinect and supported Femto Mega
+profiles use the rational form; unsupported lens models stop capture instead
+of being approximated.
 
 ## Frame index
 
-`frames.csv` starts with:
+`frames.csv` has this fixed header:
 
 ```text
-index,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_us,m00,...,m33
+index,source_sequence,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_us,m00,...,m33
 ```
 
-When live reconstruction is enabled, `live-frame-selection.csv` contains:
+- `index` is dense archive order.
+- `source_sequence` is the full-rate sensor sequence and may contain gaps by design.
+- `depth_path` and `color_path` are always present.
+- `rgb_path` is empty for Kinect and can also be empty if the bounded modern-camera JPEG queue dropped that native image. Consumers then use the aligned RGB frame with depth-camera intrinsics and an identity depth-to-RGB transform.
+- `m00…m33` contains an optional row-major camera-to-world pose, supplied by Kinect Fusion.
 
-```text
-index,accepted,reason
-```
+`depth/*.u16` is little-endian `width × height` unsigned depth in millimetres. Zero is invalid. `color/*.rgb` is `width × height × 3` RGB8 already aligned to the depth camera. On Azure/Femto, `rgb/*.jpg` is the synchronized native RGB-camera view preferred for final texturing and 2DGS training. Kinect uses the aligned RGB source exclusively because its SDK coordinate mapper is the authoritative calibration.
 
-The live tracker writes one decision per processed frame. `accepted=false` marks a continuity gap: raw depth/RGB files and the main frame index are retained, while the normal offline loader excludes that frame. A later `accepted=true` row means the sensor returned to known geometry and tracking continuity was recovered. Removing this optional selection file restores access to every raw frame for diagnostics or manual recovery.
+## Tracking journal
 
-`rgb_path` and `rgb_timestamp_us` are optional. The optional 4×4 row-major matrix maps camera coordinates into the phase coordinate system. Mock and imported tracked data may supply it. Untracked captures leave it empty so Open3D estimates the trajectory offline.
-
-## Sensor and IMU metadata
-
-Phase manifests can include a sensor descriptor and calibrated IMU stream:
+`tracking.jsonl` is schema 1, one compact JSON record per processed full-rate frame:
 
 ```json
 {
-  "poseSource": "imu_aided_offline",
-  "sensor": {
-    "kind": "femto_mega",
-    "name": "Orbbec Femto Mega",
-    "connection": "network",
-    "serial": "...",
-    "address": "192.168.1.10"
-  },
-  "imu": {
-    "path": "imu.csv",
-    "coordinateFrame": "depth_camera",
-    "accelerationUnit": "m/s^2",
-    "angularVelocityUnit": "rad/s"
-  }
+  "schemaVersion": 1,
+  "sequence": 127,
+  "depthTimestampUs": 42318421,
+  "state": "tracking",
+  "accepted": true,
+  "integrated": false,
+  "reason": "accepted",
+  "overlap": 0.68,
+  "inlierRatio": 0.73,
+  "depthRmseMm": 11.2,
+  "worldToCamera": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
 }
 ```
 
-`imu.csv` contains `timestamp_us,type,x,y,z,temperature_c`. Capture workers rotate acceleration and angular velocity into the calibrated depth-camera frame. Reconstruction integrates gyro samples between RGB-D timestamps as an odometry rotation prior.
+The production loader matches the journal to archived frames by `source_sequence`. Explicitly rejected frames are excluded. A complete accepted trajectory is inverted to camera-to-world and validated before being used as the final-pass seed.
 
-## Canonical posed-frame dataset
+## IMU
 
-After final pose-graph optimization, ScanLan writes a fingerprinted dataset below `outputs/cache/datasets/`. `current.json` points to the current fingerprint. A frame contains native RGB, RGB-view metric depth, a depth-discontinuity mask, native intrinsics, and an unmodified `worldFromRgbCamera` matrix. RGB-view depth uses nearest-depth z-buffer collision resolution.
-
-Canonical dataset convention:
-
-- right-handed world
-- metres for RGB-D captures; arbitrary scale for COLMAP media
-- OpenCV camera axes: +X right, +Y down, +Z forward
-- `worldFromCamera` transforms
-- row-major matrices on disk
-
-Viewer-oriented `camera-poses.json` is a separate display artifact and is never used as splat training input.
-
-## Phase alignment
-
-Automatic processing registers each phase against the preceding phase. If automatic global registration is ambiguous, add `manual_transform.json` to the later phase:
-
-```json
-{
-  "toPrevious": [
-    [1, 0, 0, 0],
-    [0, 1, 0, 0],
-    [0, 0, 1, 0],
-    [0, 0, 0, 1]
-  ]
-}
-```
-
-The matrix maps points in the current phase into the previous phase.
-
-## Point cloud, mesh, and camera trajectory
-
-The artifact coordinate system is right-handed and uses metres for RGB-D captures. PLY vertex colors are 8-bit sRGB. Viewer exports use +Y up and record their display-axis conversion separately.
-
-`room-mesh.obj` is a single indexed surface extracted after TSDF fusion of selected posed depth keyframes; dependency-free known-pose builds spatially weld and de-duplicate the same depth surfaces. Native-RGB texturing projects every fused vertex through each visible depth and RGB camera, applies `rgbFromDepth`, RGB intrinsics/distortion, depth-occlusion rejection, exposure compensation, view-angle weighting, and bilinear sampling. Per-triangle padded atlas charts share the same blended colors at common mesh vertices, preventing view-tile seams without reintroducing overlapping geometry. Atlases scale up to the configured 8K/16K capacity. Legacy archives use aligned-RGB identity calibration through the same projection path.
-
-`camera-poses.json` stores reconstructed camera-to-viewer matrices, field of view, phase, timestamp, and source-frame index. `textureFrame` marks the texture subset. These matrices are flattened row-major 4×4 transforms.
-
-## Gaussian splats
-
-`room-splat.ply` is a canonical 3D Gaussian Splatting PLY with:
+`imu.csv` fields are:
 
 ```text
-x y z
-nx ny nz
-f_dc_0..2
-f_rest_0..44
-opacity
-scale_0..2
-rot_0..3
+timestamp_us,type,x,y,z,temperature_c
 ```
 
-`splat-manifest.json` records the source fingerprint, trainer/runtime versions, metric scale, loss configuration, and coordinate convention. `room-splat.transform.json` is applied at the Unity GameObject level. Non-uniform viewer transforms are not baked into Gaussian covariance or spherical harmonics.
+Acceleration is `m/s²`; angular velocity is `rad/s`. Native workers rotate both into the calibrated depth-camera frame. Gyro samples are integrated between RGB-D timestamps to provide an odometry rotation prior, never an unconstrained final pose.
 
-RGB-D training initializes from the canonical metric cloud and combines RGB L1, SSIM, and masked robust expected-depth loss. Photo/video sources are durably copied, filtered, GPU-registered with COLMAP, and marked arbitrary-scale. The optional splat runtime uses CUDA mixed precision and gsplat's Splatfacto-style adaptive strategy, and remains isolated from the Open3D PyInstaller worker.
+## Coordinate conventions
 
-## Durable artifact jobs
+- right-handed metric world;
+- OpenCV camera axes: +X right, +Y down, +Z forward;
+- row-major transforms on disk;
+- internal pose artifacts are camera-to-world unless their field explicitly says `worldToCamera`;
+- viewer packets apply display-axis conversion separately and never rewrite the reconstruction.
 
-`outputs/jobs/<job-id>.json` and its adjacent log record pipeline, targets, stage, progress, iteration/loss/ETA, fingerprint, status, and resumability. Only one Open3D CUDA/gsplat accelerator job runs at once. Cancellation requests create `outputs/cancel.flag`; splat checkpoints resume only when the source fingerprint still matches.
+## Canonical posed dataset
+
+The production pass writes a fingerprinted schema-3 dataset beneath
+`outputs/cache/datasets`. Each selected keyframe contains RGB and metric depth
+projected directly onto the same bounded-resolution pinhole grid, a robust
+depth mask, and `worldFromRgbCamera`. Native RGB is undistorted while it is
+resampled, rather than producing an intermediate 2K/4K depth map. 2DGS rejects
+distorted inputs because its rasterizer traces pinhole rays. There is no COLMAP
+or arbitrary-scale media path.

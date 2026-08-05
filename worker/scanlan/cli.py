@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -23,11 +24,23 @@ def parser() -> argparse.ArgumentParser:
         help="Comma-separated point_cloud,textured_mesh,gaussian_splat targets",
     )
 
-    live = commands.add_parser("live", help="Track and fuse a capture phase while it is recorded")
-    live.add_argument("phase", type=Path)
-    live.add_argument("--mode", choices=["points", "mesh"], default="points")
-    live.add_argument("--voxel-size", type=float, default=0.015, help="TSDF voxel size in metres")
-    live.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    realtime = commands.add_parser(
+        "realtime",
+        help="Consume the ScanLan RGB-D stream on stdin and emit engine messages on stdout",
+    )
+    realtime.add_argument("--mode", choices=["points", "mesh"], default="mesh")
+    realtime.add_argument(
+        "--voxel-size", type=float, default=0.01, help="TSDF voxel size in metres"
+    )
+    realtime.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    realtime.add_argument(
+        "--session", type=Path, required=True, help="Capture directory for the tracking journal"
+    )
+
+    replay = commands.add_parser(
+        "replay", help="Emit a recorded RGB-D capture using the live stream protocol"
+    )
+    replay.add_argument("capture", type=Path)
 
     return root
 
@@ -35,15 +48,29 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
-        if arguments.command == "live":
-            from .live import live_reconstruct
+        if arguments.command in {"realtime", "replay"}:
+            if sys.platform == "win32":
+                import msvcrt
 
-            result = live_reconstruct(
-                arguments.phase,
-                arguments.voxel_size,
-                arguments.mode,
-                arguments.device,
+                msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+                msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+        if arguments.command == "realtime":
+            from .realtime import run_realtime_engine
+
+            run_realtime_engine(
+                sys.stdin.buffer,
+                sys.stdout.buffer,
+                mode=arguments.mode,
+                voxel_size_m=arguments.voxel_size,
+                requested_device=arguments.device,
+                session_root=arguments.session,
             )
+            return 0
+        if arguments.command == "replay":
+            from .replay import replay_archive
+
+            replay_archive(arguments.capture, sys.stdout.buffer)
+            return 0
         else:
             targets = tuple(value.strip() for value in arguments.targets.split(",") if value.strip())
             unknown = set(targets) - {"point_cloud", "textured_mesh", "gaussian_splat"}

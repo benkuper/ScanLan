@@ -1,74 +1,90 @@
-use crate::models::{ArtifactSummary, PhaseManifest, ProjectSummary};
-use std::fs::{self, File};
-use std::io::BufWriter;
+use crate::models::{PhaseManifest, ProjectSummary};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 pub type StorageResult<T> = Result<T, String>;
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> StorageResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(format!(
+            "Could not publish {}: {}",
+            destination.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> StorageResult<()> {
+    fs::rename(source, destination).map_err(|error| error.to_string())
+}
 
 pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> StorageResult<()> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("No parent directory for {}", path.display()))?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension("json.tmp");
-    let file = File::create(&temporary).map_err(|error| error.to_string())?;
-    serde_json::to_writer_pretty(BufWriter::new(file), value).map_err(|error| error.to_string())?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| error.to_string())?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| format!("No file name for {}", path.display()))?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, value).map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        drop(writer);
+        replace_file(&temporary, path)
+    })();
+    if result.is_err() {
+        fs::remove_file(&temporary).ok();
     }
-    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
-    Ok(())
+    result
 }
 
 pub fn read_project(path: &Path) -> StorageResult<ProjectSummary> {
     let file = File::open(path.join("project.json")).map_err(|error| error.to_string())?;
-    let mut project: ProjectSummary =
+    let project: ProjectSummary =
         serde_json::from_reader(file).map_err(|error| error.to_string())?;
-    let mut changed = false;
-    if project.schema_version < 2 {
-        project.schema_version = 2;
-        changed = true;
+    if project.schema_version != 3 {
+        return Err(format!(
+            "Project schema {} is unsupported; ScanLan requires schema 3",
+            project.schema_version
+        ));
     }
     if project.path.is_empty() || Path::new(&project.path) != path {
-        project.path = path.to_string_lossy().into_owned();
-        changed = true;
-    }
-    if project.artifacts.point_cloud.is_none() {
-        if let Some(output_path) = &project.output_path {
-            project.artifacts.point_cloud = Some(ArtifactSummary {
-                path: output_path.clone(),
-                status: if project.processing_status == "complete" {
-                    "ready".to_string()
-                } else {
-                    "stale".to_string()
-                },
-                source_fingerprint: String::new(),
-                updated_at: project.created_at.clone(),
-                metric: true,
-                stale: project.processing_status != "complete",
-            });
-            changed = true;
-        }
-    }
-    if project.artifacts.textured_mesh.is_none() {
-        if let Some(mesh_path) = &project.mesh_output_path {
-            project.artifacts.textured_mesh = Some(ArtifactSummary {
-                path: mesh_path.clone(),
-                status: if project.processing_status == "complete" {
-                    "ready".to_string()
-                } else {
-                    "stale".to_string()
-                },
-                source_fingerprint: String::new(),
-                updated_at: project.created_at.clone(),
-                metric: true,
-                stale: project.processing_status != "complete",
-            });
-            changed = true;
-        }
-    }
-    if changed {
-        write_json(path.join("project.json").as_path(), &project)?;
+        return Err("Project path does not match its manifest".to_string());
     }
     Ok(project)
 }
@@ -156,7 +172,6 @@ pub fn create_project(root: &Path) -> StorageResult<ProjectSummary> {
     fs::create_dir_all(root.join("phases")).map_err(|error| error.to_string())?;
     fs::create_dir_all(root.join("outputs")).map_err(|error| error.to_string())?;
     fs::create_dir_all(root.join("outputs").join("jobs")).map_err(|error| error.to_string())?;
-    fs::create_dir_all(root.join("sources")).map_err(|error| error.to_string())?;
     let project = ProjectSummary::at_path(root);
     write_project(&project)?;
     Ok(project)
@@ -220,61 +235,6 @@ pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf
     candidates
 }
 
-fn development_media_tool_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("media-tools")
-}
-
-pub fn candidate_ffmpeg_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = vec![development_media_tool_root()
-        .join("ffmpeg")
-        .join("bin")
-        .join("ffmpeg.exe")];
-    if let Some(root) = resource_root {
-        candidates.push(
-            root.join("media-tools")
-                .join("ffmpeg")
-                .join("bin")
-                .join("ffmpeg.exe"),
-        );
-    }
-    candidates
-}
-
-pub fn candidate_colmap_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = vec![development_media_tool_root()
-        .join("colmap")
-        .join("bin")
-        .join("colmap.exe")];
-    if let Some(root) = resource_root {
-        candidates.push(
-            root.join("media-tools")
-                .join("colmap")
-                .join("bin")
-                .join("colmap.exe"),
-        );
-    }
-    candidates
-}
-
-pub fn media_tool_directories(resource_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots = vec![development_media_tool_root()];
-    if let Some(root) = resource_root {
-        roots.push(root.join("media-tools"));
-    }
-    roots
-        .into_iter()
-        .flat_map(|root| {
-            [
-                root.join("ffmpeg").join("bin"),
-                root.join("colmap").join("bin"),
-            ]
-        })
-        .filter(|path| path.is_dir())
-        .collect()
-}
-
 pub fn candidate_reconstruction_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let development_binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -307,23 +267,23 @@ pub fn candidate_kinect_worker_paths(resource_root: Option<&Path>) -> Vec<PathBu
         .join("build")
         .join("kinect-capture")
         .join("Release")
-        .join("legacy-capture-worker.exe");
+        .join("kinect2-capture-worker.exe");
     if cfg!(debug_assertions) {
         candidates.push(development_binary.clone());
     }
     if let Some(root) = resource_root {
-        candidates.push(root.join("legacy-capture-worker.exe"));
-        candidates.push(root.join("legacy").join("legacy-capture-worker.exe"));
+        candidates.push(root.join("kinect2-capture-worker.exe"));
+        candidates.push(root.join("kinect2").join("kinect2-capture-worker.exe"));
     }
     if let Ok(executable) = std::env::current_exe() {
         if let Some(parent) = executable.parent() {
-            candidates.push(parent.join("legacy-capture-worker.exe"));
-            candidates.push(parent.join("resources").join("legacy-capture-worker.exe"));
+            candidates.push(parent.join("kinect2-capture-worker.exe"));
+            candidates.push(parent.join("resources").join("kinect2-capture-worker.exe"));
             candidates.push(
                 parent
                     .join("resources")
-                    .join("legacy")
-                    .join("legacy-capture-worker.exe"),
+                    .join("kinect2")
+                    .join("kinect2-capture-worker.exe"),
             );
         }
     }
@@ -364,53 +324,4 @@ pub fn candidate_modern_sensor_worker_paths(resource_root: Option<&Path>) -> Vec
         candidates.push(development_binary);
     }
     candidates
-}
-
-#[cfg(test)]
-mod tests {
-    use super::read_project;
-    use std::fs;
-
-    #[test]
-    fn schema_one_project_migrates_additively() {
-        let root = std::env::temp_dir().join(format!("scanlan-migrate-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("project.json"),
-            format!(
-                r#"{{
-                  "schemaVersion": 1,
-                  "id": "legacy",
-                  "name": "Legacy",
-                  "path": "{}",
-                  "createdAt": "2026-01-01T00:00:00Z",
-                  "phases": [],
-                  "settings": {{
-                    "captureFps": 10,
-                    "maxDepthM": 4.2,
-                    "voxelSizeMm": 15,
-                    "environment": "indoor"
-                  }},
-                  "processingStatus": "complete",
-                  "pointCount": 42,
-                  "outputPath": "outputs/room-cloud.ply"
-                }}"#,
-                root.to_string_lossy().replace('\\', "\\\\")
-            ),
-        )
-        .unwrap();
-        let project = read_project(&root).unwrap();
-        assert_eq!(project.schema_version, 2);
-        assert!(project.media_sources.is_empty());
-        assert!(project.active_job.is_none());
-        assert_eq!(
-            project
-                .artifacts
-                .point_cloud
-                .as_ref()
-                .map(|value| value.path.as_str()),
-            Some("outputs/room-cloud.ply")
-        );
-        fs::remove_dir_all(root).ok();
-    }
 }
