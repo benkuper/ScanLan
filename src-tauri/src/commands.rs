@@ -1,7 +1,7 @@
 use crate::models::{
-    AvailableSensor, CaptureSettings, CaptureStatus, CloudTransform, LiveReconstructionStatus,
-    LiveWorkerStatus, MediaSourceSummary, PreviewPoint, ProjectCatalogEntry, ProjectSummary,
-    ReconstructionProgress, RuntimeInfo,
+    AvailableSensor, BoundingBoxClip, CaptureSettings, CaptureStatus, CloudTransform,
+    LiveReconstructionStatus, LiveWorkerStatus, MediaSourceSummary, PreviewPoint,
+    ProjectCatalogEntry, ProjectSummary, ReconstructionProgress, RuntimeInfo,
 };
 use crate::storage;
 use chrono::{DateTime, Utc};
@@ -662,9 +662,10 @@ fn read_supplemental_photo_manifest(project_root: &Path) -> Result<serde_json::V
         let Some(photo_id) = photo.get("id").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        if attempts.iter().any(|attempt| {
-            attempt.get("id").and_then(serde_json::Value::as_str) == Some(photo_id)
-        }) {
+        if attempts
+            .iter()
+            .any(|attempt| attempt.get("id").and_then(serde_json::Value::as_str) == Some(photo_id))
+        {
             continue;
         }
         let mut attempt = photo.clone();
@@ -713,9 +714,7 @@ pub fn supplemental_photo_progress(
         .active_photo_localization
         .lock()
         .map_err(|_| "Photo localization state is unavailable".to_string())?;
-    if progress.get("status").and_then(serde_json::Value::as_str) == Some("running")
-        && !active
-    {
+    if progress.get("status").and_then(serde_json::Value::as_str) == Some("running") && !active {
         progress["status"] = serde_json::Value::String("failed".to_string());
         progress["stage"] = serde_json::Value::String("interrupted".to_string());
         progress["detail"] = serde_json::Value::String(
@@ -2165,8 +2164,7 @@ fn start_sensor_phase_blocking(
     }
     if !project.media_sources.is_empty() {
         return Err(
-            "Start a new project for RGB-D capture; this project uses photos/video"
-                .to_string(),
+            "Start a new project for RGB-D capture; this project uses photos/video".to_string(),
         );
     }
     project.settings = settings;
@@ -3241,6 +3239,32 @@ fn validate_cloud_transform(transform: &CloudTransform) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_clip_bounds(bounds: &Option<BoundingBoxClip>) -> Result<(), String> {
+    let Some(bounds) = bounds else {
+        return Ok(());
+    };
+    if bounds
+        .min
+        .iter()
+        .chain(bounds.max.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("The bounding box contains a non-finite value".to_string());
+    }
+    if (0..3).any(|axis| bounds.max[axis] - bounds.min[axis] < 1e-6) {
+        return Err("Each bounding-box maximum must be greater than its minimum".to_string());
+    }
+    Ok(())
+}
+
+fn clip_contains(bounds: &BoundingBoxClip, position: [f32; 3]) -> bool {
+    (0..3).all(|axis| {
+        position[axis].is_finite()
+            && position[axis] >= bounds.min[axis]
+            && position[axis] <= bounds.max[axis]
+    })
+}
+
 fn transformed_position(position: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
     let [x_angle, y_angle, z_angle] = transform.rotation.map(f32::to_radians);
     let (sx, cx) = (x_angle * 0.5).sin_cos();
@@ -3341,6 +3365,341 @@ fn transformed_obj(source: &str, transform: &CloudTransform) -> Result<String, S
             output.push_str(line);
             output.push('\n');
         }
+    }
+    Ok(output)
+}
+
+#[derive(Clone)]
+struct ObjClipVertex {
+    position: [f32; 3],
+    texcoord: Option<[f32; 2]>,
+    normal: Option<[f32; 3]>,
+    source_position: Option<usize>,
+    source_texcoord: Option<usize>,
+    source_normal: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct ObjOutputRef {
+    position: usize,
+    texcoord: Option<usize>,
+    normal: Option<usize>,
+}
+
+#[derive(Default)]
+struct ClippedObjGeometry {
+    positions: Vec<[f32; 3]>,
+    texcoords: Vec<[f32; 2]>,
+    normals: Vec<[f32; 3]>,
+    faces: Vec<[ObjOutputRef; 3]>,
+    position_map: HashMap<usize, usize>,
+    texcoord_map: HashMap<usize, usize>,
+    normal_map: HashMap<usize, usize>,
+}
+
+fn parse_obj_index(value: &str, length: usize) -> Result<usize, String> {
+    let parsed = value
+        .parse::<isize>()
+        .map_err(|_| "The generated OBJ contains an invalid face index".to_string())?;
+    let index = if parsed > 0 {
+        parsed - 1
+    } else if parsed < 0 {
+        length as isize + parsed
+    } else {
+        -1
+    };
+    if index < 0 || index as usize >= length {
+        return Err("The generated OBJ face index is out of range".to_string());
+    }
+    Ok(index as usize)
+}
+
+fn parse_obj_clip_vertex(
+    value: &str,
+    positions: &[[f32; 3]],
+    texcoords: &[[f32; 2]],
+    normals: &[[f32; 3]],
+) -> Result<ObjClipVertex, String> {
+    let fields = value.split('/').collect::<Vec<_>>();
+    let position_index = parse_obj_index(
+        fields
+            .first()
+            .filter(|field| !field.is_empty())
+            .ok_or_else(|| "The generated OBJ face is missing a position".to_string())?,
+        positions.len(),
+    )?;
+    let texcoord_index = fields
+        .get(1)
+        .filter(|field| !field.is_empty())
+        .map(|field| parse_obj_index(field, texcoords.len()))
+        .transpose()?;
+    let normal_index = fields
+        .get(2)
+        .filter(|field| !field.is_empty())
+        .map(|field| parse_obj_index(field, normals.len()))
+        .transpose()?;
+    Ok(ObjClipVertex {
+        position: positions[position_index],
+        texcoord: texcoord_index.map(|index| texcoords[index]),
+        normal: normal_index.map(|index| normals[index]),
+        source_position: Some(position_index),
+        source_texcoord: texcoord_index,
+        source_normal: normal_index,
+    })
+}
+
+fn interpolate_obj_clip_vertex(
+    left: &ObjClipVertex,
+    right: &ObjClipVertex,
+    t: f32,
+) -> ObjClipVertex {
+    let lerp3 = |left: [f32; 3], right: [f32; 3]| {
+        std::array::from_fn(|axis| left[axis] + (right[axis] - left[axis]) * t)
+    };
+    let texcoord = left.texcoord.zip(right.texcoord).map(|(left, right)| {
+        std::array::from_fn(|axis| left[axis] + (right[axis] - left[axis]) * t)
+    });
+    let normal = left.normal.zip(right.normal).map(|(left, right)| {
+        let mut value = lerp3(left, right);
+        let length = value
+            .iter()
+            .map(|component| component * component)
+            .sum::<f32>()
+            .sqrt();
+        if length > f32::EPSILON {
+            value.iter_mut().for_each(|component| *component /= length);
+        }
+        value
+    });
+    ObjClipVertex {
+        position: lerp3(left.position, right.position),
+        texcoord,
+        normal,
+        source_position: None,
+        source_texcoord: None,
+        source_normal: None,
+    }
+}
+
+fn clip_obj_polygon_axis(
+    polygon: &[ObjClipVertex],
+    axis: usize,
+    boundary: f32,
+    keep_greater: bool,
+) -> Vec<ObjClipVertex> {
+    if polygon.is_empty() {
+        return Vec::new();
+    }
+    let inside = |vertex: &ObjClipVertex| {
+        if keep_greater {
+            vertex.position[axis] >= boundary
+        } else {
+            vertex.position[axis] <= boundary
+        }
+    };
+    let mut output = Vec::with_capacity(polygon.len() + 1);
+    let mut previous = polygon.last().unwrap();
+    let mut previous_inside = inside(previous);
+    for current in polygon {
+        let current_inside = inside(current);
+        if previous_inside != current_inside {
+            let denominator = current.position[axis] - previous.position[axis];
+            if denominator.abs() > f32::EPSILON {
+                let t = ((boundary - previous.position[axis]) / denominator).clamp(0.0, 1.0);
+                output.push(interpolate_obj_clip_vertex(previous, current, t));
+            }
+        }
+        if current_inside {
+            output.push(current.clone());
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    output
+}
+
+fn intern_obj_clip_vertex(
+    vertex: &ObjClipVertex,
+    geometry: &mut ClippedObjGeometry,
+) -> ObjOutputRef {
+    let position = if let Some(source) = vertex.source_position {
+        if let Some(index) = geometry.position_map.get(&source) {
+            *index
+        } else {
+            let index = geometry.positions.len();
+            geometry.positions.push(vertex.position);
+            geometry.position_map.insert(source, index);
+            index
+        }
+    } else {
+        let index = geometry.positions.len();
+        geometry.positions.push(vertex.position);
+        index
+    };
+    let texcoord = vertex.texcoord.map(|value| {
+        if let Some(source) = vertex.source_texcoord {
+            if let Some(index) = geometry.texcoord_map.get(&source) {
+                return *index;
+            }
+            let index = geometry.texcoords.len();
+            geometry.texcoords.push(value);
+            geometry.texcoord_map.insert(source, index);
+            index
+        } else {
+            let index = geometry.texcoords.len();
+            geometry.texcoords.push(value);
+            index
+        }
+    });
+    let normal = vertex.normal.map(|value| {
+        if let Some(source) = vertex.source_normal {
+            if let Some(index) = geometry.normal_map.get(&source) {
+                return *index;
+            }
+            let index = geometry.normals.len();
+            geometry.normals.push(value);
+            geometry.normal_map.insert(source, index);
+            index
+        } else {
+            let index = geometry.normals.len();
+            geometry.normals.push(value);
+            index
+        }
+    });
+    ObjOutputRef {
+        position,
+        texcoord,
+        normal,
+    }
+}
+
+fn clipped_obj(source: &str, bounds: &BoundingBoxClip) -> Result<String, String> {
+    let mut metadata = Vec::new();
+    let mut positions = Vec::new();
+    let mut texcoords = Vec::new();
+    let mut normals = Vec::new();
+    let mut face_lines = Vec::new();
+    for line in source.lines() {
+        if let Some(value) = line.strip_prefix("v ") {
+            let values = value
+                .split_whitespace()
+                .take(3)
+                .map(str::parse::<f32>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "The generated OBJ contains an invalid vertex".to_string())?;
+            if values.len() != 3 {
+                return Err("The generated OBJ contains an incomplete vertex".to_string());
+            }
+            positions.push([values[0], values[1], values[2]]);
+        } else if let Some(value) = line.strip_prefix("vt ") {
+            let values = value
+                .split_whitespace()
+                .take(2)
+                .map(str::parse::<f32>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    "The generated OBJ contains an invalid texture coordinate".to_string()
+                })?;
+            if values.len() != 2 {
+                return Err(
+                    "The generated OBJ contains an incomplete texture coordinate".to_string(),
+                );
+            }
+            texcoords.push([values[0], values[1]]);
+        } else if let Some(value) = line.strip_prefix("vn ") {
+            let values = value
+                .split_whitespace()
+                .take(3)
+                .map(str::parse::<f32>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "The generated OBJ contains an invalid normal".to_string())?;
+            if values.len() != 3 {
+                return Err("The generated OBJ contains an incomplete normal".to_string());
+            }
+            normals.push([values[0], values[1], values[2]]);
+        } else if let Some(value) = line.strip_prefix("f ") {
+            face_lines.push(value.to_string());
+        } else {
+            metadata.push(line.to_string());
+        }
+    }
+
+    let mut geometry = ClippedObjGeometry::default();
+    for face in face_lines {
+        let corners = face
+            .split_whitespace()
+            .map(|value| parse_obj_clip_vertex(value, &positions, &texcoords, &normals))
+            .collect::<Result<Vec<_>, _>>()?;
+        if corners.len() < 3 {
+            return Err("The generated OBJ contains an incomplete face".to_string());
+        }
+        for triangle_index in 1..corners.len() - 1 {
+            let mut polygon = vec![
+                corners[0].clone(),
+                corners[triangle_index].clone(),
+                corners[triangle_index + 1].clone(),
+            ];
+            for axis in 0..3 {
+                polygon = clip_obj_polygon_axis(&polygon, axis, bounds.min[axis], true);
+                polygon = clip_obj_polygon_axis(&polygon, axis, bounds.max[axis], false);
+                if polygon.len() < 3 {
+                    break;
+                }
+            }
+            if polygon.len() < 3 {
+                continue;
+            }
+            let references = polygon
+                .iter()
+                .map(|vertex| intern_obj_clip_vertex(vertex, &mut geometry))
+                .collect::<Vec<_>>();
+            for index in 1..references.len() - 1 {
+                geometry
+                    .faces
+                    .push([references[0], references[index], references[index + 1]]);
+            }
+        }
+    }
+    if geometry.faces.is_empty() {
+        return Err("The bounding box does not contain any mesh triangles".to_string());
+    }
+
+    let mut output = String::with_capacity(source.len());
+    for line in metadata {
+        output.push_str(&line);
+        output.push('\n');
+    }
+    for value in geometry.positions {
+        output.push_str(&format!(
+            "v {:.7} {:.7} {:.7}\n",
+            value[0], value[1], value[2]
+        ));
+    }
+    for value in geometry.normals {
+        output.push_str(&format!(
+            "vn {:.7} {:.7} {:.7}\n",
+            value[0], value[1], value[2]
+        ));
+    }
+    for value in geometry.texcoords {
+        output.push_str(&format!("vt {:.7} {:.7}\n", value[0], value[1]));
+    }
+    for face in geometry.faces {
+        output.push_str("f");
+        for vertex in face {
+            let position = vertex.position + 1;
+            match (vertex.texcoord, vertex.normal) {
+                (Some(texcoord), Some(normal)) => {
+                    output.push_str(&format!(" {}/{}/{}", position, texcoord + 1, normal + 1))
+                }
+                (Some(texcoord), None) => {
+                    output.push_str(&format!(" {}/{}", position, texcoord + 1))
+                }
+                (None, Some(normal)) => output.push_str(&format!(" {}//{}", position, normal + 1)),
+                (None, None) => output.push_str(&format!(" {position}")),
+            }
+        }
+        output.push('\n');
     }
     Ok(output)
 }
@@ -3464,8 +3823,10 @@ pub fn export_ply(
     project_path: String,
     destination_path: String,
     transform: CloudTransform,
+    clip_bounds: Option<BoundingBoxClip>,
 ) -> Result<String, String> {
     validate_cloud_transform(&transform)?;
+    validate_clip_bounds(&clip_bounds)?;
     let root = PathBuf::from(project_path);
     let project = storage::read_project(&root)?;
     if project.processing_status != "complete" {
@@ -3495,7 +3856,12 @@ pub fn export_ply(
 
     let bytes = fs::read(&source)
         .map_err(|error| format!("Could not read the reconstructed PLY: {error}"))?;
-    let unity_bytes = unity_compatible_ply(transformed_cloud_ply(bytes, &transform)?)?;
+    let transformed = transformed_cloud_ply(bytes, &transform)?;
+    let clipped = match &clip_bounds {
+        Some(bounds) => clipped_binary_ply(transformed, bounds, "point cloud")?,
+        None => transformed,
+    };
+    let unity_bytes = unity_compatible_ply(clipped)?;
     write_export(&destination, &unity_bytes)?;
     Ok(destination.to_string_lossy().into_owned())
 }
@@ -3505,8 +3871,10 @@ pub fn export_textured_mesh(
     project_path: String,
     destination_path: String,
     transform: CloudTransform,
+    clip_bounds: Option<BoundingBoxClip>,
 ) -> Result<String, String> {
     validate_cloud_transform(&transform)?;
+    validate_clip_bounds(&clip_bounds)?;
     let root = PathBuf::from(project_path);
     let project = storage::read_project(&root)?;
     if project.processing_status != "complete" {
@@ -3551,8 +3919,12 @@ pub fn export_textured_mesh(
 
     let source_obj = fs::read_to_string(source_obj)
         .map_err(|error| format!("Could not read the reconstructed OBJ: {error}"))?;
-    let obj = transformed_obj(&source_obj, &transform)?
-        .replace("mtllib room-mesh.mtl", &format!("mtllib {mtl_name}"));
+    let transformed = transformed_obj(&source_obj, &transform)?;
+    let clipped = match &clip_bounds {
+        Some(bounds) => clipped_obj(&transformed, bounds)?,
+        None => transformed,
+    };
+    let obj = clipped.replace("mtllib room-mesh.mtl", &format!("mtllib {mtl_name}"));
     let mtl = fs::read_to_string(source_mtl)
         .map_err(|error| format!("Could not read the reconstructed material: {error}"))?
         .replace("map_Kd room-texture.png", &format!("map_Kd {texture_name}"));
@@ -3613,6 +3985,498 @@ impl PlyScalarType {
             Self::F64 => f64::from_le_bytes(bytes.try_into().unwrap()) as f32,
         }
     }
+
+    fn write(self, bytes: &mut [u8], value: f32) -> Result<(), String> {
+        match self {
+            Self::F32 => bytes.copy_from_slice(&value.to_le_bytes()),
+            Self::F64 => bytes.copy_from_slice(&(value as f64).to_le_bytes()),
+            _ => {
+                return Err(
+                    "Gaussian geometry properties must use floating-point values".to_string(),
+                )
+            }
+        }
+        Ok(())
+    }
+}
+
+type Matrix3 = [[f64; 3]; 3];
+
+fn matrix_product(left: Matrix3, right: Matrix3) -> Matrix3 {
+    std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            (0..3)
+                .map(|axis| left[row][axis] * right[axis][column])
+                .sum()
+        })
+    })
+}
+
+fn matrix_determinant(matrix: Matrix3) -> f64 {
+    matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+}
+
+fn quaternion_matrix(mut quaternion: [f64; 4]) -> Matrix3 {
+    let norm = quaternion
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm < 1e-12 {
+        quaternion = [1.0, 0.0, 0.0, 0.0];
+    } else {
+        quaternion.iter_mut().for_each(|value| *value /= norm);
+    }
+    let [w, x, y, z] = quaternion;
+    [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+        ],
+        [
+            2.0 * (x * y + w * z),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - w * x),
+        ],
+        [
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ]
+}
+
+fn matrix_quaternion(matrix: Matrix3) -> [f32; 4] {
+    let trace = matrix[0][0] + matrix[1][1] + matrix[2][2];
+    let quaternion = if trace > 0.0 {
+        let scale = (trace + 1.0).sqrt() * 2.0;
+        [
+            0.25 * scale,
+            (matrix[2][1] - matrix[1][2]) / scale,
+            (matrix[0][2] - matrix[2][0]) / scale,
+            (matrix[1][0] - matrix[0][1]) / scale,
+        ]
+    } else if matrix[0][0] > matrix[1][1] && matrix[0][0] > matrix[2][2] {
+        let scale = (1.0 + matrix[0][0] - matrix[1][1] - matrix[2][2])
+            .max(0.0)
+            .sqrt()
+            * 2.0;
+        [
+            (matrix[2][1] - matrix[1][2]) / scale,
+            0.25 * scale,
+            (matrix[0][1] + matrix[1][0]) / scale,
+            (matrix[0][2] + matrix[2][0]) / scale,
+        ]
+    } else if matrix[1][1] > matrix[2][2] {
+        let scale = (1.0 + matrix[1][1] - matrix[0][0] - matrix[2][2])
+            .max(0.0)
+            .sqrt()
+            * 2.0;
+        [
+            (matrix[0][2] - matrix[2][0]) / scale,
+            (matrix[0][1] + matrix[1][0]) / scale,
+            0.25 * scale,
+            (matrix[1][2] + matrix[2][1]) / scale,
+        ]
+    } else {
+        let scale = (1.0 + matrix[2][2] - matrix[0][0] - matrix[1][1])
+            .max(0.0)
+            .sqrt()
+            * 2.0;
+        [
+            (matrix[1][0] - matrix[0][1]) / scale,
+            (matrix[0][2] + matrix[2][0]) / scale,
+            (matrix[1][2] + matrix[2][1]) / scale,
+            0.25 * scale,
+        ]
+    };
+    let norm = quaternion
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm < 1e-12 {
+        [1.0, 0.0, 0.0, 0.0]
+    } else {
+        quaternion.map(|value| (value / norm) as f32)
+    }
+}
+
+fn symmetric_eigen(mut matrix: Matrix3) -> ([f64; 3], Matrix3) {
+    let mut vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..32 {
+        let mut pair = (0, 1);
+        let mut largest = matrix[0][1].abs();
+        for candidate in [(0, 2), (1, 2)] {
+            if matrix[candidate.0][candidate.1].abs() > largest {
+                pair = candidate;
+                largest = matrix[candidate.0][candidate.1].abs();
+            }
+        }
+        let diagonal_scale = matrix[0][0].abs() + matrix[1][1].abs() + matrix[2][2].abs();
+        if largest <= 1e-14 * diagonal_scale.max(1.0) {
+            break;
+        }
+        let (p, q) = pair;
+        let angle = 0.5 * (2.0 * matrix[p][q]).atan2(matrix[q][q] - matrix[p][p]);
+        let (sine, cosine) = angle.sin_cos();
+        let app = matrix[p][p];
+        let aqq = matrix[q][q];
+        let apq = matrix[p][q];
+        matrix[p][p] = cosine * cosine * app - 2.0 * sine * cosine * apq + sine * sine * aqq;
+        matrix[q][q] = sine * sine * app + 2.0 * sine * cosine * apq + cosine * cosine * aqq;
+        matrix[p][q] = 0.0;
+        matrix[q][p] = 0.0;
+        for axis in 0..3 {
+            if axis == p || axis == q {
+                continue;
+            }
+            let aip = matrix[axis][p];
+            let aiq = matrix[axis][q];
+            matrix[axis][p] = cosine * aip - sine * aiq;
+            matrix[p][axis] = matrix[axis][p];
+            matrix[axis][q] = sine * aip + cosine * aiq;
+            matrix[q][axis] = matrix[axis][q];
+        }
+        for row in &mut vectors {
+            let vip = row[p];
+            let viq = row[q];
+            row[p] = cosine * vip - sine * viq;
+            row[q] = sine * vip + cosine * viq;
+        }
+    }
+
+    let values = [matrix[0][0], matrix[1][1], matrix[2][2]];
+    let mut order = [0, 1, 2];
+    order.sort_by(|left, right| values[*right].total_cmp(&values[*left]));
+    let sorted_values = order.map(|axis| values[axis]);
+    let mut sorted_vectors = std::array::from_fn(|row| order.map(|axis| vectors[row][axis]));
+    if matrix_determinant(sorted_vectors) < 0.0 {
+        for row in &mut sorted_vectors {
+            row[2] = -row[2];
+        }
+    }
+    (sorted_values, sorted_vectors)
+}
+
+fn gaussian_edit_matrix(transform: &CloudTransform) -> Matrix3 {
+    let columns = [
+        transformed_direction([1.0, 0.0, 0.0], transform),
+        transformed_direction([0.0, 1.0, 0.0], transform),
+        transformed_direction([0.0, 0.0, 1.0], transform),
+    ];
+    std::array::from_fn(|row| std::array::from_fn(|column| columns[column][row] as f64))
+}
+
+fn read_ply_property(
+    record: &[u8],
+    properties: &HashMap<String, (usize, PlyScalarType)>,
+    name: &str,
+) -> f32 {
+    let (offset, scalar_type) = properties[name];
+    scalar_type.read(&record[offset..offset + scalar_type.size()])
+}
+
+fn write_ply_property(
+    record: &mut [u8],
+    properties: &HashMap<String, (usize, PlyScalarType)>,
+    name: &str,
+    value: f32,
+) -> Result<(), String> {
+    let (offset, scalar_type) = properties[name];
+    scalar_type.write(&mut record[offset..offset + scalar_type.size()], value)
+}
+
+fn transformed_gaussian_ply(
+    mut bytes: Vec<u8>,
+    transform: &CloudTransform,
+) -> Result<Vec<u8>, String> {
+    let marker = b"end_header\n";
+    let payload_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .map(|position| position + marker.len())
+        .ok_or_else(|| "The Gaussian PLY header is invalid".to_string())?;
+    let header = std::str::from_utf8(&bytes[..payload_start])
+        .map_err(|_| "The Gaussian PLY header is not valid ASCII".to_string())?;
+    let mut vertex_count = None;
+    let mut vertex_stride = 0usize;
+    let mut in_vertex_element = false;
+    let mut properties: HashMap<String, (usize, PlyScalarType)> = HashMap::new();
+    let mut binary_little_endian = false;
+    for line in header.lines() {
+        let fields = line
+            .trim_end_matches('\r')
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        if fields.first() == Some(&"format") {
+            binary_little_endian = fields.get(1) == Some(&"binary_little_endian");
+        } else if fields.first() == Some(&"element") && fields.len() >= 3 {
+            in_vertex_element = fields[1] == "vertex";
+            if in_vertex_element {
+                vertex_count = Some(
+                    fields[2]
+                        .parse::<usize>()
+                        .map_err(|_| "The Gaussian PLY vertex count is invalid".to_string())?,
+                );
+            }
+        } else if fields.first() == Some(&"property") && in_vertex_element {
+            if fields.get(1) == Some(&"list") || fields.len() < 3 {
+                return Err(
+                    "List-valued Gaussian PLY vertex properties are unsupported".to_string()
+                );
+            }
+            let scalar_type = PlyScalarType::parse(fields[1])
+                .ok_or_else(|| format!("Unsupported Gaussian PLY property type: {}", fields[1]))?;
+            properties.insert(fields[2].to_string(), (vertex_stride, scalar_type));
+            vertex_stride = vertex_stride
+                .checked_add(scalar_type.size())
+                .ok_or_else(|| "The Gaussian PLY vertex layout is too large".to_string())?;
+        }
+    }
+    if !binary_little_endian {
+        return Err("Only binary little-endian Gaussian PLY files can be transformed".to_string());
+    }
+    let vertex_count =
+        vertex_count.ok_or_else(|| "The Gaussian PLY has no vertices".to_string())?;
+    for property in [
+        "x", "y", "z", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+    ] {
+        if !properties.contains_key(property) {
+            return Err(format!("The Gaussian PLY is missing property {property}"));
+        }
+    }
+    let payload_end = payload_start
+        .checked_add(
+            vertex_count
+                .checked_mul(vertex_stride)
+                .ok_or_else(|| "The Gaussian PLY is too large".to_string())?,
+        )
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| "The Gaussian PLY vertex payload is incomplete".to_string())?;
+    let edit_matrix = gaussian_edit_matrix(transform);
+    let uniform_edit = if transform.scale[0] > 0.0
+        && transform
+            .scale
+            .iter()
+            .all(|value| (*value - transform.scale[0]).abs() < 1e-6)
+    {
+        let scale = transform.scale[0] as f64;
+        Some((scale, edit_matrix.map(|row| row.map(|value| value / scale))))
+    } else {
+        None
+    };
+    let scale_names = ["scale_0", "scale_1", "scale_2"];
+    let rotation_names = ["rot_0", "rot_1", "rot_2", "rot_3"];
+    let has_normals = ["nx", "ny", "nz"]
+        .iter()
+        .all(|name| properties.contains_key(*name));
+    for record in bytes[payload_start..payload_end].chunks_exact_mut(vertex_stride) {
+        let position = [
+            read_ply_property(record, &properties, "x"),
+            read_ply_property(record, &properties, "y"),
+            read_ply_property(record, &properties, "z"),
+        ];
+        let transformed = transformed_position(position, transform);
+        for (name, value) in ["x", "y", "z"].into_iter().zip(transformed) {
+            write_ply_property(record, &properties, name, value)?;
+        }
+
+        if has_normals {
+            let normal = transformed_normal(
+                [
+                    read_ply_property(record, &properties, "nx"),
+                    read_ply_property(record, &properties, "ny"),
+                    read_ply_property(record, &properties, "nz"),
+                ],
+                transform,
+            );
+            for (name, value) in ["nx", "ny", "nz"].into_iter().zip(normal) {
+                write_ply_property(record, &properties, name, value)?;
+            }
+        }
+
+        let gaussian_rotation = quaternion_matrix([
+            read_ply_property(record, &properties, rotation_names[0]) as f64,
+            read_ply_property(record, &properties, rotation_names[1]) as f64,
+            read_ply_property(record, &properties, rotation_names[2]) as f64,
+            read_ply_property(record, &properties, rotation_names[3]) as f64,
+        ]);
+        let log_scales = scale_names.map(|name| read_ply_property(record, &properties, name));
+        if let Some((uniform_scale, edit_rotation)) = uniform_edit {
+            for axis in 0..3 {
+                write_ply_property(
+                    record,
+                    &properties,
+                    scale_names[axis],
+                    log_scales[axis] + uniform_scale.ln() as f32,
+                )?;
+            }
+            let quaternion = matrix_quaternion(matrix_product(edit_rotation, gaussian_rotation));
+            for (axis, value) in quaternion.into_iter().enumerate() {
+                write_ply_property(record, &properties, rotation_names[axis], value)?;
+            }
+            continue;
+        }
+        let mut gaussian_basis = gaussian_rotation;
+        for axis in 0..3 {
+            let scale = (log_scales[axis] as f64).exp();
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err("The Gaussian PLY contains an invalid scale".to_string());
+            }
+            for row in &mut gaussian_basis {
+                row[axis] *= scale;
+            }
+        }
+        let deformed_basis = matrix_product(edit_matrix, gaussian_basis);
+        // Gaussian scale and rotation encode a covariance basis. Under a
+        // general affine edit A, covariance becomes (A*B)*(A*B)^T; its
+        // eigensystem converts that result back to 3DGS scale/quaternion form.
+        let covariance = std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                (0..3)
+                    .map(|axis| deformed_basis[row][axis] * deformed_basis[column][axis])
+                    .sum()
+            })
+        });
+        let (variances, orientation) = symmetric_eigen(covariance);
+        if variances
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err("The transformed Gaussian covariance is invalid".to_string());
+        }
+        for (axis, variance) in variances.into_iter().enumerate() {
+            write_ply_property(
+                record,
+                &properties,
+                scale_names[axis],
+                (variance.sqrt().ln()) as f32,
+            )?;
+        }
+        let quaternion = matrix_quaternion(orientation);
+        for (axis, value) in quaternion.into_iter().enumerate() {
+            write_ply_property(record, &properties, rotation_names[axis], value)?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn clipped_binary_ply(
+    bytes: Vec<u8>,
+    bounds: &BoundingBoxClip,
+    content_name: &str,
+) -> Result<Vec<u8>, String> {
+    let marker = b"end_header\n";
+    let payload_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .map(|position| position + marker.len())
+        .ok_or_else(|| format!("The {content_name} PLY header is invalid"))?;
+    let header = std::str::from_utf8(&bytes[..payload_start])
+        .map_err(|_| format!("The {content_name} PLY header is not valid ASCII"))?;
+    let mut vertex_count = None;
+    let mut vertex_stride = 0usize;
+    let mut in_vertex_element = false;
+    let mut properties: HashMap<String, (usize, PlyScalarType)> = HashMap::new();
+    let mut binary_little_endian = false;
+    for line in header.lines() {
+        let fields = line
+            .trim_end_matches('\r')
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        if fields.first() == Some(&"format") {
+            binary_little_endian = fields.get(1) == Some(&"binary_little_endian");
+        } else if fields.first() == Some(&"element") && fields.len() >= 3 {
+            in_vertex_element = fields[1] == "vertex";
+            if in_vertex_element {
+                vertex_count = Some(
+                    fields[2]
+                        .parse::<usize>()
+                        .map_err(|_| format!("The {content_name} PLY vertex count is invalid"))?,
+                );
+            }
+        } else if fields.first() == Some(&"property") && in_vertex_element {
+            if fields.get(1) == Some(&"list") || fields.len() < 3 {
+                return Err(format!(
+                    "List-valued {content_name} PLY vertex properties are unsupported"
+                ));
+            }
+            let scalar_type = PlyScalarType::parse(fields[1]).ok_or_else(|| {
+                format!(
+                    "Unsupported {content_name} PLY property type: {}",
+                    fields[1]
+                )
+            })?;
+            properties.insert(fields[2].to_string(), (vertex_stride, scalar_type));
+            vertex_stride = vertex_stride
+                .checked_add(scalar_type.size())
+                .ok_or_else(|| format!("The {content_name} PLY vertex layout is too large"))?;
+        }
+    }
+    if !binary_little_endian {
+        return Err(format!(
+            "Only binary little-endian {content_name} PLY files can be clipped"
+        ));
+    }
+    let vertex_count = vertex_count
+        .ok_or_else(|| format!("The {content_name} PLY does not declare its vertex count"))?;
+    if vertex_stride == 0 {
+        return Err(format!("The {content_name} PLY has no vertex properties"));
+    }
+    for property in ["x", "y", "z"] {
+        if !properties.contains_key(property) {
+            return Err(format!(
+                "The {content_name} PLY is missing property {property}"
+            ));
+        }
+    }
+    let vertex_payload_size = vertex_count
+        .checked_mul(vertex_stride)
+        .ok_or_else(|| format!("The {content_name} PLY is too large"))?;
+    let vertex_payload_end = payload_start
+        .checked_add(vertex_payload_size)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| format!("The {content_name} PLY vertex payload is incomplete"))?;
+    let property = |record: &[u8], name: &str| -> f32 {
+        let (offset, scalar_type) = properties[name];
+        scalar_type.read(&record[offset..offset + scalar_type.size()])
+    };
+    let mut retained = Vec::with_capacity(vertex_payload_size);
+    for record in bytes[payload_start..vertex_payload_end].chunks_exact(vertex_stride) {
+        let position = [
+            property(record, "x"),
+            property(record, "y"),
+            property(record, "z"),
+        ];
+        if clip_contains(bounds, position) {
+            retained.extend_from_slice(record);
+        }
+    }
+    let retained_count = retained.len() / vertex_stride;
+    if retained_count == 0 {
+        return Err(format!(
+            "The bounding box does not contain any {content_name} vertices"
+        ));
+    }
+    let declaration = format!("element vertex {vertex_count}");
+    if !header.contains(&declaration) {
+        return Err(format!(
+            "The {content_name} PLY vertex declaration is invalid"
+        ));
+    }
+    let clipped_header =
+        header.replacen(&declaration, &format!("element vertex {retained_count}"), 1);
+    let mut output = Vec::with_capacity(
+        clipped_header.len() + retained.len() + bytes.len() - vertex_payload_end,
+    );
+    output.extend_from_slice(clipped_header.as_bytes());
+    output.extend_from_slice(&retained);
+    output.extend_from_slice(&bytes[vertex_payload_end..]);
+    Ok(output)
 }
 
 fn gaussian_splat_preview_path(source: &Path) -> PathBuf {
@@ -3851,7 +4715,11 @@ fn gaussian_splat_preview_is_live(project: &ProjectSummary) -> bool {
 pub fn export_gaussian_splat(
     project_path: String,
     destination_path: String,
+    transform: CloudTransform,
+    clip_bounds: Option<BoundingBoxClip>,
 ) -> Result<String, String> {
+    validate_cloud_transform(&transform)?;
+    validate_clip_bounds(&clip_bounds)?;
     let root = PathBuf::from(project_path);
     let project = storage::read_project(&root)?;
     let relative = project
@@ -3875,10 +4743,14 @@ pub fn export_gaussian_splat(
     {
         destination.set_extension("ply");
     }
-    write_export(
-        &destination,
-        &fs::read(&source).map_err(|error| format!("Could not read Gaussian PLY: {error}"))?,
-    )?;
+    let bytes =
+        fs::read(&source).map_err(|error| format!("Could not read Gaussian PLY: {error}"))?;
+    let transformed = transformed_gaussian_ply(bytes, &transform)?;
+    let clipped = match &clip_bounds {
+        Some(bounds) => clipped_binary_ply(transformed, bounds, "Gaussian splat")?,
+        None => transformed,
+    };
+    write_export(&destination, &clipped)?;
     let stem = destination
         .file_stem()
         .and_then(|value| value.to_str())
@@ -3890,10 +4762,33 @@ pub fn export_gaussian_splat(
         let sidecar = root.join("outputs").join(source_name);
         if sidecar.is_file() {
             let destination_sidecar = destination.with_file_name(format!("{stem}.{suffix}"));
-            write_export(
-                &destination_sidecar,
-                &fs::read(&sidecar).map_err(|error| error.to_string())?,
-            )?;
+            let mut sidecar_bytes = fs::read(&sidecar).map_err(|error| error.to_string())?;
+            if source_name == "room-splat.transform.json" {
+                let mut metadata = serde_json::from_slice::<serde_json::Value>(&sidecar_bytes)
+                    .unwrap_or_else(|_| serde_json::json!({ "schemaVersion": 1 }));
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert(
+                        "applyAtGameObject".to_string(),
+                        serde_json::Value::Bool(false),
+                    );
+                    object.insert(
+                        "editPoseBakedIntoPly".to_string(),
+                        serde_json::to_value(&transform).unwrap(),
+                    );
+                    object.insert(
+                        "note".to_string(),
+                        serde_json::Value::String(
+                            "The ScanLan edit pose is baked into Gaussian means, normals, scales, and rotations."
+                                .to_string(),
+                        ),
+                    );
+                }
+                sidecar_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
+                    format!("Could not serialize Gaussian transform metadata: {error}")
+                })?;
+                sidecar_bytes.push(b'\n');
+            }
+            write_export(&destination_sidecar, &sidecar_bytes)?;
         }
     }
     Ok(destination.to_string_lossy().into_owned())
@@ -3902,13 +4797,14 @@ pub fn export_gaussian_splat(
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_splat_preview, convert_3dgs_ply_to_splat, gaussian_splat_preview_is_live,
-        normalize_project, pack_preview_mesh, read_supplemental_photo_manifest,
-        save_live_reconstruction_preview,
-        transformed_cloud_ply, transformed_obj, unity_compatible_ply, valid_packed_preview_mesh,
+        clipped_binary_ply, clipped_obj, compact_splat_preview, convert_3dgs_ply_to_splat, gaussian_edit_matrix,
+        gaussian_splat_preview_is_live, matrix_product, normalize_project, pack_preview_mesh,
+        quaternion_matrix, read_supplemental_photo_manifest, save_live_reconstruction_preview,
+        transformed_cloud_ply, transformed_gaussian_ply, transformed_normal, transformed_obj,
+        transformed_position, unity_compatible_ply, valid_packed_preview_mesh,
         validate_sensor_settings, LiveGeometryFrame, RealtimeEngineSnapshot,
     };
-    use crate::models::{CaptureSettings, CloudTransform, ProjectSummary};
+    use crate::models::{BoundingBoxClip, CaptureSettings, CloudTransform, ProjectSummary};
     use std::fs;
     use std::sync::{Arc, Mutex};
 
@@ -4151,6 +5047,89 @@ mod tests {
     }
 
     #[test]
+    fn point_cloud_bounds_are_applied_after_the_edit_pose() {
+        let header = concat!(
+            "ply\n",
+            "format binary_little_endian 1.0\n",
+            "element vertex 2\n",
+            "property float x\n",
+            "property float y\n",
+            "property float z\n",
+            "property uchar red\n",
+            "property uchar green\n",
+            "property uchar blue\n",
+            "end_header\n"
+        );
+        let mut source = header.as_bytes().to_vec();
+        for position in [[0.0_f32, 0.0, 0.0], [2.0_f32, 0.0, 0.0]] {
+            position
+                .into_iter()
+                .for_each(|value| source.extend_from_slice(&value.to_le_bytes()));
+            source.extend_from_slice(&[10, 20, 30]);
+        }
+        let transform = CloudTransform {
+            position: [10.0, 0.0, 0.0],
+            rotation: [0.0; 3],
+            scale: [1.0; 3],
+        };
+        let bounds = BoundingBoxClip {
+            min: [11.5, -1.0, -1.0],
+            max: [12.5, 1.0, 1.0],
+        };
+
+        let transformed = transformed_cloud_ply(source, &transform).unwrap();
+        let clipped = clipped_binary_ply(transformed, &bounds, "point cloud").unwrap();
+        let marker = b"end_header\n";
+        let payload_start = clipped
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap()
+            + marker.len();
+        assert!(String::from_utf8_lossy(&clipped[..payload_start]).contains("element vertex 1"));
+        assert_eq!(clipped.len() - payload_start, 15);
+        assert_eq!(
+            f32::from_le_bytes(clipped[payload_start..payload_start + 4].try_into().unwrap()),
+            12.0
+        );
+    }
+
+    #[test]
+    fn mesh_clip_cuts_crossing_triangles_and_interpolates_attributes() {
+        let source = concat!(
+            "mtllib room-mesh.mtl\n",
+            "v -1 0 0\n",
+            "v 1 0 0\n",
+            "v 0 1 0\n",
+            "vn 0 0 1\n",
+            "vn 0 0 1\n",
+            "vn 0 0 1\n",
+            "vt 0 0\n",
+            "vt 1 0\n",
+            "vt 0.5 1\n",
+            "f 1/1/1 2/2/2 3/3/3\n"
+        );
+        let bounds = BoundingBoxClip {
+            min: [-0.5, -1.0, -1.0],
+            max: [1.0, 2.0, 1.0],
+        };
+
+        let clipped = clipped_obj(source, &bounds).unwrap();
+        let positions = clipped
+            .lines()
+            .filter_map(|line| line.strip_prefix("v "))
+            .map(|line| {
+                line.split_whitespace()
+                    .map(|value| value.parse::<f32>().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(positions.iter().all(|position| position[0] >= -0.500_001));
+        assert!(positions.iter().any(|position| (position[0] + 0.5).abs() < 1e-6));
+        assert_eq!(clipped.lines().filter(|line| line.starts_with("f ")).count(), 2);
+        assert!(clipped.lines().filter(|line| line.starts_with("vt ")).count() >= 4);
+    }
+
+    #[test]
     fn edit_pose_transforms_point_and_mesh_exports() {
         let transform = CloudTransform {
             position: [1.0, 2.0, 3.0],
@@ -4213,6 +5192,115 @@ mod tests {
         assert!(transformed_obj("f 1 2 3\n", &mirrored)
             .unwrap()
             .contains("f 1 3 2"));
+    }
+
+    #[test]
+    fn edit_pose_transforms_gaussian_means_normals_and_covariances() {
+        let names = [
+            "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "scale_0", "scale_1", "scale_2", "rot_0",
+            "rot_1", "rot_2", "rot_3",
+        ];
+        let header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex 1\n{}end_header\n",
+            names
+                .iter()
+                .map(|name| format!("property float {name}\n"))
+                .collect::<String>()
+        );
+        let half_angle = 15.0_f32.to_radians();
+        let source_values = [
+            1.0_f32,
+            -2.0,
+            0.5,
+            1.0,
+            0.0,
+            0.0,
+            7.25,
+            0.1_f32.ln(),
+            0.2_f32.ln(),
+            0.3_f32.ln(),
+            half_angle.cos(),
+            0.0,
+            half_angle.sin(),
+            0.0,
+        ];
+        let mut source = header.as_bytes().to_vec();
+        for value in source_values {
+            source.extend_from_slice(&value.to_le_bytes());
+        }
+        let transform = CloudTransform {
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 90.0],
+            scale: [2.0, 1.0, -0.5],
+        };
+
+        let output = transformed_gaussian_ply(source, &transform).unwrap();
+        let values = output[header.len()..]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let expected_position = transformed_position([1.0, -2.0, 0.5], &transform);
+        let expected_normal = transformed_normal([1.0, 0.0, 0.0], &transform);
+        for (actual, expected) in values[0..3].iter().zip(expected_position) {
+            assert!((*actual - expected).abs() < 1e-5);
+        }
+        for (actual, expected) in values[3..6].iter().zip(expected_normal) {
+            assert!((*actual - expected).abs() < 1e-5);
+        }
+        assert_eq!(values[6], 7.25);
+
+        let original_rotation = quaternion_matrix([
+            source_values[10] as f64,
+            source_values[11] as f64,
+            source_values[12] as f64,
+            source_values[13] as f64,
+        ]);
+        let mut original_basis = original_rotation;
+        for axis in 0..3 {
+            for row in &mut original_basis {
+                row[axis] *= [0.1, 0.2, 0.3][axis];
+            }
+        }
+        let expected_basis = matrix_product(gaussian_edit_matrix(&transform), original_basis);
+        let expected_covariance: [[f64; 3]; 3] = std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                (0..3)
+                    .map(|axis| expected_basis[row][axis] * expected_basis[column][axis])
+                    .sum()
+            })
+        });
+
+        let actual_rotation = quaternion_matrix([
+            values[10] as f64,
+            values[11] as f64,
+            values[12] as f64,
+            values[13] as f64,
+        ]);
+        let mut actual_basis = actual_rotation;
+        for axis in 0..3 {
+            let scale = (values[7 + axis] as f64).exp();
+            for row in &mut actual_basis {
+                row[axis] *= scale;
+            }
+        }
+        let actual_covariance: [[f64; 3]; 3] = std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                (0..3)
+                    .map(|axis| actual_basis[row][axis] * actual_basis[column][axis])
+                    .sum()
+            })
+        });
+        for row in 0..3 {
+            for column in 0..3 {
+                assert!(
+                    (actual_covariance[row][column] - expected_covariance[row][column]).abs()
+                        < 1e-6,
+                    "covariance[{row}][{column}] differs: {} != {}",
+                    actual_covariance[row][column],
+                    expected_covariance[row][column]
+                );
+            }
+        }
     }
 
     #[test]

@@ -210,6 +210,12 @@ export interface CloudTransform {
   scale: [number, number, number];
 }
 
+/** Axis-aligned export bounds, expressed after the model edit pose. */
+export interface BoundingBoxClip {
+  min: [number, number, number];
+  max: [number, number, number];
+}
+
 export interface PackedPreviewFrame {
   frameCount: number;
   pointCount: number;

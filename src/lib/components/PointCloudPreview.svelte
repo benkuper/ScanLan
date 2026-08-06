@@ -5,7 +5,7 @@
   import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
   import type { TransformControlsMode } from 'three/examples/jsm/controls/TransformControls.js';
   import { AnchorAngleTransformControls } from '../controls/AnchorAngleTransformControls';
-  import type { CloudTransform, MeshViewMode, PackedPreviewFrame, PreviewMesh, PreviewPoint } from '../types';
+  import type { BoundingBoxClip, CloudTransform, MeshViewMode, PackedPreviewFrame, PreviewMesh, PreviewPoint } from '../types';
 
   type RenderMode = 'points' | 'mesh' | 'splat';
   type AssetLoadingState = 'points' | 'mesh' | 'mesh-texture' | 'splat' | 'splat-gpu' | null;
@@ -30,10 +30,15 @@
   export let editMode = false;
   export let gizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
   export let rotationSnapDegrees = 0;
+  export let clipBounds: BoundingBoxClip | null = null;
+  export let clipEditMode = false;
+  export let clipGizmoMode: 'translate' | 'scale' = 'scale';
   export let onFloorDetected: (transform: CloudTransform) => void = () => undefined;
   export let onFloorMessage: (message: string) => void = () => undefined;
   export let onTransformChanged: (transform: CloudTransform) => void = () => undefined;
   export let onTransformCommitted: () => void = () => undefined;
+  export let onClipBoundsChanged: (bounds: BoundingBoxClip) => void = () => undefined;
+  export let onClipBoundsCommitted: () => void = () => undefined;
 
   let canvas: HTMLCanvasElement;
   let setPoints: (next: PreviewPoint[]) => void = () => undefined;
@@ -41,10 +46,11 @@
   let setMaterial: (size: number, alpha: number, colors: boolean) => void = () => undefined;
   let setMesh: (next: PreviewMesh | null) => void = () => undefined;
   let setMeshMode: (next: MeshViewMode) => void = () => undefined;
-  let setSplat: (next: Uint8Array | null) => void = () => undefined;
+  let setSplat: (next: Uint8Array | null, force?: boolean) => void = () => undefined;
   let setRenderMode: (next: RenderMode) => void = () => undefined;
   let setTransform: (transform: CloudTransform, anchor: [number, number, number]) => void = () => undefined;
-  let setGizmo: (enabled: boolean, mode: 'translate' | 'rotate' | 'scale') => void = () => undefined;
+  let setClip: (bounds: BoundingBoxClip | null) => void = () => undefined;
+  let setGizmo: (modelEnabled: boolean, modelMode: 'translate' | 'rotate' | 'scale', clipEnabled: boolean, clipMode: 'translate' | 'scale') => void = () => undefined;
   let setRotationSnap: (degrees: number) => void = () => undefined;
   let splatReady = false;
   let splatError = '';
@@ -73,11 +79,46 @@
   $: setMaterial(pointSize, opacity, showColors);
   $: setMesh(mesh);
   $: setMeshMode(meshViewMode);
+  $: setClip(clipBounds);
   $: setSplat(splatBytes);
   $: setRenderMode(renderMode);
   $: setTransform(cloudTransform, gizmoAnchor);
-  $: setGizmo(editMode, gizmoMode);
+  $: setGizmo(editMode, gizmoMode, clipEditMode, clipGizmoMode);
   $: setRotationSnap(rotationSnapDegrees);
+
+  function clippedSplatBytes(bytes: Uint8Array, bounds: BoundingBoxClip | null, transform: CloudTransform): Uint8Array {
+    if (!bounds || bytes.byteLength % 32 !== 0) return bytes;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const output = new Uint8Array(bytes.byteLength);
+    const rotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+      THREE.MathUtils.degToRad(transform.rotation[0]),
+      THREE.MathUtils.degToRad(transform.rotation[1]),
+      THREE.MathUtils.degToRad(transform.rotation[2]),
+      'XYZ'
+    ));
+    const elements = new THREE.Matrix4().compose(
+      new THREE.Vector3().fromArray(transform.position),
+      rotation,
+      new THREE.Vector3().fromArray(transform.scale)
+    ).elements;
+    let outputOffset = 0;
+    for (let offset = 0; offset < bytes.byteLength; offset += 32) {
+      const x = view.getFloat32(offset, true);
+      const y = view.getFloat32(offset + 4, true);
+      const z = view.getFloat32(offset + 8, true);
+      const transformed = [
+        elements[0] * x + elements[4] * y + elements[8] * z + elements[12],
+        elements[1] * x + elements[5] * y + elements[9] * z + elements[13],
+        elements[2] * x + elements[6] * y + elements[10] * z + elements[14]
+      ];
+      const inside = transformed.every((value, axis) => Number.isFinite(value) && value >= bounds.min[axis] && value <= bounds.max[axis]);
+      if (!inside) continue;
+      output.set(bytes.subarray(offset, offset + 32), outputOffset);
+      outputOffset += 32;
+    }
+    if (outputOffset === bytes.byteLength) return bytes;
+    return output.slice(0, outputOffset);
+  }
 
   onMount(() => {
     const loadingTimer = window.setInterval(() => {
@@ -97,6 +138,7 @@
       powerPreference: 'high-performance'
     });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.localClippingEnabled = true;
 
     const qualityPixelRatio = Math.min(window.devicePixelRatio, 1.5);
     const interactionPixelRatio = Math.min(window.devicePixelRatio, 1);
@@ -169,6 +211,28 @@
     scene.add(root);
     const anchor = new THREE.Vector3();
 
+    const clipBoxGeometry = new THREE.BoxGeometry(1, 1, 1);
+    const clipBoxMaterial = new THREE.MeshBasicMaterial({
+      color: '#efb366',
+      transparent: true,
+      opacity: 0.07,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    });
+    const clipBox = new THREE.Mesh(clipBoxGeometry, clipBoxMaterial);
+    const clipEdgeGeometry = new THREE.EdgesGeometry(clipBoxGeometry);
+    const clipEdgeMaterial = new THREE.LineBasicMaterial({ color: '#efb366', transparent: true, opacity: 0.92 });
+    clipBox.add(new THREE.LineSegments(clipEdgeGeometry, clipEdgeMaterial));
+    clipBox.visible = false;
+    clipBox.renderOrder = 10;
+    scene.add(clipBox);
+
+    const clippingPlanes = Array.from({ length: 6 }, () => new THREE.Plane());
+    let activeClipBounds: BoundingBoxClip | null = null;
+    let appliedClipKey = 'off';
+    let activeCloudTransform: CloudTransform = cloudTransform;
+    let appliedTransformKey = '';
+
     const transformControls = new AnchorAngleTransformControls(camera, renderer.domElement);
     const transformHelper = transformControls.getHelper();
     transformControls.setSpace('world');
@@ -187,7 +251,8 @@
       sizeAttenuation: true,
       transparent: opacity < 1,
       depthWrite: opacity >= 0.98,
-      opacity
+      opacity,
+      clippingPlanes: null
     });
     const pointCloud = new THREE.Points(pointGeometry, pointMaterial);
     root.add(pointCloud);
@@ -199,7 +264,8 @@
       side: THREE.DoubleSide,
       polygonOffset: true,
       polygonOffsetFactor: 1,
-      polygonOffsetUnits: 1
+      polygonOffsetUnits: 1,
+      clippingPlanes: null
     });
     const shadedMaterial = new THREE.MeshStandardMaterial({
       color: '#93c6d4',
@@ -208,7 +274,8 @@
       side: THREE.DoubleSide,
       polygonOffset: true,
       polygonOffsetFactor: 1,
-      polygonOffsetUnits: 1
+      polygonOffsetUnits: 1,
+      clippingPlanes: null
     });
     const wireMaterial = new THREE.MeshBasicMaterial({
       color: '#69cbea',
@@ -216,7 +283,8 @@
       wireframe: true,
       transparent: true,
       depthWrite: false,
-      opacity
+      opacity,
+      clippingPlanes: null
     });
     let meshSurface: THREE.Mesh | null = null;
     let meshWireframe: THREE.Mesh | null = null;
@@ -366,10 +434,75 @@
       updateMeshAppearance();
     };
 
+    const updateClippingPlanes = (bounds: BoundingBoxClip | null) => {
+      const materials = [pointMaterial, surfaceMaterial, shadedMaterial, wireMaterial];
+      if (!bounds) {
+        for (const material of materials) {
+          if (material.clippingPlanes !== null) {
+            material.clippingPlanes = null;
+            material.needsUpdate = true;
+          }
+        }
+        invalidate();
+        return;
+      }
+      clippingPlanes[0].setComponents(-1, 0, 0, -bounds.min[0]);
+      clippingPlanes[1].setComponents(1, 0, 0, bounds.max[0]);
+      clippingPlanes[2].setComponents(0, -1, 0, -bounds.min[1]);
+      clippingPlanes[3].setComponents(0, 1, 0, bounds.max[1]);
+      clippingPlanes[4].setComponents(0, 0, -1, -bounds.min[2]);
+      clippingPlanes[5].setComponents(0, 0, 1, bounds.max[2]);
+      for (const material of materials) {
+        if (material.clippingPlanes !== clippingPlanes) {
+          material.clippingPlanes = clippingPlanes;
+          material.needsUpdate = true;
+        }
+      }
+      invalidate();
+    };
+
+    const boundsFromClipBox = (): BoundingBoxClip => {
+      const halfSize = new THREE.Vector3(
+        Math.max(0.001, Math.abs(clipBox.scale.x)) * 0.5,
+        Math.max(0.001, Math.abs(clipBox.scale.y)) * 0.5,
+        Math.max(0.001, Math.abs(clipBox.scale.z)) * 0.5
+      );
+      return {
+        min: [clipBox.position.x - halfSize.x, clipBox.position.y - halfSize.y, clipBox.position.z - halfSize.z],
+        max: [clipBox.position.x + halfSize.x, clipBox.position.y + halfSize.y, clipBox.position.z + halfSize.z]
+      };
+    };
+
+    setClip = (bounds) => {
+      const key = bounds ? [...bounds.min, ...bounds.max].join(':') : 'off';
+      if (key === appliedClipKey) return;
+      appliedClipKey = key;
+      activeClipBounds = bounds
+        ? { min: [...bounds.min], max: [...bounds.max] }
+        : null;
+      clipBox.visible = Boolean(bounds);
+      if (bounds) {
+        clipBox.position.set(
+          (bounds.min[0] + bounds.max[0]) * 0.5,
+          (bounds.min[1] + bounds.max[1]) * 0.5,
+          (bounds.min[2] + bounds.max[2]) * 0.5
+        );
+        clipBox.rotation.set(0, 0, 0);
+        clipBox.scale.set(
+          Math.max(0.001, bounds.max[0] - bounds.min[0]),
+          Math.max(0.001, bounds.max[1] - bounds.min[1]),
+          Math.max(0.001, bounds.max[2] - bounds.min[2])
+        );
+      }
+      updateClippingPlanes(activeClipBounds);
+      if (appliedSplat) setSplat(appliedSplat, true);
+    };
+
     const splatGroup = new THREE.Group();
     root.add(splatGroup);
     let loadedSplat: SplatMeshInstance | null = null;
     let appliedSplat: Uint8Array | null = null;
+    let appliedSplatView: DataView | null = null;
     let splatGeneration = 0;
     const clearSplat = () => {
       splatGeneration += 1;
@@ -383,23 +516,38 @@
       splatLoadProgress = null;
       invalidate();
     };
-    setSplat = (next) => {
-      if (next === appliedSplat) return;
+    setSplat = (next, force = false) => {
+      if (!force && next === appliedSplat) return;
       appliedSplat = next;
+      appliedSplatView = next
+        ? new DataView(next.buffer, next.byteOffset, next.byteLength)
+        : null;
       if (!next) {
         clearSplat();
         return;
       }
+      const displayBytes = clippedSplatBytes(next, activeClipBounds, activeCloudTransform);
       splatGeneration += 1;
       const generation = splatGeneration;
       splatReady = false;
       splatError = '';
       splatLoadProgress = 0;
+      if (!displayBytes.byteLength) {
+        if (loadedSplat) {
+          splatGroup.remove(loadedSplat);
+          loadedSplat.dispose();
+          loadedSplat = null;
+        }
+        splatLoadProgress = null;
+        splatError = 'Bounding box contains no Gaussian centers';
+        invalidate();
+        return;
+      }
       void ensureSpark().then((module) => {
         if (!module || generation !== splatGeneration) return;
         const previous = loadedSplat;
         const candidate = new module.SplatMesh({
-          fileBytes: next,
+          fileBytes: displayBytes,
           fileName: 'scanlan-preview.splat',
           editable: false,
           raycastable: false,
@@ -508,6 +656,14 @@
     };
 
     setTransform = (transform, nextAnchor) => {
+      const transformKey = [...transform.position, ...transform.rotation, ...transform.scale].join(':');
+      const transformChanged = transformKey !== appliedTransformKey;
+      appliedTransformKey = transformKey;
+      activeCloudTransform = {
+        position: [...transform.position],
+        rotation: [...transform.rotation],
+        scale: [...transform.scale]
+      };
       anchor.fromArray(nextAnchor);
       const inverseAnchor = anchor.clone().multiplyScalar(-1);
       pointCloud.position.copy(inverseAnchor);
@@ -522,20 +678,25 @@
       root.scale.fromArray(transform.scale);
       const anchorOffset = anchor.clone().multiply(root.scale).applyQuaternion(root.quaternion);
       root.position.fromArray(transform.position).add(anchorOffset);
+      if (transformChanged && appliedSplat) setSplat(appliedSplat, true);
       invalidate();
     };
     let activeGizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
-    let gizmoAttached = false;
-    setGizmo = (enabled, mode) => {
-      if (mode !== activeGizmoMode) {
-        activeGizmoMode = mode;
-        transformControls.setMode(mode as TransformControlsMode);
+    let gizmoTarget: 'model' | 'clip' | null = null;
+    setGizmo = (modelEnabled, modelMode, clipEnabled, clipMode) => {
+      const nextTarget = clipEnabled && activeClipBounds ? 'clip' : modelEnabled ? 'model' : null;
+      const nextMode = nextTarget === 'clip' ? clipMode : modelMode;
+      if (nextMode !== activeGizmoMode) {
+        activeGizmoMode = nextMode;
+        transformControls.setMode(nextMode as TransformControlsMode);
       }
-      if (enabled !== gizmoAttached) {
-        gizmoAttached = enabled;
-        transformHelper.visible = enabled;
-        if (enabled) {
-          transformControls.attach(root);
+      if (nextTarget !== gizmoTarget) {
+        gizmoTarget = nextTarget;
+        transformControls.detach();
+        transformHelper.visible = Boolean(nextTarget);
+        if (nextTarget) {
+          transformControls.setSpace('world');
+          transformControls.attach(nextTarget === 'clip' ? clipBox : root);
           // Keep a stable interaction resolution for the whole edit session.
           // Resizing the WebGL target after every mouse-up caused the release stall.
           applyPixelRatio(interactionPixelRatio);
@@ -567,21 +728,43 @@
       const dragging = Boolean(event.value);
       controls.enabled = !dragging;
       if (dragging) interactionStart();
-      else if (!editMode) interactionEnd();
+      else if (!editMode && !clipEditMode) interactionEnd();
     };
     const commitTransform = () => {
+      if (gizmoTarget === 'clip') {
+        const bounds = boundsFromClipBox();
+        activeClipBounds = bounds;
+        updateClippingPlanes(bounds);
+        onClipBoundsChanged(bounds);
+        onClipBoundsCommitted();
+        return;
+      }
       emitTransform();
       onTransformCommitted();
+    };
+    const handleGizmoObjectChange = () => {
+      if (gizmoTarget === 'clip') updateClippingPlanes(boundsFromClipBox());
+      invalidate();
     };
     // TransformControls already edits `root` directly. Sending every pointer
     // event through Svelte only writes the same matrix back and makes large
     // scenes feel CPU-bound. Publish the final pose once on mouse-up instead.
-    transformControls.addEventListener('objectChange', invalidate);
+    transformControls.addEventListener('objectChange', handleGizmoObjectChange);
     transformControls.addEventListener('dragging-changed', handleGizmoDragging);
     transformControls.addEventListener('mouseUp', commitTransform);
 
-    const sourcePointCount = () => points.length || Math.floor((mesh?.positions.length ?? 0) / 3);
+    const sourcePointCount = () => activeRenderMode === 'splat'
+      ? Math.floor((appliedSplat?.byteLength ?? 0) / 32)
+      : points.length || Math.floor((mesh?.positions.length ?? 0) / 3);
     const sourcePoint = (index: number, target = new THREE.Vector3()) => {
+      if (activeRenderMode === 'splat' && appliedSplatView) {
+        const offset = index * 32;
+        return target.set(
+          appliedSplatView.getFloat32(offset, true),
+          appliedSplatView.getFloat32(offset + 4, true),
+          appliedSplatView.getFloat32(offset + 8, true)
+        );
+      }
       if (points.length) return target.fromArray(points[index].position);
       const positions = mesh?.positions;
       return positions
@@ -684,12 +867,42 @@
     raycaster.params.Points = { threshold: 0.06 };
     const pointer = new THREE.Vector2();
     const handleFloorPick = (event: PointerEvent) => {
-      if (!floorPickMode || activeRenderMode === 'splat' || sourcePointCount() === 0) return;
+      if (!floorPickMode || sourcePointCount() === 0) return;
       const bounds = canvas.getBoundingClientRect();
       pointer.x = ((event.clientX - bounds.left) / bounds.width) * 2 - 1;
       pointer.y = -((event.clientY - bounds.top) / bounds.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
-      const contentObject = activeRenderMode === 'mesh' ? meshGroup : pointCloud;
+      const contentObject = activeRenderMode === 'mesh'
+        ? meshGroup
+        : activeRenderMode === 'splat' ? splatGroup : pointCloud;
+      if (activeRenderMode === 'splat') {
+        root.updateMatrixWorld(true);
+        const count = sourcePointCount();
+        const stride = Math.max(1, Math.floor(count / 200_000));
+        const localPoint = new THREE.Vector3();
+        const worldPoint = new THREE.Vector3();
+        const cameraOffset = new THREE.Vector3();
+        let selected: THREE.Vector3 | null = null;
+        let bestAngularDistance = 0.0002;
+        for (let index = 0; index < count; index += stride) {
+          sourcePoint(index, localPoint);
+          worldPoint.copy(localPoint).applyMatrix4(contentObject.matrixWorld);
+          cameraOffset.copy(worldPoint).sub(raycaster.ray.origin);
+          const forwardDistance = raycaster.ray.direction.dot(cameraOffset);
+          if (forwardDistance <= 0) continue;
+          const angularDistance = raycaster.ray.distanceSqToPoint(worldPoint) / (forwardDistance * forwardDistance);
+          if (angularDistance < bestAngularDistance) {
+            bestAngularDistance = angularDistance;
+            selected = localPoint.clone();
+          }
+        }
+        if (!selected) {
+          onFloorMessage('No Gaussian surface selected. Click directly on a dense floor patch.');
+          return;
+        }
+        fitFloor(selected, contentObject);
+        return;
+      }
       const hit = raycaster.intersectObject(contentObject, true)[0];
       if (!hit) {
         onFloorMessage('No surface selected. Click directly on a dense floor patch.');
@@ -702,12 +915,13 @@
     if (packedFrame) setPackedPoints(packedFrame);
     else setPoints(points);
     setMesh(mesh);
-    setSplat(splatBytes);
     setMaterial(pointSize, opacity, showColors);
     setMeshMode(meshViewMode);
     setRenderMode(renderMode);
     setTransform(cloudTransform, gizmoAnchor);
-    setGizmo(editMode, gizmoMode);
+    setClip(clipBounds);
+    setSplat(splatBytes);
+    setGizmo(editMode, gizmoMode, clipEditMode, clipGizmoMode);
     setRotationSnap(rotationSnapDegrees);
 
     let resizeFrame = 0;
@@ -756,12 +970,13 @@
       controls.removeEventListener('start', interactionStart);
       controls.removeEventListener('end', interactionEnd);
       controls.dispose();
-      transformControls.removeEventListener('objectChange', invalidate);
+      transformControls.removeEventListener('objectChange', handleGizmoObjectChange);
       transformControls.removeEventListener('dragging-changed', handleGizmoDragging);
       transformControls.removeEventListener('mouseUp', commitTransform);
       transformControls.detach();
       transformControls.dispose();
       scene.remove(transformHelper);
+      scene.remove(clipBox);
       clearSplat();
       clearMesh();
       sparkRenderer?.dispose();
@@ -770,12 +985,16 @@
       surfaceMaterial.dispose();
       shadedMaterial.dispose();
       wireMaterial.dispose();
+      clipBoxGeometry.dispose();
+      clipBoxMaterial.dispose();
+      clipEdgeGeometry.dispose();
+      clipEdgeMaterial.dispose();
       renderer.dispose();
     };
   });
 </script>
 
-<div class:processing class:point-pick={floorPickMode} class="viewer">
+<div class:processing class:point-pick={floorPickMode} class:clip-edit={clipEditMode} class="viewer">
   <canvas bind:this={canvas} aria-label="Interactive 3D reconstruction"></canvas>
   <div class:live class="viewer-hud top-left">
     <span class="pulse"></span>
@@ -813,6 +1032,7 @@
   canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; cursor: grab; }
   canvas:active { cursor: grabbing; }
   .point-pick canvas, .point-pick canvas:active { cursor: crosshair; }
+  .clip-edit canvas { cursor: default; }
   .viewer-hud { position: absolute; display: flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid rgba(157, 204, 223, 0.12); border-radius: 10px; background: rgba(5, 15, 25, 0.68); color: #adc3d0; font-size: 11px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; backdrop-filter: blur(12px); pointer-events: none; }
   .top-left { top: 16px; left: 16px; }
   .bottom-right { right: 16px; bottom: 16px; text-transform: none; letter-spacing: 0; }

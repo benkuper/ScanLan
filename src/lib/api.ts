@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ArtifactJob, ArtifactTarget, AvailableSensor, CaptureSettings, CaptureStatus, CloudTransform, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
+import type { ArtifactJob, ArtifactTarget, AvailableSensor, BoundingBoxClip, CaptureSettings, CaptureStatus, CloudTransform, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
 
 const inTauri = () => typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
 
@@ -314,17 +314,17 @@ export async function loadGaussianSplat(projectPath: string): Promise<Uint8Array
   return normalizeBinary(response);
 }
 
-export async function exportPly(projectPath: string, destinationPath: string, transform: CloudTransform): Promise<string> {
+export async function exportPly(projectPath: string, destinationPath: string, transform: CloudTransform, clipBounds: BoundingBoxClip | null): Promise<string> {
   requireDesktop();
-  return invoke<string>('export_ply', { projectPath, destinationPath, transform });
+  return invoke<string>('export_ply', { projectPath, destinationPath, transform, clipBounds });
 }
 
-export async function exportTexturedMesh(projectPath: string, destinationPath: string, transform: CloudTransform): Promise<string> {
+export async function exportTexturedMesh(projectPath: string, destinationPath: string, transform: CloudTransform, clipBounds: BoundingBoxClip | null): Promise<string> {
   requireDesktop();
-  return invoke<string>('export_textured_mesh', { projectPath, destinationPath, transform });
+  return invoke<string>('export_textured_mesh', { projectPath, destinationPath, transform, clipBounds });
 }
 
-export async function exportGaussianSplat(projectPath: string, destinationPath: string): Promise<string> {
+export async function exportGaussianSplat(projectPath: string, destinationPath: string, transform: CloudTransform, clipBounds: BoundingBoxClip | null): Promise<string> {
   requireDesktop();
-  return invoke<string>('export_gaussian_splat', { projectPath, destinationPath });
+  return invoke<string>('export_gaussian_splat', { projectPath, destinationPath, transform, clipBounds });
 }

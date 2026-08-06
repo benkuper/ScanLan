@@ -478,6 +478,13 @@ pub struct CloudTransform {
     pub scale: [f32; 3],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundingBoxClip {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
 fn unit_scale() -> [f32; 3] {
     [1.0, 1.0, 1.0]
 }

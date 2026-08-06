@@ -44,6 +44,7 @@
     ArtifactJob,
     ArtifactTarget,
     AvailableSensor,
+    BoundingBoxClip,
     CaptureSettings,
     CaptureStatus,
     CloudTransform,
@@ -88,6 +89,10 @@
   let savedCloudTransform: CloudTransform = identityTransform();
   let gizmoAnchor: [number, number, number] = [0, 0, 0];
   let loadedTransformProjectId = '';
+  let clippingEnabled = false;
+  let clipEditMode = false;
+  let clipGizmoMode: 'translate' | 'scale' = 'scale';
+  let clipBounds: BoundingBoxClip | null = null;
 
   let previewPoints: PreviewPoint[] = [];
   let packedPreviewFrame: PackedPreviewFrame | null = null;
@@ -146,6 +151,7 @@
   let selectedSensor: AvailableSensor | null = null;
   let selectedSensorConnected = false;
   let canEditModel = false;
+  let canClipModel = false;
   let hasEditPose = false;
   let viewerCloudTransform: CloudTransform = identityTransform();
   let localizedTexturePhotoCount = 0;
@@ -185,11 +191,13 @@
     : Boolean(selectedSensor?.connected);
   $: canEditModel = workspace === 'inspect'
     && !processing
-    && renderMode !== 'splat'
-    && (previewPoints.length > 0 || Boolean(previewMesh?.positions.length));
+    && (renderMode === 'splat'
+      ? Boolean(previewSplat?.byteLength)
+      : previewPoints.length > 0 || Boolean(previewMesh?.positions.length));
+  $: canClipModel = canEditModel;
   $: hasEditPose = !isIdentityTransform(cloudTransform);
-  $: gizmoAnchor = modelCenter(renderMode, previewPoints, previewMesh);
-  $: viewerCloudTransform = workspace === 'inspect' && renderMode !== 'splat'
+  $: gizmoAnchor = modelCenter(renderMode, previewPoints, previewMesh, previewSplat);
+  $: viewerCloudTransform = workspace === 'inspect'
     ? cloudTransform
     : identityTransform();
   $: localizedTexturePhotoCount = texturePhotos.filter((photo) => photo.status === 'localized').length;
@@ -262,6 +270,7 @@
   }
 
   const transformStorageKey = (projectId: string) => `scanlan-cloud-transform:${projectId}`;
+  const clipStorageKey = (projectId: string) => `scanlan-bounding-box:${projectId}`;
   const transformSaveModeStorageKey = 'scanlan-transform-save-mode';
   const rotationSnapStorageKey = 'scanlan-rotation-snap-degrees';
 
@@ -277,6 +286,20 @@
     const leftValues = [...left.position, ...left.rotation, ...left.scale];
     const rightValues = [...right.position, ...right.rotation, ...right.scale];
     return leftValues.every((value, index) => Math.abs(value - rightValues[index]) < 1e-5);
+  }
+
+  function cloneClipBounds(bounds: BoundingBoxClip): BoundingBoxClip {
+    return { min: [...bounds.min], max: [...bounds.max] };
+  }
+
+  function validClipBounds(value: unknown): BoundingBoxClip | null {
+    if (!value || typeof value !== 'object') return null;
+    const candidate = value as Partial<BoundingBoxClip>;
+    const min = validVector(candidate.min, [Number.NaN, Number.NaN, Number.NaN]);
+    const max = validVector(candidate.max, [Number.NaN, Number.NaN, Number.NaN]);
+    return min.every((item, axis) => Number.isFinite(item) && max[axis] - item >= 0.001)
+      ? { min, max }
+      : null;
   }
 
   function loadEditorPreferences(): void {
@@ -300,19 +323,36 @@
     transformDirty = false;
     editMode = false;
     floorPickMode = false;
+    clippingEnabled = false;
+    clipEditMode = false;
+    clipBounds = null;
     const stored = localStorage.getItem(transformStorageKey(projectId));
-    if (!stored) return;
-    try {
-      const parsed = JSON.parse(stored) as Partial<CloudTransform>;
-      const scale = validVector(parsed.scale, [1, 1, 1]);
-      cloudTransform = {
-        position: validVector(parsed.position, [0, 0, 0]),
-        rotation: validVector(parsed.rotation, [0, 0, 0]),
-        scale: scale.map((value) => Math.abs(value) < 1e-4 ? (value < 0 ? -1e-4 : 1e-4) : value) as [number, number, number]
-      };
-      savedCloudTransform = cloneTransform(cloudTransform);
-    } catch {
-      localStorage.removeItem(transformStorageKey(projectId));
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored) as Partial<CloudTransform>;
+        const scale = validVector(parsed.scale, [1, 1, 1]);
+        cloudTransform = {
+          position: validVector(parsed.position, [0, 0, 0]),
+          rotation: validVector(parsed.rotation, [0, 0, 0]),
+          scale: scale.map((value) => Math.abs(value) < 1e-4 ? (value < 0 ? -1e-4 : 1e-4) : value) as [number, number, number]
+        };
+        savedCloudTransform = cloneTransform(cloudTransform);
+      } catch {
+        localStorage.removeItem(transformStorageKey(projectId));
+      }
+    }
+    const storedClip = localStorage.getItem(clipStorageKey(projectId));
+    if (storedClip) {
+      try {
+        const parsed = JSON.parse(storedClip) as { enabled?: unknown; bounds?: unknown };
+        const bounds = validClipBounds(parsed.bounds);
+        if (bounds) {
+          clipBounds = bounds;
+          clippingEnabled = parsed.enabled === true;
+        }
+      } catch {
+        localStorage.removeItem(clipStorageKey(projectId));
+      }
     }
   }
 
@@ -322,6 +362,14 @@
     else localStorage.setItem(transformStorageKey(project.id), JSON.stringify(cloudTransform));
     savedCloudTransform = cloneTransform(cloudTransform);
     transformDirty = false;
+  }
+
+  function persistClip(): void {
+    if (!project || !clipBounds) return;
+    localStorage.setItem(clipStorageKey(project.id), JSON.stringify({
+      enabled: clippingEnabled,
+      bounds: clipBounds
+    }));
   }
 
   function setTransformSaveMode(mode: TransformSaveMode): void {
@@ -358,7 +406,12 @@
     message = 'Model pose saved; exports will use this pose.';
   }
 
-  function modelCenter(mode: RenderMode, points: PreviewPoint[], mesh: PreviewMesh | null): [number, number, number] {
+  function modelCenter(
+    mode: RenderMode,
+    points: PreviewPoint[],
+    mesh: PreviewMesh | null,
+    splat: Uint8Array | null
+  ): [number, number, number] {
     let count = 0;
     let stride = 1;
     let pointAt: (index: number) => [number, number, number];
@@ -366,6 +419,15 @@
       count = Math.floor(mesh.positions.length / 3);
       stride = Math.max(1, Math.floor(count / 100_000));
       pointAt = (index) => [mesh.positions[index * 3], mesh.positions[index * 3 + 1], mesh.positions[index * 3 + 2]];
+    } else if (mode === 'splat' && splat?.byteLength) {
+      count = Math.floor(splat.byteLength / 32);
+      stride = Math.max(1, Math.floor(count / 100_000));
+      const view = new DataView(splat.buffer, splat.byteOffset, splat.byteLength);
+      pointAt = (index) => [
+        view.getFloat32(index * 32, true),
+        view.getFloat32(index * 32 + 4, true),
+        view.getFloat32(index * 32 + 8, true)
+      ];
     } else if (points.length) {
       count = points.length;
       stride = Math.max(1, Math.floor(count / 100_000));
@@ -385,10 +447,135 @@
     return [0, 1, 2].map((axis) => (minimum[axis] + maximum[axis]) * 0.5) as [number, number, number];
   }
 
+  function transformedPosition(position: [number, number, number], transform: CloudTransform): [number, number, number] {
+    const [xAngle, yAngle, zAngle] = transform.rotation.map((value) => value * Math.PI / 180);
+    const sx = Math.sin(xAngle * 0.5);
+    const cx = Math.cos(xAngle * 0.5);
+    const sy = Math.sin(yAngle * 0.5);
+    const cy = Math.cos(yAngle * 0.5);
+    const sz = Math.sin(zAngle * 0.5);
+    const cz = Math.cos(zAngle * 0.5);
+    const qx = sx * cy * cz + cx * sy * sz;
+    const qy = cx * sy * cz - sx * cy * sz;
+    const qz = cx * cy * sz + sx * sy * cz;
+    const qw = cx * cy * cz - sx * sy * sz;
+    const [x, y, z] = position.map((value, axis) => value * transform.scale[axis]);
+    const tx = 2 * (qy * z - qz * y);
+    const ty = 2 * (qz * x - qx * z);
+    const tz = 2 * (qx * y - qy * x);
+    return [
+      x + qw * tx + (qy * tz - qz * ty) + transform.position[0],
+      y + qw * ty + (qz * tx - qx * tz) + transform.position[1],
+      z + qw * tz + (qx * ty - qy * tx) + transform.position[2]
+    ];
+  }
+
+  function fittedClipBounds(): BoundingBoxClip | null {
+    let count = 0;
+    let pointAt: (index: number) => [number, number, number];
+    if (renderMode === 'mesh' && previewMesh?.positions.length) {
+      count = Math.floor(previewMesh.positions.length / 3);
+      pointAt = (index) => [
+        previewMesh!.positions[index * 3],
+        previewMesh!.positions[index * 3 + 1],
+        previewMesh!.positions[index * 3 + 2]
+      ];
+    } else if (renderMode === 'splat' && previewSplat?.byteLength) {
+      count = Math.floor(previewSplat.byteLength / 32);
+      const view = new DataView(previewSplat.buffer, previewSplat.byteOffset, previewSplat.byteLength);
+      pointAt = (index) => [
+        view.getFloat32(index * 32, true),
+        view.getFloat32(index * 32 + 4, true),
+        view.getFloat32(index * 32 + 8, true)
+      ];
+    } else if (previewPoints.length) {
+      count = previewPoints.length;
+      pointAt = (index) => previewPoints[index].position;
+    } else {
+      return null;
+    }
+    const min: [number, number, number] = [Infinity, Infinity, Infinity];
+    const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+    for (let index = 0; index < count; index += 1) {
+      const point = transformedPosition(pointAt(index), cloudTransform);
+      if (point.some((value) => !Number.isFinite(value))) continue;
+      for (let axis = 0; axis < 3; axis += 1) {
+        min[axis] = Math.min(min[axis], point[axis]);
+        max[axis] = Math.max(max[axis], point[axis]);
+      }
+    }
+    if (min.some((value) => !Number.isFinite(value))) return null;
+    for (let axis = 0; axis < 3; axis += 1) {
+      const padding = Math.max(0.005, (max[axis] - min[axis]) * 0.005);
+      min[axis] -= padding;
+      max[axis] += padding;
+    }
+    return { min, max };
+  }
+
+  function setClippingEnabled(enabled: boolean): void {
+    if (enabled && !clipBounds) {
+      clipBounds = fittedClipBounds();
+      if (!clipBounds) {
+        message = 'Load a result before enabling bounding-box clipping.';
+        return;
+      }
+    }
+    clippingEnabled = enabled;
+    clipEditMode = enabled;
+    editMode = false;
+    floorPickMode = false;
+    persistClip();
+    message = enabled
+      ? 'Bounding-box clipping enabled after the model pose. Drag the box or edit its limits.'
+      : 'Bounding-box clipping disabled; exports will include the full result.';
+  }
+
+  function fitBoundingBox(): void {
+    const bounds = fittedClipBounds();
+    if (!bounds) {
+      message = 'Load a result before fitting the bounding box.';
+      return;
+    }
+    clipBounds = bounds;
+    clippingEnabled = true;
+    persistClip();
+    message = 'Bounding box fitted around the transformed result.';
+  }
+
+  function setClipGizmoMode(mode: 'translate' | 'scale'): void {
+    clipGizmoMode = mode;
+    clipEditMode = true;
+    editMode = false;
+    floorPickMode = false;
+  }
+
+  function handleClipBoundsChanged(bounds: BoundingBoxClip): void {
+    clipBounds = cloneClipBounds(bounds);
+  }
+
+  function commitClipBounds(): void {
+    persistClip();
+    message = 'Bounding box updated; previews and exports use these final-space limits.';
+  }
+
+  function setClipCoordinate(side: 'min' | 'max', axis: number, value: string): void {
+    if (!clipBounds) return;
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return;
+    const next = cloneClipBounds(clipBounds);
+    if (side === 'min') next.min[axis] = Math.min(numeric, next.max[axis] - 0.001);
+    else next.max[axis] = Math.max(numeric, next.min[axis] + 0.001);
+    clipBounds = next;
+    clippingEnabled = true;
+    persistClip();
+  }
+
   function setGizmoMode(mode: 'translate' | 'rotate' | 'scale'): void {
     gizmoMode = mode;
     editMode = true;
     floorPickMode = false;
+    clipEditMode = false;
   }
 
   function handleGizmoTransform(transform: CloudTransform): void {
@@ -425,12 +612,24 @@
       closeProjectManager();
       return;
     }
-    if (event.key === 'Escape' && (editMode || floorPickMode)) {
+    if (event.key === 'Escape' && (editMode || floorPickMode || clipEditMode)) {
       editMode = false;
       floorPickMode = false;
+      clipEditMode = false;
       return;
     }
     if (!canEditModel || event.repeat || isTextEntryTarget(event.target)) return;
+    if (clipEditMode) {
+      const clipMode = event.key.toLowerCase() === 'w'
+        ? 'translate'
+        : event.key.toLowerCase() === 'r'
+          ? 'scale'
+          : null;
+      if (!clipMode) return;
+      event.preventDefault();
+      setClipGizmoMode(clipMode);
+      return;
+    }
     const mode = event.key.toLowerCase() === 'w'
       ? 'translate'
       : event.key.toLowerCase() === 'e'
@@ -1239,6 +1438,7 @@
       const deletingCurrent = entry.id === project.id;
       const active = await deleteProject(entry.path);
       localStorage.removeItem(transformStorageKey(entry.id));
+      localStorage.removeItem(clipStorageKey(entry.id));
       if (deletingCurrent) await activateProject(active, `${entry.name} deleted. ${active.name} is now open.`);
       else message = `${entry.name} deleted.`;
       await refreshProjectCatalog();
@@ -1276,7 +1476,7 @@
     const destination = await save({ title: 'Export metric point cloud', defaultPath: 'scan-cloud.ply', filters: [{ name: 'PLY point cloud', extensions: ['ply'] }] });
     if (!destination) return;
     try {
-      message = `Aligned point cloud exported to ${await exportPly(project.path, destination, cloudTransform)}.`;
+      message = `Aligned${clippingEnabled ? ' and clipped' : ''} point cloud exported to ${await exportPly(project.path, destination, cloudTransform, clippingEnabled ? clipBounds : null)}.`;
     } catch (error) { message = errorText(error); }
   }
 
@@ -1285,7 +1485,7 @@
     const destination = await save({ title: 'Export textured mesh bundle', defaultPath: 'scan-mesh.obj', filters: [{ name: 'Wavefront OBJ', extensions: ['obj'] }] });
     if (!destination) return;
     try {
-      message = `Aligned OBJ, MTL, and texture exported beside ${await exportTexturedMesh(project.path, destination, cloudTransform)}.`;
+      message = `Aligned${clippingEnabled ? ' and clipped' : ''} OBJ, MTL, and texture exported beside ${await exportTexturedMesh(project.path, destination, cloudTransform, clippingEnabled ? clipBounds : null)}.`;
     } catch (error) { message = errorText(error); }
   }
 
@@ -1294,7 +1494,7 @@
     const destination = await save({ title: 'Export metric 2D Gaussian surface', defaultPath: 'scan-2dgs.ply', filters: [{ name: 'Gaussian PLY', extensions: ['ply'] }] });
     if (!destination) return;
     try {
-      message = `Gaussian surface and coordinate sidecars exported to ${await exportGaussianSplat(project.path, destination)}.`;
+      message = `Aligned${clippingEnabled ? ' and clipped' : ''} Gaussian surface and coordinate sidecars exported to ${await exportGaussianSplat(project.path, destination, cloudTransform, clippingEnabled ? clipBounds : null)}.`;
     } catch (error) { message = errorText(error); }
   }
 
@@ -1459,10 +1659,15 @@
         editMode={editMode && canEditModel}
         {gizmoMode}
         {rotationSnapDegrees}
+        clipBounds={clippingEnabled ? clipBounds : null}
+        {clipEditMode}
+        {clipGizmoMode}
         onFloorDetected={setFloorTransform}
         onFloorMessage={(value) => message = value}
         onTransformChanged={handleGizmoTransform}
         onTransformCommitted={commitGizmoTransform}
+        onClipBoundsChanged={handleClipBoundsChanged}
+        onClipBoundsCommitted={commitClipBounds}
       />
 
       {#if liveSensor && sensor}
@@ -1722,12 +1927,11 @@
         {#if renderMode === 'mesh'}
           <section class="panel settings"><label>Mesh display<select bind:value={meshViewMode}><option value="surface">Textured</option><option value="surface-wireframe">Texture + wire</option><option value="wireframe">Wireframe</option><option value="shaded">Shaded</option></select></label></section>
         {/if}
-        {#if renderMode !== 'splat'}
-          <section class="panel edit-tools">
+        <section class="panel edit-tools">
             <div class="section-title"><span>MODEL POSE</span><strong class:edited={hasEditPose}>{hasEditPose ? 'EDITED' : 'ORIGINAL'}</strong></div>
             <div class="edit-actions">
-              <button class:active={floorPickMode} disabled={!canEditModel} on:click={() => { floorPickMode = !floorPickMode; editMode = false; }}>{floorPickMode ? 'Cancel floor pick' : 'Pick floor'}</button>
-              <button class:active={editMode} disabled={!canEditModel} on:click={() => { editMode = !editMode; floorPickMode = false; }}>{editMode ? 'Close gizmo' : 'Transform gizmo'}</button>
+              <button class:active={floorPickMode} disabled={!canEditModel} on:click={() => { floorPickMode = !floorPickMode; editMode = false; clipEditMode = false; }}>{floorPickMode ? 'Cancel floor pick' : 'Pick floor'}</button>
+              <button class:active={editMode} disabled={!canEditModel} on:click={() => { editMode = !editMode; floorPickMode = false; clipEditMode = false; }}>{editMode ? 'Close gizmo' : 'Transform gizmo'}</button>
             </div>
             {#if editMode && canEditModel}
               <div class="gizmo-modes">
@@ -1756,9 +1960,31 @@
               <button class="save-pose" class:dirty={transformDirty} disabled={!transformDirty} on:click={saveTransform}>{transformDirty ? 'Save pose' : 'Pose saved'}</button>
             {/if}
             <button class="reset-pose" disabled={!hasEditPose} on:click={resetEditPose}>Reset pose</button>
-            <p>{transformSaveMode === 'manual' ? 'Manipulations stay in memory until Save pose, so you can edit without persistence work between tools.' : 'Each completed manipulation is saved automatically.'} The current pose is applied to point-cloud and mesh exports.</p>
+            <p>{transformSaveMode === 'manual' ? 'Manipulations stay in memory until Save pose, so you can edit without persistence work between tools.' : 'Each completed manipulation is saved automatically.'} The current pose is shared by point-cloud, mesh, and Gaussian exports.</p>
           </section>
-        {/if}
+        <section class="panel edit-tools clip-tools">
+          <div class="section-title"><span>BOUNDING BOX</span><strong class:edited={clippingEnabled}>{clippingEnabled ? 'CLIPPING' : 'OFF'}</strong></div>
+          <div class="edit-actions">
+            <button class:active={clippingEnabled} disabled={!canClipModel && !clipBounds} on:click={() => setClippingEnabled(!clippingEnabled)}>{clippingEnabled ? 'Disable clipping' : 'Enable clipping'}</button>
+            <button class:active={clipEditMode} disabled={!clippingEnabled || !clipBounds} on:click={() => { clipEditMode = !clipEditMode; editMode = false; floorPickMode = false; }}>{clipEditMode ? 'Close box gizmo' : 'Edit box'}</button>
+          </div>
+          <button class="reset-pose" disabled={!canClipModel} on:click={fitBoundingBox}>Fit to transformed result</button>
+          {#if clippingEnabled && clipBounds}
+            {#if clipEditMode}
+              <div class="gizmo-modes">
+                <button class:active={clipGizmoMode === 'translate'} on:click={() => setClipGizmoMode('translate')}>Move <kbd>W</kbd></button>
+                <button class:active={clipGizmoMode === 'scale'} on:click={() => setClipGizmoMode('scale')}>Resize <kbd>R</kbd></button>
+              </div>
+            {/if}
+            <div class="clip-grid">
+              <span></span><small>MIN</small><small>MAX</small>
+              <b>X</b><input aria-label="Minimum X" type="number" step="0.01" value={clipBounds.min[0]} on:change={(event) => setClipCoordinate('min', 0, inputValue(event))}><input aria-label="Maximum X" type="number" step="0.01" value={clipBounds.max[0]} on:change={(event) => setClipCoordinate('max', 0, inputValue(event))}>
+              <b>Y</b><input aria-label="Minimum Y" type="number" step="0.01" value={clipBounds.min[1]} on:change={(event) => setClipCoordinate('min', 1, inputValue(event))}><input aria-label="Maximum Y" type="number" step="0.01" value={clipBounds.max[1]} on:change={(event) => setClipCoordinate('max', 1, inputValue(event))}>
+              <b>Z</b><input aria-label="Minimum Z" type="number" step="0.01" value={clipBounds.min[2]} on:change={(event) => setClipCoordinate('min', 2, inputValue(event))}><input aria-label="Maximum Z" type="number" step="0.01" value={clipBounds.max[2]} on:change={(event) => setClipCoordinate('max', 2, inputValue(event))}>
+            </div>
+          {/if}
+          <p>The box is world-axis aligned after the model pose. Only geometry inside it is exported.</p>
+        </section>
         <section class="panel result-stats">
           <div><span>Points</span><strong>{formatCount(project.pointCount)}</strong></div>
           <div><span>Triangles</span><strong>{formatCount(project.meshTriangleCount)}</strong></div>
@@ -1769,7 +1995,7 @@
         <section class="panel export-list">
           <button on:click={exportPointCloud} disabled={!artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>Metric colored vertices</small></div><i>Export…</i></button>
           <button on:click={exportMesh} disabled={!artifactReady('texturedMesh')}><span>M</span><div><strong>Textured OBJ bundle</strong><small>OBJ + MTL + PNG</small></div><i>Export…</i></button>
-          <button on:click={exportSplat} disabled={!artifactReady('gaussianSplat')}><span>G</span><div><strong>2D Gaussian PLY</strong><small>Canonical metric splat + sidecars</small></div><i>Export…</i></button>
+          <button on:click={exportSplat} disabled={!artifactReady('gaussianSplat')}><span>G</span><div><strong>2D Gaussian PLY</strong><small>Aligned metric splat + sidecars</small></div><i>Export…</i></button>
         </section>
       {/if}
     </aside>
@@ -1985,6 +2211,7 @@
   .edit-tools .section-title strong.edited { color: var(--amber); }
   .edit-actions, .gizmo-modes { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
   .gizmo-modes { grid-template-columns: repeat(3, 1fr); }
+  .clip-tools .gizmo-modes { grid-template-columns: repeat(2, 1fr); }
   .edit-options { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding-top: 2px; }
   .edit-options label { display: grid; gap: 5px; color: #78909d; font-size: 9px; font-weight: 700; }
   .edit-options select { height: 32px; padding: 0 8px; font-size: 9px; }
@@ -1995,6 +2222,10 @@
   .edit-tools kbd { margin-left: 3px; padding: 1px 4px; border: 1px solid rgba(155,199,215,.16); border-radius: 4px; color: var(--cyan); font-family: ui-monospace, monospace; font-size: 8px; }
   .edit-tools .reset-pose { min-height: 30px; color: #7f97a2; }
   .edit-tools > p { color: #687f8a; font-size: 9px; line-height: 1.45; }
+  .clip-grid { display: grid; grid-template-columns: 18px 1fr 1fr; align-items: center; gap: 5px; }
+  .clip-grid small { color: #617985; font-size: 7px; font-weight: 800; letter-spacing: .08em; text-align: center; }
+  .clip-grid b { color: var(--amber); font-size: 9px; text-align: center; }
+  .clip-grid input { width: 100%; min-width: 0; padding: 6px; border: 1px solid var(--line); border-radius: 6px; background: #081620; color: #b8cbd3; font-size: 9px; font-variant-numeric: tabular-nums; }
   .result-stats { padding: 0; }
   .result-stats p { grid-column: 1 / -1; margin: 0; padding: 10px; background: #0b1924; }
   .export-list { display: grid; gap: 7px; }
