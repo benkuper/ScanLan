@@ -9,6 +9,7 @@
 
   type RenderMode = 'points' | 'mesh' | 'splat';
   type AssetLoadingState = 'points' | 'mesh' | 'mesh-texture' | 'splat' | 'splat-gpu' | null;
+  type ProjectionMode = 'orthographic' | 'perspective';
 
   export let points: PreviewPoint[] = [];
   export let packedFrame: PackedPreviewFrame | null = null;
@@ -41,6 +42,7 @@
   export let onClipBoundsCommitted: () => void = () => undefined;
 
   let canvas: HTMLCanvasElement;
+  let viewCubeCanvas: HTMLCanvasElement;
   let setPoints: (next: PreviewPoint[]) => void = () => undefined;
   let setPackedPoints: (next: PackedPreviewFrame) => void = () => undefined;
   let setMaterial: (size: number, alpha: number, colors: boolean) => void = () => undefined;
@@ -52,6 +54,9 @@
   let setClip: (bounds: BoundingBoxClip | null) => void = () => undefined;
   let setGizmo: (modelEnabled: boolean, modelMode: 'translate' | 'rotate' | 'scale', clipEnabled: boolean, clipMode: 'translate' | 'scale') => void = () => undefined;
   let setRotationSnap: (degrees: number) => void = () => undefined;
+  let resetCameraView: () => void = () => undefined;
+  let toggleProjection: () => void = () => undefined;
+  let projectionMode: ProjectionMode = 'perspective';
   let splatReady = false;
   let splatError = '';
   let splatLoadProgress: number | null = null;
@@ -129,8 +134,11 @@
     scene.background = new THREE.Color('#07111c');
     scene.fog = new THREE.FogExp2('#07111c', 0.055);
 
-    const camera = new THREE.PerspectiveCamera(48, 1, 0.01, 100);
-    camera.position.set(6.8, 4.7, 7.6);
+    const perspectiveCamera = new THREE.PerspectiveCamera(48, 1, 0.01, 100);
+    const orthographicCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 100);
+    perspectiveCamera.position.set(6.8, 4.7, 7.6);
+    orthographicCamera.position.copy(perspectiveCamera.position);
+    let camera: THREE.Camera = perspectiveCamera;
     const renderer = new THREE.WebGLRenderer({
       canvas,
       antialias: false,
@@ -182,8 +190,17 @@
     controls.target.set(0, 1.1, 0);
     controls.minDistance = 0.15;
     controls.maxDistance = 30;
+    let cameraTween: {
+      startedAt: number;
+      fromOffset: THREE.Vector3;
+      rotation: THREE.Quaternion;
+      projectionAfter: ProjectionMode | null;
+    } | null = null;
+    let applyProjectionMode: (next: ProjectionMode) => void = () => undefined;
+    let controlsStartDirection: THREE.Vector3 | null = null;
     let restoreQualityTimer = 0;
     const interactionStart = () => {
+      cameraTween = null;
       window.clearTimeout(restoreQualityTimer);
       if (renderMode === 'splat' && sparkRenderer) sparkRenderer.maxStdDev = Math.sqrt(5);
       applyPixelRatio(interactionPixelRatio);
@@ -195,9 +212,208 @@
         applyPixelRatio(renderMode === 'splat' ? qualityPixelRatio : Math.min(window.devicePixelRatio, 2));
       }, 120);
     };
-    controls.addEventListener('change', invalidate);
-    controls.addEventListener('start', interactionStart);
-    controls.addEventListener('end', interactionEnd);
+    const handleControlsChange = () => {
+      if (projectionMode === 'orthographic' && controlsStartDirection && !cameraTween) {
+        const direction = camera.position.clone().sub(controls.target).normalize();
+        if (direction.angleTo(controlsStartDirection) > 0.001) applyProjectionMode('perspective');
+      }
+      invalidate();
+    };
+    const handleControlsStart = () => {
+      controlsStartDirection = camera.position.clone().sub(controls.target).normalize();
+      interactionStart();
+    };
+    const handleControlsEnd = () => {
+      controlsStartDirection = null;
+      interactionEnd();
+    };
+    controls.addEventListener('change', handleControlsChange);
+    controls.addEventListener('start', handleControlsStart);
+    controls.addEventListener('end', handleControlsEnd);
+
+    const viewCubeScene = new THREE.Scene();
+    const viewCubeOrthographicCamera = new THREE.OrthographicCamera(-2.05, 2.05, 2.05, -2.05, 0.1, 20);
+    const viewCubePerspectiveCamera = new THREE.PerspectiveCamera(34, 1, 0.1, 20);
+    viewCubeOrthographicCamera.position.set(0, 0, 6);
+    viewCubePerspectiveCamera.position.copy(viewCubeOrthographicCamera.position);
+    let viewCubeCamera: THREE.Camera = viewCubePerspectiveCamera;
+    const viewCubeRenderer = new THREE.WebGLRenderer({
+      canvas: viewCubeCanvas,
+      alpha: true,
+      antialias: true,
+      powerPreference: 'low-power'
+    });
+    viewCubeRenderer.setClearColor(0x000000, 0);
+    viewCubeRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    viewCubeRenderer.setSize(118, 118, false);
+    viewCubeRenderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const makeFaceTexture = (label: string, axis: string, topColor: string, bottomColor: string) => {
+      const textureCanvas = document.createElement('canvas');
+      textureCanvas.width = 256;
+      textureCanvas.height = 256;
+      const context = textureCanvas.getContext('2d')!;
+      const gradient = context.createLinearGradient(0, 0, 0, 256);
+      gradient.addColorStop(0, topColor);
+      gradient.addColorStop(1, bottomColor);
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, 256, 256);
+      context.strokeStyle = 'rgba(172, 229, 247, 0.5)';
+      context.lineWidth = 10;
+      context.strokeRect(5, 5, 246, 246);
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.shadowColor = 'rgba(0, 0, 0, 0.5)';
+      context.shadowBlur = 7;
+      context.fillStyle = '#f0fbfe';
+      context.font = '850 58px Inter, Segoe UI, sans-serif';
+      context.fillText(axis, 128, 112);
+      context.shadowBlur = 4;
+      context.fillStyle = 'rgba(232, 248, 252, 0.9)';
+      context.font = `800 ${label.length > 5 ? 22 : 25}px Inter, Segoe UI, sans-serif`;
+      context.fillText(label, 128, 171);
+      const texture = new THREE.CanvasTexture(textureCanvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.anisotropy = Math.min(4, viewCubeRenderer.capabilities.getMaxAnisotropy());
+      return texture;
+    };
+
+    const viewCubeFaceSpecs = [
+      ['RIGHT', '+X', '#b64f59', '#6e2833'],
+      ['LEFT', '-X', '#923e49', '#511e29'],
+      ['TOP', '+Y', '#4f9b6d', '#245c3d'],
+      ['BOTTOM', '-Y', '#397952', '#193f2c'],
+      ['BACK', '-Z', '#306797', '#17385f'],
+      ['FRONT', '+Z', '#397fb5', '#1e4c78']
+    ] as const;
+    const viewCubeTextures = viewCubeFaceSpecs.map(([label, axis, topColor, bottomColor]) =>
+      makeFaceTexture(label, axis, topColor, bottomColor)
+    );
+    const viewCubeMaterials = viewCubeTextures.map((map) => new THREE.MeshBasicMaterial({ map }));
+    const viewCubeGeometry = new THREE.BoxGeometry(1.42, 1.42, 1.42);
+    const viewCubeMesh = new THREE.Mesh(viewCubeGeometry, viewCubeMaterials);
+    const viewCubeRoot = new THREE.Group();
+    viewCubeRoot.add(viewCubeMesh);
+    const viewCubeEdgeGeometry = new THREE.EdgesGeometry(viewCubeGeometry);
+    const viewCubeEdgeMaterial = new THREE.LineBasicMaterial({
+      color: '#d0edf4',
+      transparent: true,
+      opacity: 0.8
+    });
+    const viewCubeEdges = new THREE.LineSegments(viewCubeEdgeGeometry, viewCubeEdgeMaterial);
+    viewCubeEdges.scale.setScalar(1.003);
+    viewCubeRoot.add(viewCubeEdges);
+    viewCubeScene.add(viewCubeRoot);
+
+    const viewCubeRaycaster = new THREE.Raycaster();
+    const viewCubePointer = new THREE.Vector2();
+    const pickViewCubeFace = (event: PointerEvent) => {
+      const bounds = viewCubeCanvas.getBoundingClientRect();
+      viewCubePointer.set(
+        ((event.clientX - bounds.left) / bounds.width) * 2 - 1,
+        -((event.clientY - bounds.top) / bounds.height) * 2 + 1
+      );
+      viewCubeRoot.updateMatrixWorld(true);
+      viewCubeRaycaster.setFromCamera(viewCubePointer, viewCubeCamera);
+      return viewCubeRaycaster.intersectObject(viewCubeMesh, false)[0] ?? null;
+    };
+    const updateViewCubeHover = (materialIndex: number | null) => {
+      viewCubeMaterials.forEach((material, index) => {
+        material.color.set(index === materialIndex ? '#bfefff' : '#ffffff');
+      });
+      invalidate();
+    };
+    const snapCameraTo = (direction: THREE.Vector3, projectionAfter: ProjectionMode | null = null) => {
+      if (projectionAfter === 'perspective') applyProjectionMode('perspective');
+      const fromOffset = camera.position.clone().sub(controls.target);
+      if (fromOffset.lengthSq() < 1e-8 || direction.lengthSq() < 1e-8) return;
+      const fromDirection = fromOffset.clone().normalize();
+      const toDirection = direction.clone().normalize();
+      cameraTween = {
+        startedAt: performance.now(),
+        fromOffset,
+        rotation: new THREE.Quaternion().setFromUnitVectors(fromDirection, toDirection),
+        projectionAfter
+      };
+      window.clearTimeout(restoreQualityTimer);
+      applyPixelRatio(interactionPixelRatio);
+      invalidate();
+    };
+    resetCameraView = () => snapCameraTo(new THREE.Vector3(0.68, 0.48, 0.76), 'perspective');
+
+    let viewCubePointerId: number | null = null;
+    let viewCubeDragging = false;
+    let viewCubeLastX = 0;
+    let viewCubeLastY = 0;
+    let viewCubeTravel = 0;
+    const handleViewCubePointerDown = (event: PointerEvent) => {
+      event.preventDefault();
+      viewCubePointerId = event.pointerId;
+      viewCubeDragging = false;
+      viewCubeTravel = 0;
+      viewCubeLastX = event.clientX;
+      viewCubeLastY = event.clientY;
+      viewCubeCanvas.setPointerCapture(event.pointerId);
+      interactionStart();
+    };
+    const handleViewCubePointerMove = (event: PointerEvent) => {
+      if (viewCubePointerId !== event.pointerId) {
+        const hit = pickViewCubeFace(event);
+        updateViewCubeHover(hit?.face?.materialIndex ?? null);
+        return;
+      }
+      const deltaX = event.clientX - viewCubeLastX;
+      const deltaY = event.clientY - viewCubeLastY;
+      viewCubeLastX = event.clientX;
+      viewCubeLastY = event.clientY;
+      viewCubeTravel += Math.abs(deltaX) + Math.abs(deltaY);
+      if (viewCubeTravel > 4 && !viewCubeDragging) {
+        viewCubeDragging = true;
+        applyProjectionMode('perspective');
+      }
+      if (!viewCubeDragging) return;
+
+      const offset = camera.position.clone().sub(controls.target);
+      const spherical = new THREE.Spherical().setFromVector3(offset);
+      spherical.theta -= deltaX * 0.012;
+      spherical.phi = THREE.MathUtils.clamp(spherical.phi - deltaY * 0.012, 0.025, Math.PI - 0.025);
+      camera.position.copy(controls.target).add(new THREE.Vector3().setFromSpherical(spherical));
+      camera.lookAt(controls.target);
+      controls.update();
+      invalidate();
+    };
+    const handleViewCubePointerUp = (event: PointerEvent) => {
+      if (viewCubePointerId !== event.pointerId) return;
+      if (viewCubeCanvas.hasPointerCapture(event.pointerId)) viewCubeCanvas.releasePointerCapture(event.pointerId);
+      viewCubePointerId = null;
+      if (viewCubeDragging) {
+        viewCubeDragging = false;
+        interactionEnd();
+        return;
+      }
+      const hit = pickViewCubeFace(event);
+      if (!hit?.face) {
+        interactionEnd();
+        return;
+      }
+      const localPoint = viewCubeMesh.worldToLocal(hit.point.clone());
+      const direction = hit.face.normal.clone();
+      const edgeThreshold = 0.51;
+      if (Math.abs(localPoint.x) > edgeThreshold) direction.x = Math.sign(localPoint.x);
+      if (Math.abs(localPoint.y) > edgeThreshold) direction.y = Math.sign(localPoint.y);
+      if (Math.abs(localPoint.z) > edgeThreshold) direction.z = Math.sign(localPoint.z);
+      const componentCount = [direction.x, direction.y, direction.z]
+        .filter((component) => Math.abs(component) > 0.5).length;
+      snapCameraTo(direction.normalize(), componentCount === 1 ? 'orthographic' : 'perspective');
+    };
+    const handleViewCubePointerLeave = () => {
+      if (viewCubePointerId === null) updateViewCubeHover(null);
+    };
+    viewCubeCanvas.addEventListener('pointerdown', handleViewCubePointerDown);
+    viewCubeCanvas.addEventListener('pointermove', handleViewCubePointerMove);
+    viewCubeCanvas.addEventListener('pointerup', handleViewCubePointerUp);
+    viewCubeCanvas.addEventListener('pointercancel', handleViewCubePointerUp);
+    viewCubeCanvas.addEventListener('pointerleave', handleViewCubePointerLeave);
 
     const grid = new THREE.GridHelper(12, 24, '#19384a', '#102a39');
     grid.position.y = -0.015;
@@ -242,6 +458,51 @@
     transformControls.scaleSnap = 0.01;
     transformHelper.visible = false;
     scene.add(transformHelper);
+
+    const viewportAspect = () => {
+      const bounds = canvas.getBoundingClientRect();
+      return bounds.height > 0 ? Math.max(0.01, bounds.width / bounds.height) : perspectiveCamera.aspect;
+    };
+    applyProjectionMode = (next) => {
+      if (next === projectionMode) return;
+      const aspect = viewportAspect();
+      if (next === 'orthographic') {
+        const distance = Math.max(0.01, camera.position.distanceTo(controls.target));
+        const verticalSpan = 2 * distance * Math.tan(THREE.MathUtils.degToRad(perspectiveCamera.fov * 0.5));
+        orthographicCamera.left = -verticalSpan * aspect * 0.5;
+        orthographicCamera.right = verticalSpan * aspect * 0.5;
+        orthographicCamera.top = verticalSpan * 0.5;
+        orthographicCamera.bottom = -verticalSpan * 0.5;
+        orthographicCamera.zoom = 1;
+        orthographicCamera.position.copy(camera.position);
+        orthographicCamera.quaternion.copy(camera.quaternion);
+        orthographicCamera.up.copy(camera.up);
+        orthographicCamera.updateProjectionMatrix();
+        camera = orthographicCamera;
+        viewCubeCamera = viewCubeOrthographicCamera;
+      } else {
+        if (camera === orthographicCamera) {
+          const verticalSpan = (orthographicCamera.top - orthographicCamera.bottom) / orthographicCamera.zoom;
+          const distance = verticalSpan
+            / (2 * Math.tan(THREE.MathUtils.degToRad(perspectiveCamera.fov * 0.5)));
+          const direction = orthographicCamera.position.clone().sub(controls.target).normalize();
+          perspectiveCamera.position.copy(controls.target).addScaledVector(direction, distance);
+          perspectiveCamera.quaternion.copy(orthographicCamera.quaternion);
+          perspectiveCamera.up.copy(orthographicCamera.up);
+        }
+        perspectiveCamera.aspect = aspect;
+        perspectiveCamera.updateProjectionMatrix();
+        camera = perspectiveCamera;
+        viewCubeCamera = viewCubePerspectiveCamera;
+      }
+      controls.object = camera;
+      transformControls.camera = camera;
+      projectionMode = next;
+      invalidate();
+    };
+    toggleProjection = () => {
+      applyProjectionMode(projectionMode === 'perspective' ? 'orthographic' : 'perspective');
+    };
 
     const pointGeometry = new THREE.BufferGeometry();
     const pointMaterial = new THREE.PointsMaterial({
@@ -446,12 +707,17 @@
         invalidate();
         return;
       }
-      clippingPlanes[0].setComponents(-1, 0, 0, -bounds.min[0]);
-      clippingPlanes[1].setComponents(1, 0, 0, bounds.max[0]);
-      clippingPlanes[2].setComponents(0, -1, 0, -bounds.min[1]);
-      clippingPlanes[3].setComponents(0, 1, 0, bounds.max[1]);
-      clippingPlanes[4].setComponents(0, 0, -1, -bounds.min[2]);
-      clippingPlanes[5].setComponents(0, 0, 1, bounds.max[2]);
+      // Three.js discards the negative half-space of each material clipping
+      // plane. Keep the box interior by pointing the minimum planes inward
+      // and the maximum planes inward from the opposite side. These planes
+      // are expressed in world space, so clipping remains after `root`'s
+      // model transform, matching the CPU-filtered splat path.
+      clippingPlanes[0].setComponents(1, 0, 0, -bounds.min[0]);
+      clippingPlanes[1].setComponents(-1, 0, 0, bounds.max[0]);
+      clippingPlanes[2].setComponents(0, 1, 0, -bounds.min[1]);
+      clippingPlanes[3].setComponents(0, -1, 0, bounds.max[1]);
+      clippingPlanes[4].setComponents(0, 0, 1, -bounds.min[2]);
+      clippingPlanes[5].setComponents(0, 0, -1, bounds.max[2]);
       for (const material of materials) {
         if (material.clippingPlanes !== clippingPlanes) {
           material.clippingPlanes = clippingPlanes;
@@ -649,7 +915,7 @@
       pointCloud.visible = next === 'points';
       meshGroup.visible = next === 'mesh';
       splatGroup.visible = next === 'splat';
-      grid.visible = next !== 'splat';
+      grid.visible = true;
       applyPixelRatio(next === 'splat' ? qualityPixelRatio : Math.min(window.devicePixelRatio, 2));
       updateMeshAppearance();
       invalidate();
@@ -939,8 +1205,13 @@
         renderedWidth = width;
         renderedHeight = height;
         renderer.setSize(width, height, false);
-        camera.aspect = width / height;
-        camera.updateProjectionMatrix();
+        const aspect = width / height;
+        perspectiveCamera.aspect = aspect;
+        perspectiveCamera.updateProjectionMatrix();
+        const orthographicHalfHeight = (orthographicCamera.top - orthographicCamera.bottom) * 0.5;
+        orthographicCamera.left = -orthographicHalfHeight * aspect;
+        orthographicCamera.right = orthographicHalfHeight * aspect;
+        orthographicCamera.updateProjectionMatrix();
         invalidate();
       });
     };
@@ -951,10 +1222,31 @@
     let animationFrame = 0;
     const animate = () => {
       animationFrame = requestAnimationFrame(animate);
+      let tweenChanged = false;
+      if (cameraTween) {
+        const elapsed = (performance.now() - cameraTween.startedAt) / 360;
+        const progress = THREE.MathUtils.clamp(elapsed, 0, 1);
+        const eased = progress < 0.5
+          ? 4 * progress * progress * progress
+          : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+        const stepRotation = new THREE.Quaternion().slerp(cameraTween.rotation, eased);
+        const offset = cameraTween.fromOffset.clone().applyQuaternion(stepRotation);
+        camera.position.copy(controls.target).add(offset);
+        camera.lookAt(controls.target);
+        tweenChanged = true;
+        if (progress >= 1) {
+          const projectionAfter = cameraTween.projectionAfter;
+          cameraTween = null;
+          if (projectionAfter) applyProjectionMode(projectionAfter);
+          interactionEnd();
+        }
+      }
       const changed = controls.update();
-      if (!changed && !renderInvalidated) return;
+      if (!changed && !tweenChanged && !renderInvalidated) return;
       renderInvalidated = false;
       renderer.render(scene, camera);
+      viewCubeRoot.quaternion.copy(camera.quaternion).invert();
+      viewCubeRenderer.render(viewCubeScene, viewCubeCamera);
     };
     animate();
 
@@ -964,11 +1256,18 @@
       cancelAnimationFrame(resizeFrame);
       window.clearInterval(loadingTimer);
       window.clearTimeout(restoreQualityTimer);
+      resetCameraView = () => undefined;
+      toggleProjection = () => undefined;
       canvas.removeEventListener('pointerup', handleFloorPick);
+      viewCubeCanvas.removeEventListener('pointerdown', handleViewCubePointerDown);
+      viewCubeCanvas.removeEventListener('pointermove', handleViewCubePointerMove);
+      viewCubeCanvas.removeEventListener('pointerup', handleViewCubePointerUp);
+      viewCubeCanvas.removeEventListener('pointercancel', handleViewCubePointerUp);
+      viewCubeCanvas.removeEventListener('pointerleave', handleViewCubePointerLeave);
       resizeObserver.disconnect();
-      controls.removeEventListener('change', invalidate);
-      controls.removeEventListener('start', interactionStart);
-      controls.removeEventListener('end', interactionEnd);
+      controls.removeEventListener('change', handleControlsChange);
+      controls.removeEventListener('start', handleControlsStart);
+      controls.removeEventListener('end', handleControlsEnd);
       controls.dispose();
       transformControls.removeEventListener('objectChange', handleGizmoObjectChange);
       transformControls.removeEventListener('dragging-changed', handleGizmoDragging);
@@ -989,16 +1288,44 @@
       clipBoxMaterial.dispose();
       clipEdgeGeometry.dispose();
       clipEdgeMaterial.dispose();
+      viewCubeGeometry.dispose();
+      viewCubeEdgeGeometry.dispose();
+      viewCubeEdgeMaterial.dispose();
+      viewCubeTextures.forEach((texture) => texture.dispose());
+      viewCubeMaterials.forEach((material) => material.dispose());
+      viewCubeRenderer.dispose();
       renderer.dispose();
     };
   });
 </script>
 
 <div class:processing class:point-pick={floorPickMode} class:clip-edit={clipEditMode} class="viewer">
-  <canvas bind:this={canvas} aria-label="Interactive 3D reconstruction"></canvas>
+  <canvas class="scene-canvas" bind:this={canvas} aria-label="Interactive 3D reconstruction"></canvas>
   <div class:live class="viewer-hud top-left">
     <span class="pulse"></span>
     {processing ? renderMode === 'splat' ? 'Training 2D Gaussian splats' : 'Reconstructing geometry' : live ? liveLabel : renderMode === 'splat' ? splatError ? 'Splat preview failed' : splatReady ? '2D Gaussian splat' : 'Loading splat' : renderMode === 'mesh' && mesh ? meshViewMode === 'wireframe' ? 'Wireframe' : meshViewMode === 'shaded' ? 'Shaded mesh' : meshViewMode === 'surface-wireframe' ? 'Mesh + wireframe' : 'Textured mesh' : points.length || packedFrame?.pointCount ? 'Point cloud' : 'Awaiting RGB-D frames'}
+  </div>
+
+  <div class:live-offset={live} class="view-cube-shell">
+    <canvas
+      class="view-cube-canvas"
+      bind:this={viewCubeCanvas}
+      aria-label="View cube. Drag to orbit or click a face, edge, or corner to align the camera."
+      title="Drag to orbit · Click a face, edge, or corner to snap"
+    ></canvas>
+    <button
+      class:orthographic={projectionMode === 'orthographic'}
+      class="projection-toggle"
+      type="button"
+      on:click={toggleProjection}
+      aria-label={`Switch to ${projectionMode === 'orthographic' ? 'perspective' : 'orthographic'} projection`}
+      title={`Switch to ${projectionMode === 'orthographic' ? 'perspective' : 'orthographic'} projection`}
+    >{projectionMode === 'orthographic' ? 'ISO' : 'PERSP'}</button>
+    <button class="view-home" type="button" on:click={resetCameraView} aria-label="Reset to isometric view" title="Reset to isometric view">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3.5 11.1 12 4l8.5 7.1M5.8 9.4v9.1h4.1v-5.2h4.2v5.2h4.1V9.4" />
+      </svg>
+    </button>
   </div>
 
   {#if floorPickMode}
@@ -1029,10 +1356,22 @@
 
 <style>
   .viewer { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; border-radius: 22px; background: #07111c; box-shadow: inset 0 0 0 1px rgba(139, 193, 216, 0.08); }
-  canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; cursor: grab; }
-  canvas:active { cursor: grabbing; }
-  .point-pick canvas, .point-pick canvas:active { cursor: crosshair; }
-  .clip-edit canvas { cursor: default; }
+  .scene-canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; cursor: grab; }
+  .scene-canvas:active { cursor: grabbing; }
+  .point-pick .scene-canvas, .point-pick .scene-canvas:active { cursor: crosshair; }
+  .clip-edit .scene-canvas { cursor: default; }
+  .view-cube-shell { position: absolute; z-index: 7; top: 14px; right: 14px; width: 118px; height: 118px; pointer-events: none; transition: top 180ms ease; }
+  .view-cube-shell.live-offset { top: 82px; }
+  .view-cube-canvas { position: relative; display: block; width: 118px; height: 118px; cursor: grab; filter: drop-shadow(0 10px 12px rgba(0, 0, 0, 0.36)); pointer-events: auto; touch-action: none; }
+  .view-cube-canvas:active { cursor: grabbing; }
+  .projection-toggle { position: absolute; z-index: 1; top: 1px; left: 1px; min-width: 37px; height: 27px; padding: 0 7px; border: 1px solid rgba(139, 210, 234, 0.23); border-radius: 14px; background: rgba(7, 23, 34, 0.72); box-shadow: 0 6px 16px rgba(0, 0, 0, 0.28); color: #7899a7; font: 800 7px/1 Inter, Segoe UI, sans-serif; letter-spacing: 0.06em; cursor: pointer; pointer-events: auto; backdrop-filter: blur(10px); }
+  .projection-toggle.orthographic { border-color: rgba(98, 214, 186, 0.34); color: #6ed7bd; }
+  .projection-toggle:hover { border-color: rgba(103, 201, 231, 0.52); background: rgba(19, 52, 67, 0.82); color: #cef4fc; }
+  .projection-toggle:focus-visible { outline: 2px solid rgba(99, 199, 231, 0.75); outline-offset: 2px; }
+  .view-home { position: absolute; z-index: 1; top: 1px; right: 1px; display: grid; place-items: center; width: 27px; height: 27px; padding: 0; border: 1px solid rgba(139, 210, 234, 0.23); border-radius: 50%; background: rgba(7, 23, 34, 0.72); box-shadow: 0 6px 16px rgba(0, 0, 0, 0.28); color: #80cfe7; cursor: pointer; pointer-events: auto; backdrop-filter: blur(10px); }
+  .view-home svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .view-home:hover { border-color: rgba(103, 201, 231, 0.52); background: rgba(19, 52, 67, 0.82); color: #cef4fc; }
+  .view-home:focus-visible { outline: 2px solid rgba(99, 199, 231, 0.75); outline-offset: 2px; }
   .viewer-hud { position: absolute; display: flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid rgba(157, 204, 223, 0.12); border-radius: 10px; background: rgba(5, 15, 25, 0.68); color: #adc3d0; font-size: 11px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; backdrop-filter: blur(12px); pointer-events: none; }
   .top-left { top: 16px; left: 16px; }
   .bottom-right { right: 16px; bottom: 16px; text-transform: none; letter-spacing: 0; }
