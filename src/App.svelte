@@ -1026,6 +1026,7 @@
     workspace = 'capture';
     editMode = false;
     floorPickMode = false;
+    clipEditMode = false;
     await ensureSensorPreview();
   }
 
@@ -1034,6 +1035,7 @@
     workspace = 'reconstruct';
     editMode = false;
     floorPickMode = false;
+    clipEditMode = false;
     if (previewing) {
       await stopSensorPreview();
       sensor = null;
@@ -1659,8 +1661,8 @@
         editMode={editMode && canEditModel}
         {gizmoMode}
         {rotationSnapDegrees}
-        clipBounds={clippingEnabled ? clipBounds : null}
-        {clipEditMode}
+        clipBounds={workspace === 'inspect' && clippingEnabled ? clipBounds : null}
+        clipEditMode={workspace === 'inspect' && clipEditMode}
         {clipGizmoMode}
         onFloorDetected={setFloorTransform}
         onFloorMessage={(value) => message = value}
