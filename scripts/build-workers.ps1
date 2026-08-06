@@ -78,7 +78,8 @@ if ($LASTEXITCODE -ne 0) { throw "Modern sensor worker configuration failed." }
 & $CMakeCommand --build $ModernCaptureBuild --config Release
 if ($LASTEXITCODE -ne 0) { throw "Modern sensor worker build failed." }
 
-$ReconstructionExe = Join-Path $ProjectRoot "worker/dist/scanlan-worker.exe"
+$ReconstructionDirectory = Join-Path $ProjectRoot "worker/dist/scanlan-worker"
+$ReconstructionExe = Join-Path $ReconstructionDirectory "scanlan-worker.exe"
 $CudaWheel = Get-ChildItem -Path $CudaWheelRoot -Filter "open3d*.whl" -File -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTimeUtc -Descending |
   Select-Object -First 1
@@ -176,7 +177,10 @@ if ($NeedsWorkerBuild) {
   }
   Push-Location (Join-Path $ProjectRoot "worker")
   try {
-    & $WorkerPython -m PyInstaller --noconfirm --clean --onefile --name scanlan-worker --collect-all open3d entry.py
+    # Open3D plus CUDA is close to 1 GB. A one-file executable unpacked that
+    # payload on every preview/reconstruction launch and made the UI appear to
+    # freeze. Keep the runtime extracted once and launch it directly instead.
+    & $WorkerPython -m PyInstaller --noconfirm --clean --onedir --name scanlan-worker --collect-all open3d entry.py
     if ($LASTEXITCODE -ne 0) { throw "Reconstruction worker packaging failed." }
   } finally {
     Pop-Location

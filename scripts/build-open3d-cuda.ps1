@@ -102,8 +102,17 @@ if (-not (Test-Path (Join-Path $Open3DSource ".git"))) {
 
 $CompatibilityPatch = Join-Path $PSScriptRoot "patches/open3d-0.19-cuda13-cmake4.patch"
 $StdgpuCompatibilityPatch = (Resolve-Path (Join-Path $PSScriptRoot "patches/stdgpu-cuda13.patch")).Path -replace '\\', '/'
-& git -C $Open3DSource apply --reverse --check $CompatibilityPatch 2>$null
-$PatchAlreadyApplied = $LASTEXITCODE -eq 0
+$PreviousErrorActionPreference = $ErrorActionPreference
+try {
+  # A failed reverse check is expected for a fresh checkout. Windows PowerShell
+  # otherwise promotes git's stderr to a terminating NativeCommandError before
+  # the exit code can select the normal patch-application path below.
+  $ErrorActionPreference = "SilentlyContinue"
+  & git -C $Open3DSource apply --reverse --check $CompatibilityPatch 2>$null
+  $PatchAlreadyApplied = $LASTEXITCODE -eq 0
+} finally {
+  $ErrorActionPreference = $PreviousErrorActionPreference
+}
 if (-not $PatchAlreadyApplied) {
   & git -C $Open3DSource apply --check $CompatibilityPatch
   if ($LASTEXITCODE -ne 0) {

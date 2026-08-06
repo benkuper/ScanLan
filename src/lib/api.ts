@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ArtifactJob, ArtifactTarget, AvailableSensor, CaptureSettings, CaptureStatus, PreviewMesh, PreviewPoint, ProjectSummary, RuntimeInfo } from './types';
+import type { ArtifactJob, ArtifactTarget, AvailableSensor, CaptureSettings, CaptureStatus, CloudTransform, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
 
 const inTauri = () => typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
 
@@ -24,9 +24,37 @@ export async function currentProject(): Promise<ProjectSummary> {
   return invoke<ProjectSummary>('current_project');
 }
 
-export async function createProject(): Promise<ProjectSummary> {
+export async function listProjects(): Promise<ProjectCatalogEntry[]> {
   requireDesktop();
-  return invoke<ProjectSummary>('create_project');
+  return invoke<ProjectCatalogEntry[]>('list_projects');
+}
+
+export async function openProject(projectPath: string): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('open_project', { projectPath });
+}
+
+export async function saveProject(projectPath: string, name: string): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('save_project', { projectPath, name });
+}
+
+export async function createProject(name?: string): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('create_project', { name });
+}
+
+export async function deleteProject(projectPath: string): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('delete_project', { projectPath });
+}
+
+export async function importMediaSources(
+  projectPath: string,
+  mediaPaths: string[]
+): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('import_media_sources', { projectPath, mediaPaths });
 }
 
 export async function updateProjectSettings(
@@ -37,12 +65,103 @@ export async function updateProjectSettings(
   return invoke<ProjectSummary>('update_project_settings', { projectPath, settings });
 }
 
+export interface SupplementalPhotoLocalizationResult {
+  localizedPhotoCount: number;
+  failedPhotoCount: number;
+  localized: Array<{
+    id: string;
+    name: string;
+    inlierCount: number;
+    reprojectionRmsePixels: number;
+    qualityScore: number;
+    qualityLabel: string;
+  }>;
+  failures: Array<{ id: string; name: string; path: string; error: string }>;
+  manifestPath: string;
+}
+
+export interface SupplementalPhotoAttempt {
+  id: string;
+  name: string;
+  path: string;
+  sourcePath?: string;
+  status: 'queued' | 'localizing' | 'localized' | 'rejected';
+  qualityScore?: number;
+  qualityLabel?: string;
+  matchCount?: number;
+  twoViewInlierCount?: number;
+  inlierCount?: number;
+  reprojectionRmsePixels?: number;
+  referenceDistanceMeters?: number;
+  error?: string;
+}
+
+export interface SupplementalPhotoManifest {
+  schemaVersion: number;
+  photos: SupplementalPhotoAttempt[];
+  attempts: SupplementalPhotoAttempt[];
+}
+
+export interface SupplementalPhotoProgress {
+  schemaVersion: number;
+  status: 'running' | 'complete' | 'failed';
+  stage: string;
+  detail: string;
+  progress: number;
+  processedPhotos: number;
+  totalPhotos: number;
+  localizedPhotos: number;
+  failedPhotos: number;
+}
+
+export async function localizeSupplementalPhotos(
+  projectPath: string,
+  photoPaths: string[]
+): Promise<SupplementalPhotoLocalizationResult> {
+  requireDesktop();
+  return invoke<SupplementalPhotoLocalizationResult>('localize_supplemental_photos', {
+    projectPath,
+    photoPaths
+  });
+}
+
+export async function supplementalPhotos(projectPath: string): Promise<SupplementalPhotoManifest> {
+  requireDesktop();
+  return invoke<SupplementalPhotoManifest>('supplemental_photos', { projectPath });
+}
+
+export async function supplementalPhotoProgress(projectPath: string): Promise<SupplementalPhotoProgress | null> {
+  requireDesktop();
+  return invoke<SupplementalPhotoProgress | null>('supplemental_photo_progress', { projectPath });
+}
+
+export async function removeSupplementalPhoto(
+  projectPath: string,
+  photoId: string
+): Promise<SupplementalPhotoManifest> {
+  requireDesktop();
+  return invoke<SupplementalPhotoManifest>('remove_supplemental_photo', { projectPath, photoId });
+}
+
 export async function startSensorPhase(
   projectPath: string,
   settings: CaptureSettings
 ): Promise<ProjectSummary> {
   requireDesktop();
   return invoke<ProjectSummary>('start_sensor_phase', { projectPath, settings });
+}
+
+export async function startSensorPreview(
+  projectPath: string,
+  settings: CaptureSettings
+): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('start_sensor_preview', { projectPath, settings });
+}
+
+export async function stopSensorPreview(): Promise<void> {
+  requireDesktop();
+  return invoke<void>('stop_sensor_preview');
 }
 
 export async function stopSensorPhase(): Promise<ProjectSummary> {
@@ -63,6 +182,16 @@ export async function captureStatus(): Promise<CaptureStatus> {
 export async function loadLivePreviewFrame(afterFrame: number): Promise<ArrayBuffer> {
   requireDesktop();
   const response = await invoke<ArrayBuffer | Uint8Array | number[]>('live_preview_frame', { afterFrame });
+  if (response instanceof ArrayBuffer) return response;
+  if (ArrayBuffer.isView(response)) {
+    return response.buffer.slice(response.byteOffset, response.byteOffset + response.byteLength) as ArrayBuffer;
+  }
+  return Uint8Array.from(response).buffer;
+}
+
+export async function loadCaptureDraft(projectPath: string): Promise<ArrayBuffer> {
+  requireDesktop();
+  const response = await invoke<ArrayBuffer | Uint8Array | number[]>('load_capture_draft', { projectPath });
   if (response instanceof ArrayBuffer) return response;
   if (ArrayBuffer.isView(response)) {
     return response.buffer.slice(response.byteOffset, response.byteOffset + response.byteLength) as ArrayBuffer;
@@ -185,14 +314,14 @@ export async function loadGaussianSplat(projectPath: string): Promise<Uint8Array
   return normalizeBinary(response);
 }
 
-export async function exportPly(projectPath: string, destinationPath: string): Promise<string> {
+export async function exportPly(projectPath: string, destinationPath: string, transform: CloudTransform): Promise<string> {
   requireDesktop();
-  return invoke<string>('export_ply', { projectPath, destinationPath });
+  return invoke<string>('export_ply', { projectPath, destinationPath, transform });
 }
 
-export async function exportTexturedMesh(projectPath: string, destinationPath: string): Promise<string> {
+export async function exportTexturedMesh(projectPath: string, destinationPath: string, transform: CloudTransform): Promise<string> {
   requireDesktop();
-  return invoke<string>('export_textured_mesh', { projectPath, destinationPath });
+  return invoke<string>('export_textured_mesh', { projectPath, destinationPath, transform });
 }
 
 export async function exportGaussianSplat(projectPath: string, destinationPath: string): Promise<string> {

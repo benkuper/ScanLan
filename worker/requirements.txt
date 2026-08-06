@@ -1,3 +1,4 @@
 numpy>=1.26,<3
 Pillow>=10.4,<12
+opencv-python-headless>=4.10,<5
 open3d>=0.19,<0.20

@@ -42,6 +42,13 @@ def parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("capture", type=Path)
 
+    localize = commands.add_parser(
+        "localize-photos",
+        help="Pose high-resolution photos against an existing RGB-D reconstruction",
+    )
+    localize.add_argument("project", type=Path)
+    localize.add_argument("photos", type=Path, nargs="+")
+
     return root
 
 
@@ -71,6 +78,10 @@ def main(argv: list[str] | None = None) -> int:
 
             replay_archive(arguments.capture, sys.stdout.buffer)
             return 0
+        if arguments.command == "localize-photos":
+            from .supplemental import localize_supplemental_photos
+
+            result = localize_supplemental_photos(arguments.project, arguments.photos)
         else:
             targets = tuple(value.strip() for value in arguments.targets.split(",") if value.strip())
             unknown = set(targets) - {"point_cloud", "textured_mesh", "gaussian_splat"}
@@ -86,6 +97,33 @@ def main(argv: list[str] | None = None) -> int:
                 project["processingStatus"] = "failed"
                 project["processingError"] = str(error)
                 write_json(arguments.project / "project.json", project)
+            except Exception:
+                pass
+        elif arguments.command == "localize-photos":
+            try:
+                from .supplemental import write_localization_progress
+
+                progress_path = (
+                    arguments.project
+                    / "outputs"
+                    / "photo-localization-progress.json"
+                )
+                previous = (
+                    json.loads(progress_path.read_text(encoding="utf-8"))
+                    if progress_path.is_file()
+                    else {}
+                )
+                write_localization_progress(
+                    arguments.project,
+                    status="failed",
+                    stage="failed",
+                    detail=str(error),
+                    progress=float(previous.get("progress", 0.0)),
+                    processed_photos=int(previous.get("processedPhotos", 0)),
+                    total_photos=len(arguments.photos),
+                    localized_photos=int(previous.get("localizedPhotos", 0)),
+                    failed_photos=int(previous.get("failedPhotos", 0)),
+                )
             except Exception:
                 pass
         print(f"scanlan-worker: {error}", file=sys.stderr)

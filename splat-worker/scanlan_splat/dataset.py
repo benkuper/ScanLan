@@ -22,15 +22,14 @@ def load_dataset(path: Path) -> tuple[Path, dict[str, Any]]:
     root = resolve_dataset(path)
     manifest = root / "dataset.json"
     if not manifest.is_file():
-        raise FileNotFoundError(f"RGB-D Gaussian dataset is missing: {manifest}")
+        raise FileNotFoundError(f"Gaussian dataset is missing: {manifest}")
     dataset = json.loads(manifest.read_text(encoding="utf-8"))
     if int(dataset.get("schemaVersion", 0)) != 3:
-        raise ValueError("ScanLan 2DGS requires canonical dataset schema 3")
-    if not dataset.get("metric", False):
-        raise ValueError("ScanLan only trains Gaussian surfaces from metric RGB-D datasets")
+        raise ValueError("ScanLan Gaussian training requires canonical dataset schema 3")
     frames = dataset.get("frames")
     if not isinstance(frames, list) or not frames:
-        raise ValueError("ScanLan 2DGS requires at least one calibrated RGB-D frame")
+        raise ValueError("ScanLan Gaussian training requires calibrated registered frames")
+    metric = bool(dataset.get("metric", False))
     for index, frame in enumerate(frames):
         intrinsics = frame.get("intrinsics") if isinstance(frame, dict) else None
         if (
@@ -62,8 +61,27 @@ def load_dataset(path: Path) -> tuple[Path, dict[str, Any]]:
             or not all(math.isfinite(float(value)) for value in pose)
         ):
             raise ValueError(f"Canonical frame {index} has an invalid camera pose")
-        for field in ("image", "depth", "depthMask"):
+        required_fields = ["image"]
+        if metric:
+            required_fields.extend(("depth", "depthMask"))
+        elif bool(frame.get("depth")) != bool(frame.get("depthMask")):
+            raise ValueError(
+                f"Canonical frame {index} must provide both depth and depthMask or neither"
+            )
+        for field in required_fields:
             relative = Path(str(frame.get(field, "")))
             if not relative.parts or relative.is_absolute() or ".." in relative.parts:
                 raise ValueError(f"Canonical frame {index} has an unsafe {field} path")
+            if not (root / relative).is_file():
+                raise FileNotFoundError(
+                    f"Canonical frame {index} is missing {field}: {relative}"
+                )
+    initialization = Path(str(dataset.get("initialization", "")))
+    if (
+        not initialization.parts
+        or initialization.is_absolute()
+        or ".." in initialization.parts
+        or not (root / initialization).is_file()
+    ):
+        raise FileNotFoundError("Gaussian sparse initialization is missing or unsafe")
     return root, dataset

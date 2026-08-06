@@ -27,12 +27,32 @@ ENGINE_VERSION = 1
 ENGINE_STATUS = 1
 ENGINE_POINTS = 2
 ENGINE_MESH = 3
+ENGINE_CAMERA_POINTS = 4
 ENGINE_HEADER = struct.Struct("<8sHHIQ")
 
 POINT_MAGIC = b"K2P1"
 MESH_MAGIC = b"K2M2"
 MAX_PREVIEW_POINTS = 150_000
 MAX_PREVIEW_TRIANGLES = 150_000
+TRACKING_ANCHOR_TRANSLATION_M = 0.08
+TRACKING_ANCHOR_ROTATION_DEGREES = 6.0
+MAX_TRACKING_ANCHORS = 48
+RECENT_TRACKING_ANCHORS = 8
+RELOCALIZATION_CANDIDATES_PER_FRAME = 4
+RECOVERY_CONFIRMATION_FRAMES = 3
+RECOVERY_MAX_TRANSLATION_M = 0.15
+RECOVERY_MAX_ROTATION_DEGREES = 10.0
+RECOVERY_MAX_GYRO_ERROR_DEGREES = 10.0
+RECOVERY_CONFIRM_TRANSLATION_M = 0.05
+RECOVERY_CONFIRM_ROTATION_DEGREES = 4.0
+RECOVERY_PENDING_MAX_SEQUENCE_GAP = 240
+MAX_TRACKING_LINEAR_SPEED_M_S = 1.5
+MAX_TRACKING_ANGULAR_SPEED_DEG_S = 120.0
+TRACKING_MIN_OVERLAP = 0.28
+TRACKING_MIN_INLIER_RATIO = 0.65
+TRACKING_MAX_RMSE_FRACTION = 0.62
+MAPPING_MIN_OVERLAP = 0.50
+MAPPING_MIN_INLIER_RATIO = 0.82
 
 
 @dataclass(frozen=True)
@@ -60,6 +80,20 @@ class TrackingAnchor:
     frame: RgbdFrame
     representation: Any
     world_to_camera: np.ndarray
+
+
+@dataclass(frozen=True)
+class PendingRecovery:
+    world_to_camera: np.ndarray
+    confirmations: int
+    sequence: int
+    anchor_sequence: int | None
+
+
+@dataclass(frozen=True)
+class ResetLiveMap:
+    sequence: int
+    timestamp_us: int
 
 
 class TrackingJournal:
@@ -139,6 +173,27 @@ class TrackingJournal:
 def _rotation_degrees(matrix: np.ndarray) -> float:
     cosine = np.clip((np.trace(matrix[:3, :3]) - 1.0) * 0.5, -1.0, 1.0)
     return math.degrees(math.acos(float(cosine)))
+
+
+def _recovery_pose_is_credible(
+    last_world_to_camera: np.ndarray,
+    candidate_world_to_camera: np.ndarray,
+    gyro_predicted_world_to_camera: np.ndarray | None,
+) -> bool:
+    """Reject recovery poses capable of creating a second copy of the scene."""
+    relative = candidate_world_to_camera @ np.linalg.inv(last_world_to_camera)
+    if (
+        float(np.linalg.norm(relative[:3, 3])) > RECOVERY_MAX_TRANSLATION_M
+        or _rotation_degrees(relative) > RECOVERY_MAX_ROTATION_DEGREES
+    ):
+        return False
+    if gyro_predicted_world_to_camera is not None:
+        gyro_error = candidate_world_to_camera @ np.linalg.inv(
+            gyro_predicted_world_to_camera
+        )
+        if _rotation_degrees(gyro_error) > RECOVERY_MAX_GYRO_ERROR_DEGREES:
+            return False
+    return True
 
 
 def evaluate_depth_alignment(
@@ -236,12 +291,16 @@ def evaluate_depth_alignment(
         if inlier_count
         else math.inf
     )
-    accepted = overlap >= 0.18 and inlier_ratio >= 0.52 and rmse_m <= depth_threshold_m * 0.72
-    if overlap < 0.18:
+    accepted = (
+        overlap >= TRACKING_MIN_OVERLAP
+        and inlier_ratio >= TRACKING_MIN_INLIER_RATIO
+        and rmse_m <= depth_threshold_m * TRACKING_MAX_RMSE_FRACTION
+    )
+    if overlap < TRACKING_MIN_OVERLAP:
         reason = f"low overlap ({overlap:.0%})"
-    elif inlier_ratio < 0.52:
+    elif inlier_ratio < TRACKING_MIN_INLIER_RATIO:
         reason = f"low depth agreement ({inlier_ratio:.0%})"
-    elif rmse_m > depth_threshold_m * 0.72:
+    elif rmse_m > depth_threshold_m * TRACKING_MAX_RMSE_FRACTION:
         reason = f"high depth residual ({rmse_m * 1000:.0f} mm)"
     else:
         reason = "depth alignment accepted"
@@ -262,6 +321,32 @@ def _display_positions(values: np.ndarray, mirror_x: bool) -> np.ndarray:
     if len(result):
         result[:, 1:] *= -1.0
     return result
+
+
+def frame_point_cloud(frame: RgbdFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Create an immediate viewport fallback from one calibrated RGB-D frame."""
+    depth_m = np.asarray(frame.depth, dtype=np.float32) / frame.camera.depth_scale
+    valid = (
+        np.isfinite(depth_m)
+        & (depth_m >= frame.camera.min_depth_m)
+        & (depth_m <= frame.camera.max_depth_m)
+    )
+    rows, columns = np.nonzero(valid)
+    if not len(rows):
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+    z = depth_m[rows, columns]
+    points = np.column_stack(
+        (
+            (columns.astype(np.float32) - frame.camera.cx) * z / frame.camera.fx,
+            (rows.astype(np.float32) - frame.camera.cy) * z / frame.camera.fy,
+            z,
+        )
+    ).astype(np.float32, copy=False)
+    if frame.color is not None and frame.color.shape[:2] == depth_m.shape:
+        colors = np.asarray(frame.color[rows, columns], dtype=np.uint8)
+    else:
+        colors = np.full((len(points), 3), 180, dtype=np.uint8)
+    return _display_positions(points, frame.mirror_x), colors
 
 
 def _bounded_indices(count: int, limit: int) -> np.ndarray:
@@ -420,8 +505,14 @@ class RealtimeTracker:
         self.previous_rgbd: Any | None = None
         self.previous_tensor: Any | None = None
         self.anchors: list[TrackingAnchor] = []
+        self.relocalization_cursor = 0
+        self.relocalization_features: dict[int, tuple[Any, Any]] = {}
         self.last_integrated_pose: np.ndarray | None = None
         self.last_integrated_timestamp_us = 0
+        self.rejected_since_accept = 0
+        self.gyro_since_accept = np.eye(4, dtype=np.float64)
+        self.gyro_samples_since_accept = 0
+        self.pending_recovery: PendingRecovery | None = None
 
     def _initialize_camera(self, camera: StreamCamera) -> None:
         if self.camera is None:
@@ -518,11 +609,155 @@ class RealtimeTracker:
         representation: Any,
         world_to_camera: np.ndarray,
     ) -> None:
+        if self.anchors:
+            relative = (
+                np.asarray(world_to_camera)
+                @ np.linalg.inv(self.anchors[-1].world_to_camera)
+            )
+            if (
+                float(np.linalg.norm(relative[:3, 3]))
+                < TRACKING_ANCHOR_TRANSLATION_M
+                and _rotation_degrees(relative) < TRACKING_ANCHOR_ROTATION_DEGREES
+            ):
+                return
         self.anchors.append(
             TrackingAnchor(frame, representation, np.asarray(world_to_camera).copy())
         )
-        if len(self.anchors) > 8:
-            del self.anchors[0]
+        if len(self.anchors) > MAX_TRACKING_ANCHORS:
+            # Keep the first view, a spatially broad history, and the newest
+            # views.  Periodic compaction bounds GPU memory without turning the
+            # bank into a recent-only ring buffer; a user can therefore return
+            # to any earlier part of a long take after tracking is lost.
+            history_end = max(1, len(self.anchors) - RECENT_TRACKING_ANCHORS)
+            history = self.anchors[:history_end]
+            recent = self.anchors[history_end:]
+            self.anchors = history[::2] + recent
+            self.relocalization_cursor %= max(len(self.anchors), 1)
+            retained_sequences = {anchor.frame.sequence for anchor in self.anchors}
+            self.relocalization_features = {
+                sequence: value
+                for sequence, value in self.relocalization_features.items()
+                if sequence in retained_sequences
+            }
+
+    def _relocalization_anchors(self) -> list[TrackingAnchor]:
+        if not self.anchors:
+            return []
+        previous_sequence = (
+            self.previous_frame.sequence if self.previous_frame is not None else None
+        )
+        available = [
+            anchor
+            for anchor in self.anchors
+            if anchor.frame.sequence != previous_sequence
+        ]
+        if not available:
+            return []
+
+        # Once a candidate begins temporal confirmation, test its exact anchor
+        # on every frame. Without this priority a rotating bank may not revisit
+        # that anchor for several seconds, making a valid recovery impossible.
+        selected: list[TrackingAnchor] = []
+        pending_sequence = (
+            self.pending_recovery.anchor_sequence
+            if self.pending_recovery is not None
+            else None
+        )
+        if pending_sequence is not None:
+            pending_anchor = next(
+                (
+                    anchor
+                    for anchor in available
+                    if anchor.frame.sequence == pending_sequence
+                ),
+                None,
+            )
+            if pending_anchor is not None:
+                selected.append(pending_anchor)
+
+        # The initial view remains the natural fallback. The remaining budget
+        # walks the complete saved bank, so every accepted view is eventually
+        # searchable without sacrificing a pending confirmation.
+        if all(
+            anchor.frame.sequence != available[0].frame.sequence
+            for anchor in selected
+        ):
+            selected.append(available[0])
+        selected_sequences = {anchor.frame.sequence for anchor in selected}
+        rotating = [
+            anchor
+            for anchor in available[1:]
+            if anchor.frame.sequence not in selected_sequences
+        ]
+        budget = RELOCALIZATION_CANDIDATES_PER_FRAME - len(selected)
+        if rotating and budget > 0:
+            start = self.relocalization_cursor % len(rotating)
+            count = min(budget, len(rotating))
+            selected.extend(
+                rotating[(start + offset) % len(rotating)] for offset in range(count)
+            )
+            self.relocalization_cursor = (start + count) % len(rotating)
+        return selected
+
+    def _feature_geometry(self, frame: RgbdFrame) -> tuple[Any, Any]:
+        voxel_size = max(0.06, self.voxel_size_m * 6.0)
+        intrinsic = self.o3d.camera.PinholeCameraIntrinsic(
+            frame.camera.width,
+            frame.camera.height,
+            frame.camera.fx,
+            frame.camera.fy,
+            frame.camera.cx,
+            frame.camera.cy,
+        )
+        cloud = self.o3d.geometry.PointCloud.create_from_depth_image(
+            self.o3d.geometry.Image(np.ascontiguousarray(frame.depth)),
+            intrinsic,
+            depth_scale=frame.camera.depth_scale,
+            depth_trunc=frame.camera.max_depth_m,
+            project_valid_depth_only=True,
+        ).voxel_down_sample(voxel_size)
+        if len(cloud.points) < 80:
+            raise RuntimeError("not enough geometry for feature relocalization")
+        cloud.estimate_normals(
+            self.o3d.geometry.KDTreeSearchParamHybrid(
+                radius=voxel_size * 2.3,
+                max_nn=30,
+            )
+        )
+        features = self.o3d.pipelines.registration.compute_fpfh_feature(
+            cloud,
+            self.o3d.geometry.KDTreeSearchParamHybrid(
+                radius=voxel_size * 5.0,
+                max_nn=80,
+            ),
+        )
+        return cloud, features
+
+    def _feature_relocalization_transform(
+        self,
+        anchor: TrackingAnchor,
+        current_geometry: tuple[Any, Any],
+    ) -> np.ndarray | None:
+        cached = self.relocalization_features.get(anchor.frame.sequence)
+        if cached is None:
+            cached = self._feature_geometry(anchor.frame)
+            self.relocalization_features[anchor.frame.sequence] = cached
+        source_cloud, source_features = cached
+        current_cloud, current_features = current_geometry
+        voxel_size = max(0.06, self.voxel_size_m * 6.0)
+        result = self.o3d.pipelines.registration.registration_fgr_based_on_feature_matching(
+            source_cloud,
+            current_cloud,
+            source_features,
+            current_features,
+            self.o3d.pipelines.registration.FastGlobalRegistrationOption(
+                maximum_correspondence_distance=voxel_size * 1.5,
+                iteration_number=48,
+                maximum_tuple_count=500,
+            ),
+        )
+        transformation = np.asarray(result.transformation, dtype=np.float64)
+        return transformation if np.isfinite(transformation).all() else None
 
     def _should_integrate(self, world_to_camera: np.ndarray, timestamp_us: int) -> bool:
         camera_to_world = np.linalg.inv(world_to_camera)
@@ -541,6 +776,16 @@ class RealtimeTracker:
         self.last_integrated_pose = camera_to_world
         self.last_integrated_timestamp_us = timestamp_us
         return True
+
+    def _quality_is_safe_to_integrate(self, quality: AlignmentQuality) -> bool:
+        """Apply a stricter gate to irreversible map writes than pose tracking."""
+        maximum_rmse_m = max(0.016, min(0.022, self.voxel_size_m * 2.0))
+        return (
+            quality.accepted
+            and quality.overlap >= MAPPING_MIN_OVERLAP
+            and quality.inlier_ratio >= MAPPING_MIN_INLIER_RATIO
+            and quality.rmse_m <= maximum_rmse_m
+        )
 
     def track(self, frame: RgbdFrame) -> TrackedFrame:
         self._initialize_camera(frame.camera)
@@ -566,8 +811,10 @@ class RealtimeTracker:
                 )
                 relative = proposed @ np.linalg.inv(self.world_to_camera)
                 if (
-                    np.linalg.norm(relative[:3, 3]) / elapsed > 2.4
-                    or _rotation_degrees(relative) / elapsed > 220.0
+                    np.linalg.norm(relative[:3, 3]) / elapsed
+                    > MAX_TRACKING_LINEAR_SPEED_M_S
+                    or _rotation_degrees(relative) / elapsed
+                    > MAX_TRACKING_ANGULAR_SPEED_DEG_S
                 ):
                     return TrackedFrame(frame, None, AlignmentQuality(False, 0, 0, math.inf, 0, "captured motion jump"), False, "lost", "Captured pose jumped beyond physical limits")
                 quality = evaluate_depth_alignment(
@@ -589,7 +836,9 @@ class RealtimeTracker:
             self.world_to_camera = proposed
             representation = self._representation(frame)
             self._remember(frame, representation)
-            integrate = self._should_integrate(proposed, frame.depth_timestamp_us)
+            integrate = self._quality_is_safe_to_integrate(quality) and self._should_integrate(
+                proposed, frame.depth_timestamp_us
+            )
             if integrate:
                 self._remember_anchor(frame, representation, proposed)
             detail = "Kinect Fusion pose accepted"
@@ -608,18 +857,72 @@ class RealtimeTracker:
             )
 
         if self.previous_frame is None:
+            depth_m = np.asarray(frame.depth, dtype=np.float32) / frame.camera.depth_scale
+            valid_samples = int(
+                np.count_nonzero(
+                    np.isfinite(depth_m)
+                    & (depth_m >= frame.camera.min_depth_m)
+                    & (depth_m <= frame.camera.max_depth_m)
+                )
+            )
+            minimum_samples = min(
+                350,
+                max(40, frame.camera.width * frame.camera.height // 80),
+            )
+            if valid_samples < minimum_samples:
+                return TrackedFrame(
+                    frame,
+                    None,
+                    AlignmentQuality(
+                        False,
+                        0.0,
+                        0.0,
+                        math.inf,
+                        valid_samples,
+                        f"only {valid_samples} valid depth samples",
+                    ),
+                    False,
+                    "lost",
+                    f"Waiting for usable depth ({valid_samples} samples); aim beyond the camera's minimum range",
+                )
             representation = self._representation(frame)
             self._remember(frame, representation)
-            integrate = self._should_integrate(self.world_to_camera, frame.depth_timestamp_us)
+            integrate = self._quality_is_safe_to_integrate(perfect) and self._should_integrate(
+                self.world_to_camera, frame.depth_timestamp_us
+            )
             if integrate:
                 self._remember_anchor(frame, representation, self.world_to_camera)
+            self.rejected_since_accept = 0
+            self.gyro_since_accept = np.eye(4, dtype=np.float64)
+            self.gyro_samples_since_accept = 0
+            self.pending_recovery = None
             return TrackedFrame(frame, self.world_to_camera.copy(), perfect, integrate, "tracking", "RGB-D odometry initialized")
 
         current = self._representation(frame)
         previous_representation = (
             self.previous_tensor if self.backend.uses_cuda else self.previous_rgbd
         )
-        initial = self._initial_guess(frame)
+        incremental_gyro = self._initial_guess(frame)
+        if frame.gyro_delta_xyzw is not None:
+            self.gyro_since_accept = incremental_gyro @ self.gyro_since_accept
+            self.gyro_samples_since_accept += 1
+        initial = self.gyro_since_accept.copy()
+        # Track directly from the latest integration keyframe whenever it is
+        # older than the immediately preceding frame.  Chaining every 30 Hz
+        # frame compounds sub-millimetre errors into visible duplicate walls;
+        # a bounded keyframe baseline estimates the whole local motion in one
+        # solve while previous-frame tracking remains the fallback.
+        source_frame = self.previous_frame
+        source_representation = previous_representation
+        source_world_to_camera = self.world_to_camera
+        keyframe_tracking = False
+        if self.anchors and self.anchors[-1].frame.sequence != self.previous_frame.sequence:
+            anchor = self.anchors[-1]
+            source_frame = anchor.frame
+            source_representation = anchor.representation
+            source_world_to_camera = anchor.world_to_camera
+            initial = initial @ self.world_to_camera @ np.linalg.inv(anchor.world_to_camera)
+            keyframe_tracking = True
         attempts = [initial]
         if not np.allclose(initial, np.eye(4), atol=1e-6):
             attempts.append(np.eye(4, dtype=np.float64))
@@ -627,14 +930,14 @@ class RealtimeTracker:
         for guess in attempts:
             try:
                 success, transformation = self._odometry(
-                    previous_representation, current, frame, guess
+                    source_representation, current, frame, guess
                 )
             except RuntimeError:
                 continue
             if not success:
                 continue
             quality = evaluate_depth_alignment(
-                self.previous_frame.depth,
+                source_frame.depth,
                 frame.depth,
                 frame.camera,
                 transformation,
@@ -649,20 +952,24 @@ class RealtimeTracker:
                 break
 
         accepted: tuple[AlignmentQuality, np.ndarray, str] | None = None
+        accepted_anchor_sequence: int | None = None
         if best is not None and best[0].accepted:
             quality, transformation = best
             elapsed = max(
-                (frame.depth_timestamp_us - self.previous_frame.depth_timestamp_us)
+                (frame.depth_timestamp_us - source_frame.depth_timestamp_us)
                 / 1_000_000.0,
                 1 / 30,
             )
             distance = float(np.linalg.norm(transformation[:3, 3]))
             angle = _rotation_degrees(transformation)
-            if distance / elapsed <= 2.4 and angle / elapsed <= 220.0:
+            if (
+                distance / elapsed <= MAX_TRACKING_LINEAR_SPEED_M_S
+                and angle / elapsed <= MAX_TRACKING_ANGULAR_SPEED_DEG_S
+            ):
                 accepted = (
                     quality,
-                    transformation @ self.world_to_camera,
-                    "Tracking accepted",
+                    transformation @ source_world_to_camera,
+                    "Keyframe tracking accepted" if keyframe_tracking else "Tracking accepted",
                 )
             else:
                 best = (
@@ -677,15 +984,65 @@ class RealtimeTracker:
                     transformation,
                 )
 
-        if accepted is None:
-            strongest: tuple[AlignmentQuality, np.ndarray] | None = None
-            attempts_used = 0
-            for anchor in reversed(self.anchors):
-                if anchor.frame.sequence == self.previous_frame.sequence:
+        if accepted is None and keyframe_tracking:
+            # Large motion or poor overlap can make the longer keyframe
+            # baseline fail even though the adjacent pair is still usable.
+            best = None
+            previous_initial = self.gyro_since_accept.copy()
+            previous_attempts = [previous_initial]
+            if not np.allclose(previous_initial, np.eye(4), atol=1e-6):
+                previous_attempts.append(np.eye(4, dtype=np.float64))
+            for guess in previous_attempts:
+                try:
+                    success, transformation = self._odometry(
+                        previous_representation, current, frame, guess
+                    )
+                except RuntimeError:
                     continue
-                attempts_used += 1
-                if attempts_used > 3:
+                if not success:
+                    continue
+                quality = evaluate_depth_alignment(
+                    self.previous_frame.depth,
+                    frame.depth,
+                    frame.camera,
+                    transformation,
+                    depth_threshold_m=max(0.04, self.voxel_size_m * 4.0),
+                )
+                if best is None or (
+                    quality.inlier_ratio - quality.rmse_m
+                    > best[0].inlier_ratio - best[0].rmse_m
+                ):
+                    best = quality, transformation
+                if quality.accepted:
                     break
+            if best is not None and best[0].accepted:
+                quality, transformation = best
+                elapsed = max(
+                    (frame.depth_timestamp_us - self.previous_frame.depth_timestamp_us)
+                    / 1_000_000.0,
+                    1 / 30,
+                )
+                if (
+                    float(np.linalg.norm(transformation[:3, 3])) / elapsed
+                    <= MAX_TRACKING_LINEAR_SPEED_M_S
+                    and _rotation_degrees(transformation) / elapsed
+                    <= MAX_TRACKING_ANGULAR_SPEED_DEG_S
+                ):
+                    accepted = (
+                        quality,
+                        transformation @ self.world_to_camera,
+                        "Previous-frame fallback accepted",
+                    )
+
+        relocalization_anchors: list[TrackingAnchor] = []
+        if (
+            accepted is None
+            or self.rejected_since_accept > 0
+            or self.pending_recovery is not None
+        ):
+            relocalized: list[tuple[AlignmentQuality, np.ndarray, int]] = []
+            relocalization_anchors = self._relocalization_anchors()
+            for anchor in relocalization_anchors:
                 try:
                     success, transformation = self._odometry(
                         anchor.representation,
@@ -705,22 +1062,133 @@ class RealtimeTracker:
                     depth_threshold_m=max(0.04, self.voxel_size_m * 4.0),
                 )
                 candidate_world_to_camera = transformation @ anchor.world_to_camera
-                pose_jump = candidate_world_to_camera @ np.linalg.inv(self.world_to_camera)
+                # A global recovery may legitimately be far from the last
+                # accepted pose. Bound the solve relative to the saved view,
+                # not relative to the stale pose where tracking was lost.
                 if (
                     quality.accepted
                     and quality.overlap >= 0.25
                     and quality.inlier_ratio >= 0.62
-                    and float(np.linalg.norm(pose_jump[:3, 3])) <= 1.5
-                    and _rotation_degrees(pose_jump) <= 90.0
-                    and (
-                        strongest is None
-                        or quality.inlier_ratio - quality.rmse_m
-                        > strongest[0].inlier_ratio - strongest[0].rmse_m
-                    )
+                    and float(np.linalg.norm(transformation[:3, 3])) <= 0.9
+                    and _rotation_degrees(transformation) <= 60.0
                 ):
-                    strongest = quality, candidate_world_to_camera
-            if strongest is not None:
-                accepted = strongest[0], strongest[1], "Tracking relocalized to a recent keyframe"
+                    relocalized.append(
+                        (quality, candidate_world_to_camera, anchor.frame.sequence)
+                    )
+            if relocalized:
+                pending_anchor_sequence = (
+                    self.pending_recovery.anchor_sequence
+                    if self.pending_recovery is not None
+                    else None
+                )
+                relocalized.sort(
+                    key=lambda value: value[0].inlier_ratio - value[0].rmse_m,
+                    reverse=True,
+                )
+                strongest = relocalized[0]
+                strong_enough = lambda candidate: (
+                    candidate[0].overlap >= 0.60
+                    and candidate[0].inlier_ratio >= 0.88
+                    and candidate[0].rmse_m
+                    <= max(0.014, self.voxel_size_m * 1.4)
+                )
+                pending_candidate = next(
+                    (
+                        candidate
+                        for candidate in relocalized
+                        if candidate[2] == pending_anchor_sequence
+                        and strong_enough(candidate)
+                    ),
+                    None,
+                )
+                if pending_candidate is not None:
+                    strongest = pending_candidate
+                strong_single = strong_enough(strongest)
+                consensus = False
+                for candidate in relocalized[1:]:
+                    difference = candidate[1] @ np.linalg.inv(strongest[1])
+                    if (
+                        float(np.linalg.norm(difference[:3, 3])) <= 0.20
+                        and _rotation_degrees(difference) <= 12.0
+                    ):
+                        consensus = True
+                        break
+                if strong_single or consensus:
+                    accepted = (
+                        strongest[0],
+                        strongest[1],
+                        "Tracking relocalized to a saved capture keyframe",
+                    )
+                    accepted_anchor_sequence = strongest[2]
+
+        if (
+            accepted_anchor_sequence is None
+            and relocalization_anchors
+            and self.rejected_since_accept >= 5
+        ):
+            # Projective RGB-D odometry only converges when the recovered view
+            # is already close to a saved view. FPFH supplies the missing
+            # coarse transform when the user returns with a different angle;
+            # full-resolution hybrid odometry and metric depth gates still make
+            # the final decision, so a look-alike wall is not admitted merely
+            # because its sparse features happen to match.
+            feature_matches: list[tuple[AlignmentQuality, np.ndarray, int]] = []
+            try:
+                current_geometry = self._feature_geometry(frame)
+            except RuntimeError:
+                current_geometry = None
+            if current_geometry is not None:
+                for anchor in relocalization_anchors[:2]:
+                    try:
+                        coarse = self._feature_relocalization_transform(
+                            anchor,
+                            current_geometry,
+                        )
+                        if coarse is None:
+                            continue
+                        success, transformation = self._odometry(
+                            anchor.representation,
+                            current,
+                            frame,
+                            coarse,
+                        )
+                    except RuntimeError:
+                        continue
+                    if not success:
+                        continue
+                    quality = evaluate_depth_alignment(
+                        anchor.frame.depth,
+                        frame.depth,
+                        frame.camera,
+                        transformation,
+                        depth_threshold_m=max(0.04, self.voxel_size_m * 4.0),
+                    )
+                    if (
+                        quality.accepted
+                        and quality.overlap >= 0.38
+                        and quality.inlier_ratio >= 0.80
+                        and quality.rmse_m <= max(0.022, self.voxel_size_m * 2.2)
+                        and float(np.linalg.norm(transformation[:3, 3])) <= 1.5
+                        and _rotation_degrees(transformation) <= 90.0
+                    ):
+                        feature_matches.append(
+                            (
+                                quality,
+                                transformation @ anchor.world_to_camera,
+                                anchor.frame.sequence,
+                            )
+                        )
+                if feature_matches:
+                    quality, pose, anchor_sequence = max(
+                        feature_matches,
+                        key=lambda value: value[0].inlier_ratio - value[0].rmse_m,
+                    )
+                    accepted = (
+                        quality,
+                        pose,
+                        "Tracking globally relocalized to captured geometry",
+                    )
+                    accepted_anchor_sequence = anchor_sequence
 
         if accepted is None:
             quality = (
@@ -728,21 +1196,108 @@ class RealtimeTracker:
                 if best is not None
                 else AlignmentQuality(False, 0, 0, math.inf, 0, "odometry failed")
             )
+            self.rejected_since_accept += 1
+            if (
+                self.pending_recovery is not None
+                and frame.sequence - self.pending_recovery.sequence
+                > RECOVERY_PENDING_MAX_SEQUENCE_GAP
+            ):
+                self.pending_recovery = None
             return TrackedFrame(
                 frame,
                 None,
                 quality,
                 False,
                 "lost",
-                f"Tracking rejected: {quality.reason}; return to recently scanned geometry",
+                f"Tracking rejected: {quality.reason}; searching all saved capture keyframes",
             )
 
         quality, proposed_world_to_camera, detail = accepted
+        recovery_required = self.rejected_since_accept > 0 or "relocalized" in detail
+        if recovery_required:
+            anchor_recovery = accepted_anchor_sequence is not None
+            gyro_prediction = None
+            if not anchor_recovery and self.gyro_samples_since_accept:
+                gyro_prediction = self.gyro_since_accept @ self.world_to_camera
+            if not anchor_recovery and not _recovery_pose_is_credible(
+                self.world_to_camera, proposed_world_to_camera, gyro_prediction
+            ):
+                self.rejected_since_accept += 1
+                rejected_quality = AlignmentQuality(
+                    False,
+                    quality.overlap,
+                    quality.inlier_ratio,
+                    quality.rmse_m,
+                    quality.correspondence_count,
+                    "recovery pose exceeded strict continuity or IMU limits",
+                )
+                return TrackedFrame(
+                    frame,
+                    None,
+                    rejected_quality,
+                    False,
+                    "lost",
+                    "Tracking recovery rejected; return to the last correctly aligned view",
+                )
+
+            confirmations = 1
+            if self.pending_recovery is not None:
+                difference = proposed_world_to_camera @ np.linalg.inv(
+                    self.pending_recovery.world_to_camera
+                )
+                if (
+                    self.pending_recovery.anchor_sequence
+                    == accepted_anchor_sequence
+                    and float(np.linalg.norm(difference[:3, 3]))
+                    <= RECOVERY_CONFIRM_TRANSLATION_M
+                    and _rotation_degrees(difference)
+                    <= RECOVERY_CONFIRM_ROTATION_DEGREES
+                ):
+                    confirmations = self.pending_recovery.confirmations + 1
+            self.pending_recovery = PendingRecovery(
+                proposed_world_to_camera.copy(),
+                confirmations,
+                frame.sequence,
+                accepted_anchor_sequence,
+            )
+            if confirmations < RECOVERY_CONFIRMATION_FRAMES:
+                self.rejected_since_accept += 1
+                pending_quality = AlignmentQuality(
+                    False,
+                    quality.overlap,
+                    quality.inlier_ratio,
+                    quality.rmse_m,
+                    quality.correspondence_count,
+                    "recovery pose awaiting temporal confirmation",
+                )
+                return TrackedFrame(
+                    frame,
+                    None,
+                    pending_quality,
+                    False,
+                    "recovering",
+                    f"Verifying tracking recovery {confirmations}/{RECOVERY_CONFIRMATION_FRAMES}; hold the camera steady",
+                )
+
         self.world_to_camera = proposed_world_to_camera
         self._remember(frame, current)
-        integrate = self._should_integrate(self.world_to_camera, frame.depth_timestamp_us)
+        integrate = (
+            not recovery_required
+            and self._quality_is_safe_to_integrate(quality)
+            and self._should_integrate(
+                self.world_to_camera, frame.depth_timestamp_us
+            )
+        )
         if integrate:
             self._remember_anchor(frame, current, self.world_to_camera)
+        self.rejected_since_accept = 0
+        self.gyro_since_accept = np.eye(4, dtype=np.float64)
+        self.gyro_samples_since_accept = 0
+        self.pending_recovery = None
+        if recovery_required:
+            detail += " - relocalization locked; map resumes after the next validated frame"
+        elif not integrate:
+            detail += " - map held for fusion quality"
         return TrackedFrame(
             frame,
             self.world_to_camera.copy(),
@@ -839,7 +1394,11 @@ class RealtimeVolume:
     def points(self) -> tuple[np.ndarray, np.ndarray]:
         if self.backend.uses_cuda:
             self.o3d.core.cuda.synchronize(self.backend.device)
-            cloud = self.volume.extract_point_cloud(weight_threshold=3.0).cpu().to_legacy()
+            # Live preview should become visible after the first integrated
+            # camera frame. The production reconstruction still applies its
+            # normal confidence thresholds; this only controls the transient
+            # viewport extraction from the realtime TSDF.
+            cloud = self.volume.extract_point_cloud(weight_threshold=1.0).cpu().to_legacy()
         else:
             cloud = self.volume.extract_point_cloud()
         points = _display_positions(np.asarray(cloud.points), self.mirror_x)
@@ -904,7 +1463,7 @@ def run_realtime_engine(
     )
     journal = TrackingJournal(session_root) if session_root is not None else None
     frame_queue = LatestFrameQueue(capacity=4)
-    map_queue: queue.Queue[TrackedFrame | None] = queue.Queue(maxsize=8)
+    map_queue: queue.Queue[TrackedFrame | ResetLiveMap | None] = queue.Queue(maxsize=8)
     reader_done = threading.Event()
     stop = threading.Event()
     failure: list[BaseException] = []
@@ -977,6 +1536,35 @@ def run_realtime_engine(
                     continue
                 if tracked is None:
                     break
+                if isinstance(tracked, ResetLiveMap):
+                    volume = None
+                    last_tracked = None
+                    last_points = 0.0
+                    last_mesh = 0.0
+                    writer.write(
+                        ENGINE_POINTS,
+                        tracked.sequence,
+                        point_packet(
+                            0,
+                            tracked.timestamp_us,
+                            0.0,
+                            np.empty((0, 3), dtype=np.float32),
+                            np.empty((0, 3), dtype=np.uint8),
+                        ),
+                    )
+                    if mode == "mesh":
+                        writer.write(
+                            ENGINE_MESH,
+                            tracked.sequence,
+                            mesh_packet(
+                                0,
+                                np.empty((0, 3), dtype=np.float32),
+                                np.empty((0, 3), dtype=np.uint8),
+                                np.empty((0, 3), dtype=np.uint32),
+                                flip_winding=False,
+                            ),
+                        )
+                    continue
                 last_tracked = tracked
                 if volume is None:
                     volume = RealtimeVolume(o3d, tracked.frame, voxel_size_m, backend)
@@ -987,7 +1575,7 @@ def run_realtime_engine(
                     accepted = counters["accepted"]
                 now = time.perf_counter()
                 update_fps = accepted / max(now - started, 1e-3)
-                if now - last_points >= 0.35:
+                if now - last_points >= 0.20:
                     points, colors = volume.points()
                     with counters_lock:
                         counters["pointCount"] = len(points)
@@ -1044,6 +1632,12 @@ def run_realtime_engine(
     tracker = RealtimeTracker(o3d, backend, voxel_size_m)
     last_sequence: int | None = None
     last_status_at = 0.0
+    last_raw_preview_at = 0.0
+    recording_path = session_root / "recording.flag" if session_root else None
+    preview_path = session_root / "preview.flag" if session_root else None
+    preview_session = False
+    recording_sequence: int | None = None
+    capture_map_started = False
 
     try:
         while not stop.is_set() and (not reader_done.is_set() or frame_queue.qsize()):
@@ -1052,6 +1646,102 @@ def run_realtime_engine(
             except queue.Empty:
                 continue
             last_sequence = frame.sequence
+            if preview_path is not None and preview_path.exists():
+                preview_session = True
+            if (
+                recording_sequence is None
+                and recording_path is not None
+                and recording_path.exists()
+            ):
+                try:
+                    recording_sequence = int(recording_path.read_text(encoding="ascii").strip())
+                except (OSError, ValueError):
+                    # The native worker writes then closes this small handoff
+                    # file before removing preview.flag. Never guess an early
+                    # sequence while that write is still becoming visible.
+                    pass
+            if (
+                not capture_map_started
+                and recording_sequence is not None
+                and frame.sequence >= recording_sequence
+            ):
+                capture_map_started = True
+                while True:
+                    try:
+                        pending = map_queue.get_nowait()
+                        if isinstance(pending, TrackedFrame):
+                            with counters_lock:
+                                counters["mappingDrops"] += 1
+                    except queue.Empty:
+                        break
+                # Preview intentionally performs no odometry. Begin capture
+                # with a completely fresh tracker so its first usable recorded
+                # frame is identity and no preview reference can reject it.
+                tracker = RealtimeTracker(o3d, backend, voxel_size_m)
+                started = time.perf_counter()
+                with counters_lock:
+                    for name in (
+                        "processed",
+                        "accepted",
+                        "rejected",
+                        "integrated",
+                        "sourceDrops",
+                        "mappingDrops",
+                        "pointCount",
+                        "triangleCount",
+                    ):
+                        counters[name] = 0
+                map_queue.put_nowait(ResetLiveMap(frame.sequence, frame.depth_timestamp_us))
+                last_status_at = 0.0
+
+            if preview_session and not capture_map_started:
+                now = time.perf_counter()
+                with counters_lock:
+                    counters["processed"] += 1
+                    snapshot = dict(counters)
+                if now - last_raw_preview_at >= 0.075:
+                    points, colors = frame_point_cloud(frame)
+                    writer.write(
+                        ENGINE_CAMERA_POINTS,
+                        frame.sequence,
+                        point_packet(
+                            frame.sequence,
+                            frame.depth_timestamp_us,
+                            snapshot["processed"] / max(now - started, 1e-3),
+                            points,
+                            colors,
+                        ),
+                    )
+                    last_raw_preview_at = now
+                if now - last_status_at >= 0.09:
+                    writer.status(
+                        frame.sequence,
+                        {
+                            "active": True,
+                            "state": "preview",
+                            "detail": "Raw camera preview; tracking starts from the first recorded frame",
+                            "backend": backend.label,
+                            "processedFrames": snapshot["processed"],
+                            "acceptedFrames": 0,
+                            "rejectedFrames": 0,
+                            "integratedFrames": 0,
+                            "sourceDrops": snapshot["sourceDrops"],
+                            "trackingQueueDrops": frame_queue.dropped,
+                            "mappingDrops": 0,
+                            "journalDrops": journal.dropped if journal is not None else 0,
+                            "pointCount": 0,
+                            "triangleCount": 0,
+                            "overlap": 0.0,
+                            "inlierRatio": 0.0,
+                            "depthRmseMm": None,
+                            "trackingFps": 0.0,
+                            "trackingQueueDepth": frame_queue.qsize(),
+                            "mappingQueueDepth": 0,
+                        },
+                    )
+                    last_status_at = now
+                continue
+
             tracked = tracker.track(frame)
             if journal is not None:
                 journal.append(tracked)

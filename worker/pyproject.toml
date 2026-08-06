@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Realtime and production RGB-D reconstruction engine for ScanLan"
 license = "GPL-3.0-only"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.26,<3", "Pillow>=10.4,<12"]
+dependencies = ["numpy>=1.26,<3", "Pillow>=10.4,<12", "opencv-python-headless>=4.10,<5"]
 
 [project.urls]
 Repository = "https://github.com/benkuper/ScanLan"

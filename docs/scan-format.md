@@ -5,6 +5,8 @@ Schema 3 is the only supported project and phase format. ScanLan does not migrat
 ```text
 scan-project/
 ├── project.json
+├── supplemental-photos.json       # optional localized high-resolution texture views
+├── supplemental/                  # optional orientation-normalized lossless photos
 ├── phases/
 │   └── <phase-id>/
 │       ├── phase.json
@@ -28,6 +30,7 @@ scan-project/
     ├── room-splat.transform.json
     ├── splat-manifest.json
     ├── camera-poses.json
+    ├── photo-localization-progress.json
     ├── preview.json
     ├── result.json
     └── progress.json
@@ -66,6 +69,35 @@ scan-project/
 
 An artifact records its relative path, status, source fingerprint, update time, metric flag, and staleness. Rebuilding one representation does not remove another.
 
+## Supplemental photo manifest
+
+`supplemental-photos.json` is optional schema 1. `photos` contains only accepted views used by texture baking. `attempts` is the persistent UI registry and also retains queued, currently localizing, and rejected files with their validation reason. Every accepted photo records its project-relative lossless image path, original source path, pinhole intrinsics, row-major `worldFromCamera`, depth-backed match and inlier counts, final reprojection RMSE, and a 0–100 quality score. Camera coordinates use OpenCV axes and world units remain metres. The reconstruction worker rejects missing images, non-finite poses, and unknown manifest versions.
+
+```json
+{
+  "schemaVersion": 1,
+  "coordinateConvention": "scanlan_world_opencv_camera_axes",
+  "photos": [{
+    "id": "content-hash",
+    "path": "supplemental/content-hash.png",
+    "camera": { "width": 4032, "height": 3024, "fx": 3100.0, "fy": 3100.0, "cx": 2015.5, "cy": 1511.5, "model": "pinhole", "distortion": [] },
+    "worldFromCamera": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "inlierCount": 184,
+    "reprojectionRmsePixels": 1.21,
+    "qualityScore": 88,
+    "qualityLabel": "Excellent"
+  }],
+  "attempts": [{
+    "id": "content-hash",
+    "name": "view-01",
+    "status": "localized",
+    "qualityScore": 88
+  }]
+}
+```
+
+`outputs/photo-localization-progress.json` is an atomic schema-1 checkpoint with batch status, stage, detail, overall progress, and accepted/rejected counters. The desktop UI polls it so a reloaded webview can reconnect to an active worker.
+
 ## Phase manifest
 
 Every `phase.json` requires:
@@ -99,7 +131,7 @@ index,source_sequence,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_
 - `rgb_path` is empty for Kinect and can also be empty if the bounded modern-camera JPEG queue dropped that native image. Consumers then use the aligned RGB frame with depth-camera intrinsics and an identity depth-to-RGB transform.
 - `m00…m33` contains an optional row-major camera-to-world pose, supplied by Kinect Fusion.
 
-`depth/*.u16` is little-endian `width × height` unsigned depth in millimetres. Zero is invalid. `color/*.rgb` is `width × height × 3` RGB8 already aligned to the depth camera. On Azure/Femto, `rgb/*.jpg` is the synchronized native RGB-camera view preferred for final texturing and 2DGS training. Kinect uses the aligned RGB source exclusively because its SDK coordinate mapper is the authoritative calibration.
+`depth/*.u16` is little-endian `width × height` unsigned depth in millimetres. Zero is invalid. `color/*.rgb` is `width × height × 3` RGB8 already aligned to the depth camera. Femto Mega frames are distortion-corrected through the Orbbec calibration XY table onto a wide-FOV virtual pinhole grid; the manifest `camera` intrinsics describe that grid, and aligned color receives the same remap. Narrow depth extends slightly beyond the tilted RGB sensor at its vertical boundary, so those otherwise valid edge samples use the nearest calibrated native-RGB boundary color rather than a synthetic black hole. On Azure/Femto, `rgb/*.jpg` is the synchronized native RGB-camera view preferred for final texturing and 2DGS training. Kinect uses the aligned RGB source exclusively because its SDK coordinate mapper is the authoritative calibration.
 
 ## Tracking journal
 

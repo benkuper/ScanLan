@@ -206,10 +206,7 @@ fn write_job(project_root: &Path, job: &ArtifactJob) -> Result<(), String> {
     storage::write_json(&job_path(project_root, &job.id), job)
 }
 
-fn source_fingerprint(
-    project_root: &Path,
-    project: &ProjectSummary,
-) -> String {
+fn source_fingerprint(project_root: &Path, project: &ProjectSummary) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     project.schema_version.hash(&mut hasher);
     project.settings.capture_fps.hash(&mut hasher);
@@ -221,6 +218,12 @@ fn source_fingerprint(
             let path = project_root.join("phases").join(&phase.id).join(name);
             hash_file_metadata(&path, &mut hasher);
         }
+    }
+    for source in &project.media_sources {
+        source.id.hash(&mut hasher);
+        source.kind.hash(&mut hasher);
+        source.byte_size.hash(&mut hasher);
+        hash_file_metadata(&project_root.join(&source.path), &mut hasher);
     }
     format!("{:016x}", hasher.finish())
 }
@@ -248,6 +251,14 @@ fn progress_file(project_root: &Path, splat: bool) -> PathBuf {
 }
 
 fn stage_plan(job: &ArtifactJob) -> Vec<(&'static str, f32)> {
+    if job.source_kind == "media" {
+        return vec![
+            ("prepare", 0.05),
+            ("media", 0.35),
+            ("splat", 0.55),
+            ("publish", 0.05),
+        ];
+    }
     let wants_mesh = job.targets.iter().any(|target| target == "texturedMesh");
     let wants_splat = job.targets.iter().any(|target| target == "gaussianSplat");
     let mut plan = vec![
@@ -274,6 +285,12 @@ fn stage_key(stage: &str) -> Option<&'static str> {
     let stage = stage.to_ascii_lowercase().replace('_', " ");
     if stage.contains("complete") || stage.contains("export") || stage.contains("publish") {
         Some("publish")
+    } else if stage.contains("media")
+        || stage.contains("feature")
+        || stage.contains("camera solving")
+        || stage.contains("undistort")
+    {
+        Some("media")
     } else if stage.contains("splat") && (stage.contains("train") || stage.contains("initial")) {
         Some("splat")
     } else if stage.contains("mesh") || stage.contains("textur") {
@@ -292,8 +309,7 @@ fn stage_key(stage: &str) -> Option<&'static str> {
     } else if stage.contains("tracking") || stage.contains("placing") || stage.contains("keyframe")
     {
         Some("track")
-    } else if matches!(stage.as_str(), "queued" | "preparing" | "resuming")
-    {
+    } else if matches!(stage.as_str(), "queued" | "preparing" | "resuming") {
         Some("prepare")
     } else {
         None
@@ -403,6 +419,11 @@ fn merge_progress(project_root: &Path, job: &mut ArtifactJob, splat: bool) {
         .and_then(Value::as_f64)
         .map(|value| value as f32)
         .or(job.loss);
+    job.smoothed_loss = value
+        .get("smoothedLoss")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .or(job.smoothed_loss);
     job.stage_eta_seconds = value
         .get("stageEtaSeconds")
         .and_then(Value::as_u64)
@@ -545,6 +566,41 @@ fn run_pipeline(
     resume: bool,
 ) -> Result<(), String> {
     fs::remove_file(project_root.join("outputs").join("cancel.flag")).ok();
+    if job.source_kind == "media" {
+        let splat_worker = existing_runtime(resources, true)?;
+        job.stage = "media_preparation".to_string();
+        job.detail = "Selecting sharp views and solving cameras".to_string();
+        job.stage_progress = Some(0.0);
+        write_job(project_root, job)?;
+        let mut prepare = worker_command(&splat_worker);
+        prepare
+            .arg("prepare-media")
+            .arg("--project")
+            .arg(project_root);
+        run_command(prepare, project_root, job, cancel, true)?;
+        job.stage = "splat_training".to_string();
+        job.detail = "Initializing photoreal 3D Gaussian optimization".to_string();
+        job.stage_progress = Some(0.0);
+        write_job(project_root, job)?;
+        let dataset = project_root
+            .join("outputs")
+            .join("cache")
+            .join("datasets")
+            .join("current.json");
+        let mut train = worker_command(&splat_worker);
+        train
+            .arg("train")
+            .arg("--project")
+            .arg(project_root)
+            .arg("--dataset")
+            .arg(dataset)
+            .arg("--iterations")
+            .arg(iterations.to_string());
+        if resume {
+            train.arg("--resume");
+        }
+        return run_command(train, project_root, job, cancel, true);
+    }
     let reconstruction = existing_runtime(resources, false)?;
     let targets = job
         .targets
@@ -761,6 +817,21 @@ pub fn start_artifact_job(
     {
         return Err("Stop RGB-D capture before starting reconstruction".to_string());
     }
+    if state
+        .active_preview
+        .lock()
+        .map_err(|_| "Preview state is unavailable".to_string())?
+        .is_some()
+    {
+        return Err("Stop the camera preview before starting reconstruction".to_string());
+    }
+    if *state
+        .active_photo_localization
+        .lock()
+        .map_err(|_| "Photo localization state is unavailable".to_string())?
+    {
+        return Err("Wait for texture-photo localization to finish before reconstructing".to_string());
+    }
     if targets.is_empty() {
         return Err("Choose at least one artifact target".to_string());
     }
@@ -774,11 +845,7 @@ pub fn start_artifact_job(
     }
     let targets = ["pointCloud", "texturedMesh", "gaussianSplat"]
         .into_iter()
-        .filter(|candidate| {
-            targets
-                .iter()
-                .any(|target| target.as_str() == *candidate)
-        })
+        .filter(|candidate| targets.iter().any(|target| target.as_str() == *candidate))
         .map(str::to_string)
         .collect::<Vec<_>>();
     let mut project = storage::read_project(&root)?;
@@ -800,12 +867,20 @@ pub fn start_artifact_job(
     if project.active_job.is_some() || project.processing_status == "processing" {
         return Err("An artifact job is already running for this project".to_string());
     }
-    if !project
+    let has_rgbd = project
         .phases
         .iter()
-        .any(|phase| phase.status == "complete" && phase.frame_count > 0)
+        .any(|phase| phase.status == "complete" && phase.frame_count > 0);
+    let has_media = !project.media_sources.is_empty();
+    if !has_rgbd && !has_media {
+        return Err("Capture RGB-D data or import overlapping photos/video before reconstruction".to_string());
+    }
+    if !has_rgbd
+        && targets
+            .iter()
+            .any(|target| target != "gaussianSplat")
     {
-        return Err("Capture at least one usable RGB-D phase before reconstruction".to_string());
+        return Err("Photo/video projects currently produce Gaussian splats; disable point-cloud and mesh outputs".to_string());
     }
     let fingerprint = source_fingerprint(&root, &project);
     let now = Utc::now().to_rfc3339();
@@ -814,12 +889,14 @@ pub fn start_artifact_job(
         id: id.clone(),
         project_path: root.to_string_lossy().into_owned(),
         targets,
+        source_kind: if has_rgbd { "rgbd" } else { "media" }.to_string(),
         stage: "queued".to_string(),
         detail: "Preparing durable artifact job".to_string(),
         progress: 0.0,
         iteration: None,
         total_iterations: Some(iterations.unwrap_or(30_000).clamp(1_000, 100_000)),
         loss: None,
+        smoothed_loss: None,
         eta_seconds: None,
         stage_progress: None,
         stage_eta_seconds: None,
@@ -983,6 +1060,21 @@ pub fn resume_artifact_job(
     {
         return Err("Stop RGB-D capture before resuming reconstruction".to_string());
     }
+    if state
+        .active_preview
+        .lock()
+        .map_err(|_| "Preview state is unavailable".to_string())?
+        .is_some()
+    {
+        return Err("Stop the camera preview before resuming reconstruction".to_string());
+    }
+    if *state
+        .active_photo_localization
+        .lock()
+        .map_err(|_| "Photo localization state is unavailable".to_string())?
+    {
+        return Err("Wait for texture-photo localization to finish before reconstructing".to_string());
+    }
     let mut job = read_job(&root, &job_id)?;
     if !matches!(job.status.as_str(), "failed" | "cancelled") || !job.resumable {
         return Err("This artifact job has no resumable checkpoint".to_string());
@@ -1002,7 +1094,7 @@ pub fn resume_artifact_job(
     }
     let current_fingerprint = source_fingerprint(&root, &project);
     if current_fingerprint != job.source_fingerprint {
-        return Err("RGB-D captures changed; start a new reconstruction job".to_string());
+        return Err("Project source media changed; start a new reconstruction job".to_string());
     }
     if !splat_checkpoint_available(&root, &job) {
         job.resumable = false;
@@ -1034,12 +1126,14 @@ mod tests {
             id: "job".to_string(),
             project_path: "project".to_string(),
             targets: targets.iter().map(|value| (*value).to_string()).collect(),
+            source_kind: "rgbd".to_string(),
             stage: stage.to_string(),
             detail: String::new(),
             progress: 0.0,
             iteration: None,
             total_iterations: None,
             loss: None,
+            smoothed_loss: None,
             eta_seconds: None,
             stage_progress: None,
             stage_eta_seconds: None,
@@ -1058,10 +1152,7 @@ mod tests {
 
     #[test]
     fn overall_progress_is_weighted_separately_from_mesh_stage_progress() {
-        let job = job(
-            &["pointCloud", "texturedMesh"],
-            "Meshing",
-        );
+        let job = job(&["pointCloud", "texturedMesh"], "Meshing");
         let overall = planned_progress(&job, Some(0.5)).expect("meshing belongs to the job plan");
         assert!((overall - 0.8276).abs() < 0.001);
         assert!((overall - 0.5).abs() > 0.3);
@@ -1069,16 +1160,22 @@ mod tests {
 
     #[test]
     fn mesh_only_jobs_do_not_plan_a_gaussian_dataset_stage() {
-        let mesh = job(
-            &["pointCloud", "texturedMesh"],
-            "Meshing",
-        );
-        let splat = job(
-            &["pointCloud", "gaussianSplat"],
-            "Preparing splat data",
-        );
+        let mesh = job(&["pointCloud", "texturedMesh"], "Meshing");
+        let splat = job(&["pointCloud", "gaussianSplat"], "Preparing splat data");
         assert!(!stage_plan(&mesh).iter().any(|(key, _)| *key == "dataset"));
         assert!(stage_plan(&splat).iter().any(|(key, _)| *key == "dataset"));
+    }
+
+    #[test]
+    fn media_jobs_plan_camera_solving_without_rgbd_stages() {
+        let mut media = job(&["gaussianSplat"], "feature_matching");
+        media.source_kind = "media".to_string();
+        let plan = stage_plan(&media);
+
+        assert!(plan.iter().any(|(key, _)| *key == "media"));
+        assert!(plan.iter().any(|(key, _)| *key == "splat"));
+        assert!(!plan.iter().any(|(key, _)| *key == "track"));
+        assert_eq!(stage_key(&media.stage), Some("media"));
     }
 
     #[test]

@@ -1,13 +1,14 @@
 use crate::models::{
-    AvailableSensor, CaptureSettings, CaptureStatus, LiveReconstructionStatus, LiveWorkerStatus,
-    PreviewPoint, ProjectSummary, ReconstructionProgress, RuntimeInfo,
+    AvailableSensor, CaptureSettings, CaptureStatus, CloudTransform, LiveReconstructionStatus,
+    LiveWorkerStatus, MediaSourceSummary, PreviewPoint, ProjectCatalogEntry, ProjectSummary,
+    ReconstructionProgress, RuntimeInfo,
 };
 use crate::storage;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,8 @@ pub struct ActiveCapture {
     project_root: PathBuf,
     phase_root: PathBuf,
     phase_id: String,
+    phase_name: String,
+    settings: CaptureSettings,
 }
 
 impl Drop for ActiveCapture {
@@ -51,9 +54,17 @@ struct LiveGeometryFrame {
 struct RealtimeEngineSnapshot {
     updated: Option<Instant>,
     status: LiveReconstructionStatus,
+    camera_points: Option<LiveGeometryFrame>,
     points: Option<LiveGeometryFrame>,
     mesh: Option<LiveGeometryFrame>,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum RealtimeGeometry {
+    CameraPoints,
+    FusedPoints,
+    Mesh,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -95,7 +106,21 @@ struct RealtimeEngineStatusMessage {
 pub struct AppState {
     pub project: Arc<Mutex<ProjectSummary>>,
     pub active_capture: Arc<Mutex<Option<ActiveCapture>>>,
+    pub active_preview: Arc<Mutex<Option<ActiveCapture>>>,
+    pub active_photo_localization: Arc<Mutex<bool>>,
     pub jobs: crate::jobs::JobManager,
+}
+
+struct PhotoLocalizationGuard {
+    active: Arc<Mutex<bool>>,
+}
+
+impl Drop for PhotoLocalizationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            *active = false;
+        }
+    }
 }
 
 impl Default for AppState {
@@ -103,6 +128,8 @@ impl Default for AppState {
         Self {
             project: Arc::new(Mutex::new(ProjectSummary::placeholder())),
             active_capture: Arc::new(Mutex::new(None)),
+            active_preview: Arc::new(Mutex::new(None)),
+            active_photo_localization: Arc::new(Mutex::new(false)),
             jobs: crate::jobs::JobManager::default(),
         }
     }
@@ -131,6 +158,38 @@ pub fn terminate_active_capture(state: &AppState) {
             stop_live_reconstruction(&mut capture, Duration::from_secs(2));
             drain_sensor_relay(&mut capture, Duration::from_secs(1));
         }
+    }
+    if let Ok(mut active) = state.active_preview.lock() {
+        if let Some(mut preview) = active.take() {
+            shutdown_sensor_session(&mut preview, Duration::from_secs(3));
+            discard_preview_files(&preview);
+        }
+    }
+}
+
+fn shutdown_sensor_session(capture: &mut ActiveCapture, timeout: Duration) {
+    File::create(capture.phase_root.join("stop.flag")).ok();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match capture.child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => {
+                capture.child.kill().ok();
+                capture.child.wait().ok();
+                break;
+            }
+        }
+    }
+    drain_sensor_relay(capture, Duration::from_secs(1));
+    stop_live_reconstruction(capture, Duration::from_secs(2));
+    drain_sensor_relay(capture, Duration::from_secs(1));
+}
+
+fn discard_preview_files(preview: &ActiveCapture) {
+    let phases_root = preview.project_root.join("phases");
+    if preview.phase_root.parent() == Some(phases_root.as_path()) {
+        fs::remove_dir_all(&preview.phase_root).ok();
     }
 }
 
@@ -209,6 +268,100 @@ fn project_base(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map(|path| path.join("projects"))
         .map_err(|error| error.to_string())
+}
+
+fn validated_project_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Enter a project name".to_string());
+    }
+    if name.chars().count() > 80 {
+        return Err("Project names cannot be longer than 80 characters".to_string());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("Project names cannot contain control characters".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn project_catalog_entry(project: ProjectSummary) -> ProjectCatalogEntry {
+    let modified_at = fs::metadata(Path::new(&project.path).join("project.json"))
+        .and_then(|metadata| metadata.modified())
+        .map(|modified| DateTime::<Utc>::from(modified).to_rfc3339())
+        .unwrap_or_else(|_| project.created_at.clone());
+    let artifact_count = [
+        project.artifacts.point_cloud.as_ref(),
+        project.artifacts.textured_mesh.as_ref(),
+        project.artifacts.gaussian_splat.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|artifact| artifact.status == "ready" && !artifact.stale)
+    .count();
+    ProjectCatalogEntry {
+        id: project.id,
+        name: project.name,
+        path: project.path,
+        created_at: project.created_at,
+        modified_at,
+        capture_count: project
+            .phases
+            .iter()
+            .filter(|phase| phase.status == "complete")
+            .count(),
+        media_source_count: project.media_sources.len(),
+        frame_count: project
+            .phases
+            .iter()
+            .map(|phase| u64::from(phase.frame_count))
+            .sum(),
+        artifact_count,
+        processing_status: project.processing_status,
+    }
+}
+
+fn ensure_project_management_idle(state: &AppState) -> Result<(), String> {
+    if state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .is_some()
+    {
+        return Err("Stop recording before changing projects".to_string());
+    }
+    if *state
+        .active_photo_localization
+        .lock()
+        .map_err(|_| "Photo localization state is unavailable".to_string())?
+    {
+        return Err("Wait for photo localization to finish before changing projects".to_string());
+    }
+    let active_job = state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?
+        .active_job
+        .clone();
+    if active_job
+        .as_deref()
+        .is_some_and(|job_id| state.jobs.is_running(job_id))
+    {
+        return Err("Wait for reconstruction to finish before changing projects".to_string());
+    }
+    Ok(())
+}
+
+fn stop_active_preview(state: &AppState) -> Result<(), String> {
+    if let Some(mut preview) = state
+        .active_preview
+        .lock()
+        .map_err(|_| "Preview state is unavailable".to_string())?
+        .take()
+    {
+        shutdown_sensor_session(&mut preview, Duration::from_secs(3));
+        discard_preview_files(&preview);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -386,6 +539,392 @@ pub(crate) fn worker_command(worker: &Path) -> Command {
     command
 }
 
+#[tauri::command]
+pub async fn localize_supplemental_photos(
+    app: AppHandle,
+    project_path: String,
+    photo_paths: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    if photo_paths.is_empty() {
+        return Err("Choose at least one high-resolution scene photo".to_string());
+    }
+    if state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .is_some()
+        || state
+            .active_preview
+            .lock()
+            .map_err(|_| "Preview state is unavailable".to_string())?
+            .is_some()
+    {
+        return Err("Stop RGB-D capture before localizing texture photos".to_string());
+    }
+    let project_root = PathBuf::from(&project_path);
+    let project = storage::read_project(&project_root)?;
+    if project.active_job.is_some() {
+        return Err("Wait for reconstruction to finish before adding texture photos".to_string());
+    }
+    let worker = first_existing(storage::candidate_reconstruction_worker_paths(
+        resource_root(&app).as_deref(),
+    ))
+    .ok_or_else(|| "Reconstruction support is missing from this app build".to_string())?;
+    {
+        let mut active = state
+            .active_photo_localization
+            .lock()
+            .map_err(|_| "Photo localization state is unavailable".to_string())?;
+        if *active {
+            return Err("Texture-photo localization is already running".to_string());
+        }
+        *active = true;
+    }
+    let _localization_guard = PhotoLocalizationGuard {
+        active: Arc::clone(&state.active_photo_localization),
+    };
+    fs::remove_file(
+        project_root
+            .join("outputs")
+            .join("photo-localization-progress.json"),
+    )
+    .ok();
+    let worker_project = project_root.clone();
+    let output_result = tauri::async_runtime::spawn_blocking(move || {
+        let mut command = worker_command(&worker);
+        command
+            .arg("localize-photos")
+            .arg(&worker_project)
+            .args(photo_paths)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.output().map_err(|error| error.to_string())
+    })
+    .await;
+    let output = output_result.map_err(|error| error.to_string())??;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "The texture photos could not be localized".to_string()
+        } else {
+            detail
+        });
+    }
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+    if result
+        .get("localizedPhotoCount")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        let mut updated = storage::read_project(&project_root)?;
+        if let Some(mesh) = updated.artifacts.textured_mesh.as_mut() {
+            mesh.stale = true;
+        }
+        storage::write_project(&updated)?;
+        *state
+            .project
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())? = updated;
+    }
+    Ok(result)
+}
+
+fn read_supplemental_photo_manifest(project_root: &Path) -> Result<serde_json::Value, String> {
+    storage::read_project(project_root)?;
+    let manifest_path = project_root.join("supplemental-photos.json");
+    if !manifest_path.is_file() {
+        return Ok(serde_json::json!({ "schemaVersion": 1, "photos": [], "attempts": [] }));
+    }
+    let file = File::open(&manifest_path).map_err(|error| error.to_string())?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_reader(file).map_err(|error| error.to_string())?;
+    if manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err("The supplemental-photo manifest uses an unsupported schema".to_string());
+    }
+    let photos = manifest
+        .get("photos")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut attempts = manifest
+        .get("attempts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for photo in &photos {
+        let Some(photo_id) = photo.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if attempts.iter().any(|attempt| {
+            attempt.get("id").and_then(serde_json::Value::as_str) == Some(photo_id)
+        }) {
+            continue;
+        }
+        let mut attempt = photo.clone();
+        if let Some(object) = attempt.as_object_mut() {
+            object.insert(
+                "status".to_string(),
+                serde_json::Value::String("localized".to_string()),
+            );
+        }
+        attempts.push(attempt);
+    }
+    manifest["photos"] = serde_json::Value::Array(photos);
+    manifest["attempts"] = serde_json::Value::Array(attempts);
+    Ok(manifest)
+}
+
+#[tauri::command]
+pub fn supplemental_photos(project_path: String) -> Result<serde_json::Value, String> {
+    read_supplemental_photo_manifest(Path::new(&project_path))
+}
+
+#[tauri::command]
+pub fn supplemental_photo_progress(
+    project_path: String,
+    state: State<'_, AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let project_root = PathBuf::from(project_path);
+    storage::read_project(&project_root)?;
+    let progress_path = project_root
+        .join("outputs")
+        .join("photo-localization-progress.json");
+    if !progress_path.is_file() {
+        return Ok(None);
+    }
+    let file = File::open(progress_path).map_err(|error| error.to_string())?;
+    let mut progress: serde_json::Value =
+        serde_json::from_reader(file).map_err(|error| error.to_string())?;
+    if progress
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err("The texture-photo progress file uses an unsupported schema".to_string());
+    }
+    let active = *state
+        .active_photo_localization
+        .lock()
+        .map_err(|_| "Photo localization state is unavailable".to_string())?;
+    if progress.get("status").and_then(serde_json::Value::as_str) == Some("running")
+        && !active
+    {
+        progress["status"] = serde_json::Value::String("failed".to_string());
+        progress["stage"] = serde_json::Value::String("interrupted".to_string());
+        progress["detail"] = serde_json::Value::String(
+            "The previous photo-localization worker stopped before finishing. Completed photos were kept."
+                .to_string(),
+        );
+    }
+    Ok(Some(progress))
+}
+
+#[tauri::command]
+pub fn remove_supplemental_photo(
+    project_path: String,
+    photo_id: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    if photo_id.is_empty()
+        || photo_id.len() > 128
+        || !photo_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("The supplemental photo id is invalid".to_string());
+    }
+    if *state
+        .active_photo_localization
+        .lock()
+        .map_err(|_| "Photo localization state is unavailable".to_string())?
+    {
+        return Err("Wait for photo localization to finish before removing a photo".to_string());
+    }
+    let project_root = PathBuf::from(&project_path);
+    let mut manifest = read_supplemental_photo_manifest(&project_root)?;
+    let photos = manifest["photos"]
+        .as_array_mut()
+        .ok_or_else(|| "The supplemental-photo manifest is invalid".to_string())?;
+    let stored_path = photos
+        .iter()
+        .find(|photo| {
+            photo.get("id").and_then(serde_json::Value::as_str) == Some(photo_id.as_str())
+        })
+        .and_then(|photo| photo.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let removed_localized = stored_path.is_some();
+    photos.retain(|photo| {
+        photo.get("id").and_then(serde_json::Value::as_str) != Some(photo_id.as_str())
+    });
+    manifest["attempts"]
+        .as_array_mut()
+        .ok_or_else(|| "The supplemental-photo manifest is invalid".to_string())?
+        .retain(|photo| {
+            photo.get("id").and_then(serde_json::Value::as_str) != Some(photo_id.as_str())
+        });
+    storage::write_json(&project_root.join("supplemental-photos.json"), &manifest)?;
+
+    if let Some(relative_path) = stored_path {
+        let relative = Path::new(&relative_path);
+        let is_safe = !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if is_safe {
+            fs::remove_file(project_root.join(relative)).ok();
+        }
+    }
+    if removed_localized {
+        let mut project = storage::read_project(&project_root)?;
+        if let Some(mesh) = project.artifacts.textured_mesh.as_mut() {
+            mesh.stale = true;
+        }
+        storage::write_project(&project)?;
+        *state
+            .project
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())? = project;
+    }
+    Ok(manifest)
+}
+
+#[tauri::command]
+pub fn import_media_sources(
+    project_path: String,
+    media_paths: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    if media_paths.is_empty() {
+        return Err("Choose at least three photos or one video".to_string());
+    }
+    if media_paths.len() > 5_000 {
+        return Err("Import at most 5,000 media files at once".to_string());
+    }
+    if state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .is_some()
+        || state
+            .active_preview
+            .lock()
+            .map_err(|_| "Preview state is unavailable".to_string())?
+            .is_some()
+    {
+        return Err("Stop the camera before importing photos or video".to_string());
+    }
+    let root = PathBuf::from(&project_path);
+    let mut project = storage::read_project(&root)?;
+    if project.active_job.is_some() || project.processing_status == "processing" {
+        return Err("Wait for reconstruction to finish before importing media".to_string());
+    }
+    let active_path = state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?
+        .path
+        .clone();
+    if active_path != project.path {
+        return Err("The selected project is no longer active".to_string());
+    }
+    if project
+        .phases
+        .iter()
+        .any(|phase| phase.status == "complete" && phase.frame_count > 0)
+    {
+        return Err(
+            "Start a new project to reconstruct a splat from photos/video; this project already contains RGB-D captures"
+                .to_string(),
+        );
+    }
+    let photo_extensions = ["jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp"];
+    let video_extensions = ["mp4", "mov", "m4v", "avi", "mkv", "webm", "mts", "m2ts"];
+    let mut validated = Vec::with_capacity(media_paths.len());
+    for value in media_paths {
+        let source = PathBuf::from(&value);
+        if !source.is_file() {
+            return Err(format!("Media source is missing: {}", source.display()));
+        }
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let kind = if photo_extensions.contains(&extension.as_str()) {
+            "photo"
+        } else if video_extensions.contains(&extension.as_str()) {
+            "video"
+        } else {
+            return Err(format!("Unsupported photo or video: {}", source.display()));
+        };
+        validated.push((source, extension, kind));
+    }
+    let media_root = root.join("media");
+    fs::create_dir_all(&media_root).map_err(|error| error.to_string())?;
+    let mut imported = Vec::new();
+    let mut copied_paths = Vec::new();
+    for (source, extension, kind) in validated {
+        let id = Uuid::new_v4().to_string();
+        let relative = PathBuf::from("media").join(format!("{id}.{extension}"));
+        let destination = root.join(&relative);
+        let temporary = media_root.join(format!(".{id}.importing"));
+        let copied = (|| {
+            fs::copy(&source, &temporary).map_err(|error| error.to_string())?;
+            fs::rename(&temporary, &destination).map_err(|error| error.to_string())
+        })();
+        if let Err(error) = copied {
+            fs::remove_file(&temporary).ok();
+            for copied in copied_paths {
+                fs::remove_file(copied).ok();
+            }
+            return Err(error);
+        }
+        copied_paths.push(destination.clone());
+        let byte_size = destination
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len();
+        imported.push(MediaSourceSummary {
+            id,
+            name: source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("media")
+                .to_string(),
+            path: relative.to_string_lossy().into_owned(),
+            kind: kind.to_string(),
+            byte_size,
+            created_at: Utc::now().to_rfc3339(),
+        });
+    }
+    project.media_sources.extend(imported);
+    if let Some(splat) = project.artifacts.gaussian_splat.as_mut() {
+        splat.stale = true;
+        splat.status = "stale".to_string();
+    }
+    project.processing_status = "idle".to_string();
+    project.processing_error = None;
+    if let Err(error) = storage::write_project(&project) {
+        for copied in copied_paths {
+            fs::remove_file(copied).ok();
+        }
+        return Err(error);
+    }
+    *state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
+    Ok(project)
+}
+
 fn worker_capabilities(worker: &Path) -> Vec<String> {
     let Ok(output) = worker_command(worker).arg("--capabilities").output() else {
         return Vec::new();
@@ -516,9 +1055,7 @@ fn start_realtime_engine(
     let worker = first_existing(storage::candidate_reconstruction_worker_paths(
         resource_root(app).as_deref(),
     ))
-    .ok_or_else(|| {
-        "Realtime reconstruction support is missing from this app build".to_string()
-    })?;
+    .ok_or_else(|| "Realtime reconstruction support is missing from this app build".to_string())?;
     let stderr = File::create(phase_root.join("live-reconstruction.log"))
         .map_err(|error| error.to_string())?;
     let live_voxel_size_m = (settings.voxel_size_mm.clamp(5, 40) as f32) / 1000.0;
@@ -694,15 +1231,16 @@ fn read_realtime_engine_stream(
             match reader.read_exact(&mut header) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(error) => return Err(format!("Could not read realtime engine output: {error}")),
+                Err(error) => {
+                    return Err(format!("Could not read realtime engine output: {error}"))
+                }
             }
             if &header[0..8] != b"SCANENG1" {
                 return Err("Realtime engine emitted an unknown protocol".to_string());
             }
             let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
             let kind = u16::from_le_bytes(header[10..12].try_into().unwrap());
-            let payload_size =
-                u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+            let payload_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
             if version != 1 || payload_size > MAX_PAYLOAD_SIZE {
                 return Err("Realtime engine emitted an unsupported message".to_string());
             }
@@ -742,7 +1280,7 @@ fn read_realtime_engine_stream(
                         depth_rmse_mm: message.depth_rmse_mm,
                     };
                 }
-                2 => {
+                2 | 4 => {
                     if payload.len() < 24 || &payload[0..4] != b"K2P1" {
                         return Err("Realtime point packet has an invalid header".to_string());
                     }
@@ -755,11 +1293,16 @@ fn read_realtime_engine_stream(
                     if point_count > 150_000 || payload.len() != expected {
                         return Err("Realtime point packet is incomplete".to_string());
                     }
-                    snapshot.status.point_count = point_count as u64;
-                    snapshot.points = Some(LiveGeometryFrame {
+                    let frame = LiveGeometryFrame {
                         frame_count,
                         packet: Arc::new(payload),
-                    });
+                    };
+                    if kind == 2 {
+                        snapshot.status.point_count = point_count as u64;
+                        snapshot.points = Some(frame);
+                    } else {
+                        snapshot.camera_points = Some(frame);
+                    }
                 }
                 3 => {
                     if payload.len() < 16 || &payload[0..4] != b"K2M2" {
@@ -804,21 +1347,55 @@ fn read_realtime_engine_stream(
 
 fn realtime_packet(
     snapshot: &Arc<Mutex<RealtimeEngineSnapshot>>,
-    mesh: bool,
+    geometry: RealtimeGeometry,
     after_frame: u32,
 ) -> Vec<u8> {
     let Ok(snapshot) = snapshot.lock() else {
         return Vec::new();
     };
-    let geometry = if mesh {
-        snapshot.mesh.as_ref()
-    } else {
-        snapshot.points.as_ref()
+    let geometry = match geometry {
+        RealtimeGeometry::CameraPoints => snapshot.camera_points.as_ref(),
+        RealtimeGeometry::FusedPoints => snapshot.points.as_ref(),
+        RealtimeGeometry::Mesh => snapshot.mesh.as_ref(),
     };
     match geometry {
         Some(frame) if frame.frame_count != after_frame => frame.packet.as_ref().clone(),
         _ => Vec::new(),
     }
+}
+
+const LIVE_CAPTURE_PREVIEW_FILE: &str = "live-reconstruction.preview.bin";
+
+fn valid_packed_point_preview(packet: &[u8]) -> bool {
+    if packet.len() < 24 || &packet[0..4] != b"K2P1" {
+        return false;
+    }
+    let Ok(count_bytes) = packet[20..24].try_into() else {
+        return false;
+    };
+    let point_count = u32::from_le_bytes(count_bytes) as usize;
+    point_count <= 150_000 && packet.len() == 24 + point_count * 15
+}
+
+fn save_live_reconstruction_preview(
+    phase_root: &Path,
+    realtime: &Arc<Mutex<RealtimeEngineSnapshot>>,
+) -> Result<bool, String> {
+    let packet = realtime
+        .lock()
+        .map_err(|_| "Realtime preview state is unavailable".to_string())?
+        .points
+        .as_ref()
+        .map(|frame| Arc::clone(&frame.packet));
+    let Some(packet) = packet else {
+        return Ok(false);
+    };
+    if !valid_packed_point_preview(packet.as_ref()) {
+        return Err("Realtime point preview is incomplete".to_string());
+    }
+    fs::write(phase_root.join(LIVE_CAPTURE_PREVIEW_FILE), packet.as_ref())
+        .map_err(|error| format!("Could not preserve the live reconstruction: {error}"))?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -831,9 +1408,17 @@ pub async fn live_preview_frame(
         .lock()
         .ok()
         .and_then(|active| active.as_ref().map(|capture| Arc::clone(&capture.realtime)));
-    let body = capture_root
-        .map(|snapshot| realtime_packet(&snapshot, false, after_frame))
-        .unwrap_or_default();
+    let body = if let Some(snapshot) = capture_root {
+        realtime_packet(&snapshot, RealtimeGeometry::FusedPoints, after_frame)
+    } else {
+        state
+            .active_preview
+            .lock()
+            .ok()
+            .and_then(|active| active.as_ref().map(|preview| Arc::clone(&preview.realtime)))
+            .map(|snapshot| realtime_packet(&snapshot, RealtimeGeometry::CameraPoints, after_frame))
+            .unwrap_or_default()
+    };
     Ok(tauri::ipc::Response::new(body))
 }
 
@@ -848,11 +1433,37 @@ pub async fn live_reconstruction_mesh(
         .ok()
         .and_then(|active| active.as_ref().map(|capture| Arc::clone(&capture.realtime)));
     let body = if let Some(snapshot) = capture_root {
-        realtime_packet(&snapshot, true, after_frame)
+        realtime_packet(&snapshot, RealtimeGeometry::Mesh, after_frame)
     } else {
         Vec::new()
     };
     Ok(tauri::ipc::Response::new(body))
+}
+
+#[tauri::command]
+pub async fn load_capture_draft(project_path: String) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = PathBuf::from(project_path);
+        let project = storage::read_project(&root)?;
+        let packet = project
+            .phases
+            .iter()
+            .rev()
+            .filter(|phase| phase.status == "complete")
+            .find_map(|phase| {
+                fs::read(
+                    root.join("phases")
+                        .join(&phase.id)
+                        .join(LIVE_CAPTURE_PREVIEW_FILE),
+                )
+                .ok()
+            })
+            .filter(|packet| valid_packed_point_preview(packet))
+            .unwrap_or_default();
+        Ok(tauri::ipc::Response::new(packet))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn load_project_preview(project_root: &Path) -> Result<Vec<PreviewPoint>, String> {
@@ -901,6 +1512,7 @@ pub async fn available_sensors(
                 connection: "usb".to_string(),
                 address: String::new(),
                 serial: String::new(),
+                connected: false,
                 supports_imu: false,
             });
         }
@@ -936,6 +1548,7 @@ pub async fn available_sensors(
                     connection: "network".to_string(),
                     address: saved.sensor_address.clone(),
                     serial: String::new(),
+                    connected: false,
                     supports_imu: true,
                 });
             }
@@ -1077,10 +1690,70 @@ pub fn current_project(
 }
 
 #[tauri::command]
-pub fn create_project(
+pub fn list_projects(app: AppHandle) -> Result<Vec<ProjectCatalogEntry>, String> {
+    storage::list_projects(&project_base(&app)?)
+        .map(|projects| projects.into_iter().map(project_catalog_entry).collect())
+}
+
+#[tauri::command]
+pub fn open_project(
     app: AppHandle,
+    project_path: String,
     state: State<'_, AppState>,
 ) -> Result<ProjectSummary, String> {
+    ensure_project_management_idle(state.inner())?;
+    let base = project_base(&app)?;
+    let requested = PathBuf::from(&project_path);
+    storage::managed_project_path(&base, &requested)?;
+    let mut project = storage::read_project(&requested)?;
+    storage::recover_interrupted_phases(&mut project)?;
+    if normalize_project(&mut project)
+        | restore_sensor_preference(&app, &mut project)
+        | crate::jobs::recover_interrupted_job(&mut project, &state.jobs)
+    {
+        storage::write_project(&project)?;
+    }
+    stop_active_preview(state.inner())?;
+    *state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn save_project(
+    project_path: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    ensure_project_management_idle(state.inner())?;
+    let mut project = state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?
+        .clone();
+    if project.path != project_path {
+        return Err("The selected project is no longer active".to_string());
+    }
+    project.name = validated_project_name(&name)?;
+    storage::write_project(&project)?;
+    *state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn create_project(
+    app: AppHandle,
+    name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    ensure_project_management_idle(state.inner())?;
+    let name = name.as_deref().map(validated_project_name).transpose()?;
+    stop_active_preview(state.inner())?;
     let previous_settings = state
         .project
         .lock()
@@ -1090,12 +1763,71 @@ pub fn create_project(
     let folder = format!("scan-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f"));
     let mut project = storage::create_project(&project_base(&app)?.join(folder))?;
     project.settings = previous_settings;
+    if let Some(name) = name {
+        project.name = name;
+    }
     storage::write_project(&project)?;
     *state
         .project
         .lock()
         .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
     Ok(project)
+}
+
+#[tauri::command]
+pub fn delete_project(
+    app: AppHandle,
+    project_path: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    ensure_project_management_idle(state.inner())?;
+    let base = project_base(&app)?;
+    let requested = PathBuf::from(&project_path);
+    let managed_path = storage::managed_project_path(&base, &requested)?;
+    let selected = storage::read_project(&requested)?;
+    let current = state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?
+        .clone();
+    let deleting_current = current.id == selected.id;
+
+    let mut replacement = if deleting_current {
+        storage::list_projects(&base)?
+            .into_iter()
+            .find(|candidate| candidate.id != selected.id)
+    } else {
+        None
+    };
+    if deleting_current && replacement.is_none() {
+        let folder = format!("scan-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+        let mut created = storage::create_project(&base.join(folder))?;
+        created.settings = current.settings.clone();
+        storage::write_project(&created)?;
+        replacement = Some(created);
+    }
+    if deleting_current {
+        stop_active_preview(state.inner())?;
+    }
+    fs::remove_dir_all(&managed_path)
+        .map_err(|error| format!("Could not delete the project: {error}"))?;
+
+    if let Some(mut project) = replacement {
+        storage::recover_interrupted_phases(&mut project)?;
+        if normalize_project(&mut project)
+            | restore_sensor_preference(&app, &mut project)
+            | crate::jobs::recover_interrupted_job(&mut project, &state.jobs)
+        {
+            storage::write_project(&project)?;
+        }
+        *state
+            .project
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
+        Ok(project)
+    } else {
+        Ok(current)
+    }
 }
 
 #[tauri::command]
@@ -1112,6 +1844,15 @@ pub fn update_project_settings(
         .is_some()
     {
         return Err("Capture settings cannot change while recording".to_string());
+    }
+    if let Some(mut preview) = state
+        .active_preview
+        .lock()
+        .map_err(|_| "Preview state is unavailable".to_string())?
+        .take()
+    {
+        shutdown_sensor_session(&mut preview, Duration::from_secs(3));
+        discard_preview_files(&preview);
     }
     let mut project = state
         .project
@@ -1138,12 +1879,274 @@ pub fn update_project_settings(
     Ok(project)
 }
 
+fn start_sensor_session(
+    app: &AppHandle,
+    project_root: &Path,
+    settings: &CaptureSettings,
+    phase_id: String,
+    phase_name: String,
+    preview: bool,
+) -> Result<ActiveCapture, String> {
+    let worker = sensor_worker(app, settings)?;
+    let phase_root = project_root.join("phases").join(&phase_id);
+    fs::create_dir_all(&phase_root).map_err(|error| error.to_string())?;
+
+    let (live_child, mut live_input, realtime) = start_realtime_engine(app, &phase_root, settings)?;
+    let mut live_reconstruction = Some(live_child);
+    if let Err(error) = wait_for_realtime_engine_ready(
+        live_reconstruction.as_mut().unwrap(),
+        &realtime,
+        Duration::from_secs(45),
+    ) {
+        drop(live_input);
+        stop_live_reconstruction_child(
+            &phase_root,
+            &mut live_reconstruction,
+            Duration::from_secs(2),
+        );
+        return Err(error);
+    }
+
+    let mut command = worker_command(&worker);
+    command
+        .arg("--phase")
+        .arg(&phase_root)
+        .arg("--id")
+        .arg(&phase_id)
+        .arg("--name")
+        .arg(&phase_name)
+        .arg("--fps")
+        .arg(settings.capture_fps.to_string())
+        .arg("--max-depth")
+        .arg(settings.max_depth_m.to_string())
+        .arg("--stream-rgbd");
+    if preview {
+        command.arg("--preview");
+    }
+    append_sensor_args(&mut command, settings);
+    let sensor_log = match File::create(phase_root.join("sensor.log")) {
+        Ok(log) => log,
+        Err(error) => {
+            drop(live_input);
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
+            return Err(format!("Could not create the sensor log: {error}"));
+        }
+    };
+    let mut child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(sensor_log))
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            drop(live_input);
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
+            return Err(format!(
+                "Could not start {} capture: {error}",
+                sensor_name(settings)
+            ));
+        }
+    };
+
+    let manifest_path = phase_root.join("phase.json");
+    let startup_deadline = Instant::now() + Duration::from_secs(12);
+    while !manifest_path.exists() {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let detail = read_sensor_log(&phase_root);
+                drop(live_input);
+                stop_live_reconstruction_child(
+                    &phase_root,
+                    &mut live_reconstruction,
+                    Duration::from_secs(2),
+                );
+                return Err(if detail.is_empty() {
+                    format!("Sensor capture stopped during startup ({status})")
+                } else {
+                    detail
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                child.kill().ok();
+                child.wait().ok();
+                drop(live_input);
+                stop_live_reconstruction_child(
+                    &phase_root,
+                    &mut live_reconstruction,
+                    Duration::from_secs(2),
+                );
+                return Err(format!("Could not inspect sensor startup: {error}"));
+            }
+        }
+        if Instant::now() >= startup_deadline {
+            child.kill().ok();
+            child.wait().ok();
+            let detail = read_sensor_log(&phase_root);
+            drop(live_input);
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
+            return Err(if detail.is_empty() {
+                format!(
+                    "{} did not begin streaming within 12 seconds",
+                    sensor_name(settings)
+                )
+            } else {
+                detail
+            });
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let sensor_output = match child.stdout.take() {
+        Some(output) => output,
+        None => {
+            child.kill().ok();
+            child.wait().ok();
+            drop(live_input);
+            stop_live_reconstruction_child(
+                &phase_root,
+                &mut live_reconstruction,
+                Duration::from_secs(2),
+            );
+            return Err("Could not open the RGB-D sensor stream".to_string());
+        }
+    };
+    let sensor_relay = thread::spawn(move || {
+        let mut source = BufReader::new(sensor_output);
+        std::io::copy(&mut source, &mut live_input).ok();
+        live_input.flush().ok();
+    });
+
+    Ok(ActiveCapture {
+        child,
+        sensor_relay: Some(sensor_relay),
+        live_reconstruction,
+        realtime,
+        project_root: project_root.to_path_buf(),
+        phase_root,
+        phase_id,
+        phase_name,
+        settings: settings.clone(),
+    })
+}
+
 #[tauri::command]
-pub fn start_sensor_phase(
+pub async fn start_sensor_preview(
+    app: AppHandle,
+    project_path: String,
+    settings: CaptureSettings,
+    state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        start_sensor_preview_blocking(app, project_path, settings, &state)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn start_sensor_preview_blocking(
     app: AppHandle,
     project_path: String,
     mut settings: CaptureSettings,
+    state: &AppState,
+) -> Result<ProjectSummary, String> {
+    validate_sensor_settings(&mut settings)?;
+    if settings.sensor_kind == "kinect_v2" {
+        return Err("Kinect v2 preview opens when capture starts".to_string());
+    }
+    if state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .is_some()
+    {
+        return Err("A sensor capture is already running".to_string());
+    }
+    let project_root = PathBuf::from(project_path);
+    let project = storage::read_project(&project_root)?;
+    if project.processing_status == "processing" || project.active_job.is_some() {
+        return Err("Camera preview is paused during reconstruction".to_string());
+    }
+    let mut active = state
+        .active_preview
+        .lock()
+        .map_err(|_| "Preview state is unavailable".to_string())?;
+    if active
+        .as_ref()
+        .is_some_and(|preview| preview.project_root == project_root && preview.settings == settings)
+    {
+        return Ok(project);
+    }
+    if let Some(mut previous) = active.take() {
+        shutdown_sensor_session(&mut previous, Duration::from_secs(3));
+        discard_preview_files(&previous);
+    }
+    let phase_id = Uuid::new_v4().to_string();
+    let phase_name = format!(
+        "{} phase {}",
+        sensor_name(&settings),
+        project.phases.len() + 1
+    );
+    let preview = start_sensor_session(&app, &project_root, &settings, phase_id, phase_name, true)?;
+    *active = Some(preview);
+    Ok(project)
+}
+
+#[tauri::command]
+pub async fn stop_sensor_preview(state: State<'_, AppState>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || stop_sensor_preview_blocking(&state))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn stop_sensor_preview_blocking(state: &AppState) -> Result<(), String> {
+    let preview = state
+        .active_preview
+        .lock()
+        .map_err(|_| "Preview state is unavailable".to_string())?
+        .take();
+    if let Some(mut preview) = preview {
+        shutdown_sensor_session(&mut preview, Duration::from_secs(4));
+        discard_preview_files(&preview);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_sensor_phase(
+    app: AppHandle,
+    project_path: String,
+    settings: CaptureSettings,
     state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        start_sensor_phase_blocking(app, project_path, settings, &state)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn start_sensor_phase_blocking(
+    app: AppHandle,
+    project_path: String,
+    mut settings: CaptureSettings,
+    state: &AppState,
 ) -> Result<ProjectSummary, String> {
     validate_sensor_settings(&mut settings)?;
     let mut active = state
@@ -1159,6 +2162,12 @@ pub fn start_sensor_phase(
     let mut project = storage::read_project(&project_root)?;
     if project.active_job.is_some() {
         return Err("Cancel the active artifact job before capturing another phase".to_string());
+    }
+    if !project.media_sources.is_empty() {
+        return Err(
+            "Start a new project for RGB-D capture; this project uses photos/video"
+                .to_string(),
+        );
     }
     project.settings = settings;
     write_sensor_preference(&app, &project.settings)?;
@@ -1177,6 +2186,53 @@ pub fn start_sensor_phase(
     project.processing_backend = None;
     project.processing_duration_seconds = None;
     project.artifacts = crate::models::ArtifactCatalog::default();
+
+    let preview = state
+        .active_preview
+        .lock()
+        .map_err(|_| "Preview state is unavailable".to_string())?
+        .take();
+    if let Some(mut preview) = preview {
+        let reusable = preview.project_root == project_root
+            && preview.settings == project.settings
+            && matches!(preview.child.try_wait(), Ok(None));
+        if reusable {
+            if let Ok(mut snapshot) = preview.realtime.lock() {
+                snapshot.points = None;
+                snapshot.mesh = None;
+                snapshot.status.processed_frames = 0;
+                snapshot.status.integrated_frames = 0;
+                snapshot.status.rejected_frames = 0;
+                snapshot.status.point_count = 0;
+                snapshot.status.triangle_count = 0;
+            }
+            File::create(preview.phase_root.join("record.flag"))
+                .map_err(|error| format!("Could not begin recording: {error}"))?;
+            let is_reference = project.phases.is_empty();
+            project.phases.push(crate::models::PhaseSummary {
+                id: preview.phase_id.clone(),
+                name: preview.phase_name.clone(),
+                created_at: Utc::now().to_rfc3339(),
+                duration_seconds: 0,
+                frame_count: 0,
+                status: "capturing".to_string(),
+                overlap_hint: if is_reference {
+                    "Reference phase".to_string()
+                } else {
+                    "Capture overlapping geometry".to_string()
+                },
+            });
+            storage::write_project(&project)?;
+            *state
+                .project
+                .lock()
+                .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
+            *active = Some(preview);
+            return Ok(project);
+        }
+        shutdown_sensor_session(&mut preview, Duration::from_secs(3));
+        discard_preview_files(&preview);
+    }
     let phase_id = Uuid::new_v4().to_string();
     let phase_name = format!(
         "{} phase {}",
@@ -1186,9 +2242,9 @@ pub fn start_sensor_phase(
     let phase_root = project_root.join("phases").join(&phase_id);
     fs::create_dir_all(&phase_root).map_err(|error| error.to_string())?;
 
-    // PyInstaller's one-file Open3D runtime can take several seconds to unpack
-    // on a cold launch. Warm it completely before opening the sensor so the
-    // first captured frames can already contribute to the visible map.
+    // Make the CUDA engine ready before opening the sensor so the first
+    // captured frames can already contribute to the visible map. The packaged
+    // runtime is kept extracted, so this is normally sub-second initialization.
     let (live_child, mut live_input, realtime) =
         start_realtime_engine(&app, &phase_root, &project.settings)?;
     let mut live_reconstruction = Some(live_child);
@@ -1329,7 +2385,7 @@ pub fn start_sensor_phase(
     let is_reference = project.phases.is_empty();
     project.phases.push(crate::models::PhaseSummary {
         id: phase_id.clone(),
-        name: phase_name,
+        name: phase_name.clone(),
         created_at: Utc::now().to_rfc3339(),
         duration_seconds: 0,
         frame_count: 0,
@@ -1348,6 +2404,8 @@ pub fn start_sensor_phase(
         project_root,
         phase_root,
         phase_id,
+        phase_name,
+        settings: project.settings.clone(),
     };
     let mut project_state = state
         .project
@@ -1380,6 +2438,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
                         capture.phase_root.clone(),
                         capture.phase_id.clone(),
                         Arc::clone(&capture.realtime),
+                        true,
                     ));
                     None
                 }
@@ -1398,6 +2457,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
         drain_live_reconstruction(&mut capture, Duration::from_secs(1));
         stop_live_reconstruction(&mut capture, Duration::from_secs(2));
+        save_live_reconstruction_preview(&capture.phase_root, &capture.realtime).ok();
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
         let detail = read_sensor_log(&capture.phase_root);
         let frame_count = indexed_frame_count(&capture.phase_root);
@@ -1432,6 +2492,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             project: project.clone(),
             preview: Vec::new(),
             capturing: false,
+            previewing: false,
             sensor_connected: false,
             sensor_paused: false,
             sensor_status: if detail.is_empty() {
@@ -1478,7 +2539,48 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         });
     }
 
-    if let Some((phase_root, phase_id, realtime)) = active_snapshot {
+    let mut preview_error = None;
+    if active_snapshot.is_none() {
+        let ended_preview = {
+            let mut active = state
+                .active_preview
+                .lock()
+                .map_err(|_| "Preview state is unavailable".to_string())?;
+            if let Some(preview) = active.as_mut() {
+                match preview
+                    .child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                {
+                    Some(status) => active.take().map(|preview| (preview, status)),
+                    None => {
+                        active_snapshot = Some((
+                            preview.phase_root.clone(),
+                            preview.phase_id.clone(),
+                            Arc::clone(&preview.realtime),
+                            false,
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((mut preview, status)) = ended_preview {
+            drain_sensor_relay(&mut preview, Duration::from_secs(1));
+            stop_live_reconstruction(&mut preview, Duration::from_secs(2));
+            let detail = read_sensor_log(&preview.phase_root);
+            preview_error = Some(if detail.is_empty() {
+                format!("Camera preview stopped unexpectedly ({status})")
+            } else {
+                detail
+            });
+            discard_preview_files(&preview);
+        }
+    }
+
+    if let Some((phase_root, phase_id, realtime, recording)) = active_snapshot {
         let live = live_worker_status(&phase_root);
         let frame_count = live
             .as_ref()
@@ -1491,9 +2593,11 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
                     .map(|phase| phase.frame_count)
             })
             .unwrap_or(0);
-        if let Some(phase) = project.phases.iter_mut().find(|phase| phase.id == phase_id) {
-            phase.frame_count = frame_count;
-            phase.duration_seconds = frame_count / project.settings.capture_fps.max(1);
+        if recording {
+            if let Some(phase) = project.phases.iter_mut().find(|phase| phase.id == phase_id) {
+                phase.frame_count = frame_count;
+                phase.duration_seconds = frame_count / project.settings.capture_fps.max(1);
+            }
         }
         *state
             .project
@@ -1524,15 +2628,18 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
                 .map(|status| status.point_count)
                 .unwrap_or(preview.len() as u64),
             preview,
-            capturing: true,
+            capturing: recording,
+            previewing: !recording,
             sensor_connected: live.is_some(),
             sensor_paused: false,
             sensor_status: live
                 .as_ref()
                 .map(|status| {
                     format!(
-                        "{} streaming at {:.1} fps",
-                        selected_sensor_name, status.stream_fps
+                        "{} {} at {:.1} fps",
+                        selected_sensor_name,
+                        if recording { "recording" } else { "previewing" },
+                        status.stream_fps
                     )
                 })
                 .unwrap_or_else(|| "Waiting for the next sensor frame".to_string()),
@@ -1630,6 +2737,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             preview_point_count: preview.len() as u64,
             preview,
             capturing: false,
+            previewing: false,
             sensor_connected: false,
             sensor_paused: true,
             sensor_status: "Sensor preview paused while reconstructing".to_string(),
@@ -1666,6 +2774,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         preview_point_count: preview.len() as u64,
         preview,
         capturing: false,
+        previewing: false,
         sensor_connected: false,
         sensor_paused: false,
         sensor_status: format!("{} opens when capture starts", selected_sensor_name),
@@ -1691,7 +2800,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         depth_rmse_mm: None,
         live_reconstruction_backend: None,
         reconstruction: reconstruction_progress(&project_root),
-        error: None,
+        error: preview_error,
     })
 }
 
@@ -1809,14 +2918,14 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
         drain_sensor_relay(&mut capture, Duration::from_secs(3));
         drain_live_reconstruction(&mut capture, Duration::from_secs(3));
         stop_live_reconstruction(&mut capture, Duration::from_secs(5));
+        let live_preview_error =
+            save_live_reconstruction_preview(&capture.phase_root, &capture.realtime).err();
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
 
         let manifest_path = capture.phase_root.join("phase.json");
         let capture_summary = File::open(&manifest_path)
             .ok()
-            .and_then(|file| {
-                serde_json::from_reader::<_, crate::models::PhaseManifest>(file).ok()
-            })
+            .and_then(|file| serde_json::from_reader::<_, crate::models::PhaseManifest>(file).ok())
             .map(|manifest| (manifest.frame_count, manifest.duration_seconds))
             .unwrap_or((0, 0));
         let mut project = storage::read_project(&capture.project_root)?;
@@ -1826,8 +2935,8 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
         let duration_seconds = capture_summary.1.max(
             (frame_count / project.settings.capture_fps.max(1)).max(u32::from(frame_count > 0)),
         );
-        let clean_stop = stop_error.is_none()
-            && status.as_ref().is_some_and(|status| status.success());
+        let clean_stop =
+            stop_error.is_none() && status.as_ref().is_some_and(|status| status.success());
         // A CSV row is flushed only after both frame payloads are durable. Keep
         // those indexed frames reconstructable even if process shutdown itself
         // was forced or reported an error.
@@ -1847,6 +2956,8 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
             };
             phase.overlap_hint = if frame_count == 0 {
                 "No usable sensor frames were saved".to_string()
+            } else if let Some(error) = &live_preview_error {
+                format!("Capture saved; {error}")
             } else if let Some(error) = &stop_error {
                 format!("Recovered {frame_count} indexed frames · {error}")
             } else if !clean_stop {
@@ -2114,6 +3225,153 @@ pub async fn load_preview_mesh_texture(project_path: String) -> Result<Response,
 
 const PLY_VERTEX_STRIDE: usize = 15;
 
+fn validate_cloud_transform(transform: &CloudTransform) -> Result<(), String> {
+    if transform
+        .position
+        .iter()
+        .chain(transform.rotation.iter())
+        .chain(transform.scale.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("The model edit pose contains a non-finite value".to_string());
+    }
+    if transform.scale.iter().any(|value| value.abs() < 1e-6) {
+        return Err("The model edit pose contains a zero scale".to_string());
+    }
+    Ok(())
+}
+
+fn transformed_position(position: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
+    let [x_angle, y_angle, z_angle] = transform.rotation.map(f32::to_radians);
+    let (sx, cx) = (x_angle * 0.5).sin_cos();
+    let (sy, cy) = (y_angle * 0.5).sin_cos();
+    let (sz, cz) = (z_angle * 0.5).sin_cos();
+    let qx = sx * cy * cz + cx * sy * sz;
+    let qy = cx * sy * cz - sx * cy * sz;
+    let qz = cx * cy * sz + sx * sy * cz;
+    let qw = cx * cy * cz - sx * sy * sz;
+    let [x, y, z] = [
+        position[0] * transform.scale[0],
+        position[1] * transform.scale[1],
+        position[2] * transform.scale[2],
+    ];
+    let tx = 2.0 * (qy * z - qz * y);
+    let ty = 2.0 * (qz * x - qx * z);
+    let tz = 2.0 * (qx * y - qy * x);
+    [
+        x + qw * tx + (qy * tz - qz * ty) + transform.position[0],
+        y + qw * ty + (qz * tx - qx * tz) + transform.position[1],
+        z + qw * tz + (qx * ty - qy * tx) + transform.position[2],
+    ]
+}
+
+fn transformed_direction(direction: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
+    let origin = transformed_position([0.0, 0.0, 0.0], transform);
+    let endpoint = transformed_position(direction, transform);
+    [
+        endpoint[0] - origin[0],
+        endpoint[1] - origin[1],
+        endpoint[2] - origin[2],
+    ]
+}
+
+fn transformed_normal(normal: [f32; 3], transform: &CloudTransform) -> [f32; 3] {
+    // Positions use R*S, so normals use R*inverse(S), followed by normalization.
+    let adjusted =
+        std::array::from_fn(|axis| normal[axis] / (transform.scale[axis] * transform.scale[axis]));
+    let transformed = transformed_direction(adjusted, transform);
+    let length = transformed
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if length > f32::EPSILON {
+        transformed.map(|value| value / length)
+    } else {
+        transformed
+    }
+}
+
+fn transformed_obj(source: &str, transform: &CloudTransform) -> Result<String, String> {
+    let mut output = String::with_capacity(source.len());
+    let reverse_winding = transform.scale.iter().product::<f32>() < 0.0;
+    for line in source.lines() {
+        if let Some(vertex) = line.strip_prefix("v ") {
+            let values = vertex
+                .split_whitespace()
+                .take(3)
+                .map(str::parse::<f32>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "The generated OBJ contains an invalid vertex".to_string())?;
+            if values.len() != 3 {
+                return Err("The generated OBJ contains an incomplete vertex".to_string());
+            }
+            let position = transformed_position([values[0], values[1], values[2]], transform);
+            output.push_str(&format!(
+                "v {:.7} {:.7} {:.7}\n",
+                position[0], position[1], position[2]
+            ));
+        } else if let Some(normal) = line.strip_prefix("vn ") {
+            let values = normal
+                .split_whitespace()
+                .take(3)
+                .map(str::parse::<f32>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "The generated OBJ contains an invalid normal".to_string())?;
+            if values.len() != 3 {
+                return Err("The generated OBJ contains an incomplete normal".to_string());
+            }
+            let normal = transformed_normal([values[0], values[1], values[2]], transform);
+            output.push_str(&format!(
+                "vn {:.7} {:.7} {:.7}\n",
+                normal[0], normal[1], normal[2]
+            ));
+        } else if reverse_winding && line.starts_with("f ") {
+            let vertices = line[2..].split_whitespace().collect::<Vec<_>>();
+            if vertices.len() == 3 {
+                output.push_str(&format!(
+                    "f {} {} {}\n",
+                    vertices[0], vertices[2], vertices[1]
+                ));
+            } else {
+                output.push_str(line);
+                output.push('\n');
+            }
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn transformed_cloud_ply(
+    mut bytes: Vec<u8>,
+    transform: &CloudTransform,
+) -> Result<Vec<u8>, String> {
+    let marker = b"end_header\n";
+    let payload_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .map(|position| position + marker.len())
+        .ok_or_else(|| "The generated PLY header is invalid".to_string())?;
+    if (bytes.len() - payload_start) % PLY_VERTEX_STRIDE != 0 {
+        return Err("The generated PLY vertex data has an unexpected size".to_string());
+    }
+    for vertex in bytes[payload_start..].chunks_exact_mut(PLY_VERTEX_STRIDE) {
+        let position = [
+            f32::from_le_bytes(vertex[0..4].try_into().unwrap()),
+            f32::from_le_bytes(vertex[4..8].try_into().unwrap()),
+            f32::from_le_bytes(vertex[8..12].try_into().unwrap()),
+        ];
+        let transformed = transformed_position(position, transform);
+        vertex[0..4].copy_from_slice(&transformed[0].to_le_bytes());
+        vertex[4..8].copy_from_slice(&transformed[1].to_le_bytes());
+        vertex[8..12].copy_from_slice(&transformed[2].to_le_bytes());
+    }
+    Ok(bytes)
+}
+
 fn unity_compatible_ply(mut bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     let marker = b"end_header\n";
     let header_end = bytes
@@ -2202,7 +3460,12 @@ fn write_export(destination: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn export_ply(project_path: String, destination_path: String) -> Result<String, String> {
+pub fn export_ply(
+    project_path: String,
+    destination_path: String,
+    transform: CloudTransform,
+) -> Result<String, String> {
+    validate_cloud_transform(&transform)?;
     let root = PathBuf::from(project_path);
     let project = storage::read_project(&root)?;
     if project.processing_status != "complete" {
@@ -2232,7 +3495,7 @@ pub fn export_ply(project_path: String, destination_path: String) -> Result<Stri
 
     let bytes = fs::read(&source)
         .map_err(|error| format!("Could not read the reconstructed PLY: {error}"))?;
-    let unity_bytes = unity_compatible_ply(bytes)?;
+    let unity_bytes = unity_compatible_ply(transformed_cloud_ply(bytes, &transform)?)?;
     write_export(&destination, &unity_bytes)?;
     Ok(destination.to_string_lossy().into_owned())
 }
@@ -2241,7 +3504,9 @@ pub fn export_ply(project_path: String, destination_path: String) -> Result<Stri
 pub fn export_textured_mesh(
     project_path: String,
     destination_path: String,
+    transform: CloudTransform,
 ) -> Result<String, String> {
+    validate_cloud_transform(&transform)?;
     let root = PathBuf::from(project_path);
     let project = storage::read_project(&root)?;
     if project.processing_status != "complete" {
@@ -2284,8 +3549,9 @@ pub fn export_textured_mesh(
         .ok_or_else(|| "Choose a valid texture destination".to_string())?
         .to_string_lossy();
 
-    let obj = fs::read_to_string(source_obj)
-        .map_err(|error| format!("Could not read the reconstructed OBJ: {error}"))?
+    let source_obj = fs::read_to_string(source_obj)
+        .map_err(|error| format!("Could not read the reconstructed OBJ: {error}"))?;
+    let obj = transformed_obj(&source_obj, &transform)?
         .replace("mtllib room-mesh.mtl", &format!("mtllib {mtl_name}"));
     let mtl = fs::read_to_string(source_mtl)
         .map_err(|error| format!("Could not read the reconstructed material: {error}"))?
@@ -2545,7 +3811,10 @@ pub async fn load_gaussian_splat(project_path: String) -> Result<Response, Strin
     tauri::async_runtime::spawn_blocking(move || {
         let root = PathBuf::from(project_path);
         let project = storage::read_project(&root)?;
-        if project.processing_status == "processing" {
+        // The reconstruction worker can publish its artifacts before the
+        // separately packaged splat trainer finishes. `active_job` is the
+        // durable source of truth across that worker boundary.
+        if gaussian_splat_preview_is_live(&project) {
             let live_preview = root.join("outputs").join("room-splat.preview.splat");
             let bytes = fs::read(&live_preview).map_err(|_| {
                 "The trainer has not published its first live splat preview yet".to_string()
@@ -2572,6 +3841,10 @@ pub async fn load_gaussian_splat(project_path: String) -> Result<Response, Strin
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn gaussian_splat_preview_is_live(project: &ProjectSummary) -> bool {
+    project.processing_status == "processing" || project.active_job.is_some()
 }
 
 #[tauri::command]
@@ -2626,15 +3899,74 @@ pub fn export_gaussian_splat(
     Ok(destination.to_string_lossy().into_owned())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_splat_preview, convert_3dgs_ply_to_splat, normalize_project, pack_preview_mesh,
-        unity_compatible_ply, valid_packed_preview_mesh, validate_sensor_settings,
+        compact_splat_preview, convert_3dgs_ply_to_splat, gaussian_splat_preview_is_live,
+        normalize_project, pack_preview_mesh, read_supplemental_photo_manifest,
+        save_live_reconstruction_preview,
+        transformed_cloud_ply, transformed_obj, unity_compatible_ply, valid_packed_preview_mesh,
+        validate_sensor_settings, LiveGeometryFrame, RealtimeEngineSnapshot,
     };
-    use crate::models::{CaptureSettings, ProjectSummary};
+    use crate::models::{CaptureSettings, CloudTransform, ProjectSummary};
     use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn legacy_supplemental_photos_are_visible_as_localized_attempts() {
+        let root =
+            std::env::temp_dir().join(format!("scanlan-supplemental-{}", uuid::Uuid::new_v4()));
+        crate::storage::create_project(&root).unwrap();
+        crate::storage::write_json(
+            &root.join("supplemental-photos.json"),
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "photos": [{
+                    "id": "legacy-photo",
+                    "name": "legacy",
+                    "path": "supplemental/legacy.png"
+                }]
+            }),
+        )
+        .unwrap();
+
+        let manifest = read_supplemental_photo_manifest(&root).unwrap();
+        let attempts = manifest["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["id"], "legacy-photo");
+        assert_eq!(attempts[0]["status"], "localized");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn final_live_point_packet_is_preserved_with_the_capture() {
+        let root =
+            std::env::temp_dir().join(format!("scanlan-live-preview-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let mut packet = Vec::new();
+        packet.extend_from_slice(b"K2P1");
+        packet.extend_from_slice(&7_u32.to_le_bytes());
+        packet.extend_from_slice(&123_456_u64.to_le_bytes());
+        packet.extend_from_slice(&12.0_f32.to_le_bytes());
+        packet.extend_from_slice(&1_u32.to_le_bytes());
+        packet.extend_from_slice(&1.0_f32.to_le_bytes());
+        packet.extend_from_slice(&2.0_f32.to_le_bytes());
+        packet.extend_from_slice(&3.0_f32.to_le_bytes());
+        packet.extend_from_slice(&[10, 20, 30]);
+        let mut snapshot = RealtimeEngineSnapshot::default();
+        snapshot.points = Some(LiveGeometryFrame {
+            frame_count: 7,
+            packet: Arc::new(packet.clone()),
+        });
+
+        assert!(save_live_reconstruction_preview(&root, &Arc::new(Mutex::new(snapshot)),).unwrap());
+        assert_eq!(
+            fs::read(root.join("live-reconstruction.preview.bin")).unwrap(),
+            packet
+        );
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn mesh_preview_is_packed_as_indexed_binary_geometry() {
@@ -2819,6 +4151,71 @@ mod tests {
     }
 
     #[test]
+    fn edit_pose_transforms_point_and_mesh_exports() {
+        let transform = CloudTransform {
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 90.0],
+            scale: [2.0, 1.0, 1.0],
+        };
+        let header = concat!(
+            "ply\n",
+            "format binary_little_endian 1.0\n",
+            "element vertex 1\n",
+            "property float x\n",
+            "property float y\n",
+            "property float z\n",
+            "property uchar red\n",
+            "property uchar green\n",
+            "property uchar blue\n",
+            "end_header\n"
+        );
+        let mut source = header.as_bytes().to_vec();
+        for value in [1.0_f32, 0.0, 0.0] {
+            source.extend_from_slice(&value.to_le_bytes());
+        }
+        source.extend_from_slice(&[10, 20, 30]);
+
+        let transformed = transformed_cloud_ply(source, &transform).unwrap();
+        let vertex = &transformed[header.len()..];
+        let position = [
+            f32::from_le_bytes(vertex[0..4].try_into().unwrap()),
+            f32::from_le_bytes(vertex[4..8].try_into().unwrap()),
+            f32::from_le_bytes(vertex[8..12].try_into().unwrap()),
+        ];
+        assert!((position[0] - 1.0).abs() < 1e-5);
+        assert!((position[1] - 4.0).abs() < 1e-5);
+        assert!((position[2] - 3.0).abs() < 1e-5);
+        assert_eq!(&vertex[12..15], &[10, 20, 30]);
+
+        let obj = transformed_obj("v 1 0 0\nvn 1 0 0\nf 1 2 3\n", &transform).unwrap();
+        let values = |prefix: &str| {
+            obj.lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .unwrap()
+                .split_whitespace()
+                .map(|value| value.parse::<f32>().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let vertex = values("v ");
+        let normal = values("vn ");
+        for (actual, expected) in vertex.iter().zip([1.0, 4.0, 3.0]) {
+            assert!((*actual - expected).abs() < 1e-5);
+        }
+        for (actual, expected) in normal.iter().zip([0.0, 1.0, 0.0]) {
+            assert!((*actual - expected).abs() < 1e-5);
+        }
+
+        let mirrored = CloudTransform {
+            position: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: [-1.0, 1.0, 1.0],
+        };
+        assert!(transformed_obj("f 1 2 3\n", &mirrored)
+            .unwrap()
+            .contains("f 1 3 2"));
+    }
+
+    #[test]
     fn modern_sensor_accepts_wide_binned_depth() {
         let mut settings = CaptureSettings {
             sensor_kind: "femto_mega".to_string(),
@@ -2839,5 +4236,14 @@ mod tests {
             validate_sensor_settings(&mut settings),
             Err("Unknown live reconstruction mode".to_string())
         );
+    }
+
+    #[test]
+    fn active_artifact_job_keeps_gaussian_preview_live_between_workers() {
+        let mut project = ProjectSummary::placeholder();
+        project.processing_status = "complete".to_string();
+        project.active_job = Some("splat-job".to_string());
+
+        assert!(gaussian_splat_preview_is_live(&project));
     }
 }

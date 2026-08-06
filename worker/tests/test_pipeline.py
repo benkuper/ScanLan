@@ -7,6 +7,7 @@ import importlib.util
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,8 @@ from scanlan.io import (
     load_source_rgb,
     read_phase,
     read_project,
+    save_preview,
+    write_json,
 )
 from scanlan.mock_data import create_mock_project
 from scanlan.compute import (
@@ -42,15 +45,115 @@ from scanlan.open3d_engine import (
     _display_points,
     _interpolate_rigid_transform,
     _prefer_alignment,
+    _tracking_prefix_is_recoverable,
     _tracking_fragment_ranges,
     _trajectory_alignment_acceptable,
     reconstruct_open3d,
 )
-from scanlan.mesh import PosedFrame, _bake_triangle_atlas, _weld_depth_meshes
+from scanlan.mesh import (
+    CalibrationSamples,
+    PosedFrame,
+    TextureCalibration,
+    _bake_shared_view_atlas,
+    _bake_triangle_atlas,
+    _coherent_triangle_labels,
+    _estimate_texture_calibration,
+    _weld_depth_meshes,
+)
 from scanlan.reconstruct import reconstruct_project
+from scanlan.supplemental import (
+    _photo_quality,
+    _solve_photo_pose,
+    _world_from_depth_pose,
+    localize_supplemental_photos,
+    write_localization_progress,
+)
 
 
 class PipelineTests(unittest.TestCase):
+    def test_supplemental_photo_quality_is_bounded_and_explainable(self) -> None:
+        weak_score, weak_label = _photo_quality(8, 12, 5.5, 1.8)
+        strong_score, strong_label = _photo_quality(28, 50, 0.8, 0.2)
+
+        self.assertGreater(strong_score, weak_score)
+        self.assertEqual(strong_label, "Excellent")
+        self.assertIn(weak_label, {"Weak", "Usable", "Good", "Excellent"})
+        self.assertTrue(0 <= weak_score <= 100)
+        self.assertTrue(0 <= strong_score <= 100)
+
+    def test_supplemental_photo_progress_is_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_localization_progress(
+                root,
+                status="running",
+                stage="solving_photo_pose",
+                detail="Validating photo 2 of 4",
+                progress=0.625,
+                processed_photos=1,
+                total_photos=4,
+                localized_photos=1,
+                failed_photos=0,
+            )
+
+            progress = json.loads(
+                (root / "outputs" / "photo-localization-progress.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(progress["status"], "running")
+            self.assertEqual(progress["stage"], "solving_photo_pose")
+            self.assertEqual(progress["processedPhotos"], 1)
+            self.assertEqual(progress["totalPhotos"], 4)
+            self.assertEqual(progress["progress"], 0.625)
+
+    def test_supplemental_photos_are_registered_before_reference_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "detail.jpg"
+            source.write_bytes(b"queued-photo")
+
+            with patch("scanlan.supplemental._opencv", return_value=object()):
+                with self.assertRaisesRegex(RuntimeError, "Build the RGB-D mesh"):
+                    localize_supplemental_photos(root, [source])
+
+            manifest = json.loads(
+                (root / "supplemental-photos.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(manifest["attempts"]), 1)
+            self.assertEqual(manifest["attempts"][0]["name"], "detail")
+            self.assertEqual(manifest["attempts"][0]["status"], "queued")
+
+    def test_legacy_display_pose_recovers_canonical_depth_camera(self) -> None:
+        pose = {
+            "matrix": np.diag([1.0, -1.0, -1.0, 1.0]).reshape(-1).tolist(),
+            "imageYUp": False,
+        }
+        np.testing.assert_allclose(_world_from_depth_pose(pose, False), np.eye(4))
+
+        known_pose = {
+            "matrix": np.diag([1.0, 1.0, -1.0, 1.0]).reshape(-1).tolist(),
+            "imageYUp": True,
+        }
+        np.testing.assert_allclose(
+            _world_from_depth_pose(known_pose, False),
+            np.diag([1.0, -1.0, 1.0, 1.0]),
+        )
+
+    def test_locked_transient_build_preview_does_not_abort_artifacts(self) -> None:
+        points = np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32)
+        colors = np.asarray([[10, 20, 30]], dtype=np.uint8)
+        with patch("scanlan.io.write_json", side_effect=PermissionError("locked")):
+            save_preview(Path("build-preview.json"), points, colors)
+            with self.assertRaises(PermissionError):
+                save_preview(Path("preview.json"), points, colors)
+
+    def test_tracking_loss_only_keeps_a_substantial_validated_prefix(self) -> None:
+        self.assertFalse(_tracking_prefix_is_recoverable(945, 29))
+        self.assertFalse(_tracking_prefix_is_recoverable(945, 236))
+        self.assertTrue(_tracking_prefix_is_recoverable(945, 237))
+        self.assertTrue(_tracking_prefix_is_recoverable(945, 782))
+
     def test_tracking_journal_filters_rejections_and_seeds_offline_poses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=3)
@@ -89,6 +192,9 @@ class PipelineTests(unittest.TestCase):
 
             replay_phase = read_phase(phase_root, include_tracking_rejected=True)
             self.assertEqual(len(replay_phase.frames), 3)
+
+            result = reconstruct_project(root, engine="numpy", targets=("point_cloud",))
+            self.assertEqual(result["framesUsed"], 3)
 
     def test_kinect_fusion_trajectory_must_match_archived_depth(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -221,8 +327,13 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(preview_index_count, result["meshTriangleCount"] * 3)
             self.assertEqual(len(mesh_preview), 12 + preview_vertex_count * 20 + preview_index_count * 4)
             self.assertIn(result["meshFusionMethod"], {"tsdf", "welded_depth"})
-            self.assertEqual(result["textureSource"], "best_view_native_rgb_texel_projection")
+            self.assertEqual(result["textureSource"], "coherent_best_view_shared_image_atlas")
             self.assertGreaterEqual(result["textureCoveragePercent"], 99.0)
+            self.assertLessEqual(
+                result["textureLabelSwitchPercentAfter"],
+                result["textureLabelSwitchPercentBefore"],
+            )
+            self.assertGreater(result["texturePageResolution"], 8)
             self.assertEqual((root / "outputs" / "room-texture.png").read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
             with (root / "outputs" / "camera-poses.json").open("r", encoding="utf-8") as handle:
                 camera_frames = json.load(handle)
@@ -248,6 +359,47 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(cached_result["meshCacheHit"])
             self.assertEqual(cached_result["meshTriangleCount"], result["meshTriangleCount"])
 
+    def test_rebuild_includes_localized_supplemental_texture_photo(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=2)
+            reconstruct_project(root, engine="numpy")
+            poses = json.loads((root / "outputs" / "camera-poses.json").read_text(encoding="utf-8"))
+            reference = next(pose for pose in poses if pose["textureFrame"])
+            project = read_project(root)
+            phase = read_phase(root / "phases" / project["phases"][0]["id"])
+            image_root = root / "supplemental"
+            image_root.mkdir()
+            image_path = image_root / "detail.png"
+            Image.fromarray(load_source_rgb(phase.frames[0], phase)).save(image_path)
+            write_json(
+                root / "supplemental-photos.json",
+                {
+                    "schemaVersion": 1,
+                    "photos": [
+                        {
+                            "id": "detail",
+                            "name": "detail",
+                            "path": "supplemental/detail.png",
+                            "camera": reference["camera"],
+                            "worldFromCamera": reference["worldFromRgbCameraOpenCv"],
+                            "inlierCount": 100,
+                            "reprojectionRmsePixels": 0.4,
+                        }
+                    ],
+                },
+            )
+
+            result = reconstruct_project(root, engine="numpy")
+
+            self.assertEqual(result["supplementalTextureFrameCount"], 1)
+            self.assertNotEqual(result["supplementalTextureFingerprint"], "none")
+            rebuilt_poses = json.loads(
+                (root / "outputs" / "camera-poses.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(any(pose["supplementalPhoto"] for pose in rebuilt_poses))
+
     def test_gaussian_target_builds_the_canonical_posed_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=2)
@@ -260,6 +412,11 @@ class PipelineTests(unittest.TestCase):
             dataset = json.loads((dataset_root / "dataset.json").read_text(encoding="utf-8"))
             self.assertEqual(dataset["fingerprint"], result["datasetFingerprint"])
             self.assertEqual(dataset["schemaVersion"], 3)
+            self.assertEqual(
+                dataset["coordinateConvention"]["worldAxes"],
+                "scanlan_display_x_right_y_up_z_back",
+            )
+            self.assertEqual(read_project(root)["processingStatus"], "processing")
             self.assertEqual(len(dataset["frames"]), 2)
             self.assertTrue(
                 all(
@@ -338,6 +495,126 @@ class PipelineTests(unittest.TestCase):
             )
 
             self.assertGreater(int(np.ptp(atlas[..., 0])), 150)
+
+    def test_overlap_calibration_recovers_per_channel_linear_rgb_gains(self) -> None:
+        rng = np.random.default_rng(7)
+        truth = rng.uniform(0.08, 0.82, (1200, 3)).astype(np.float32)
+        expected_gains = np.asarray(
+            [[1.0, 1.0, 1.0], [1.22, 0.84, 1.08], [0.78, 1.17, 0.91]],
+            dtype=np.float32,
+        )
+        observations = np.stack(
+            [np.clip(truth / gain, 0.0, 1.0) for gain in expected_gains], axis=0
+        )
+        weights = np.ones((3, len(truth)), dtype=np.float32)
+        yy, xx = np.divmod(np.arange(len(truth)), 40)
+        uv = np.stack((xx, yy), axis=1).astype(np.float32)
+        samples = CalibrationSamples(
+            np.arange(len(truth), dtype=np.int64),
+            observations,
+            weights,
+            np.repeat(uv[None, ...], 3, axis=0),
+            np.asarray([[40, 30]] * 3, dtype=np.int32),
+        )
+
+        calibration = _estimate_texture_calibration(samples)
+
+        np.testing.assert_allclose(calibration.gains, expected_gains, atol=0.035)
+        self.assertEqual(calibration.overlap_edge_count, 3)
+
+    def test_mesh_label_optimization_removes_isolated_camera_switches(self) -> None:
+        vertices = np.asarray(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [2, 0, 0], [2, 1, 0]],
+            dtype=np.float32,
+        )
+        triangles = np.asarray(
+            [[0, 1, 2], [1, 3, 2], [1, 4, 3], [4, 5, 3]], dtype=np.int64
+        )
+        scores = np.asarray(
+            [[1.0, 0.96, 1.0, 0.96], [0.96, 1.0, 0.96, 1.0]], dtype=np.float32
+        )
+
+        labels, before, after = _coherent_triangle_labels(scores, vertices, triangles)
+
+        self.assertGreater(before, 0.0)
+        self.assertLess(after, before)
+        self.assertTrue(np.all(labels >= 0))
+
+    def test_shared_view_atlas_keeps_one_source_page_instead_of_microcharts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            depth_path = root / "depth.u16"
+            color_path = root / "color.rgb"
+            np.full((8, 8), 2000, dtype="<u2").tofile(depth_path)
+            yy, xx = np.indices((8, 8))
+            checker = (((xx + yy) % 2) * 255).astype(np.uint8)
+            np.repeat(checker[..., None], 3, axis=2).tofile(color_path)
+            camera = CameraModel(8, 8, 4.0, 4.0, 3.5, 3.5, 1000.0, 4.0)
+            record = FrameRecord(0, 0, 0, depth_path, color_path, None, None, np.eye(4))
+            phase = PhaseData(
+                root,
+                {},
+                camera,
+                RgbCameraModel(8, 8, 4.0, 4.0, 3.5, 3.5, "pinhole", ()),
+                np.eye(4),
+                [record],
+                [],
+            )
+            frame = PosedFrame("test", "test", phase, 0, np.eye(4), (1, 1, 1), False)
+            vertices = np.asarray([[-1.5, -1.5, 2], [1.5, -1.5, 2], [-1.5, 1.5, 2]], dtype=np.float32)
+            triangles = np.asarray([[0, 1, 2]], dtype=np.int64)
+            calibration = TextureCalibration(
+                np.ones((1, 3), dtype=np.float32),
+                np.zeros((1, 3), dtype=np.float32),
+                np.zeros((1, 16, 16, 3), dtype=np.float32),
+                0,
+                0,
+                3,
+            )
+
+            atlas, uvs, resolution = _bake_shared_view_atlas(
+                np.full((3, 3), 128, dtype=np.uint8),
+                vertices,
+                triangles,
+                [frame],
+                np.asarray([0], dtype=np.int16),
+                calibration,
+            )
+
+            self.assertEqual(resolution, 8)
+            self.assertGreater(int(np.ptp(atlas[..., 0])), 200)
+            self.assertTrue(np.all((uvs > 0.0) & (uvs < 1.0)))
+
+    @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV is optional in source test environments")
+    def test_supplemental_photo_pnp_recovers_metric_camera_pose(self) -> None:
+        import cv2
+
+        cv2.setRNGSeed(4)
+        rng = np.random.default_rng(4)
+        world = rng.uniform([-1.2, -0.8, 3.0], [1.2, 0.8, 6.0], (300, 3)).astype(np.float32)
+        angle = 0.08
+        camera_from_world = np.eye(4)
+        camera_from_world[:3, :3] = np.asarray(
+            [[math.cos(angle), 0, math.sin(angle)], [0, 1, 0], [-math.sin(angle), 0, math.cos(angle)]]
+        )
+        camera_from_world[:3, 3] = [0.12, -0.04, 0.18]
+        camera_points = world @ camera_from_world[:3, :3].T + camera_from_world[:3, 3]
+        focal = 900.0
+        image = np.column_stack(
+            (
+                focal * camera_points[:, 0] / camera_points[:, 2] + 639.5,
+                focal * camera_points[:, 1] / camera_points[:, 2] + 359.5,
+            )
+        ).astype(np.float32)
+
+        estimated, estimated_focal, inliers, rmse = _solve_photo_pose(
+            world, image, 1280, 720, [focal]
+        )
+
+        np.testing.assert_allclose(estimated, np.linalg.inv(camera_from_world), atol=2e-3)
+        self.assertAlmostEqual(estimated_focal, focal, places=4)
+        self.assertGreaterEqual(inliers, 290)
+        self.assertLess(rmse, 0.05)
 
     def test_numpy_reconstruction_honors_one_mm_point_spacing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

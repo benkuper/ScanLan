@@ -8,9 +8,18 @@ import numpy as np
 
 from scanlan_splat.train import (
     FRAME_REUSE_PER_LOAD,
+    MAX_METRIC_ITERATIONS,
+    RGBD_SURFACE_OPACITY,
+    RGBD_SURFACE_SCALE_MULTIPLIER,
     _cache_local_frame_order,
+    _exponential_lr_gamma,
+    _finish_training_step,
+    _metric_surface_scale_limit,
     _read_seed_parameters,
+    _rgbd_gaussian_limit,
+    _ssim,
     _training_limits,
+    _update_smoothed_loss,
 )
 
 
@@ -38,9 +47,48 @@ def _write_initialization(path: Path) -> None:
 
 class SeedParameterTests(unittest.TestCase):
     def test_training_limits_leave_12_gib_kernel_headroom(self) -> None:
-        self.assertEqual(_training_limits(12.0), (720, 2_000_000))
-        self.assertEqual(_training_limits(16.0), (896, 3_000_000))
-        self.assertEqual(_training_limits(24.0), (1024, 4_000_000))
+        self.assertEqual(_training_limits(8.0), (720, 1_000_000))
+        self.assertEqual(_training_limits(12.0), (960, 2_000_000))
+        self.assertEqual(_training_limits(16.0), (1280, 3_000_000))
+        self.assertEqual(_training_limits(24.0), (1600, 4_000_000))
+
+    def test_smoothed_loss_dampens_single_frame_variation(self) -> None:
+        smoothed = _update_smoothed_loss(None, 0.3)
+        self.assertEqual(smoothed, 0.3)
+        self.assertAlmostEqual(_update_smoothed_loss(smoothed, 0.5), 0.301)
+
+    def test_metric_rgbd_training_is_bounded_by_seed_density_and_scale(self) -> None:
+        self.assertEqual(_rgbd_gaussian_limit(350_000, 3_000_000), 1_050_000)
+        self.assertEqual(_rgbd_gaussian_limit(100_000, 3_000_000), 500_000)
+        scales = np.asarray(
+            [[0.02, 0.03, 0.001], [0.08, 0.10, 0.004]],
+            dtype=np.float32,
+        )
+        self.assertAlmostEqual(
+            _metric_surface_scale_limit(4.0, scales) or 0.0,
+            0.20,
+            places=6,
+        )
+        self.assertIsNone(_metric_surface_scale_limit(4.0, None))
+        self.assertEqual(RGBD_SURFACE_SCALE_MULTIPLIER, 1.3)
+        self.assertEqual(RGBD_SURFACE_OPACITY, 0.45)
+        self.assertEqual(MAX_METRIC_ITERATIONS, 2_000)
+
+    def test_position_learning_rate_decays_to_one_percent(self) -> None:
+        gamma = _exponential_lr_gamma(30_000)
+        self.assertAlmostEqual(gamma**30_000, 0.01, places=10)
+
+    def test_rgb_ssim_ignores_pixels_without_registered_depth(self) -> None:
+        import torch
+
+        predicted = torch.zeros((9, 9, 3), dtype=torch.float32)
+        target = torch.ones((9, 9, 3), dtype=torch.float32)
+        mask = torch.zeros((9, 9), dtype=torch.bool)
+        mask[3:6, 3:6] = True
+        target[mask] = 0.0
+
+        self.assertAlmostEqual(float(_ssim(predicted, target, mask)), 1.0, places=6)
+        self.assertLess(float(_ssim(predicted, target)), 0.5)
 
     def test_frame_order_reuses_only_views_that_fit_the_host_cache(self) -> None:
         order = _cache_local_frame_order(11, epoch=3, cache_size=4)
@@ -54,6 +102,56 @@ class SeedParameterTests(unittest.TestCase):
                 len(np.unique(order[start : start + 4 * FRAME_REUSE_PER_LOAD])),
                 4,
             )
+
+    def test_optimizer_steps_finish_before_densification_replaces_parameters(self) -> None:
+        events: list[tuple[str, object | None]] = []
+
+        class RecordingScaler:
+            def step(self, optimizer: object) -> None:
+                events.append(("optimizer", optimizer))
+
+            def update(self) -> None:
+                events.append(("scaler", None))
+
+        class RecordingStrategy:
+            def step_post_backward(self, *args: object, **kwargs: object) -> None:
+                self.args = args
+                self.kwargs = kwargs
+                events.append(("densification", None))
+
+        gaussian_optimizer = object()
+        pose_optimizer = object()
+        strategy = RecordingStrategy()
+        parameters = object()
+        strategy_state: dict[str, object] = {}
+        info: dict[str, object] = {}
+
+        _finish_training_step(
+            RecordingScaler(),
+            {"means": gaussian_optimizer},
+            pose_optimizer,
+            True,
+            strategy,
+            parameters,
+            strategy_state,
+            600,
+            info,
+        )
+
+        self.assertEqual(
+            events,
+            [
+                ("optimizer", gaussian_optimizer),
+                ("optimizer", pose_optimizer),
+                ("scaler", None),
+                ("densification", None),
+            ],
+        )
+        self.assertEqual(
+            strategy.args[:5],
+            (parameters, {"means": gaussian_optimizer}, strategy_state, 600, info),
+        )
+        self.assertEqual(strategy.kwargs, {"packed": True})
 
     def test_rgbd_sidecar_supplies_surface_scales_and_rotations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

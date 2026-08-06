@@ -9,7 +9,7 @@ ScanLan separates realtime latency from archival throughput and final quality. E
 | Tauri application | lifecycle, project state, status snapshots, exports | camera SDK state or reconstruction kernels |
 | Native capture worker | camera SDK, calibration, synchronized RGB-D, IMU conversion | UI rendering or Open3D |
 | Reconstruction worker | tracking, relocalization, TSDF, pose graph, point/mesh build | camera SDK |
-| Splat worker | CUDA 2DGS optimization and checkpoints | capture or trajectory estimation |
+| Splat worker | Photo/video decoding, COLMAP camera solving, CUDA 2DGS/3DGS optimization, checkpoints | RGB-D capture and TSDF reconstruction |
 
 The realtime engine is started and reports `ready` before the camera is opened. Tauri pipes camera stdout directly into engine stdin and drains engine stdout on a dedicated thread. Sensor stderr goes to `sensor.log`, so a full pipe cannot stall capture.
 
@@ -18,7 +18,7 @@ The realtime engine is started and reports `ready` before the camera is opened. 
 `SCANRGBD` version 1 frames carry:
 
 - sequence and device timestamps;
-- depth-camera dimensions and intrinsics;
+- pinhole depth-grid dimensions and intrinsics (Femto Mega native depth is calibrated and rectified before transport);
 - depth scale and valid range;
 - unsigned 16-bit depth and aligned RGB8;
 - optional gyro delta quaternion;
@@ -54,9 +54,9 @@ The tracker persists across frames. A finite transform alone is insufficient for
 - depth RMSE;
 - translation and angular-velocity limits.
 
-On failure, the map freezes and the tracker checks a bounded set of recent accepted anchors. A relocalized pose passes the same geometric and physical gates. The mapping thread receives only quality-gated keyframes.
+On failure, the map freezes and the tracker searches a rotating bank spanning the complete accepted capture. Local continuation remains subject to strict continuity and IMU limits; a strong saved-keyframe match may instead relocalize anywhere in the known map after three consistent observations. The lock frame is not fused, and mapping resumes only on the next independently validated frame. Tracking acceptance and irreversible fusion use separate gates: a marginal pose may preserve local tracking continuity, but only high-overlap, high-inlier, low-residual keyframes reach the mapping thread.
 
-Every decision is appended asynchronously to `tracking.jsonl`; no image data is duplicated. The final loader matches entries by sensor sequence, excludes explicit rejections, and uses complete accepted trajectories as the production pose seed. The archive replay command deliberately includes rejected frames and omits derived journal poses so tracker changes remain testable.
+Every decision is appended asynchronously to `tracking.jsonl`; no image data is duplicated. Raw RGB-D archival is intentionally independent from live pose acceptance: a rejected frame remains recoverable evidence, but it never enters the live TSDF map. The UI therefore reports raw archived, tracked, rejected, and fused-keyframe counts separately. The final loader matches entries by sensor sequence, excludes explicit rejections from the live pose seed, and can recover archived frames during offline optimization. The archive replay command deliberately includes rejected frames and omits derived journal poses so tracker changes remain testable.
 
 ## Shutdown
 

@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -32,6 +33,7 @@
 
 #ifdef SCANLAN_HAS_ORBBEC
 #include <libobsensor/ObSensor.hpp>
+#include <libobsensor/hpp/Utils.hpp>
 #endif
 
 namespace fs = std::filesystem;
@@ -42,6 +44,7 @@ struct Options {
     bool list = false;
     bool stream_rgbd = false;
     bool use_imu = false;
+    bool preview = false;
     fs::path root;
     std::string id = "phase";
     std::string name = "RGB-D phase";
@@ -111,6 +114,7 @@ Options parse_options(int argc, char **argv) {
         else if(argument == "--probe") options.probe = true;
         else if(argument == "--list") options.list = true;
         else if(argument == "--stream-rgbd") options.stream_rgbd = true;
+        else if(argument == "--preview") options.preview = true;
         else if(argument == "--phase") options.root = value();
         else if(argument == "--id") options.id = value();
         else if(argument == "--name") options.name = value();
@@ -197,7 +201,8 @@ void print_sensor_list(const std::vector<AvailableSensorInfo> &sensors) {
                   << "\",\"connection\":\"" << json_escape(sensor.connection)
                   << "\",\"address\":\"" << json_escape(sensor.address)
                   << "\",\"serial\":\"" << json_escape(sensor.serial)
-                  << "\",\"supportsImu\":" << (sensor.supports_imu ? "true" : "false") << '}';
+                  << "\",\"connected\":true"
+                  << ",\"supportsImu\":" << (sensor.supports_imu ? "true" : "false") << '}';
     }
     std::cout << "]\n";
 }
@@ -380,6 +385,11 @@ private:
 void prepare_root(const Options &options) {
     fs::create_directories(options.root);
     fs::remove(options.root / "stop.flag");
+    fs::remove(options.root / "record.flag");
+    fs::remove(options.root / "reconstruction-reset.flag");
+    fs::remove(options.root / "recording.flag");
+    fs::remove(options.root / "preview.flag");
+    if(options.preview) std::ofstream(options.root / "preview.flag").close();
     fs::remove(options.root / "live.json");
     fs::create_directories(options.root / "depth");
     fs::create_directories(options.root / "color");
@@ -482,12 +492,13 @@ int run_azure(const Options &options) {
         }
 
         prepare_root(options);
-        const std::string created_at = utc_now();
+        std::string created_at = utc_now();
         scanlan::RgbdArchiveWriter archive(
             options.root, options.rgb_quality, options.max_rgb_dimension, 8);
         std::unique_ptr<ImuCsv> imu;
         scanlan::GyroDeltaIntegrator gyro_integrator;
         bool imu_active = false;
+        bool recording = !options.preview;
         auto accel_to_depth = calibration.extrinsics[K4A_CALIBRATION_TYPE_ACCEL][K4A_CALIBRATION_TYPE_DEPTH];
         auto gyro_to_depth = calibration.extrinsics[K4A_CALIBRATION_TYPE_GYRO][K4A_CALIBRATION_TYPE_DEPTH];
         if(options.use_imu && k4a_device_start_imu(device) == K4A_RESULT_SUCCEEDED) {
@@ -500,8 +511,10 @@ int run_azure(const Options &options) {
             while(k4a_device_get_imu_sample(device, &sample, 0) == K4A_WAIT_RESULT_SUCCEEDED) {
                 const auto accel = rotate_k4a(accel_to_depth, sample.acc_sample);
                 const auto gyro = rotate_k4a(gyro_to_depth, sample.gyro_sample);
-                imu->write(sample.acc_timestamp_usec, "accel", accel[0], accel[1], accel[2], sample.temperature);
-                imu->write(sample.gyro_timestamp_usec, "gyro", gyro[0], gyro[1], gyro[2], sample.temperature);
+                if(recording) {
+                    imu->write(sample.acc_timestamp_usec, "accel", accel[0], accel[1], accel[2], sample.temperature);
+                    imu->write(sample.gyro_timestamp_usec, "gyro", gyro[0], gyro[1], gyro[2], sample.temperature);
+                }
                 gyro_integrator.add(sample.gyro_timestamp_usec, gyro[0], gyro[1], gyro[2]);
             }
         };
@@ -515,7 +528,9 @@ int run_azure(const Options &options) {
         k4a_transformation_t transformation = k4a_transformation_create(&calibration);
         if(!transformation) throw std::runtime_error("Azure Kinect calibration transform could not be created");
         std::uint64_t source_frames = 0;
+        std::uint64_t recording_frames = 0;
         const auto started = std::chrono::steady_clock::now();
+        auto recording_started = started;
         while(!fs::exists(options.root / "stop.flag")) {
             k4a_capture_t capture = nullptr;
             const auto wait = k4a_device_get_capture(device, &capture, 1000);
@@ -525,8 +540,20 @@ int run_azure(const Options &options) {
             k4a_image_t depth_image = k4a_capture_get_depth_image(capture);
             if(!depth_image) { k4a_capture_release(capture); continue; }
             ++source_frames;
-            const bool save_source = scanlan::archive_frame_due(
-                source_frames, depth_mode.native_fps, options.fps);
+            if(!recording && fs::exists(options.root / "record.flag")) {
+                recording = true;
+                recording_started = std::chrono::steady_clock::now();
+                created_at = utc_now();
+                {
+                    std::ofstream signal(options.root / "recording.flag");
+                    signal << (source_frames - 1) << '\n';
+                }
+                fs::remove(options.root / "preview.flag");
+                fs::remove(options.root / "record.flag");
+            }
+            if(recording) ++recording_frames;
+            const bool save_source = recording && scanlan::archive_frame_due(
+                recording_frames, depth_mode.native_fps, options.fps);
             const std::uint64_t timestamp_us = k4a_image_get_device_timestamp_usec(depth_image);
             std::vector<std::uint16_t> depth(static_cast<std::size_t>(camera.width * camera.height));
             const auto *depth_buffer = k4a_image_get_buffer(depth_image);
@@ -610,7 +637,9 @@ int run_azure(const Options &options) {
             if(source_frames == 1 || source_frames % 3 == 0) {
                 write_live_status(options, sensor, timestamp_us, archive.saved(),
                                   stream_fps, imu_active, imu ? imu->rate_hz() : 0.0F,
-                                  "Full-rate RGB-D tracking and bounded background recording");
+                                  recording
+                                      ? "Full-rate RGB-D tracking and bounded background recording"
+                                      : "Live RGB-D preview ready; press Capture to begin recording");
             }
             k4a_image_release(depth_image);
             k4a_capture_release(capture);
@@ -621,15 +650,15 @@ int run_azure(const Options &options) {
             k4a_device_stop_imu(device);
         }
         if(rgbd_stream) rgbd_stream->close();
-        const auto duration = static_cast<std::uint32_t>(std::max<std::int64_t>(1,
-            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count()));
+        const auto duration = recording_frames == 0 ? 0U : static_cast<std::uint32_t>(std::max<std::int64_t>(1,
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - recording_started).count()));
         archive.close();
         const auto saved_frames = archive.saved();
         write_manifest(options, sensor, camera, rgb_camera, created_at, saved_frames, duration, imu_active,
                        archive.dropped() + archive.failed());
         k4a_device_stop_cameras(device);
         k4a_device_close(device);
-        return saved_frames > 0 ? 0 : 2;
+        return saved_frames > 0 || options.preview ? 0 : 2;
     } catch(...) {
         k4a_device_stop_imu(device);
         k4a_device_stop_cameras(device);
@@ -644,6 +673,257 @@ int run_azure(const Options &) {
 #endif
 
 #ifdef SCANLAN_HAS_ORBBEC
+class OrbbecDepthRectifier {
+public:
+    OrbbecDepthRectifier(const std::shared_ptr<ob::Pipeline> &pipeline,
+                         const std::shared_ptr<ob::Config> &config,
+                         int width, int height)
+        : width_(width), height_(height) {
+        if(width_ < 2 || height_ < 2) {
+            throw std::runtime_error("Femto Mega depth dimensions cannot be rectified");
+        }
+
+        const auto calibration = pipeline->getCalibrationParam(config);
+        const auto &native_intrinsic = calibration.intrinsics[OB_SENSOR_DEPTH];
+        std::uint32_t table_size = static_cast<std::uint32_t>(
+            static_cast<std::size_t>(width_) * height_ * 2);
+        xy_storage_.resize(table_size);
+        if(!ob::CoordinateTransformHelper::transformationInitXYTables(
+               calibration, OB_SENSOR_DEPTH, xy_storage_.data(), &table_size, &xy_tables_)) {
+            throw std::runtime_error("Femto Mega depth distortion table is unavailable");
+        }
+        if(xy_tables_.width != width_ || xy_tables_.height != height_
+            || !xy_tables_.xTable || !xy_tables_.yTable) {
+            throw std::runtime_error("Femto Mega depth distortion table has unexpected dimensions");
+        }
+        float minimum_x = std::numeric_limits<float>::infinity();
+        float maximum_x = -std::numeric_limits<float>::infinity();
+        float minimum_y = std::numeric_limits<float>::infinity();
+        float maximum_y = -std::numeric_limits<float>::infinity();
+        const int optical_x = std::clamp(
+            static_cast<int>(std::lround(native_intrinsic.cx)), 0, width_ - 1);
+        const int optical_y = std::clamp(
+            static_cast<int>(std::lround(native_intrinsic.cy)), 0, height_ - 1);
+        for(int x = 0; x < width_; ++x) {
+            const std::size_t index = static_cast<std::size_t>(optical_y * width_ + x);
+            const float ray_x = xy_tables_.xTable[index];
+            const float ray_y = xy_tables_.yTable[index];
+            if(!valid_ray(ray_x, ray_y)) continue;
+            minimum_x = std::min(minimum_x, ray_x);
+            maximum_x = std::max(maximum_x, ray_x);
+        }
+        for(int y = 0; y < height_; ++y) {
+            const std::size_t index = static_cast<std::size_t>(y * width_ + optical_x);
+            const float ray_x = xy_tables_.xTable[index];
+            const float ray_y = xy_tables_.yTable[index];
+            if(!valid_ray(ray_x, ray_y)) continue;
+            minimum_y = std::min(minimum_y, ray_y);
+            maximum_y = std::max(maximum_y, ray_y);
+        }
+        if(!std::isfinite(minimum_x) || !std::isfinite(minimum_y)
+            || maximum_x - minimum_x < 0.1F || maximum_y - minimum_y < 0.1F) {
+            throw std::runtime_error("Femto Mega returned an invalid depth distortion table");
+        }
+
+        // The SDK's XY table gives the calibrated undistorted ray (X/Z,Y/Z)
+        // for every pixel in the native, visibly fisheye depth raster. Build a
+        // same-resolution virtual pinhole camera that contains the complete
+        // horizontal and vertical FOV. Rectilinear projection cannot retain
+        // the fisheye image's extreme diagonal corners without compressing the
+        // useful room view into a small central area, so bounds come from the
+        // calibrated optical row and column. Invert that table once for cheap
+        // per-frame nearest-neighbour depth/color resampling.
+        camera_ = {
+            width_,
+            height_,
+            static_cast<float>(width_ - 1) / (maximum_x - minimum_x),
+            static_cast<float>(height_ - 1) / (maximum_y - minimum_y),
+            -minimum_x * static_cast<float>(width_ - 1) / (maximum_x - minimum_x),
+            -minimum_y * static_cast<float>(height_ - 1) / (maximum_y - minimum_y),
+        };
+        source_index_.resize(pixel_count(), invalid_index);
+        build_inverse_map(minimum_x, maximum_x, minimum_y, maximum_y);
+    }
+
+    const CameraInfo &camera() const { return camera_; }
+
+    std::vector<std::uint16_t> rectify_depth(const std::vector<std::uint16_t> &source) const {
+        if(source.size() != pixel_count()) {
+            throw std::runtime_error("Femto Mega depth rectification input has unexpected dimensions");
+        }
+        std::vector<std::uint16_t> target(pixel_count(), 0);
+        for(std::size_t index = 0; index < target.size(); ++index) {
+            if(source_index_[index] != invalid_index) target[index] = source[source_index_[index]];
+        }
+        return target;
+    }
+
+    std::vector<std::uint8_t> rectify_color(const std::vector<std::uint8_t> &source) const {
+        if(source.size() != pixel_count() * 3) {
+            throw std::runtime_error("Femto Mega color rectification input has unexpected dimensions");
+        }
+        std::vector<std::uint8_t> target(pixel_count() * 3, 0);
+        for(std::size_t index = 0; index < pixel_count(); ++index) {
+            if(source_index_[index] == invalid_index) continue;
+            const std::size_t source_offset = static_cast<std::size_t>(source_index_[index]) * 3;
+            const std::size_t target_offset = index * 3;
+            target[target_offset] = source[source_offset];
+            target[target_offset + 1] = source[source_offset + 1];
+            target[target_offset + 2] = source[source_offset + 2];
+        }
+        return target;
+    }
+
+private:
+    static constexpr std::uint32_t invalid_index = std::numeric_limits<std::uint32_t>::max();
+
+    std::size_t pixel_count() const {
+        return static_cast<std::size_t>(width_) * height_;
+    }
+
+    static bool valid_ray(float x, float y) {
+        return std::isfinite(x) && std::isfinite(y) && std::abs(x) < 10.0F && std::abs(y) < 10.0F;
+    }
+
+    bool sample_ray(float source_x, float source_y, float &ray_x, float &ray_y,
+                    float &dx_ds, float &dx_dt, float &dy_ds, float &dy_dt) const {
+        if(source_x < 0.0F || source_y < 0.0F
+            || source_x > static_cast<float>(width_ - 1)
+            || source_y > static_cast<float>(height_ - 1)) return false;
+        const int x0 = std::min(static_cast<int>(std::floor(source_x)), width_ - 2);
+        const int y0 = std::min(static_cast<int>(std::floor(source_y)), height_ - 2);
+        const float s = source_x - static_cast<float>(x0);
+        const float t = source_y - static_cast<float>(y0);
+        const std::size_t i00 = static_cast<std::size_t>(y0 * width_ + x0);
+        const std::size_t i10 = i00 + 1;
+        const std::size_t i01 = i00 + width_;
+        const std::size_t i11 = i01 + 1;
+        const float x00 = xy_tables_.xTable[i00], x10 = xy_tables_.xTable[i10];
+        const float x01 = xy_tables_.xTable[i01], x11 = xy_tables_.xTable[i11];
+        const float y00 = xy_tables_.yTable[i00], y10 = xy_tables_.yTable[i10];
+        const float y01 = xy_tables_.yTable[i01], y11 = xy_tables_.yTable[i11];
+        if(!valid_ray(x00, y00) || !valid_ray(x10, y10)
+            || !valid_ray(x01, y01) || !valid_ray(x11, y11)) return false;
+        const float top_x = x00 + s * (x10 - x00);
+        const float bottom_x = x01 + s * (x11 - x01);
+        const float top_y = y00 + s * (y10 - y00);
+        const float bottom_y = y01 + s * (y11 - y01);
+        ray_x = top_x + t * (bottom_x - top_x);
+        ray_y = top_y + t * (bottom_y - top_y);
+        dx_ds = (1.0F - t) * (x10 - x00) + t * (x11 - x01);
+        dx_dt = bottom_x - top_x;
+        dy_ds = (1.0F - t) * (y10 - y00) + t * (y11 - y01);
+        dy_dt = bottom_y - top_y;
+        return true;
+    }
+
+    void build_inverse_map(float minimum_x, float maximum_x,
+                           float minimum_y, float maximum_y) {
+        std::size_t mapped = 0;
+        double squared_pixel_error = 0.0;
+        float maximum_pixel_error = 0.0F;
+        for(int y = 0; y < height_; ++y) {
+            const float target_y = (static_cast<float>(y) - camera_.cy) / camera_.fy;
+            for(int x = 0; x < width_; ++x) {
+                const float target_x = (static_cast<float>(x) - camera_.cx) / camera_.fx;
+                float source_x = (target_x - minimum_x) / (maximum_x - minimum_x)
+                    * static_cast<float>(width_ - 1);
+                float source_y = (target_y - minimum_y) / (maximum_y - minimum_y)
+                    * static_cast<float>(height_ - 1);
+                bool converged = false;
+                for(int iteration = 0; iteration < 10; ++iteration) {
+                    float ray_x = 0.0F, ray_y = 0.0F;
+                    float dx_ds = 0.0F, dx_dt = 0.0F, dy_ds = 0.0F, dy_dt = 0.0F;
+                    if(!sample_ray(source_x, source_y, ray_x, ray_y,
+                                   dx_ds, dx_dt, dy_ds, dy_dt)) break;
+                    const float error_x = ray_x - target_x;
+                    const float error_y = ray_y - target_y;
+                    const float pixel_error_x = error_x * camera_.fx;
+                    const float pixel_error_y = error_y * camera_.fy;
+                    if(pixel_error_x * pixel_error_x + pixel_error_y * pixel_error_y < 0.01F) {
+                        converged = true;
+                        break;
+                    }
+                    const float determinant = dx_ds * dy_dt - dx_dt * dy_ds;
+                    if(!std::isfinite(determinant) || std::abs(determinant) < 1e-12F) break;
+                    const float delta_x = std::clamp(
+                        (dy_dt * error_x - dx_dt * error_y) / determinant, -32.0F, 32.0F);
+                    const float delta_y = std::clamp(
+                        (-dy_ds * error_x + dx_ds * error_y) / determinant, -32.0F, 32.0F);
+                    source_x -= delta_x;
+                    source_y -= delta_y;
+                }
+                if(!converged || source_x < -0.5F || source_y < -0.5F
+                    || source_x > static_cast<float>(width_) - 0.5F
+                    || source_y > static_cast<float>(height_) - 0.5F) continue;
+                const int nearest_x = std::clamp(static_cast<int>(std::lround(source_x)), 0, width_ - 1);
+                const int nearest_y = std::clamp(static_cast<int>(std::lround(source_y)), 0, height_ - 1);
+                const std::uint32_t nearest_index = static_cast<std::uint32_t>(nearest_y * width_ + nearest_x);
+                source_index_[static_cast<std::size_t>(y * width_ + x)] =
+                    nearest_index;
+                const float nearest_error_x =
+                    (xy_tables_.xTable[nearest_index] - target_x) * camera_.fx;
+                const float nearest_error_y =
+                    (xy_tables_.yTable[nearest_index] - target_y) * camera_.fy;
+                const float nearest_error = std::sqrt(
+                    nearest_error_x * nearest_error_x + nearest_error_y * nearest_error_y);
+                squared_pixel_error += static_cast<double>(nearest_error) * nearest_error;
+                maximum_pixel_error = std::max(maximum_pixel_error, nearest_error);
+                ++mapped;
+            }
+        }
+        std::cerr << "Femto Mega depth rectification: " << width_ << 'x' << height_
+                  << " pinhole fx=" << camera_.fx << " fy=" << camera_.fy
+                  << " cx=" << camera_.cx << " cy=" << camera_.cy
+                  << " rays=[" << minimum_x << ',' << maximum_x << "]x["
+                  << minimum_y << ',' << maximum_y << "] ("
+                  << mapped << '/' << pixel_count() << " pixels, ray error rms="
+                  << std::sqrt(squared_pixel_error / std::max<std::size_t>(1, mapped))
+                  << " px max=" << maximum_pixel_error << " px)\n";
+        if(mapped < pixel_count() / 2) {
+            throw std::runtime_error("Femto Mega depth distortion map could not be inverted");
+        }
+    }
+
+    int width_ = 0;
+    int height_ = 0;
+    CameraInfo camera_;
+    std::vector<float> xy_storage_;
+    OBXYTables xy_tables_{};
+    std::vector<std::uint32_t> source_index_;
+};
+
+std::array<float, 9> rigid_orbbec_rotation(const float *rotation) {
+    std::array<double, 3> x{rotation[0], rotation[3], rotation[6]};
+    std::array<double, 3> y{rotation[1], rotation[4], rotation[7]};
+    const auto normalize = [](std::array<double, 3> &value) {
+        const double length = std::sqrt(
+            value[0] * value[0] + value[1] * value[1] + value[2] * value[2]);
+        if(length < 0.9) throw std::runtime_error("Femto Mega returned invalid camera extrinsics");
+        for(auto &component : value) component /= length;
+    };
+    normalize(x);
+    const double projection = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    for(std::size_t index = 0; index < 3; ++index) y[index] -= projection * x[index];
+    normalize(y);
+    std::array<double, 3> z{
+        x[1] * y[2] - x[2] * y[1],
+        x[2] * y[0] - x[0] * y[2],
+        x[0] * y[1] - x[1] * y[0],
+    };
+    const double original_z_agreement =
+        z[0] * rotation[2] + z[1] * rotation[5] + z[2] * rotation[8];
+    if(original_z_agreement < 0.0) {
+        for(auto &component : y) component = -component;
+        for(auto &component : z) component = -component;
+    }
+    return {
+        static_cast<float>(x[0]), static_cast<float>(y[0]), static_cast<float>(z[0]),
+        static_cast<float>(x[1]), static_cast<float>(y[1]), static_cast<float>(z[1]),
+        static_cast<float>(x[2]), static_cast<float>(y[2]), static_cast<float>(z[2]),
+    };
+}
+
 std::pair<std::string, std::uint16_t> network_endpoint(const std::string &address) {
     const auto separator = address.rfind(':');
     if(separator == std::string::npos) return {address, 8090};
@@ -674,6 +954,100 @@ std::pair<std::string, std::vector<float>> orbbec_rgb_distortion(
             distortion.k3, distortion.k4, distortion.k5, distortion.k6
         }
     };
+}
+
+void complete_orbbec_narrow_color(
+    const CameraInfo &depth_camera,
+    const OBCameraIntrinsic &color_camera,
+    const OBCameraDistortion &color_distortion,
+    const OBExtrinsic &depth_to_color,
+    const std::array<float, 9> &depth_to_color_rotation,
+    const std::vector<std::uint16_t> &depth,
+    const std::vector<std::uint8_t> &native_color,
+    int native_color_width,
+    int native_color_height,
+    std::vector<std::uint8_t> &aligned_color) {
+    const std::size_t pixel_count = static_cast<std::size_t>(
+        depth_camera.width) * depth_camera.height;
+    if(depth.size() != pixel_count || aligned_color.size() != pixel_count * 3
+        || native_color.size() != static_cast<std::size_t>(
+            native_color_width) * native_color_height * 3) {
+        throw std::runtime_error("Femto Mega narrow color completion input is invalid");
+    }
+
+    // The narrow depth lens is slightly taller than the RGB camera after the
+    // calibrated camera tilt and baseline are applied. Orbbec therefore emits
+    // exact-black C2D pixels along the RGB boundary even though their depth is
+    // valid. Preserve every SDK-projected sample, then complete only those
+    // holes from the nearest calibrated native RGB boundary sample.
+    for(int y = 0; y < depth_camera.height; ++y) {
+        for(int x = 0; x < depth_camera.width; ++x) {
+            const std::size_t index = static_cast<std::size_t>(
+                y * depth_camera.width + x);
+            const std::size_t target = index * 3;
+            const float z = static_cast<float>(depth[index]);
+            if(z <= 0.0F || aligned_color[target] != 0
+                || aligned_color[target + 1] != 0 || aligned_color[target + 2] != 0) {
+                continue;
+            }
+
+            const float depth_x = (static_cast<float>(x) - depth_camera.cx)
+                * z / depth_camera.fx;
+            const float depth_y = (static_cast<float>(y) - depth_camera.cy)
+                * z / depth_camera.fy;
+            const float color_x = depth_to_color_rotation[0] * depth_x
+                + depth_to_color_rotation[1] * depth_y
+                + depth_to_color_rotation[2] * z + depth_to_color.trans[0];
+            const float color_y = depth_to_color_rotation[3] * depth_x
+                + depth_to_color_rotation[4] * depth_y
+                + depth_to_color_rotation[5] * z + depth_to_color.trans[1];
+            const float color_z = depth_to_color_rotation[6] * depth_x
+                + depth_to_color_rotation[7] * depth_y
+                + depth_to_color_rotation[8] * z + depth_to_color.trans[2];
+            if(!std::isfinite(color_z) || color_z <= 1.0F) continue;
+
+            const float normalized_x = color_x / color_z;
+            const float normalized_y = color_y / color_z;
+            const float r2 = normalized_x * normalized_x + normalized_y * normalized_y;
+            const float r4 = r2 * r2;
+            const float r6 = r4 * r2;
+            float distorted_x = normalized_x;
+            float distorted_y = normalized_y;
+            if(color_distortion.model == OB_DISTORTION_BROWN_CONRADY
+                || color_distortion.model == OB_DISTORTION_BROWN_CONRADY_K6) {
+                const float denominator = 1.0F + color_distortion.k4 * r2
+                    + color_distortion.k5 * r4 + color_distortion.k6 * r6;
+                if(std::abs(denominator) < 1e-8F) continue;
+                const float radial = (1.0F + color_distortion.k1 * r2
+                    + color_distortion.k2 * r4 + color_distortion.k3 * r6)
+                    / denominator;
+                distorted_x = normalized_x * radial
+                    + 2.0F * color_distortion.p1 * normalized_x * normalized_y
+                    + color_distortion.p2 * (r2 + 2.0F * normalized_x * normalized_x);
+                distorted_y = normalized_y * radial
+                    + color_distortion.p1 * (r2 + 2.0F * normalized_y * normalized_y)
+                    + 2.0F * color_distortion.p2 * normalized_x * normalized_y;
+            }
+            const float projected_x = color_camera.fx * distorted_x + color_camera.cx;
+            const float projected_y = color_camera.fy * distorted_y + color_camera.cy;
+            if(!std::isfinite(projected_x) || !std::isfinite(projected_y)) continue;
+            const int source_x = std::clamp(
+                static_cast<int>(std::lround(projected_x)), 0, native_color_width - 1);
+            const int source_y = std::clamp(
+                static_cast<int>(std::lround(projected_y)), 0, native_color_height - 1);
+            const std::size_t source = static_cast<std::size_t>(
+                (source_y * native_color_width + source_x) * 3);
+            aligned_color[target] = native_color[source];
+            aligned_color[target + 1] = native_color[source + 1];
+            aligned_color[target + 2] = native_color[source + 2];
+            if(aligned_color[target] == 0 && aligned_color[target + 1] == 0
+                && aligned_color[target + 2] == 0) {
+                aligned_color[target] = 96;
+                aligned_color[target + 1] = 96;
+                aligned_color[target + 2] = 96;
+            }
+        }
+    }
 }
 
 std::shared_ptr<ob::Config> femto_video_config(const std::shared_ptr<ob::Pipeline> &pipeline,
@@ -713,17 +1087,26 @@ std::shared_ptr<ob::Config> femto_video_config(const std::shared_ptr<ob::Pipelin
     }
     config->enableStream(best_color);
     config->enableStream(best_depth);
-    // Keep native depth geometry. D2C alignment changes the depth image's
-    // sampling grid to the color camera and cannot be interpreted with the
-    // native depth intrinsics used by tracking and TSDF fusion.
+    // Keep the native depth sampling grid here. The capture loop first aligns
+    // color to that grid, then applies one shared calibrated depth-lens remap
+    // to produce the pinhole RGB-D frames used by tracking and TSDF fusion.
     config->setAlignMode(ALIGN_DISABLE);
-    config->setDepthScaleRequire(true);
     config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
     pipeline->enableFrameSync();
     return config;
 }
 
 int run_orbbec(const Options &options) {
+    // The SDK's default console logger writes to stdout. Stdout is reserved for
+    // the binary RGB-D transport, so even one SDK diagnostic corrupts the live
+    // stream consumed by the reconstruction worker.
+    ob::Context::setLoggerToConsole(OB_LOG_SEVERITY_OFF);
+    ob::Context::setLoggerToCallback(
+        OB_LOG_SEVERITY_ERROR,
+        [](OBLogSeverity, const char *message) {
+            if(message) std::cerr << "Orbbec SDK: " << message;
+        });
+
     std::shared_ptr<ob::Context> context;
     std::shared_ptr<ob::Device> device;
     std::shared_ptr<ob::Pipeline> pipeline;
@@ -770,9 +1153,9 @@ int run_orbbec(const Options &options) {
     auto first_depth = aligned_first->getDepthFrame();
     auto depth_profile = first_depth->getStreamProfile();
     const auto video_profile = depth_profile->as<ob::VideoStreamProfile>();
-    const auto intrinsic = video_profile->getIntrinsic();
-    CameraInfo camera{static_cast<int>(first_depth->getWidth()), static_cast<int>(first_depth->getHeight()),
-                      intrinsic.fx, intrinsic.fy, intrinsic.cx, intrinsic.cy};
+    OrbbecDepthRectifier depth_rectifier(
+        pipeline, config, static_cast<int>(first_depth->getWidth()), static_cast<int>(first_depth->getHeight()));
+    const CameraInfo camera = depth_rectifier.camera();
     auto first_color = aligned_first->getColorFrame();
     if(!first_color) throw std::runtime_error("Femto Mega did not deliver synchronized native RGB");
     auto color_profile = first_color->getStreamProfile()->as<ob::VideoStreamProfile>();
@@ -780,6 +1163,7 @@ int run_orbbec(const Options &options) {
     const auto color_distortion = color_profile->getDistortion();
     const auto [rgb_model, rgb_distortion] = orbbec_rgb_distortion(color_distortion);
     const auto depth_to_rgb = depth_profile->getExtrinsicTo(color_profile);
+    const auto rigid_depth_to_rgb = rigid_orbbec_rotation(depth_to_rgb.rot);
     RgbCameraInfo rgb_camera{
         static_cast<int>(first_color->getWidth()),
         static_cast<int>(first_color->getHeight()),
@@ -790,13 +1174,13 @@ int run_orbbec(const Options &options) {
         rgb_model,
         rgb_distortion,
         {
-            depth_to_rgb.rot[0], depth_to_rgb.rot[1], depth_to_rgb.rot[2], depth_to_rgb.trans[0] / 1000.0F,
-            depth_to_rgb.rot[3], depth_to_rgb.rot[4], depth_to_rgb.rot[5], depth_to_rgb.trans[1] / 1000.0F,
-            depth_to_rgb.rot[6], depth_to_rgb.rot[7], depth_to_rgb.rot[8], depth_to_rgb.trans[2] / 1000.0F,
+            rigid_depth_to_rgb[0], rigid_depth_to_rgb[1], rigid_depth_to_rgb[2], depth_to_rgb.trans[0] / 1000.0F,
+            rigid_depth_to_rgb[3], rigid_depth_to_rgb[4], rigid_depth_to_rgb[5], depth_to_rgb.trans[1] / 1000.0F,
+            rigid_depth_to_rgb[6], rigid_depth_to_rgb[7], rigid_depth_to_rgb[8], depth_to_rgb.trans[2] / 1000.0F,
             0, 0, 0, 1
         }
     };
-    const std::string created_at = utc_now();
+    std::string created_at = utc_now();
     scanlan::RgbdArchiveWriter archive(
         options.root, options.rgb_quality, options.max_rgb_dimension, 8);
 
@@ -805,6 +1189,7 @@ int run_orbbec(const Options &options) {
     std::shared_ptr<ob::Sensor> accel_sensor;
     std::shared_ptr<ob::Sensor> gyro_sensor;
     bool imu_active = false;
+    std::atomic<bool> recording{!options.preview};
     if(options.use_imu) {
         try {
             imu = std::make_unique<ImuCsv>(options.root / "imu.csv");
@@ -815,15 +1200,15 @@ int run_orbbec(const Options &options) {
             auto target_profile = depth_profile;
             auto accel_profile = accel_sensor->getStreamProfileList()->getProfile(0);
             auto gyro_profile = gyro_sensor->getStreamProfileList()->getProfile(0);
-            accel_sensor->start(accel_profile, [writer, target_profile](std::shared_ptr<ob::Frame> raw) {
+            accel_sensor->start(accel_profile, [writer, target_profile, &recording](std::shared_ptr<ob::Frame> raw) {
                 auto frame = raw->as<ob::AccelFrame>();
                 const auto value = rotate_ob(frame->getStreamProfile()->getExtrinsicTo(target_profile), frame->getValue());
-                writer->write(frame->getTimeStampUs(), "accel", value[0], value[1], value[2], frame->getTemperature());
+                if(recording.load()) writer->write(frame->getTimeStampUs(), "accel", value[0], value[1], value[2], frame->getTemperature());
             });
-            gyro_sensor->start(gyro_profile, [writer, target_profile, &gyro_integrator](std::shared_ptr<ob::Frame> raw) {
+            gyro_sensor->start(gyro_profile, [writer, target_profile, &gyro_integrator, &recording](std::shared_ptr<ob::Frame> raw) {
                 auto frame = raw->as<ob::GyroFrame>();
                 const auto value = rotate_ob(frame->getStreamProfile()->getExtrinsicTo(target_profile), frame->getValue());
-                writer->write(frame->getTimeStampUs(), "gyro", value[0], value[1], value[2], frame->getTemperature());
+                if(recording.load()) writer->write(frame->getTimeStampUs(), "gyro", value[0], value[1], value[2], frame->getTemperature());
                 gyro_integrator.add(frame->getTimeStampUs(), value[0], value[1], value[2]);
             });
             imu_active = true;
@@ -847,7 +1232,9 @@ int run_orbbec(const Options &options) {
     auto color_to_depth = std::make_shared<ob::Align>(OB_STREAM_DEPTH);
     const int native_fps = std::max(1, static_cast<int>(video_profile->getFps()));
     std::uint64_t source_frames = 0;
+    std::uint64_t recording_frames = 0;
     const auto started = std::chrono::steady_clock::now();
+    auto recording_started = started;
     auto frame_set = aligned_first;
     while(!fs::exists(options.root / "stop.flag")) {
         if(!frame_set) frame_set = pipeline->waitForFrameset(1000);
@@ -855,14 +1242,26 @@ int run_orbbec(const Options &options) {
         auto depth_frame = frame_set->getDepthFrame();
         if(!depth_frame) { frame_set.reset(); continue; }
         ++source_frames;
-        const bool save_source = scanlan::archive_frame_due(
-            source_frames, native_fps, options.fps);
+        if(!recording.load() && fs::exists(options.root / "record.flag")) {
+            recording.store(true);
+            recording_started = std::chrono::steady_clock::now();
+            created_at = utc_now();
+            {
+                std::ofstream signal(options.root / "recording.flag");
+                signal << (source_frames - 1) << '\n';
+            }
+            fs::remove(options.root / "preview.flag");
+            fs::remove(options.root / "record.flag");
+        }
+        if(recording.load()) ++recording_frames;
+        const bool save_source = recording.load() && scanlan::archive_frame_due(
+            recording_frames, native_fps, options.fps);
         const float scale = depth_frame->getValueScale();
         const auto *raw_depth = reinterpret_cast<const std::uint16_t *>(depth_frame->getData());
-        std::vector<std::uint16_t> depth(static_cast<std::size_t>(camera.width * camera.height));
-        for(std::size_t index = 0; index < depth.size(); ++index) {
+        std::vector<std::uint16_t> native_depth(static_cast<std::size_t>(camera.width * camera.height));
+        for(std::size_t index = 0; index < native_depth.size(); ++index) {
             const float millimetres = raw_depth[index] * scale;
-            depth[index] = millimetres > 0 && millimetres <= options.max_depth_m * 1000.0F
+            native_depth[index] = millimetres > 0 && millimetres <= options.max_depth_m * 1000.0F
                 ? static_cast<std::uint16_t>(std::lround(millimetres)) : 0;
         }
         const std::uint64_t timestamp_us = depth_frame->getTimeStampUs();
@@ -870,74 +1269,103 @@ int run_orbbec(const Options &options) {
         const float stream_fps = static_cast<float>(source_frames / elapsed);
         auto color_frame = frame_set->getColorFrame();
         if(!color_frame) { frame_set.reset(); continue; }
-            if(color_frame->getFormat() != OB_FORMAT_RGB) {
-                if(color_frame->getFormat() == OB_FORMAT_MJPG) format_converter->setFormatConvertType(FORMAT_MJPG_TO_RGB);
-                else if(color_frame->getFormat() == OB_FORMAT_UYVY) format_converter->setFormatConvertType(FORMAT_UYVY_TO_RGB);
-                else if(color_frame->getFormat() == OB_FORMAT_YUYV) format_converter->setFormatConvertType(FORMAT_YUYV_TO_RGB);
-                else throw std::runtime_error("Femto Mega returned an unsupported color format");
-                color_frame = format_converter->process(color_frame)->as<ob::ColorFrame>();
-            }
-            const auto *rgb_data = color_frame->getData();
-            auto aligned_set = color_to_depth->process(frame_set)->as<ob::FrameSet>();
-            if(!aligned_set) throw std::runtime_error("Femto Mega color-to-depth alignment failed");
-            auto aligned_color = aligned_set->getColorFrame();
-            if(!aligned_color) throw std::runtime_error("Femto Mega aligned color frame is missing");
-            if(aligned_color->getFormat() != OB_FORMAT_RGB) {
-                if(aligned_color->getFormat() == OB_FORMAT_MJPG) format_converter->setFormatConvertType(FORMAT_MJPG_TO_RGB);
-                else if(aligned_color->getFormat() == OB_FORMAT_UYVY) format_converter->setFormatConvertType(FORMAT_UYVY_TO_RGB);
-                else if(aligned_color->getFormat() == OB_FORMAT_YUYV) format_converter->setFormatConvertType(FORMAT_YUYV_TO_RGB);
-                else throw std::runtime_error("Femto Mega aligned color has an unsupported format");
-                aligned_color = format_converter->process(aligned_color)->as<ob::ColorFrame>();
-            }
-            if(static_cast<int>(aligned_color->getWidth()) != camera.width
-                || static_cast<int>(aligned_color->getHeight()) != camera.height) {
-                throw std::runtime_error("Femto Mega C2D output does not match native depth geometry");
-            }
-            const auto *aligned_data = aligned_color->getData();
-            std::vector<std::uint8_t> rgb(
-                aligned_data,
-                aligned_data + camera.width * camera.height * 3);
-            const std::uint64_t rgb_timestamp_us = color_frame->getTimeStampUs();
-            if(rgbd_stream) {
-                const auto gyro_delta = imu_active ? gyro_integrator.take() : std::nullopt;
-                rgbd_stream->publish(
-                    source_frames - 1,
-                    timestamp_us,
-                    rgb_timestamp_us,
-                    static_cast<std::uint32_t>(camera.width),
-                    static_cast<std::uint32_t>(camera.height),
-                    camera.fx,
-                    camera.fy,
-                    camera.cx,
-                    camera.cy,
-                    1000.0F,
-                    0.25F,
-                    options.max_depth_m,
-                    depth,
-                    rgb,
-                    gyro_delta ? &*gyro_delta : nullptr);
-            }
-            if(save_source) {
-                std::vector<std::uint8_t> native_rgb(
-                    rgb_data,
-                    rgb_data + color_frame->getWidth() * color_frame->getHeight() * 3);
-                scanlan::RgbdArchiveFrame archive_frame;
-                archive_frame.source_sequence = source_frames - 1;
-                archive_frame.depth_timestamp_us = timestamp_us;
-                archive_frame.color_timestamp_us = rgb_timestamp_us;
-                archive_frame.depth = std::move(depth);
-                archive_frame.aligned_color = std::move(rgb);
-                archive_frame.native_color_width =
-                    static_cast<std::uint32_t>(color_frame->getWidth());
-                archive_frame.native_color_height =
-                    static_cast<std::uint32_t>(color_frame->getHeight());
-                archive_frame.native_color = std::move(native_rgb);
-                archive.submit(std::move(archive_frame));
-            }
+        if(color_frame->getFormat() != OB_FORMAT_RGB) {
+            if(color_frame->getFormat() == OB_FORMAT_MJPG) format_converter->setFormatConvertType(FORMAT_MJPG_TO_RGB);
+            else if(color_frame->getFormat() == OB_FORMAT_UYVY) format_converter->setFormatConvertType(FORMAT_UYVY_TO_RGB);
+            else if(color_frame->getFormat() == OB_FORMAT_YUYV) format_converter->setFormatConvertType(FORMAT_YUYV_TO_RGB);
+            else throw std::runtime_error("Femto Mega returned an unsupported color format");
+            auto converted = format_converter->process(color_frame);
+            if(!converted) throw std::runtime_error("Femto Mega RGB conversion failed");
+            color_frame = converted->as<ob::ColorFrame>();
+        }
+        const auto *rgb_data = color_frame->getData();
+        std::vector<std::uint8_t> native_rgb(
+            rgb_data,
+            rgb_data + color_frame->getWidth() * color_frame->getHeight() * 3);
+
+        // Align only after replacing the camera's MJPEG frame with its RGB
+        // conversion. Orbbec SDK 2.9.x does not support MJPEG C2D input and
+        // returns a null frame; dereferencing that result previously caused an
+        // access violation during the first captured frame.
+        auto align_input = ob::FrameFactory::createFrameSet();
+        align_input->pushFrame(depth_frame);
+        align_input->pushFrame(color_frame);
+        auto aligned = color_to_depth->process(align_input);
+        if(!aligned) throw std::runtime_error("Femto Mega color-to-depth alignment failed");
+        auto aligned_set = aligned->as<ob::FrameSet>();
+        if(!aligned_set) throw std::runtime_error("Femto Mega color-to-depth alignment returned an invalid frame set");
+        auto aligned_color = aligned_set->getColorFrame();
+        if(!aligned_color) throw std::runtime_error("Femto Mega aligned color frame is missing");
+        if(aligned_color->getFormat() != OB_FORMAT_RGB) {
+            if(aligned_color->getFormat() == OB_FORMAT_MJPG) format_converter->setFormatConvertType(FORMAT_MJPG_TO_RGB);
+            else if(aligned_color->getFormat() == OB_FORMAT_UYVY) format_converter->setFormatConvertType(FORMAT_UYVY_TO_RGB);
+            else if(aligned_color->getFormat() == OB_FORMAT_YUYV) format_converter->setFormatConvertType(FORMAT_YUYV_TO_RGB);
+            else throw std::runtime_error("Femto Mega aligned color has an unsupported format");
+            aligned_color = format_converter->process(aligned_color)->as<ob::ColorFrame>();
+        }
+        if(static_cast<int>(aligned_color->getWidth()) != camera.width
+            || static_cast<int>(aligned_color->getHeight()) != camera.height) {
+            throw std::runtime_error("Femto Mega C2D output does not match native depth geometry");
+        }
+        const auto *aligned_data = aligned_color->getData();
+        std::vector<std::uint8_t> native_aligned_rgb(
+            aligned_data,
+            aligned_data + camera.width * camera.height * 3);
+        auto depth = depth_rectifier.rectify_depth(native_depth);
+        auto rgb = depth_rectifier.rectify_color(native_aligned_rgb);
+        if(options.depth_fov == "narrow") {
+            complete_orbbec_narrow_color(
+                camera,
+                color_intrinsic,
+                color_distortion,
+                depth_to_rgb,
+                rigid_depth_to_rgb,
+                depth,
+                native_rgb,
+                static_cast<int>(color_frame->getWidth()),
+                static_cast<int>(color_frame->getHeight()),
+                rgb);
+        }
+        const std::uint64_t rgb_timestamp_us = color_frame->getTimeStampUs();
+        if(rgbd_stream) {
+            const auto gyro_delta = imu_active ? gyro_integrator.take() : std::nullopt;
+            rgbd_stream->publish(
+                source_frames - 1,
+                timestamp_us,
+                rgb_timestamp_us,
+                static_cast<std::uint32_t>(camera.width),
+                static_cast<std::uint32_t>(camera.height),
+                camera.fx,
+                camera.fy,
+                camera.cx,
+                camera.cy,
+                1000.0F,
+                0.25F,
+                options.max_depth_m,
+                depth,
+                rgb,
+                gyro_delta ? &*gyro_delta : nullptr);
+        }
+        if(save_source) {
+            scanlan::RgbdArchiveFrame archive_frame;
+            archive_frame.source_sequence = source_frames - 1;
+            archive_frame.depth_timestamp_us = timestamp_us;
+            archive_frame.color_timestamp_us = rgb_timestamp_us;
+            archive_frame.depth = std::move(depth);
+            archive_frame.aligned_color = std::move(rgb);
+            archive_frame.native_color_width =
+                static_cast<std::uint32_t>(color_frame->getWidth());
+            archive_frame.native_color_height =
+                static_cast<std::uint32_t>(color_frame->getHeight());
+            archive_frame.native_color = std::move(native_rgb);
+            archive.submit(std::move(archive_frame));
+        }
         if(source_frames == 1 || source_frames % 3 == 0) {
             write_live_status(options, sensor, timestamp_us, archive.saved(),
                               stream_fps, imu_active, imu ? imu->rate_hz() : 0.0F,
-                              "Full-rate RGB-D tracking and bounded background recording");
+                              recording.load()
+                                  ? "Full-rate RGB-D tracking and bounded background recording"
+                                  : "Live RGB-D preview ready; press Capture to begin recording");
         }
         frame_set.reset();
     }
@@ -946,14 +1374,14 @@ int run_orbbec(const Options &options) {
         gyro_sensor->stop();
     }
     if(rgbd_stream) rgbd_stream->close();
-    const auto duration = static_cast<std::uint32_t>(std::max<std::int64_t>(1,
-        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count()));
+    const auto duration = recording_frames == 0 ? 0U : static_cast<std::uint32_t>(std::max<std::int64_t>(1,
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - recording_started).count()));
     archive.close();
     const auto saved_frames = archive.saved();
     write_manifest(options, sensor, camera, rgb_camera, created_at, saved_frames, duration, imu_active,
                    archive.dropped() + archive.failed());
     pipeline->stop();
-    return saved_frames > 0 ? 0 : 2;
+    return saved_frames > 0 || options.preview ? 0 : 2;
 }
 #else
 int run_orbbec(const Options &) {

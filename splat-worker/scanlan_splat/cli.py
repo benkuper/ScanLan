@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .media import MediaPreparationOptions, prepare_media_dataset
 from .train import train_dataset
 
 
@@ -52,6 +53,12 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--dataset", type=Path, required=True)
     train.add_argument("--iterations", type=int, default=30_000)
     train.add_argument("--resume", action="store_true")
+    prepare = commands.add_parser("prepare-media")
+    prepare.add_argument("--project", type=Path, required=True)
+    prepare.add_argument("--source", type=Path, action="append", default=[])
+    prepare.add_argument("--video-fps", type=float, default=2.0)
+    prepare.add_argument("--maximum-video-frames", type=int, default=600)
+    prepare.add_argument("--maximum-image-dimension", type=int, default=4096)
     diagnostics = commands.add_parser("diagnostics")
     diagnostics.add_argument("--require-cuda", action="store_true")
     return root
@@ -69,6 +76,18 @@ def main(argv: list[str] | None = None) -> int:
                 _cuda_smoke_test()
             print(json.dumps({"version": __version__, "cuda": cuda_available, "cudaSmokeTest": cuda_available and arguments.require_cuda, "device": torch.cuda.get_device_name(0) if cuda_available else None, "torch": torch.__version__, "gsplat": getattr(gsplat, "__version__", "unknown")}))
             return 2 if arguments.require_cuda and not cuda_available else 0
+        if arguments.command == "prepare-media":
+            result = prepare_media_dataset(
+                arguments.project.resolve(),
+                arguments.source,
+                MediaPreparationOptions(
+                    video_fps=max(0.1, min(arguments.video_fps, 30.0)),
+                    maximum_video_frames=max(3, min(arguments.maximum_video_frames, 5_000)),
+                    maximum_image_dimension=max(720, min(arguments.maximum_image_dimension, 8_192)),
+                ),
+            )
+            print(json.dumps(result))
+            return 0
         result = train_dataset(
             arguments.dataset.resolve(),
             arguments.project.resolve(),

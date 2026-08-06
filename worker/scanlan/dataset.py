@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from .mesh import PosedFrame
 
 
-DATASET_VERSION = "metric-rgbd-pinhole-720-v5"
+DATASET_VERSION = "metric-rgbd-pinhole-720-v6-display-world"
 CANONICAL_MAX_DIMENSION = 720
 MAX_CANONICAL_FRAMES = 600
 
@@ -109,6 +109,7 @@ def dataset_fingerprint(frames: list[PosedFrame]) -> str:
         digest.update(frame.phase_id.encode("utf-8"))
         digest.update(str(record.index).encode("ascii"))
         digest.update(np.asarray(frame.camera_to_global, dtype="<f8").tobytes())
+        digest.update(np.asarray(frame.display_axes, dtype="<f8").tobytes())
         for path in (record.depth_path, record.color_path, record.rgb_path):
             if path is not None and path.is_file():
                 stat = path.stat()
@@ -132,6 +133,15 @@ def resolve_dataset(path: Path) -> Path:
 def _save_depth_png(path: Path, depth_m: np.ndarray) -> None:
     millimetres = np.rint(np.clip(depth_m, 0.0, 65.535) * 1000.0).astype(np.uint16)
     Image.fromarray(millimetres).save(path, compress_level=3)
+
+
+def _display_world_matrix(
+    world_from_camera: np.ndarray,
+    display_axes: tuple[float, float, float],
+) -> np.ndarray:
+    """Express a camera pose in the same world axes as ScanLan artifacts."""
+    display_from_global = np.diag([*display_axes, 1.0])
+    return display_from_global @ np.asarray(world_from_camera, dtype=np.float64)
 
 
 def build_posed_dataset(
@@ -183,13 +193,17 @@ def build_posed_dataset(
             output_camera=dataset_camera,
         )
         mask = robust_depth_mask(depth_rgb)
+        world_from_depth = _display_world_matrix(
+            world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
+            frame.display_axes,
+        )
         seeds = seed_rgbd_gaussians(
             depth,
             image,
             uv_map,
             visibility,
             frame.source.camera,
-            world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
+            world_from_depth,
         )
         if len(seeds.points):
             seed_batches.append(seeds)
@@ -217,10 +231,13 @@ def build_posed_dataset(
             temporary / "masks" / f"{stem}.png",
             compress_level=3,
         )
-        world_from_rgb = world_from_rgb_camera(
-            frame.camera_to_global,
-            frame.image_y_up,
-            rgb_from_depth,
+        world_from_rgb = _display_world_matrix(
+            world_from_rgb_camera(
+                frame.camera_to_global,
+                frame.image_y_up,
+                rgb_from_depth,
+            ),
+            frame.display_axes,
         )
         records.append(
             {
@@ -272,6 +289,7 @@ def build_posed_dataset(
         "coordinateConvention": {
             "handedness": "right",
             "units": "metres",
+            "worldAxes": "scanlan_display_x_right_y_up_z_back",
             "cameraAxes": "opencv_x_right_y_down_z_forward",
             "pose": "worldFromCamera",
             "matrixStorage": "row-major",

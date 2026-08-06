@@ -26,7 +26,7 @@ from .realtime import evaluate_depth_alignment
 from .stream import StreamCamera
 
 
-LOCAL_CACHE_VERSION = 7
+LOCAL_CACHE_VERSION = 8
 
 # Frame-to-frame RGB-D odometry is locally accurate but inevitably drifts over a
 # long handheld capture.  Short internal fragments let the already-seen room
@@ -42,6 +42,16 @@ TRACKING_FRAGMENT_VOXEL_M = 0.03
 LOOP_CLOSURE_MIN_FRAGMENT_GAP = 6
 LOOP_CLOSURE_SEARCH_RADIUS_M = 3.0
 LOOP_CLOSURE_MAX_CANDIDATES = 2
+MIN_RECOVERABLE_TRACKING_FRAMES = 30
+MIN_RECOVERABLE_TRACKING_RATIO = 0.25
+
+
+def _tracking_prefix_is_recoverable(total_frames: int, tracked_frames: int) -> bool:
+    """Return whether a validated prefix is substantial enough to reconstruct safely."""
+    return tracked_frames >= max(
+        MIN_RECOVERABLE_TRACKING_FRAMES,
+        math.ceil(total_frames * MIN_RECOVERABLE_TRACKING_RATIO),
+    )
 
 
 @dataclass
@@ -484,6 +494,7 @@ def _estimate_offline_poses(
         phase.camera.max_depth_m,
     )
     previous_depth = load_depth(phase.frames[0], phase.camera)
+    omitted_tail_frames = 0
     for index in range(1, len(phase.frames)):
         current_depth = load_depth(phase.frames[index], phase.camera)
 
@@ -585,10 +596,30 @@ def _estimate_offline_poses(
             elif initial is not None:
                 imu_aided_frames += 1
         if not success:
-            raise RuntimeError(
-                f"Odometry was lost in {phase.manifest['name']} near frame {index}. "
-                "Capture more slowly or increase overlap."
+            recoverable_prefix = _tracking_prefix_is_recoverable(
+                len(phase.frames), len(poses)
             )
+            if not recoverable_prefix:
+                raise RuntimeError(
+                    f"Odometry was lost in {phase.manifest['name']} near frame {index}. "
+                    "Capture more slowly or increase overlap."
+                )
+            # Never invent a transform across an untrackable pair. A long,
+            # validated prefix is still useful production data and is safer
+            # than either rejecting the entire take or admitting a floating
+            # tail that can become duplicate walls. Later phases can recapture
+            # the omitted coverage with normal overlap-based registration.
+            omitted_tail_frames = len(phase.frames) - len(poses)
+            if progress:
+                progress(
+                    "Tracking frames",
+                    f"Using {len(poses)} validated frames from {phase.manifest['name']}; "
+                    f"omitting {omitted_tail_frames} frames after tracking loss",
+                    omitted_tail_frames,
+                    None,
+                    1.0,
+                )
+            break
         odometry = transformation @ odometry
         poses.append(np.linalg.inv(odometry))
         if backend.uses_cuda:
@@ -608,7 +639,11 @@ def _estimate_offline_poses(
     positions = np.asarray([pose[:3, 3] for pose in poses])
     path_length = float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
     duration = max(
-        (phase.frames[-1].timestamp_us - phase.frames[0].timestamp_us) / 1_000_000.0,
+        (
+            phase.frames[len(poses) - 1].timestamp_us
+            - phase.frames[0].timestamp_us
+        )
+        / 1_000_000.0,
         0.1,
     )
     extent = float(np.ptp(positions, axis=0).max())
@@ -618,13 +653,23 @@ def _estimate_offline_poses(
             "This phase was rejected instead of producing duplicated geometry."
         )
     if imu_aided_frames:
-        coverage = imu_aided_frames / max(len(phase.frames) - 1, 1)
+        coverage = imu_aided_frames / max(len(poses) - 1, 1)
+        omission = (
+            f"; safely omitted {omitted_tail_frames} trailing frames after unrecoverable tracking loss"
+            if omitted_tail_frames
+            else ""
+        )
         return (
             poses,
             min(78, round(68 + coverage * 10)),
-            f"IMU-aided RGB-D odometry passed drift checks ({coverage:.0%} gyro coverage)",
+            f"IMU-aided RGB-D odometry passed drift checks ({coverage:.0%} gyro coverage){omission}",
         )
-    return poses, 68, "RGB-D odometry passed physical drift checks"
+    omission = (
+        f"; safely omitted {omitted_tail_frames} trailing frames after unrecoverable tracking loss"
+        if omitted_tail_frames
+        else ""
+    )
+    return poses, 68, f"RGB-D odometry passed physical drift checks{omission}"
 
 
 def _select_keyframes(phase: PhaseData, poses: list[np.ndarray]) -> list[int]:
@@ -1682,24 +1727,35 @@ def _quality_summary(
     label = "High" if score >= 80 else "Medium" if score >= 60 else "Low"
     frames_used = sum(len(phase.frame_indices) for phase in local_phases)
     frames_captured = sum(len(phase.source.frames) for phase in local_phases)
+    frames_tracked = sum(
+        phase.frame_indices[-1] + 1 if phase.frame_indices else 0
+        for phase in local_phases
+    )
+    coverage_detail = (
+        f"fused {frames_used} keyframes from {frames_tracked} validated frames; "
+        f"safely omitted {frames_captured - frames_tracked} frames after tracking loss."
+        if frames_tracked < frames_captured
+        else f"fused {frames_used} keyframes from {frames_captured} validated frames."
+    )
     if alignments:
         weakest = min(alignments, key=lambda value: value.score)
         detail = (
             f"{label} confidence: weakest phase match {weakest.score}/100, "
             f"{weakest.source_overlap * 100:.0f}% overlap and "
             f"{weakest.inlier_rmse_m * 1000:.0f} mm error; "
-            f"used {frames_used} of {frames_captured} frames."
+            f"{coverage_detail}"
         )
     else:
         detail = (
             f"{label} confidence from validated camera tracking; "
-            f"used {frames_used} of {frames_captured} frames."
+            f"{coverage_detail}"
         )
     return {
         "score": score,
         "label": label,
         "detail": detail,
         "framesUsed": frames_used,
+        "framesTracked": frames_tracked,
         "framesCaptured": frames_captured,
         "tracking": [
             {
@@ -1707,6 +1763,7 @@ def _quality_summary(
                 "score": phase.tracking_confidence,
                 "detail": phase.tracking_detail,
                 "framesUsed": len(phase.frame_indices),
+                "framesTracked": phase.frame_indices[-1] + 1 if phase.frame_indices else 0,
                 "framesCaptured": len(phase.source.frames),
             }
             for index, phase in enumerate(local_phases)

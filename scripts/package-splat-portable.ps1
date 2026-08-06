@@ -45,7 +45,7 @@ try {
   $null = New-Item -ItemType Directory -Path $PortableRoot
 
   Copy-Required (Join-Path $ProjectRoot "src-tauri/target/release/scanlan.exe") (Join-Path $PortableRoot "ScanLan.exe")
-  Copy-Required (Join-Path $ProjectRoot "worker/dist/scanlan-worker.exe") (Join-Path $PortableRoot "scanlan-worker.exe")
+  Copy-Required (Join-Path $ProjectRoot "worker/dist/scanlan-worker") (Join-Path $PortableRoot "scanlan-worker")
   Copy-Required (Join-Path $ProjectRoot "build/kinect-capture/Release") (Join-Path $PortableRoot "kinect2")
   Copy-Required (Join-Path $ProjectRoot "build/modern-capture/Release") (Join-Path $PortableRoot "modern")
   Copy-Required (Join-Path $ProjectRoot "splat-worker/dist/scanlan-splat") (Join-Path $PortableRoot "splat-runtime")

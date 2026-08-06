@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureSettings {
     pub capture_fps: u32,
@@ -95,6 +95,8 @@ pub struct AvailableSensor {
     pub address: String,
     #[serde(default)]
     pub serial: String,
+    #[serde(default)]
+    pub connected: bool,
     pub supports_imu: bool,
 }
 
@@ -112,6 +114,17 @@ pub struct PhaseSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MediaSourceSummary {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub byte_size: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectSummary {
     pub schema_version: u32,
     pub id: String,
@@ -119,6 +132,8 @@ pub struct ProjectSummary {
     pub path: String,
     pub created_at: String,
     pub phases: Vec<PhaseSummary>,
+    #[serde(default)]
+    pub media_sources: Vec<MediaSourceSummary>,
     pub artifacts: ArtifactCatalog,
     pub active_job: Option<String>,
     pub settings: CaptureSettings,
@@ -149,6 +164,21 @@ pub struct ProjectSummary {
     pub processing_duration_seconds: Option<f32>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub created_at: String,
+    pub modified_at: String,
+    pub capture_count: usize,
+    pub media_source_count: usize,
+    pub frame_count: u64,
+    pub artifact_count: usize,
+    pub processing_status: String,
+}
+
 impl ProjectSummary {
     pub fn placeholder() -> Self {
         Self {
@@ -158,6 +188,7 @@ impl ProjectSummary {
             path: String::new(),
             created_at: Utc::now().to_rfc3339(),
             phases: Vec::new(),
+            media_sources: Vec::new(),
             artifacts: ArtifactCatalog::default(),
             active_job: None,
             settings: CaptureSettings::default(),
@@ -202,6 +233,7 @@ pub struct CaptureStatus {
     pub project: ProjectSummary,
     pub preview: Vec<PreviewPoint>,
     pub capturing: bool,
+    pub previewing: bool,
     pub sensor_connected: bool,
     pub sensor_paused: bool,
     pub sensor_status: String,
@@ -373,6 +405,8 @@ pub struct ArtifactJob {
     pub project_path: String,
     #[serde(default)]
     pub targets: Vec<String>,
+    #[serde(default)]
+    pub source_kind: String,
     pub stage: String,
     #[serde(default)]
     pub detail: String,
@@ -383,6 +417,8 @@ pub struct ArtifactJob {
     pub total_iterations: Option<u32>,
     #[serde(default)]
     pub loss: Option<f32>,
+    #[serde(default)]
+    pub smoothed_loss: Option<f32>,
     #[serde(default)]
     pub eta_seconds: Option<u32>,
     #[serde(default)]
@@ -431,4 +467,17 @@ pub struct ImuManifest {
 pub struct PreviewPoint {
     pub position: [f32; 3],
     pub color: [u8; 3],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudTransform {
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+    #[serde(default = "unit_scale")]
+    pub scale: [f32; 3],
+}
+
+fn unit_scale() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
 }

@@ -47,6 +47,7 @@ export interface AvailableSensor {
   connection: SensorConnection;
   address: string;
   serial: string;
+  connected: boolean;
   supportsImu: boolean;
 }
 
@@ -60,6 +61,15 @@ export interface PhaseSummary {
   overlapHint: string;
 }
 
+export interface MediaSourceSummary {
+  id: string;
+  name: string;
+  path: string;
+  kind: 'photo' | 'video';
+  byteSize: number;
+  createdAt: string;
+}
+
 export interface ProjectSummary {
   schemaVersion: number;
   id: string;
@@ -67,6 +77,7 @@ export interface ProjectSummary {
   path: string;
   createdAt: string;
   phases: PhaseSummary[];
+  mediaSources: MediaSourceSummary[];
   artifacts: ArtifactCatalog;
   activeJob: string | null;
   settings: CaptureSettings;
@@ -83,6 +94,19 @@ export interface ProjectSummary {
   framesUsed?: number;
   processingBackend?: string;
   processingDurationSeconds?: number;
+}
+
+export interface ProjectCatalogEntry {
+  id: string;
+  name: string;
+  path: string;
+  createdAt: string;
+  modifiedAt: string;
+  captureCount: number;
+  mediaSourceCount: number;
+  frameCount: number;
+  artifactCount: number;
+  processingStatus: ProcessingStatus;
 }
 
 export interface RuntimeInfo {
@@ -102,12 +126,14 @@ export interface ArtifactJob {
   id: string;
   projectPath: string;
   targets: ArtifactTarget[];
+  sourceKind: 'rgbd' | 'media';
   stage: string;
   detail: string;
   progress: number;
   iteration: number | null;
   totalIterations: number | null;
   loss: number | null;
+  smoothedLoss: number | null;
   etaSeconds: number | null;
   stageProgress: number | null;
   stageEtaSeconds: number | null;
@@ -127,6 +153,7 @@ export interface CaptureStatus {
   project: ProjectSummary;
   preview: PreviewPoint[];
   capturing: boolean;
+  previewing: boolean;
   sensorConnected: boolean;
   sensorPaused: boolean;
   sensorStatus: string;
@@ -174,6 +201,13 @@ export interface ReconstructionProgress {
 export interface PreviewPoint {
   position: [number, number, number];
   color: [number, number, number];
+}
+
+export interface CloudTransform {
+  position: [number, number, number];
+  /** XYZ Euler rotation in degrees. */
+  rotation: [number, number, number];
+  scale: [number, number, number];
 }
 
 export interface PackedPreviewFrame {

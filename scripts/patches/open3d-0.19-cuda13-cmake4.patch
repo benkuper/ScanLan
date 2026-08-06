@@ -16,7 +16,7 @@ diff --git a/3rdparty/stdgpu/stdgpu.cmake b/3rdparty/stdgpu/stdgpu.cmake
 index a725f22..e1b4f64 100644
 --- a/3rdparty/stdgpu/stdgpu.cmake
 +++ b/3rdparty/stdgpu/stdgpu.cmake
-@@ -4,6 +4,19 @@
+@@ -4,6 +4,20 @@
  
  include(ExternalProject)
  
@@ -26,8 +26,9 @@ index a725f22..e1b4f64 100644
 +        message(FATAL_ERROR "CUDA 13 stdgpu compatibility patch not found: ${SCANLAN_STDGPU_CUDA13_PATCH}")
 +    endif()
 +    set(STDGPU_PATCH_COMMAND
-+        ${CMAKE_COMMAND} -E chdir <SOURCE_DIR>
-+        ${GIT_EXECUTABLE} apply --ignore-whitespace "${SCANLAN_STDGPU_CUDA13_PATCH}")
++        ${GIT_EXECUTABLE} init
++        COMMAND ${GIT_EXECUTABLE} apply --ignore-whitespace
++                "${SCANLAN_STDGPU_CUDA13_PATCH}")
 +else()
 +    set(STDGPU_THRUST_INCLUDE_DIR "${CUDAToolkit_INCLUDE_DIRS}")
 +    set(STDGPU_PATCH_COMMAND "")
@@ -36,7 +37,7 @@ index a725f22..e1b4f64 100644
  ExternalProject_Add(
      ext_stdgpu
      PREFIX stdgpu
-@@ -11,6 +24,7 @@ ExternalProject_Add(
+@@ -11,6 +25,7 @@ ExternalProject_Add(
      URL_HASH SHA256=86e50789bbe21c57f64358c6acbd4481d56c1e45ce9ba1fb5c5c8482c3973215
      DOWNLOAD_DIR "${OPEN3D_THIRD_PARTY_DOWNLOAD_DIR}/stdgpu"
      UPDATE_COMMAND ""
@@ -44,7 +45,7 @@ index a725f22..e1b4f64 100644
      CMAKE_ARGS
          -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
          -DCUDAToolkit_ROOT=${CUDAToolkit_LIBRARY_ROOT}
-@@ -19,7 +33,8 @@ ExternalProject_Add(
+@@ -19,7 +34,8 @@ ExternalProject_Add(
          -DSTDGPU_BUILD_TESTS=OFF
          -DSTDGPU_BUILD_BENCHMARKS=OFF
          -DSTDGPU_ENABLE_CONTRACT_CHECKS=OFF

@@ -227,10 +227,29 @@ def read_phase(root: Path, *, include_tracking_rejected: bool = False) -> PhaseD
     if (
         not np.isfinite(rgb_from_depth).all()
         or not np.allclose(rgb_from_depth[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6)
-        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=2e-3)
-        or not np.isclose(np.linalg.det(rotation), 1.0, atol=2e-3)
     ):
         raise ValueError(f"Capture depth-to-RGB transform is invalid: {root}")
+    # Some Orbbec firmwares return a rotation whose first basis vector carries
+    # a small scale error (about 0.5% on Femto Mega).  It describes the right
+    # orientation but is not quite a rigid transform.  Project only modest,
+    # orientation-preserving calibration noise to SO(3); large errors and
+    # reflections remain hard failures.
+    source_determinant = float(np.linalg.det(rotation))
+    try:
+        left, singular_values, right = np.linalg.svd(rotation)
+    except np.linalg.LinAlgError as error:
+        raise ValueError(f"Capture depth-to-RGB transform is invalid: {root}") from error
+    if (
+        source_determinant <= 0.0
+        or not np.isfinite(singular_values).all()
+        or float(np.max(np.abs(singular_values - 1.0))) > 0.03
+    ):
+        raise ValueError(f"Capture depth-to-RGB transform is invalid: {root}")
+    rigid_rotation = left @ right
+    if float(np.linalg.det(rigid_rotation)) <= 0.0:
+        raise ValueError(f"Capture depth-to-RGB transform is invalid: {root}")
+    rgb_from_depth = rgb_from_depth.copy()
+    rgb_from_depth[:3, :3] = rigid_rotation
 
     tracking_poses, tracking_rejected, tracking_quality = _read_tracking_journal(root)
     frames: list[FrameRecord] = []
@@ -405,7 +424,17 @@ def save_preview(path: Path, points: np.ndarray, colors: np.ndarray, limit: int 
         }
         for point, color in zip(points, colors, strict=True)
     ]
-    write_json(path, payload)
+    try:
+        write_json(path, payload)
+    except PermissionError:
+        if path.name != "build-preview.json":
+            raise
+        # The build preview is transient UI telemetry, never an artifact. On
+        # Windows, virus scanners or a polling WebView can occasionally retain
+        # the old multi-megabyte JSON file beyond the atomic-replace retry
+        # window. Keep the previous preview and finish the real reconstruction
+        # instead of failing a valid point cloud or mesh for a display refresh.
+        return
 
 
 def phase_roots(project_root: Path, project: dict[str, Any]) -> Iterable[Path]:

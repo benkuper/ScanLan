@@ -39,24 +39,49 @@ Normal room-scale settings use weighted TSDF fusion. Fine spacing uses a memory-
 
 ## Triangle mesh
 
-The mesh is extracted from the same final CUDA/CPU TSDF used by the point output, so a combined point+mesh build does not fuse the room twice. Geometry uses every accepted depth keyframe; only atlas texturing is capped to 24 well-spaced calibrated RGB views. The surface is cleaned, simplified to a bounded triangle budget, welded, and indexed. Azure/Femto texturing uses calibrated native RGB whenever its bounded encoder produced the frame; a missing native image switches that frame to depth-aligned RGB with depth-camera calibration. Kinect always uses the SDK’s exact depth-aligned color rather than a hard-coded approximation of unavailable reusable color calibration:
+The mesh is extracted from the same final CUDA/CPU TSDF used by the point output, so a combined point+mesh build does not fuse the room twice. Geometry uses every accepted depth keyframe; texturing retains up to 24 views by greedily maximizing surface coverage and projected source-pixel density. The surface is cleaned, simplified to a bounded triangle budget, welded, and indexed. Azure/Femto texturing uses calibrated native RGB whenever its bounded encoder produced the frame; a missing native image switches that frame to depth-aligned RGB with depth-camera calibration. Kinect always uses the SDK’s exact depth-aligned color rather than a hard-coded approximation of unavailable reusable color calibration:
 
 - project geometry through depth and RGB calibration;
-- reject occluded samples using metric depth;
-- compensate exposure between views;
-- weight by visibility and viewing angle;
-- bilinearly sample the frame’s calibrated RGB source;
-- pack padded triangle charts while sharing blended colors across common edges.
+- conservatively refine RGB-D poses geometrically against the fused surface, then run a bounded rigid color-map optimization; corrections outside strict millimetre/degree gates are discarded;
+- enforce captured-depth visibility and use a mesh-vertex z-buffer for localized depthless photos;
+- estimate per-channel gains and biases from overlapping observations in linear RGB;
+- fit a smooth low-frequency correction field per image, leveling local exposure, white balance, and vignetting without averaging away detail;
+- optimize camera labels over adjacent coplanar faces, forming coherent patches instead of triangle-scale camera switches;
+- prefer frontal, close, high-pixel-density observations and keep one sharp source per patch;
+- pack every corrected source image once into a padded shared atlas page, allowing same-camera faces to reuse native detail instead of receiving independent microcharts;
+- retain blended multi-view vertex color only as a fallback for surfaces no camera observes completely.
 
 Outputs are `room-mesh.obj`, `room-mesh.mtl`, and `room-texture.png`.
+
+### Supplemental high-resolution photos
+
+After an initial mesh build, the Reconstruct workspace can import overlapping JPEG, PNG, TIFF, or WebP scene photos. The localization worker detects SIFT features in the new photo and selected depth-aligned RGB-D references, lifts reference features into metric world coordinates with captured depth, searches plausible focal lengths, and estimates the camera with PnP-RANSAC. Inlier-count, inlier-ratio, and reprojection-RMSE gates reject ambiguous poses.
+
+Selected files are registered immediately in `supplemental-photos.json`, and atomic progress is checkpointed in `outputs/photo-localization-progress.json`. The Reconstruct workspace restores that state after reload and lists queued, accepted, and rejected photos. Accepted entries include a 0–100 matching-quality score plus inlier and reprojection diagnostics; any entry can be removed without deleting its original source file.
+
+Accepted images are orientation-normalized and copied losslessly into `supplemental/`; calibrated pinhole cameras are stored in the manifest's `photos` collection. The textured mesh is marked stale, and its next rebuild includes accepted photos in coverage selection, visibility testing, radiometric calibration, coherent labeling, and atlas packing. The standalone equivalent is:
+
+```powershell
+scanlan-worker.exe localize-photos C:\path\to\project C:\photos\view-01.jpg C:\photos\view-02.jpg
+```
+
+Localization requires the OpenCV feature runtime included in packaged workers. Failed photos remain outside the texture-baking `photos` collection but persist in the `attempts` registry with their match or pose-validation reason.
 
 ## 2D Gaussian surface
 
 The splat target uses tangent-aligned 2D Gaussian discs rather than unconstrained volumetric blobs. Initial seeds come from the same metric keyframes and include local normals, anisotropic pixel footprints, and depth masks. Native Azure/Femto lens distortion is removed from RGB, reprojected depth, and masks before optimization so every training ray matches the pinhole 2DGS rasterizer. Training combines photometric, SSIM, robust expected-depth, normal, and Gaussian-distortion terms with bounded camera-pose refinement.
 
-For a 12 GB GPU, the canonical builder retains up to 600 views using camera-position, direction, roll, time, and take-boundary coverage, then projects metric depth and undistorts RGB directly onto a 720 px pinhole grid. Compact integer images remain in pinned host memory behind a four-frame LRU; shuffled views are scheduled in cache-local blocks and only the active view is transferred to CUDA. The trainer enforces a two-million-Gaussian hard ceiling at this VRAM tier. Densification stops before a single growth cycle could cross that ceiling, and checkpoints are exported atomically.
+For a 12 GB GPU, the canonical builder retains up to 600 views using camera-position, direction, roll, time, and take-boundary coverage, then projects metric depth and undistorts RGB directly onto a 960 px pinhole grid. Compact integer images remain in pinned host memory behind a four-frame LRU; shuffled views are scheduled in cache-local blocks and only the active view is transferred to CUDA. The trainer enforces a two-million-Gaussian hard ceiling at this VRAM tier. Densification stops before a single growth cycle could cross that ceiling, and checkpoints are exported atomically.
 
 The exported PLY is interoperable with 3DGS tooling by flattening the third scale axis. `room-splat.transform.json` records display conversion separately. This is the production surface-splat path; the conventional mesh remains the production triangle representation.
+
+## Photo/video 3D Gaussian splat
+
+Ordinary media uses a separate photoreal path because it has no metric depth surface to constrain 2D discs. Photos are orientation-normalized without upscaling. Video is decoded with the bundled FFmpeg/PyAV runtime, evaluated at three times the target output rate, reduced to the sharpest frame in each time bucket, pruned for near-duplicates, and capped at 600 selected frames by default.
+
+PyCOLMAP extracts bounded high-density SIFT features, uses guided geometric verification, performs exhaustive matching for normal photo sets and quadratic sequential matching for long videos, and incrementally reconstructs multiple candidate models. A solve must register at least half the usable input views and produce at least 100 reliable sparse tracks. The largest consistent model is bundle-adjusted, undistorted at source resolution, and converted into canonical schema-3 pinhole cameras. Registration ratio, excluded views, model count, reprojection error, track length, and warnings remain in `dataset.json`.
+
+Reliable COLMAP points initialize anisotropic 3D Gaussians with local-spacing-derived scales. Training uses packed gsplat rasterization, L1+SSIM, degree-three spherical harmonics, bounded camera-pose refinement, and a regularized per-view RGB log-gain/bias model to absorb exposure and white-balance changes without baking every source variation into the exported colors. The first/median-exposure anchor fixes the appearance gauge. Checkpoints, live previews, the final canonical PLY, refined cameras, and sidecars use the same atomic publication policy as RGB-D 2DGS.
 
 ## Failure policy
 
@@ -65,7 +90,7 @@ The exported PLY is interoperable with 3DGS tooling by flattening the third scal
 - A broken journal falls back to offline odometry.
 - A failed loop-graph optimization falls back to the previously validated trajectory.
 - CUDA operation failure can fall back to the CPU Open3D path for point/mesh reconstruction.
-- 2DGS requires CUDA and reports a missing runtime instead of silently changing algorithms.
+- Gaussian training requires CUDA and reports a missing runtime instead of silently changing algorithms; media camera solving remains CPU-capable.
 - Raw schema-3 capture data is never deleted by reconstruction cancellation.
 
 ## Benchmark gate

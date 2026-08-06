@@ -53,7 +53,7 @@ $CudaArchitecture = (& $Python -c "import torch; print('.'.join(map(str, torch.c
 $TorchBuild = (& $Python -c "import torch; print(torch.__version__)").Trim()
 $ExpectedGsplatFeatures = "$GsplatFeatureSchema;torch=$TorchBuild;arch=$CudaArchitecture"
 $env:TORCH_CUDA_ARCH_LIST = $CudaArchitecture
-& $Python -m pip install --upgrade "numpy==1.26.4" "Pillow==11.1.0" "ninja>=1.10" "jaxtyping" "rich>=12" "backports.tarfile" "pyinstaller==6.16.0"
+& $Python -m pip install --upgrade "numpy==1.26.4" "Pillow==11.1.0" "pycolmap==4.1.1" "av==18.0.0" "ninja>=1.10" "jaxtyping" "rich>=12" "backports.tarfile" "pyinstaller==6.16.0"
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat support dependencies could not be installed." }
 $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
 $VisualStudioRoot = if (Test-Path -LiteralPath $VsWhere) {
@@ -100,7 +100,8 @@ try {
   & $Python -m PyInstaller --noconfirm --clean --onedir --name scanlan-splat `
     --hidden-import gsplat.csrc --hidden-import backports.tarfile `
     --add-binary "${GsplatExtension};gsplat" `
-    --collect-all gsplat --copy-metadata torch --copy-metadata gsplat entry.py
+    --collect-all gsplat --collect-all pycolmap --collect-all av `
+    --copy-metadata torch --copy-metadata gsplat --copy-metadata pycolmap --copy-metadata av entry.py
   if ($LASTEXITCODE -ne 0) { throw "ScanLan splat runtime packaging failed." }
 } finally {
   Pop-Location

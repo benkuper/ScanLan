@@ -10,11 +10,21 @@ from scanlan_splat.dataset import load_dataset
 
 def _write_dataset(root: Path, *, schema: int = 3, model: str = "pinhole", distortion: list[float] | None = None) -> None:
     root.mkdir(parents=True)
+    for relative in (
+        "initialization.ply",
+        "images/000000.jpg",
+        "depths/000000.png",
+        "masks/000000.png",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
     (root / "dataset.json").write_text(
         json.dumps(
             {
                 "schemaVersion": schema,
                 "metric": True,
+                "initialization": "initialization.ply",
                 "frames": [
                     {
                         "intrinsics": {
@@ -70,6 +80,20 @@ class DatasetTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "schema 3"):
                 load_dataset(root)
+
+    def test_registered_rgb_only_dataset_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            _write_dataset(root)
+            manifest = json.loads((root / "dataset.json").read_text(encoding="utf-8"))
+            manifest["metric"] = False
+            manifest["frames"][0].pop("depth")
+            manifest["frames"][0].pop("depthMask")
+            (root / "dataset.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            _, dataset = load_dataset(root)
+
+            self.assertFalse(dataset["metric"])
 
 
 if __name__ == "__main__":

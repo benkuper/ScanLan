@@ -35,7 +35,7 @@
     "resources": {
       "../build/kinect-capture/Release": "kinect2",
       "../build/modern-capture/Release": "modern",
-      "../worker/dist/scanlan-worker.exe": "scanlan-worker.exe"
+      "../worker/dist/scanlan-worker": "scanlan-worker"
     }
   }
 }

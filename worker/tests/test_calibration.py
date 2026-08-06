@@ -97,6 +97,43 @@ class CalibrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unsupported or incomplete"):
                 read_phase(phase_root)
 
+    def test_phase_reader_projects_small_vendor_rotation_scale_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=1)
+            phase_root = next((root / "phases").iterdir())
+            manifest_path = phase_root / "phase.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            transform = np.eye(4)
+            transform[:3, :3] = np.asarray(
+                [
+                    [0.994659, -0.002730, 0.002916],
+                    [0.002415, 0.994659, 0.103184],
+                    [-0.003182, -0.103176, 0.994658],
+                ]
+            )
+            manifest["rgbFromDepth"] = transform.reshape(-1).tolist()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            phase = read_phase(phase_root)
+
+            rotation = phase.rgb_from_depth[:3, :3]
+            np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-10)
+            self.assertAlmostEqual(float(np.linalg.det(rotation)), 1.0, places=10)
+
+    def test_phase_reader_rejects_large_rotation_scale_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=1)
+            phase_root = next((root / "phases").iterdir())
+            manifest_path = phase_root / "phase.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            transform = np.eye(4)
+            transform[0, 0] = 0.8
+            manifest["rgbFromDepth"] = transform.reshape(-1).tolist()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "transform is invalid"):
+                read_phase(phase_root)
+
     def test_depth_projects_directly_to_a_scaled_pinhole_grid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = create_mock_project(Path(temporary) / "scan", phase_count=1, frame_count=1)

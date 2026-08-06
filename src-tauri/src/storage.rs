@@ -89,9 +89,9 @@ pub fn read_project(path: &Path) -> StorageResult<ProjectSummary> {
     Ok(project)
 }
 
-pub fn latest_project(base: &Path) -> StorageResult<Option<ProjectSummary>> {
+pub fn list_projects(base: &Path) -> StorageResult<Vec<ProjectSummary>> {
     if !base.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let mut projects = Vec::new();
@@ -109,7 +109,23 @@ pub fn latest_project(base: &Path) -> StorageResult<Option<ProjectSummary>> {
         }
     }
     projects.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-    Ok(projects.into_iter().next())
+    Ok(projects)
+}
+
+pub fn latest_project(base: &Path) -> StorageResult<Option<ProjectSummary>> {
+    Ok(list_projects(base)?.into_iter().next())
+}
+
+pub fn managed_project_path(base: &Path, path: &Path) -> StorageResult<PathBuf> {
+    let canonical_base = base.canonicalize().map_err(|error| error.to_string())?;
+    let canonical_path = path.canonicalize().map_err(|error| error.to_string())?;
+    if canonical_path.parent() != Some(canonical_base.as_path()) {
+        return Err("The selected folder is not a managed ScanLan project".to_string());
+    }
+    if !canonical_path.join("project.json").is_file() {
+        return Err("The selected folder does not contain a ScanLan project".to_string());
+    }
+    Ok(canonical_path)
 }
 
 pub fn recover_interrupted_phases(project: &mut ProjectSummary) -> StorageResult<bool> {
@@ -177,6 +193,45 @@ pub fn create_project(root: &Path) -> StorageResult<ProjectSummary> {
     Ok(project)
 }
 
+#[cfg(test)]
+mod project_tests {
+    use super::{create_project, list_projects, managed_project_path, write_project};
+    use std::fs;
+
+    #[test]
+    fn managed_projects_are_listed_newest_first() {
+        let base = std::env::temp_dir().join(format!("scanlan-projects-{}", uuid::Uuid::new_v4()));
+        let mut older = create_project(&base.join("older")).unwrap();
+        older.name = "Older".to_string();
+        older.created_at = "2026-01-01T00:00:00Z".to_string();
+        write_project(&older).unwrap();
+        let mut newer = create_project(&base.join("newer")).unwrap();
+        newer.name = "Newer".to_string();
+        newer.created_at = "2026-02-01T00:00:00Z".to_string();
+        write_project(&newer).unwrap();
+
+        let projects = list_projects(&base).unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].name, "Newer");
+        assert_eq!(projects[1].name, "Older");
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn managed_project_paths_cannot_escape_the_project_library() {
+        let root = std::env::temp_dir().join(format!("scanlan-paths-{}", uuid::Uuid::new_v4()));
+        let base = root.join("managed");
+        let direct = base.join("direct");
+        let outside = root.join("outside");
+        create_project(&direct).unwrap();
+        create_project(&outside).unwrap();
+
+        assert!(managed_project_path(&base, &direct).is_ok());
+        assert!(managed_project_path(&base, &outside).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+}
+
 pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let packaged_binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -237,25 +292,38 @@ pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf
 
 pub fn candidate_reconstruction_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    let development_binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let development_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("worker")
-        .join("dist")
+        .join("dist");
+    let development_binary = development_root
+        .join("scanlan-worker")
         .join("scanlan-worker.exe");
+    let legacy_development_binary = development_root.join("scanlan-worker.exe");
     if cfg!(debug_assertions) {
         candidates.push(development_binary.clone());
+        candidates.push(legacy_development_binary.clone());
     }
     if let Some(root) = resource_root {
+        candidates.push(root.join("scanlan-worker").join("scanlan-worker.exe"));
         candidates.push(root.join("scanlan-worker.exe"));
     }
     if let Ok(executable) = std::env::current_exe() {
         if let Some(parent) = executable.parent() {
+            candidates.push(parent.join("scanlan-worker").join("scanlan-worker.exe"));
+            candidates.push(
+                parent
+                    .join("resources")
+                    .join("scanlan-worker")
+                    .join("scanlan-worker.exe"),
+            );
             candidates.push(parent.join("scanlan-worker.exe"));
             candidates.push(parent.join("resources").join("scanlan-worker.exe"));
         }
     }
     if !cfg!(debug_assertions) {
         candidates.push(development_binary);
+        candidates.push(legacy_development_binary);
     }
     candidates
 }

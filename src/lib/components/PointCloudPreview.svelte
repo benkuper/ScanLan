@@ -3,7 +3,9 @@
   import * as THREE from 'three';
   import type { SparkRenderer as SparkRendererInstance, SplatMesh as SplatMeshInstance } from '@sparkjsdev/spark';
   import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-  import type { MeshViewMode, PackedPreviewFrame, PreviewMesh, PreviewPoint } from '../types';
+  import type { TransformControlsMode } from 'three/examples/jsm/controls/TransformControls.js';
+  import { AnchorAngleTransformControls } from '../controls/AnchorAngleTransformControls';
+  import type { CloudTransform, MeshViewMode, PackedPreviewFrame, PreviewMesh, PreviewPoint } from '../types';
 
   type RenderMode = 'points' | 'mesh' | 'splat';
   type AssetLoadingState = 'points' | 'mesh' | 'mesh-texture' | 'splat' | 'splat-gpu' | null;
@@ -12,6 +14,8 @@
   export let packedFrame: PackedPreviewFrame | null = null;
   export let processing = false;
   export let live = false;
+  export let liveLabel = 'Live RGB-D reconstruction';
+  export let emptyDetail = '';
   export let pointSize = 0.034;
   export let opacity = 0.92;
   export let showColors = true;
@@ -20,6 +24,16 @@
   export let mesh: PreviewMesh | null = null;
   export let splatBytes: Uint8Array | null = null;
   export let assetLoading: 'points' | 'mesh' | 'splat' | null = null;
+  export let floorPickMode = false;
+  export let cloudTransform: CloudTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
+  export let gizmoAnchor: [number, number, number] = [0, 0, 0];
+  export let editMode = false;
+  export let gizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
+  export let rotationSnapDegrees = 0;
+  export let onFloorDetected: (transform: CloudTransform) => void = () => undefined;
+  export let onFloorMessage: (message: string) => void = () => undefined;
+  export let onTransformChanged: (transform: CloudTransform) => void = () => undefined;
+  export let onTransformCommitted: () => void = () => undefined;
 
   let canvas: HTMLCanvasElement;
   let setPoints: (next: PreviewPoint[]) => void = () => undefined;
@@ -29,6 +43,9 @@
   let setMeshMode: (next: MeshViewMode) => void = () => undefined;
   let setSplat: (next: Uint8Array | null) => void = () => undefined;
   let setRenderMode: (next: RenderMode) => void = () => undefined;
+  let setTransform: (transform: CloudTransform, anchor: [number, number, number]) => void = () => undefined;
+  let setGizmo: (enabled: boolean, mode: 'translate' | 'rotate' | 'scale') => void = () => undefined;
+  let setRotationSnap: (degrees: number) => void = () => undefined;
   let splatReady = false;
   let splatError = '';
   let splatLoadProgress: number | null = null;
@@ -58,6 +75,9 @@
   $: setMeshMode(meshViewMode);
   $: setSplat(splatBytes);
   $: setRenderMode(renderMode);
+  $: setTransform(cloudTransform, gizmoAnchor);
+  $: setGizmo(editMode, gizmoMode);
+  $: setRotationSnap(rotationSnapDegrees);
 
   onMount(() => {
     const loadingTimer = window.setInterval(() => {
@@ -147,6 +167,17 @@
 
     const root = new THREE.Group();
     scene.add(root);
+    const anchor = new THREE.Vector3();
+
+    const transformControls = new AnchorAngleTransformControls(camera, renderer.domElement);
+    const transformHelper = transformControls.getHelper();
+    transformControls.setSpace('world');
+    transformControls.setSize(0.82);
+    transformControls.translationSnap = 0.01;
+    transformControls.rotationSnap = null;
+    transformControls.scaleSnap = 0.01;
+    transformHelper.visible = false;
+    scene.add(transformHelper);
 
     const pointGeometry = new THREE.BufferGeometry();
     const pointMaterial = new THREE.PointsMaterial({
@@ -246,6 +277,9 @@
         return;
       }
       texture.colorSpace = THREE.SRGBColorSpace;
+      texture.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
+      texture.wrapS = THREE.ClampToEdgeWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
       if (bitmap) texture.flipY = false;
       texture.needsUpdate = true;
       meshTexture = texture;
@@ -461,7 +495,9 @@
       updateMeshAppearance();
       invalidate();
     };
+    let activeRenderMode: RenderMode = renderMode;
     setRenderMode = (next) => {
+      activeRenderMode = next;
       pointCloud.visible = next === 'points';
       meshGroup.visible = next === 'mesh';
       splatGroup.visible = next === 'splat';
@@ -471,6 +507,198 @@
       invalidate();
     };
 
+    setTransform = (transform, nextAnchor) => {
+      anchor.fromArray(nextAnchor);
+      const inverseAnchor = anchor.clone().multiplyScalar(-1);
+      pointCloud.position.copy(inverseAnchor);
+      meshGroup.position.copy(inverseAnchor);
+      splatGroup.position.copy(inverseAnchor);
+      root.rotation.set(
+        THREE.MathUtils.degToRad(transform.rotation[0]),
+        THREE.MathUtils.degToRad(transform.rotation[1]),
+        THREE.MathUtils.degToRad(transform.rotation[2]),
+        'XYZ'
+      );
+      root.scale.fromArray(transform.scale);
+      const anchorOffset = anchor.clone().multiply(root.scale).applyQuaternion(root.quaternion);
+      root.position.fromArray(transform.position).add(anchorOffset);
+      invalidate();
+    };
+    let activeGizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
+    let gizmoAttached = false;
+    setGizmo = (enabled, mode) => {
+      if (mode !== activeGizmoMode) {
+        activeGizmoMode = mode;
+        transformControls.setMode(mode as TransformControlsMode);
+      }
+      if (enabled !== gizmoAttached) {
+        gizmoAttached = enabled;
+        transformHelper.visible = enabled;
+        if (enabled) {
+          transformControls.attach(root);
+          // Keep a stable interaction resolution for the whole edit session.
+          // Resizing the WebGL target after every mouse-up caused the release stall.
+          applyPixelRatio(interactionPixelRatio);
+        } else {
+          transformControls.detach();
+          interactionEnd();
+        }
+      }
+      invalidate();
+    };
+    setRotationSnap = (degrees) => {
+      transformControls.rotationSnap = degrees > 0 ? THREE.MathUtils.degToRad(degrees) : null;
+    };
+    const emitTransform = () => {
+      const anchorOffset = anchor.clone().multiply(root.scale).applyQuaternion(root.quaternion);
+      const origin = root.position.clone().sub(anchorOffset);
+      onTransformChanged({
+        position: [origin.x, origin.y, origin.z],
+        rotation: [
+          THREE.MathUtils.radToDeg(root.rotation.x),
+          THREE.MathUtils.radToDeg(root.rotation.y),
+          THREE.MathUtils.radToDeg(root.rotation.z)
+        ],
+        scale: [root.scale.x, root.scale.y, root.scale.z]
+      });
+      invalidate();
+    };
+    const handleGizmoDragging = (event: { value: unknown }) => {
+      const dragging = Boolean(event.value);
+      controls.enabled = !dragging;
+      if (dragging) interactionStart();
+      else if (!editMode) interactionEnd();
+    };
+    const commitTransform = () => {
+      emitTransform();
+      onTransformCommitted();
+    };
+    // TransformControls already edits `root` directly. Sending every pointer
+    // event through Svelte only writes the same matrix back and makes large
+    // scenes feel CPU-bound. Publish the final pose once on mouse-up instead.
+    transformControls.addEventListener('objectChange', invalidate);
+    transformControls.addEventListener('dragging-changed', handleGizmoDragging);
+    transformControls.addEventListener('mouseUp', commitTransform);
+
+    const sourcePointCount = () => points.length || Math.floor((mesh?.positions.length ?? 0) / 3);
+    const sourcePoint = (index: number, target = new THREE.Vector3()) => {
+      if (points.length) return target.fromArray(points[index].position);
+      const positions = mesh?.positions;
+      return positions
+        ? target.set(positions[index * 3], positions[index * 3 + 1], positions[index * 3 + 2])
+        : target.set(0, 0, 0);
+    };
+    const fitFloor = (selected: THREE.Vector3, contentObject: THREE.Object3D) => {
+      const count = sourcePointCount();
+      const stride = Math.max(1, Math.floor(count / 120_000));
+      const collectNearby = (radius: number) => {
+        const radiusSquared = radius * radius;
+        const nearby: THREE.Vector3[] = [];
+        for (let index = 0; index < count; index += stride) {
+          const candidate = sourcePoint(index);
+          if (candidate.distanceToSquared(selected) < radiusSquared) nearby.push(candidate);
+        }
+        if (nearby.length <= 8_000) return nearby;
+        const compactStride = Math.ceil(nearby.length / 8_000);
+        return nearby.filter((_, index) => index % compactStride === 0);
+      };
+      let candidates = collectNearby(0.5);
+      if (candidates.length < 30) candidates = collectNearby(1.0);
+      if (candidates.length < 12) {
+        onFloorMessage('Not enough nearby geometry to fit a floor plane. Pick a denser area.');
+        return;
+      }
+
+      let bestNormal: THREE.Vector3 | null = null;
+      let bestScore = 0;
+      const attempts = Math.min(160, candidates.length * 2);
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const a = candidates[(attempt * 17) % candidates.length];
+        const b = candidates[(attempt * 43 + 7) % candidates.length];
+        const c = candidates[(attempt * 71 + 19) % candidates.length];
+        if (a === b || a === c || b === c) continue;
+        const normal = b.clone().sub(a).cross(c.clone().sub(a));
+        if (normal.lengthSq() < 1e-7) continue;
+        normal.normalize();
+        let score = 0;
+        for (const candidate of candidates) {
+          if (Math.abs(normal.dot(candidate.clone().sub(a))) < 0.025) score += 1;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestNormal = normal;
+        }
+      }
+      if (!bestNormal || bestScore < 10) {
+        onFloorMessage('A stable floor plane could not be found around that point.');
+        return;
+      }
+
+      const orientedNormal = bestNormal.clone();
+      const sideStride = Math.max(1, Math.floor(count / 20_000));
+      let positiveSide = 0;
+      let negativeSide = 0;
+      for (let index = 0; index < count; index += sideStride) {
+        const distance = orientedNormal.dot(sourcePoint(index).sub(selected));
+        if (distance > 0.04) positiveSide += 1;
+        else if (distance < -0.04) negativeSide += 1;
+      }
+      if (negativeSide > positiveSide) orientedNormal.negate();
+      const aboveCount = Math.max(positiveSide, negativeSide);
+      const classifiedCount = Math.max(positiveSide + negativeSide, 1);
+
+      root.updateMatrixWorld(true);
+      const selectedWorld = contentObject.localToWorld(selected.clone());
+      const normalWorld = orientedNormal
+        .applyNormalMatrix(new THREE.Matrix3().getNormalMatrix(contentObject.matrixWorld))
+        .normalize();
+      const correction = new THREE.Quaternion().setFromUnitVectors(
+        normalWorld,
+        new THREE.Vector3(0, 1, 0)
+      );
+      const modelOriginWorld = contentObject.localToWorld(new THREE.Vector3());
+      const position = modelOriginWorld
+        .sub(selectedWorld)
+        .applyQuaternion(correction)
+        .add(selectedWorld);
+      position.y -= selectedWorld.y;
+      const rotation = new THREE.Euler().setFromQuaternion(
+        correction.multiply(root.quaternion),
+        'XYZ'
+      );
+      onFloorDetected({
+        position: [position.x, position.y, position.z],
+        rotation: [
+          THREE.MathUtils.radToDeg(rotation.x),
+          THREE.MathUtils.radToDeg(rotation.y),
+          THREE.MathUtils.radToDeg(rotation.z)
+        ],
+        scale: [root.scale.x, root.scale.y, root.scale.z]
+      });
+      onFloorMessage(
+        `Floor aligned; ${Math.round(aboveCount / classifiedCount * 100)}% of classified geometry is above it.`
+      );
+    };
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.params.Points = { threshold: 0.06 };
+    const pointer = new THREE.Vector2();
+    const handleFloorPick = (event: PointerEvent) => {
+      if (!floorPickMode || activeRenderMode === 'splat' || sourcePointCount() === 0) return;
+      const bounds = canvas.getBoundingClientRect();
+      pointer.x = ((event.clientX - bounds.left) / bounds.width) * 2 - 1;
+      pointer.y = -((event.clientY - bounds.top) / bounds.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const contentObject = activeRenderMode === 'mesh' ? meshGroup : pointCloud;
+      const hit = raycaster.intersectObject(contentObject, true)[0];
+      if (!hit) {
+        onFloorMessage('No surface selected. Click directly on a dense floor patch.');
+        return;
+      }
+      fitFloor(contentObject.worldToLocal(hit.point.clone()), contentObject);
+    };
+    canvas.addEventListener('pointerup', handleFloorPick);
+
     if (packedFrame) setPackedPoints(packedFrame);
     else setPoints(points);
     setMesh(mesh);
@@ -478,6 +706,9 @@
     setMaterial(pointSize, opacity, showColors);
     setMeshMode(meshViewMode);
     setRenderMode(renderMode);
+    setTransform(cloudTransform, gizmoAnchor);
+    setGizmo(editMode, gizmoMode);
+    setRotationSnap(rotationSnapDegrees);
 
     let resizeFrame = 0;
     let renderedWidth = 0;
@@ -519,11 +750,18 @@
       cancelAnimationFrame(resizeFrame);
       window.clearInterval(loadingTimer);
       window.clearTimeout(restoreQualityTimer);
+      canvas.removeEventListener('pointerup', handleFloorPick);
       resizeObserver.disconnect();
       controls.removeEventListener('change', invalidate);
       controls.removeEventListener('start', interactionStart);
       controls.removeEventListener('end', interactionEnd);
       controls.dispose();
+      transformControls.removeEventListener('objectChange', invalidate);
+      transformControls.removeEventListener('dragging-changed', handleGizmoDragging);
+      transformControls.removeEventListener('mouseUp', commitTransform);
+      transformControls.detach();
+      transformControls.dispose();
+      scene.remove(transformHelper);
       clearSplat();
       clearMesh();
       sparkRenderer?.dispose();
@@ -537,12 +775,18 @@
   });
 </script>
 
-<div class:processing class="viewer">
+<div class:processing class:point-pick={floorPickMode} class="viewer">
   <canvas bind:this={canvas} aria-label="Interactive 3D reconstruction"></canvas>
   <div class:live class="viewer-hud top-left">
     <span class="pulse"></span>
-    {processing ? renderMode === 'splat' ? 'Training 2D Gaussian splats' : 'Reconstructing geometry' : live ? 'Live RGB-D reconstruction' : renderMode === 'splat' ? splatError ? 'Splat preview failed' : splatReady ? '2D Gaussian splat' : 'Loading splat' : renderMode === 'mesh' && mesh ? meshViewMode === 'wireframe' ? 'Wireframe' : meshViewMode === 'shaded' ? 'Shaded mesh' : meshViewMode === 'surface-wireframe' ? 'Mesh + wireframe' : 'Textured mesh' : points.length || packedFrame?.pointCount ? 'Point cloud' : 'Awaiting RGB-D frames'}
+    {processing ? renderMode === 'splat' ? 'Training 2D Gaussian splats' : 'Reconstructing geometry' : live ? liveLabel : renderMode === 'splat' ? splatError ? 'Splat preview failed' : splatReady ? '2D Gaussian splat' : 'Loading splat' : renderMode === 'mesh' && mesh ? meshViewMode === 'wireframe' ? 'Wireframe' : meshViewMode === 'shaded' ? 'Shaded mesh' : meshViewMode === 'surface-wireframe' ? 'Mesh + wireframe' : 'Textured mesh' : points.length || packedFrame?.pointCount ? 'Point cloud' : 'Awaiting RGB-D frames'}
   </div>
+
+  {#if floorPickMode}
+    <div class="viewer-hud floor-hint">Click a dense patch of floor</div>
+  {:else if editMode}
+    <div class="viewer-hud floor-hint">Drag the gizmo · W move · E rotate · R scale</div>
+  {/if}
 
   {#if visibleAssetLoading}
     <div class="asset-loading" aria-live="polite" aria-busy="true">
@@ -557,8 +801,8 @@
     <div class="viewer-hud bottom-right">Drag to orbit · Scroll to zoom</div>
   {:else}
     <div class="empty-state">
-      <strong>{processing ? 'Preparing reconstruction geometry…' : renderMode === 'splat' ? splatError || 'No Gaussian splat yet' : renderMode === 'mesh' ? 'No reconstructed mesh yet' : 'No live depth points yet'}</strong>
-      <span>{processing ? 'The viewer updates whenever the worker publishes a quality-gated snapshot.' : 'Start capture or build the selected output.'}</span>
+      <strong>{processing ? 'Preparing reconstruction geometry…' : renderMode === 'splat' ? splatError || 'No Gaussian splat yet' : renderMode === 'mesh' ? 'No reconstructed mesh yet' : live ? 'No valid depth in camera range' : 'No live depth points yet'}</strong>
+      <span>{processing ? 'The viewer updates whenever the worker publishes a quality-gated snapshot.' : live ? emptyDetail || 'Aim the camera at a surface between its minimum range and the configured depth limit.' : 'Start capture or build the selected output.'}</span>
     </div>
   {/if}
   {#if processing}<div class="processing-scan"></div>{/if}
@@ -568,9 +812,11 @@
   .viewer { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; border-radius: 22px; background: #07111c; box-shadow: inset 0 0 0 1px rgba(139, 193, 216, 0.08); }
   canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; cursor: grab; }
   canvas:active { cursor: grabbing; }
+  .point-pick canvas, .point-pick canvas:active { cursor: crosshair; }
   .viewer-hud { position: absolute; display: flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid rgba(157, 204, 223, 0.12); border-radius: 10px; background: rgba(5, 15, 25, 0.68); color: #adc3d0; font-size: 11px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; backdrop-filter: blur(12px); pointer-events: none; }
   .top-left { top: 16px; left: 16px; }
   .bottom-right { right: 16px; bottom: 16px; text-transform: none; letter-spacing: 0; }
+  .floor-hint { left: 50%; bottom: 16px; transform: translateX(-50%); border-color: rgba(240, 183, 107, 0.35); color: #f0c68f; }
   .pulse { width: 7px; height: 7px; border-radius: 50%; background: #58d5b5; box-shadow: 0 0 0 4px rgba(88, 213, 181, 0.1); }
   .processing .pulse { background: #f0b76b; animation: pulse 1.1s infinite; }
   .viewer-hud.live .pulse { animation: pulse 1.1s infinite; }

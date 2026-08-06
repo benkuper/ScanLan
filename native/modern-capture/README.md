@@ -1,6 +1,6 @@
 # Azure Kinect / Femto Mega capture worker
 
-`rgbd-capture-worker.exe` is the Windows backend for Azure Kinect DK and Orbbec Femto Mega. It captures synchronized native depth/RGB, performs calibrated color-to-depth alignment, rotates IMU samples into the depth camera, streams full-rate RGB-D, and archives schema-3 frames asynchronously.
+`rgbd-capture-worker.exe` is the Windows backend for Azure Kinect DK and Orbbec Femto Mega. It captures synchronized depth/RGB, performs calibrated color-to-depth alignment, rotates IMU samples into the depth camera, streams full-rate RGB-D, and archives schema-3 frames asynchronously. Femto Mega's distorted native depth raster is resampled through the Orbbec calibration XY table onto a wide-FOV virtual pinhole camera before streaming or archiving; the aligned color uses the identical remap. In Narrow mode, valid depth pixels that fall just beyond the tilted RGB camera's vertical boundary receive the nearest calibrated native-RGB boundary sample instead of an artificial black color.
 
 ## SDK discovery
 

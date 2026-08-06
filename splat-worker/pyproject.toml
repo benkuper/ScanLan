@@ -5,13 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scanlan-splat"
 version = "0.1.0"
-description = "Isolated depth-aware Gaussian-splat runtime for ScanLan"
+description = "Photo, video, and depth-aware Gaussian-splat runtime for ScanLan"
 requires-python = ">=3.11,<3.12"
 dependencies = [
   "numpy==1.26.4",
   "Pillow==11.1.0",
   "torch==2.12.1",
   "gsplat==1.5.3",
+  "pycolmap==4.1.1",
+  "av==18.0.0",
 ]
 
 [project.optional-dependencies]

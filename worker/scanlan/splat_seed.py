@@ -8,12 +8,12 @@ import numpy as np
 from .calibration import robust_depth_mask
 
 
-SEED_VERSION = "rgbd-quadtree-discs-v2"
+SEED_VERSION = "rgbd-quadtree-discs-v3-500k"
 DEFAULT_SEED_VOXEL_M = 0.01
 DEFAULT_CONTRAST_THRESHOLD = 2.0e-4
 DEFAULT_MAX_CELL_SIZE = 24
 DEFAULT_MIN_CELL_SIZE = 2
-MAX_INITIAL_GAUSSIANS = 350_000
+MAX_INITIAL_GAUSSIANS = 500_000
 
 
 @dataclass(frozen=True)

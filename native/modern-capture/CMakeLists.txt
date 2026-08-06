@@ -63,10 +63,27 @@ if(TARGET ob::OrbbecSDK)
   target_compile_definitions(rgbd-capture-worker PRIVATE SCANLAN_HAS_ORBBEC=1)
   target_link_libraries(rgbd-capture-worker PRIVATE ob::OrbbecSDK)
   if(EXISTS "${ORBBEC_SDK_ROOT}/bin")
-    add_custom_command(TARGET rgbd-capture-worker POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${ORBBEC_SDK_ROOT}/bin"
-        "$<TARGET_FILE_DIR:rgbd-capture-worker>")
+    # copy_directory attempts to replace every destination file even when it
+    # is unchanged. On Windows that fails whenever a running preview has the
+    # Orbbec DLL loaded. Copy each runtime file conditionally so an unchanged
+    # SDK can coexist with an active debug camera session; a genuinely changed
+    # DLL still fails safely and asks for the preview to be restarted.
+    file(GLOB_RECURSE ORBBEC_RUNTIME_FILES
+      CONFIGURE_DEPENDS
+      RELATIVE "${ORBBEC_SDK_ROOT}/bin"
+      "${ORBBEC_SDK_ROOT}/bin/*")
+    foreach(runtime IN LISTS ORBBEC_RUNTIME_FILES)
+      get_filename_component(runtime_directory "${runtime}" DIRECTORY)
+      if(runtime_directory)
+        add_custom_command(TARGET rgbd-capture-worker POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:rgbd-capture-worker>/${runtime_directory}")
+      endif()
+      add_custom_command(TARGET rgbd-capture-worker POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${ORBBEC_SDK_ROOT}/bin/${runtime}"
+          "$<TARGET_FILE_DIR:rgbd-capture-worker>/${runtime}")
+    endforeach()
   endif()
   message(STATUS "Orbbec Femto Mega backend enabled: ${ORBBEC_SDK_ROOT}")
 else()

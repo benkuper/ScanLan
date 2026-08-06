@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -109,7 +110,14 @@ def reconstruct_project(
 ) -> dict:
     project_root = project_root.resolve()
     project = read_project(project_root)
-    phases = [read_phase(path) for path in phase_roots(project_root, project)]
+    # Live tracking rejection marks a pose estimate as unsafe; it does not make
+    # the archived RGB-D pixels unusable.  Keep those consecutive frames for
+    # production odometry so a lost live tracker cannot turn a smooth recording
+    # into large temporal gaps that offline tracking cannot bridge.
+    phases = [
+        read_phase(path, include_tracking_rejected=True)
+        for path in phase_roots(project_root, project)
+    ]
     if not phases:
         raise ValueError("Capture at least one phase before building a point cloud")
 
@@ -258,7 +266,12 @@ def reconstruct_project(
             "datasetFingerprint": source_fingerprint,
         }
 
-        project["processingStatus"] = "complete"
+        # Gaussian training is a separate worker launched by the desktop job
+        # orchestrator. Keep the overall project active while that selected
+        # target is still pending so live splat previews remain available.
+        project["processingStatus"] = (
+            "processing" if "gaussian_splat" in targets else "complete"
+        )
         project.pop("processingError", None)
         project["schemaVersion"] = 3
         artifacts = project.setdefault("artifacts", {})
@@ -276,13 +289,20 @@ def reconstruct_project(
                 "stale": False,
             }
         if "textured_mesh" in targets:
+            mesh_fingerprint = hashlib.sha256(
+                (
+                    fingerprint
+                    + ":"
+                    + str(result.get("supplementalTextureFingerprint", "none"))
+                ).encode("utf-8")
+            ).hexdigest()[:24]
             project["meshTriangleCount"] = result["meshTriangleCount"]
             project["meshOutputPath"] = result.get("meshOutputPath")
             project["cameraFrameCount"] = result["cameraFrameCount"]
             artifacts["texturedMesh"] = {
                 "path": "outputs/room-mesh.obj",
                 "status": "ready",
-                "sourceFingerprint": fingerprint,
+                "sourceFingerprint": mesh_fingerprint,
                 "updatedAt": updated_at,
                 "metric": True,
                 "stale": False,
