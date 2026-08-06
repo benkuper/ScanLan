@@ -1,0 +1,9 @@
+{
+  "name": "scanlan-mesh-repair",
+  "version-string": "0.1.0",
+  "builtin-baseline": "17f35ad2418007a895ced8a4cece4ab34068a58d",
+  "dependencies": [
+    "cgal",
+    "nlohmann-json"
+  ]
+}
