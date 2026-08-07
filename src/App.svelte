@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { open, save } from '@tauri-apps/plugin-dialog';
   import PointCloudPreview from './lib/components/PointCloudPreview.svelte';
   import {
@@ -64,6 +64,7 @@
   type Workspace = 'capture' | 'reconstruct' | 'inspect';
   type RenderMode = 'points' | 'mesh' | 'splat';
   type TransformSaveMode = 'auto' | 'manual';
+  type ExportKind = 'points' | 'mesh' | 'splat';
 
   let project: ProjectSummary | null = null;
   let projectCatalog: ProjectCatalogEntry[] = [];
@@ -102,6 +103,7 @@
   let liveMesh: PreviewMesh | null = null;
   let previewSplat: Uint8Array | null = null;
   let assetLoading: RenderMode | null = null;
+  let exporting: ExportKind | null = null;
 
   let buildPointCloud = true;
   let buildTexturedMesh = true;
@@ -1476,30 +1478,51 @@
   }
 
   async function exportPointCloud(): Promise<void> {
-    if (!project || !artifactReady('pointCloud')) return;
+    if (!project || exporting || !artifactReady('pointCloud')) return;
     const destination = await save({ title: 'Export metric point cloud', defaultPath: 'scan-cloud.ply', filters: [{ name: 'PLY point cloud', extensions: ['ply'] }] });
     if (!destination) return;
+    exporting = 'points';
+    message = `Exporting${clippingEnabled ? ' clipped' : ''} point cloud…`;
+    await tick();
     try {
       message = `Aligned${clippingEnabled ? ' and clipped' : ''} point cloud exported to ${await exportPly(project.path, destination, cloudTransform, clippingEnabled ? clipBounds : null)}.`;
-    } catch (error) { message = errorText(error); }
+    } catch (error) {
+      message = `Point cloud export failed: ${errorText(error)}`;
+    } finally {
+      exporting = null;
+    }
   }
 
   async function exportMesh(): Promise<void> {
-    if (!project || !artifactReady('texturedMesh')) return;
+    if (!project || exporting || !artifactReady('texturedMesh')) return;
     const destination = await save({ title: 'Export textured mesh bundle', defaultPath: 'scan-mesh.obj', filters: [{ name: 'Wavefront OBJ', extensions: ['obj'] }] });
     if (!destination) return;
+    exporting = 'mesh';
+    message = `Exporting${clippingEnabled ? ' clipped' : ''} textured mesh bundle…`;
+    await tick();
     try {
       message = `Aligned${clippingEnabled ? ' and clipped' : ''} OBJ, MTL, and texture exported beside ${await exportTexturedMesh(project.path, destination, cloudTransform, clippingEnabled ? clipBounds : null)}.`;
-    } catch (error) { message = errorText(error); }
+    } catch (error) {
+      message = `Mesh export failed: ${errorText(error)}`;
+    } finally {
+      exporting = null;
+    }
   }
 
   async function exportSplat(): Promise<void> {
-    if (!project || !artifactReady('gaussianSplat')) return;
+    if (!project || exporting || !artifactReady('gaussianSplat')) return;
     const destination = await save({ title: 'Export metric 2D Gaussian surface', defaultPath: 'scan-2dgs.ply', filters: [{ name: 'Gaussian PLY', extensions: ['ply'] }] });
     if (!destination) return;
+    exporting = 'splat';
+    message = `Exporting${clippingEnabled ? ' clipped' : ''} 2D Gaussian surface…`;
+    await tick();
     try {
       message = `Aligned${clippingEnabled ? ' and clipped' : ''} Gaussian surface and coordinate sidecars exported to ${await exportGaussianSplat(project.path, destination, cloudTransform, clippingEnabled ? clipBounds : null)}.`;
-    } catch (error) { message = errorText(error); }
+    } catch (error) {
+      message = `2D Gaussian export failed: ${errorText(error)}`;
+    } finally {
+      exporting = null;
+    }
   }
 
   onMount(() => {
@@ -2034,17 +2057,23 @@
           <p>{project.confidenceDetail ?? 'Build an output to see trajectory and coverage quality.'}</p>
         </section>
         <section class="panel export-list">
-          <button on:click={exportPointCloud} disabled={!artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>Metric colored vertices</small></div><i>Export…</i></button>
-          <button on:click={exportMesh} disabled={!artifactReady('texturedMesh')}><span>M</span><div><strong>Textured OBJ bundle</strong><small>OBJ + MTL + PNG</small></div><i>Export…</i></button>
-          <button on:click={exportSplat} disabled={!artifactReady('gaussianSplat')}><span>G</span><div><strong>2D Gaussian PLY</strong><small>Aligned metric splat + sidecars</small></div><i>Export…</i></button>
+          <button class:exporting={exporting === 'points'} aria-busy={exporting === 'points'} on:click={exportPointCloud} disabled={Boolean(exporting) || !artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>Metric colored vertices</small></div><i>{exporting === 'points' ? 'Exporting…' : 'Export…'}</i></button>
+          <button class:exporting={exporting === 'mesh'} aria-busy={exporting === 'mesh'} on:click={exportMesh} disabled={Boolean(exporting) || !artifactReady('texturedMesh')}><span>M</span><div><strong>Textured OBJ bundle</strong><small>OBJ + MTL + PNG</small></div><i>{exporting === 'mesh' ? 'Exporting…' : 'Export…'}</i></button>
+          <button class:exporting={exporting === 'splat'} aria-busy={exporting === 'splat'} on:click={exportSplat} disabled={Boolean(exporting) || !artifactReady('gaussianSplat')}><span>G</span><div><strong>2D Gaussian PLY</strong><small>Aligned metric splat + sidecars</small></div><i>{exporting === 'splat' ? 'Exporting…' : 'Export…'}</i></button>
+          {#if exporting}
+            <div class="export-feedback" role="status" aria-live="polite">
+              <div><strong>{exporting === 'points' ? 'Exporting point cloud' : exporting === 'mesh' ? 'Exporting textured mesh' : 'Exporting 2D Gaussian surface'}</strong><small>Applying the saved pose{clippingEnabled ? ' and clipping bounds' : ''}, then writing to disk.</small></div>
+              <span class="export-progress"><i></i></span>
+            </div>
+          {/if}
         </section>
       {/if}
     </aside>
   </main>
 
   <footer class:error={Boolean(fatalError)}>
-    <span class="status-dot" class:busy={busy || capturing || processing || photoLocalizationActive}></span>
-    <strong>{capturing ? 'LIVE' : processing ? 'BUILDING' : photoLocalizationActive ? 'LOCALIZING' : fatalError ? 'ERROR' : 'READY'}</strong>
+    <span class="status-dot" class:busy={busy || capturing || processing || photoLocalizationActive || Boolean(exporting)}></span>
+    <strong>{capturing ? 'LIVE' : processing ? 'BUILDING' : photoLocalizationActive ? 'LOCALIZING' : exporting ? 'EXPORTING' : fatalError ? 'ERROR' : 'READY'}</strong>
     <p>{message}</p>
     {#if sensor?.imuActive}<span class="footer-metric">IMU {sensor.imuRateHz.toFixed(0)} Hz</span>{/if}
     {#if sensor?.liveReconstructionBackend}<span class="footer-metric">{sensor.liveReconstructionBackend}</span>{/if}
@@ -2284,10 +2313,17 @@
   .export-list { display: grid; gap: 7px; }
   .export-list button { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 9px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0a1823; text-align: left; }
   .export-list button:hover:not(:disabled) { border-color: rgba(99,199,231,.36); }
+  .export-list button.exporting { border-color: rgba(99,199,231,.36); background: rgba(99,199,231,.07); }
   .export-list button div { display: grid; gap: 3px; }
   .export-list button strong { font-size: 10px; }
   .export-list button small { color: #687f8a; font-size: 8px; }
   .export-list button > i { color: var(--cyan); font-size: 9px; font-style: normal; }
+  .export-feedback { display: grid; gap: 8px; padding: 9px 10px; border: 1px solid rgba(99,199,231,.18); border-radius: 8px; background: rgba(99,199,231,.045); }
+  .export-feedback > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .export-feedback strong { color: #a9c3cd; font-size: 9px; }
+  .export-feedback small { color: #687f8a; font-size: 8px; text-align: right; }
+  .export-progress { display: block; height: 3px; overflow: hidden; border-radius: 4px; background: #172a35; }
+  .export-progress i { display: block; width: 35%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--mint)); animation: export-slide 1.1s ease-in-out infinite; }
 
   .live-metrics { position: absolute; top: 26px; right: 26px; display: grid; grid-template-columns: repeat(3, minmax(80px, 1fr)); gap: 1px; overflow: hidden; border: 1px solid rgba(141,195,214,.16); border-radius: 9px; background: rgba(5,14,22,.72); box-shadow: 0 12px 35px rgba(0,0,0,.22); backdrop-filter: blur(12px); }
   .live-metrics div { display: grid; gap: 3px; padding: 8px 10px; background: rgba(10,26,37,.78); }
@@ -2309,6 +2345,7 @@
   .spinner { width: 24px; height: 24px; margin-bottom: 12px; border: 2px solid rgba(99,199,231,.16); border-top-color: var(--cyan); border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes pulse { 50% { opacity: .35; } }
+  @keyframes export-slide { from { transform: translateX(-110%); } to { transform: translateX(300%); } }
 
   @media (max-width: 1120px) {
     main { grid-template-columns: minmax(0, 1fr) 340px; }

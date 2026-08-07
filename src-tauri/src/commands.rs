@@ -3804,17 +3804,44 @@ fn unity_compatible_ply(mut bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     }
 
     for vertex in bytes[payload_start..].chunks_exact_mut(PLY_VERTEX_STRIDE) {
-        let x = f32::from_le_bytes(vertex[0..4].try_into().unwrap());
-        vertex[0..4].copy_from_slice(&(-x).to_le_bytes());
+        let z = f32::from_le_bytes(vertex[8..12].try_into().unwrap());
+        vertex[8..12].copy_from_slice(&(-z).to_le_bytes());
     }
 
-    let unity_comment = b"comment Unity-ready coordinates: X axis flipped\n";
+    let unity_comment = b"comment Unity-ready coordinates: Z axis flipped\n";
     let mut output = Vec::with_capacity(bytes.len() + unity_comment.len());
     output.extend_from_slice(&bytes[..header_end]);
     output.extend_from_slice(unity_comment);
     output.extend_from_slice(marker);
     output.extend_from_slice(&bytes[payload_start..]);
     Ok(output)
+}
+
+fn unity_compatible_obj(source: &str) -> Result<String, String> {
+    // Unity's OBJ import convention leaves ScanLan OBJ bundles facing 180
+    // degrees away from the equivalent Unity-ready PLY/splat exports. Bake the
+    // same Y rotation users would otherwise need on the imported GameObject.
+    transformed_obj(
+        source,
+        &CloudTransform {
+            position: [0.0; 3],
+            rotation: [0.0, 180.0, 0.0],
+            scale: [1.0; 3],
+        },
+    )
+}
+
+fn unity_compatible_gaussian_ply(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    // A Gaussian's orientation is part of its covariance, so the handedness
+    // conversion must transform more than its centre position.
+    transformed_gaussian_ply(
+        bytes,
+        &CloudTransform {
+            position: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: [1.0, 1.0, -1.0],
+        },
+    )
 }
 
 fn write_export(destination: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -3860,7 +3887,20 @@ fn write_export(destination: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn export_ply(
+pub async fn export_ply(
+    project_path: String,
+    destination_path: String,
+    transform: CloudTransform,
+    clip_bounds: Option<BoundingBoxClip>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_ply_blocking(project_path, destination_path, transform, clip_bounds)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn export_ply_blocking(
     project_path: String,
     destination_path: String,
     transform: CloudTransform,
@@ -3908,7 +3948,20 @@ pub fn export_ply(
 }
 
 #[tauri::command]
-pub fn export_textured_mesh(
+pub async fn export_textured_mesh(
+    project_path: String,
+    destination_path: String,
+    transform: CloudTransform,
+    clip_bounds: Option<BoundingBoxClip>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_textured_mesh_blocking(project_path, destination_path, transform, clip_bounds)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn export_textured_mesh_blocking(
     project_path: String,
     destination_path: String,
     transform: CloudTransform,
@@ -3965,7 +4018,8 @@ pub fn export_textured_mesh(
         Some(bounds) => clipped_obj(&transformed, bounds)?,
         None => transformed,
     };
-    let obj = clipped.replace("mtllib room-mesh.mtl", &format!("mtllib {mtl_name}"));
+    let unity_obj = unity_compatible_obj(&clipped)?;
+    let obj = unity_obj.replace("mtllib room-mesh.mtl", &format!("mtllib {mtl_name}"));
     let mtl = fs::read_to_string(source_mtl)
         .map_err(|error| format!("Could not read the reconstructed material: {error}"))?
         .replace("map_Kd room-texture.png", &format!("map_Kd {texture_name}"));
@@ -4753,7 +4807,20 @@ fn gaussian_splat_preview_is_live(project: &ProjectSummary) -> bool {
 }
 
 #[tauri::command]
-pub fn export_gaussian_splat(
+pub async fn export_gaussian_splat(
+    project_path: String,
+    destination_path: String,
+    transform: CloudTransform,
+    clip_bounds: Option<BoundingBoxClip>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_gaussian_splat_blocking(project_path, destination_path, transform, clip_bounds)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn export_gaussian_splat_blocking(
     project_path: String,
     destination_path: String,
     transform: CloudTransform,
@@ -4791,7 +4858,8 @@ pub fn export_gaussian_splat(
         Some(bounds) => clipped_binary_ply(transformed, bounds, "Gaussian splat")?,
         None => transformed,
     };
-    write_export(&destination, &clipped)?;
+    let unity_bytes = unity_compatible_gaussian_ply(clipped)?;
+    write_export(&destination, &unity_bytes)?;
     let stem = destination
         .file_stem()
         .and_then(|value| value.to_str())
@@ -4819,13 +4887,45 @@ pub fn export_gaussian_splat(
                     object.insert(
                         "note".to_string(),
                         serde_json::Value::String(
-                            "The ScanLan edit pose is baked into Gaussian means, normals, scales, and rotations."
+                            "The ScanLan edit pose and Unity Z-axis handedness conversion are baked into Gaussian means, normals, scales, and rotations."
                                 .to_string(),
                         ),
+                    );
+                    object.insert(
+                        "unityCoordinateConversionBakedIntoPly".to_string(),
+                        serde_json::Value::String("flip_z".to_string()),
                     );
                 }
                 sidecar_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
                     format!("Could not serialize Gaussian transform metadata: {error}")
+                })?;
+                sidecar_bytes.push(b'\n');
+            } else if source_name == "splat-manifest.json" {
+                let mut metadata = serde_json::from_slice::<serde_json::Value>(&sidecar_bytes)
+                    .unwrap_or_else(|_| serde_json::json!({ "schemaVersion": 1 }));
+                if let Some(object) = metadata.as_object_mut() {
+                    let convention = object
+                        .entry("coordinateConvention")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(convention) = convention.as_object_mut() {
+                        convention.insert(
+                            "handedness".to_string(),
+                            serde_json::Value::String("left".to_string()),
+                        );
+                        convention.insert(
+                            "worldAxes".to_string(),
+                            serde_json::Value::String(
+                                "unity_x_right_y_up_z_forward".to_string(),
+                            ),
+                        );
+                        convention.insert(
+                            "conversionBakedIntoPly".to_string(),
+                            serde_json::Value::String("flip_z".to_string()),
+                        );
+                    }
+                }
+                sidecar_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
+                    format!("Could not serialize Gaussian manifest metadata: {error}")
                 })?;
                 sidecar_bytes.push(b'\n');
             }
@@ -4838,11 +4938,12 @@ pub fn export_gaussian_splat(
 #[cfg(test)]
 mod tests {
     use super::{
-        clipped_binary_ply, clipped_obj, compact_splat_preview, convert_3dgs_ply_to_splat, gaussian_edit_matrix,
-        gaussian_splat_preview_is_live, matrix_product, normalize_project, pack_preview_mesh,
-        quaternion_matrix, read_supplemental_photo_manifest, save_live_reconstruction_preview,
-        transformed_cloud_ply, transformed_gaussian_ply, transformed_normal, transformed_obj,
-        transformed_position, unity_compatible_ply, valid_packed_preview_mesh,
+        clipped_binary_ply, clipped_obj, compact_splat_preview, convert_3dgs_ply_to_splat,
+        gaussian_edit_matrix, gaussian_splat_preview_is_live, matrix_product, normalize_project,
+        pack_preview_mesh, quaternion_matrix, read_supplemental_photo_manifest,
+        save_live_reconstruction_preview, transformed_cloud_ply, transformed_gaussian_ply,
+        transformed_normal, transformed_obj, transformed_position, unity_compatible_gaussian_ply,
+        unity_compatible_obj, unity_compatible_ply, valid_packed_preview_mesh,
         validate_sensor_settings, LiveGeometryFrame, RealtimeEngineSnapshot,
     };
     use crate::models::{BoundingBoxClip, CaptureSettings, CloudTransform, ProjectSummary};
@@ -5036,7 +5137,7 @@ mod tests {
     }
 
     #[test]
-    fn unity_export_flips_only_x_and_preserves_rgb() {
+    fn unity_point_cloud_export_flips_only_z_and_preserves_rgb() {
         let header = concat!(
             "ply\n",
             "format binary_little_endian 1.0\n",
@@ -5082,9 +5183,80 @@ mod tests {
             .collect();
 
         assert!(String::from_utf8_lossy(&exported[..payload_start])
-            .contains("comment Unity-ready coordinates: X axis flipped"));
-        assert_eq!(vertices[0], ([-1.25, 2.5, -3.75], [10, 20, 30]));
-        assert_eq!(vertices[1], ([4.5, 5.75, 6.0], [40, 50, 60]));
+            .contains("comment Unity-ready coordinates: Z axis flipped"));
+        assert_eq!(vertices[0], ([1.25, 2.5, 3.75], [10, 20, 30]));
+        assert_eq!(vertices[1], ([-4.5, 5.75, -6.0], [40, 50, 60]));
+    }
+
+    #[test]
+    fn unity_mesh_export_bakes_the_required_y_half_turn() {
+        let exported = unity_compatible_obj(
+            "v 1.25 2.5 -3.75\nvn 0.25 0.5 -0.75\nvt 0.2 0.8\nf 1/1/1 2/2/2 3/3/3\n",
+        )
+        .unwrap();
+        let values = |prefix: &str| {
+            exported
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .unwrap()
+                .split_whitespace()
+                .map(|value| value.parse::<f32>().unwrap())
+                .collect::<Vec<_>>()
+        };
+        for (actual, expected) in values("v ").iter().zip([-1.25, 2.5, 3.75]) {
+            assert!((*actual - expected).abs() < 1e-5);
+        }
+        let normal_length = (0.25_f32 * 0.25 + 0.5 * 0.5 + 0.75 * 0.75).sqrt();
+        for (actual, expected) in values("vn ").iter().zip([
+            -0.25 / normal_length,
+            0.5 / normal_length,
+            0.75 / normal_length,
+        ]) {
+            assert!((*actual - expected).abs() < 1e-5);
+        }
+        assert!(exported.contains("vt 0.2 0.8"));
+        assert!(exported.contains("f 1/1/1 2/2/2 3/3/3"));
+    }
+
+    #[test]
+    fn unity_gaussian_export_bakes_the_z_reflection() {
+        let names = [
+            "x", "y", "z", "nx", "ny", "nz", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1",
+            "rot_2", "rot_3",
+        ];
+        let header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex 1\n{}end_header\n",
+            names
+                .iter()
+                .map(|name| format!("property float {name}\n"))
+                .collect::<String>()
+        );
+        let mut source = header.as_bytes().to_vec();
+        for value in [
+            1.25_f32,
+            2.5,
+            -3.75,
+            0.0,
+            0.0,
+            1.0,
+            0.3_f32.ln(),
+            0.2_f32.ln(),
+            0.01_f32.ln(),
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        ] {
+            source.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let exported = unity_compatible_gaussian_ply(source).unwrap();
+        let values = exported[header.len()..]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(&values[0..3], &[1.25, 2.5, 3.75]);
+        assert_eq!(&values[3..6], &[0.0, 0.0, -1.0]);
     }
 
     #[test]
