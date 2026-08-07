@@ -4,8 +4,11 @@ import math
 import hashlib
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -24,7 +27,7 @@ from .io import write_json
 
 
 MESH_REPAIR_REPORT_SCHEMA_VERSION = 1
-MESH_REPAIR_ALGORITHM_VERSION = "1.0.0"
+MESH_REPAIR_ALGORITHM_VERSION = "1.1.0"
 MeshRepairProfile = Literal["faithful", "architectural", "natural", "watertight"]
 
 
@@ -231,7 +234,10 @@ def classify_boundary_loop(
         and supporting_views >= settings.min_supporting_views
     ):
         classification = "fill_measured"
-    elif occluded_ratio >= 0.25 and counts[SUPPORTED] == 0:
+    elif (
+        occluded_ratio >= 0.25
+        and support_ratio < settings.min_support_ratio
+    ):
         classification = "preserve_occluded"
     elif (
         settings.fill_inferred_holes
@@ -267,11 +273,27 @@ def classify_topology_report(
     frames: list[Any],
     mesh_voxel_size_m: float,
     settings: MeshRepairSettings,
+    progress: Any | None = None,
+    progress_start: float = 0.0,
+    progress_end: float = 1.0,
 ) -> dict[str, Any]:
-    decisions = [
-        classify_boundary_loop(loop, frames, mesh_voxel_size_m, settings)
-        for loop in topology_report.get("boundaryLoops", [])
-    ]
+    loops = topology_report.get("boundaryLoops", [])
+    decisions: list[dict[str, Any]] = []
+    for index, loop in enumerate(loops, start=1):
+        decisions.append(
+            classify_boundary_loop(loop, frames, mesh_voxel_size_m, settings)
+        )
+        if progress:
+            progress(
+                "Checking openings against depth",
+                f"Checked boundary {index:,} of {len(loops):,} against captured depth",
+                0,
+                None,
+                progress_start
+                + (progress_end - progress_start)
+                * index
+                / max(len(loops), 1),
+            )
     selected = [
         decision["loopId"]
         for decision in decisions
@@ -421,24 +443,106 @@ def find_mesh_repair_backend() -> Path | None:
     return None
 
 
-def _run_backend(arguments: list[str], report_path: Path, timeout_seconds: int = 600) -> dict[str, Any]:
-    completed = subprocess.run(
+def _run_backend(
+    arguments: list[str],
+    report_path: Path,
+    timeout_seconds: int = 600,
+    progress: Any | None = None,
+    progress_start: float = 0.0,
+    progress_end: float = 1.0,
+) -> dict[str, Any]:
+    process = subprocess.Popen(
         arguments,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout_seconds,
-        check=False,
+        bufsize=1,
     )
+    messages: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def read_stream(name: str, stream: Any) -> None:
+        try:
+            for line in stream:
+                messages.put((name, line.rstrip()))
+        finally:
+            messages.put((name, None))
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=("stdout", process.stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=("stderr", process.stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + timeout_seconds
+    closed_streams = 0
+    stderr_lines: list[str] = []
+    last_detail = "starting the native backend"
+    try:
+        while closed_streams < len(readers) or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise RuntimeError(
+                    f"Native mesh repair timed out after {timeout_seconds} seconds while {last_detail}"
+                )
+            try:
+                stream_name, line = messages.get(timeout=min(0.2, remaining))
+            except queue.Empty:
+                continue
+            if line is None:
+                closed_streams += 1
+                continue
+            if stream_name == "stderr":
+                stderr_lines.append(line)
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("event") == "progress":
+                last_detail = str(event.get("detail", last_detail))
+                if progress:
+                    progress(
+                        str(event.get("stage", "Repairing mesh")),
+                        last_detail,
+                        0,
+                        None,
+                        progress_start
+                        + (progress_end - progress_start)
+                        * float(event.get("progress", 0.0)),
+                    )
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for reader in readers:
+            reader.join(timeout=1)
+        raise
+
+    return_code = process.wait()
+    for reader in readers:
+        reader.join(timeout=1)
+    completed_stderr = "\n".join(stderr_lines).strip()
     report: dict[str, Any] = {}
     if report_path.is_file():
         try:
             report = json.loads(report_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             report = {}
-    if completed.returncode != 0:
+    if return_code != 0:
         message = str(report.get("error", {}).get("message", "")).strip()
         if not message:
-            message = completed.stderr.strip() or "Native mesh repair failed"
+            message = completed_stderr or "Native mesh repair failed"
         raise RuntimeError(message)
     if report.get("status") not in {"ok", "classified"}:
         raise RuntimeError("Native mesh repair returned an invalid report")
@@ -487,6 +591,9 @@ def _repair_summary(
     return {
         "topologyDefectsFixed": defects_fixed,
         "holesFilled": len(native.get("filledLoops", [])) if native else 0,
+        "authorizedHolesSkipped": (
+            len(native.get("skippedAuthorizedLoops", [])) if native else 0
+        ),
         "openingsPreserved": int(decisions.get("preserve_opening", 0)),
         "occludedBoundariesPreserved": int(decisions.get("preserve_occluded", 0)),
         "unknownBoundariesPreserved": int(decisions.get("preserve_unknown", 0)),
@@ -595,7 +702,7 @@ def repair_mesh_geometry(
 
     topology_path = cache_root / f"topology-{raw_fingerprint[:24]}.json"
     if progress:
-        progress("Analyzing topology", "Finding mesh defects and boundary loops", 0, None, 0.60)
+        progress("Analyzing topology", "Finding mesh defects and boundary loops", 0, None, 0.58)
     topology = _run_backend(
         [
             str(backend),
@@ -608,6 +715,9 @@ def repair_mesh_geometry(
             str(mesh_voxel_size_m),
         ],
         topology_path,
+        progress=progress,
+        progress_start=0.58,
+        progress_end=0.62,
     )
     if progress:
         progress(
@@ -615,9 +725,17 @@ def repair_mesh_geometry(
             f"Projecting {len(topology.get('boundaryLoops', []))} boundaries into original depth frames",
             0,
             None,
-            0.66,
+            0.62,
         )
-    classification = classify_topology_report(topology, frames, mesh_voxel_size_m, settings)
+    classification = classify_topology_report(
+        topology,
+        frames,
+        mesh_voxel_size_m,
+        settings,
+        progress,
+        0.62,
+        0.66,
+    )
     selected_by_id = {
         decision["loopId"]: decision
         for decision in classification["holes"]
@@ -630,6 +748,7 @@ def repair_mesh_geometry(
         "profile": settings.profile if settings.profile != "watertight" else "faithful",
         "repairNonManifold": settings.repair_non_manifold,
         "repairSelfIntersections": settings.repair_self_intersections,
+        "inputTopology": topology.get("topology", {}),
         "selectedLoops": [selected_by_id[key] for key in sorted(selected_by_id)],
     }
     policy_path = cache_root / f"policy-{cache_key}.json"
@@ -641,7 +760,7 @@ def repair_mesh_geometry(
             f"Repairing {len(selected_by_id)} depth-supported boundaries with the {settings.profile} profile",
             0,
             None,
-            0.72,
+            0.66,
         )
     try:
         native = _run_backend(
@@ -658,6 +777,9 @@ def repair_mesh_geometry(
                 str(native_report_path),
             ],
             native_report_path,
+            progress=progress,
+            progress_start=0.66,
+            progress_end=0.70,
         )
     except Exception as error:
         report = {
@@ -675,7 +797,7 @@ def repair_mesh_geometry(
         raise
 
     if progress:
-        progress("Validating repaired mesh", "Rechecking topology before texturing", 0, None, 0.78)
+        progress("Validating repaired mesh", "Rechecking topology before texturing", 0, None, 0.70)
     validation_path = cache_root / f"validation-{cache_key}.json"
     try:
         validation = _run_backend(
@@ -690,6 +812,9 @@ def repair_mesh_geometry(
                 str(mesh_voxel_size_m),
             ],
             validation_path,
+            progress=progress,
+            progress_start=0.70,
+            progress_end=0.72,
         )
         if int(validation["topology"]["nonManifoldVertexCount"]) > int(
             topology["topology"]["nonManifoldVertexCount"]
@@ -760,6 +885,9 @@ def repair_mesh_geometry(
                     str(watertight_report_path),
                 ],
                 watertight_report_path,
+                progress=progress,
+                progress_start=0.70,
+                progress_end=0.71,
             )
             watertight_validation_path = (
                 cache_root / f"watertight-validation-{cache_key}.json"
@@ -776,6 +904,9 @@ def repair_mesh_geometry(
                     str(mesh_voxel_size_m),
                 ],
                 watertight_validation_path,
+                progress=progress,
+                progress_start=0.71,
+                progress_end=0.72,
             )
             watertight_topology = watertight_validation["topology"]
             if (

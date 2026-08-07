@@ -181,6 +181,17 @@ def test_inferred_fill_requires_explicit_opt_in(tmp_path: Path) -> None:
     assert decision["classification"] == "fill_inferred"
 
 
+def test_inferred_fill_does_not_patch_behind_foreground_geometry(tmp_path: Path) -> None:
+    frames = [_frame(tmp_path, 1.0), _frame(tmp_path, 2.0)]
+    decision = classify_boundary_loop(
+        _loop(),
+        frames,
+        0.008,
+        MeshRepairSettings(fill_inferred_holes=True),
+    )
+    assert decision["classification"] == "preserve_occluded"
+
+
 def test_disabled_repair_preserves_geometry_and_writes_report(tmp_path: Path) -> None:
     vertices, triangles = _square_ring()
     repaired_vertices, repaired_triangles, report = repair_mesh_geometry(
@@ -201,6 +212,7 @@ def test_disabled_repair_preserves_geometry_and_writes_report(tmp_path: Path) ->
 def test_supported_wall_hole_is_filled_by_native_backend(tmp_path: Path) -> None:
     vertices, triangles = _square_ring()
     frames = [_frame(tmp_path, 2.0), _frame(tmp_path, 2.0)]
+    updates: list[tuple[str, str, float]] = []
     repaired_vertices, repaired_triangles, report = repair_mesh_geometry(
         tmp_path,
         vertices,
@@ -208,11 +220,16 @@ def test_supported_wall_hole_is_filled_by_native_backend(tmp_path: Path) -> None
         frames,
         0.008,
         MeshRepairSettings(),
+        lambda stage, detail, _advance, _points, stage_progress: updates.append(
+            (stage, detail, stage_progress)
+        ),
     )
     assert report["status"] == "ok"
     assert report["repairSummary"]["holesFilled"] == 1
     assert len(repaired_vertices) >= len(vertices)
     assert len(repaired_triangles) > len(triangles)
+    assert [item[2] for item in updates] == sorted(item[2] for item in updates)
+    assert any("Filling boundary 1 of 1" in item[1] for item in updates)
 
 
 @pytest.mark.skipif(find_mesh_repair_backend() is None, reason="CGAL test backend not built")
@@ -291,6 +308,7 @@ def test_texture_generation_uses_repaired_geometry(tmp_path: Path) -> None:
         for index, frame in enumerate(simple_frames)
     ]
     output_dir = tmp_path / "outputs"
+    stage_updates: list[float] = []
     with (
         patch(
             "scanlan.mesh._fused_mesh",
@@ -301,9 +319,17 @@ def test_texture_generation_uses_repaired_geometry(tmp_path: Path) -> None:
             return_value=tmp_path / "synthetic-mesh-cache.npz",
         ),
     ):
-        result = build_mesh_artifacts(output_dir, frames, voxel_size_m=0.008)
+        result = build_mesh_artifacts(
+            output_dir,
+            frames,
+            progress=lambda _stage, _detail, _advance, _points, stage_progress: (
+                stage_updates.append(stage_progress)
+            ),
+            voxel_size_m=0.008,
+        )
     assert result["meshRepairStatus"] == "ok"
     assert result["meshRepairHolesFilled"] == 1
     assert result["meshTriangleCount"] > len(triangles)
+    assert stage_updates == sorted(stage_updates)
     assert (output_dir / "room-mesh.obj").is_file()
     assert (output_dir / "room-texture.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"

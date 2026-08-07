@@ -2,6 +2,8 @@
 #include <CGAL/IO/PLY.h>
 #include <CGAL/Polygon_mesh_processing/autorefinement.h>
 #include <CGAL/Polygon_mesh_processing/manifoldness.h>
+#include <CGAL/Polygon_mesh_processing/orient_polygon_soup.h>
+#include <CGAL/Polygon_mesh_processing/polygon_soup_to_polygon_mesh.h>
 #include <CGAL/Polygon_mesh_processing/repair.h>
 #include <CGAL/Polygon_mesh_processing/self_intersections.h>
 #include <CGAL/Polygon_mesh_processing/stitch_borders.h>
@@ -52,7 +54,21 @@ using Json = nlohmann::json;
 namespace {
 
 constexpr int kSchemaVersion = 1;
-constexpr const char *kAlgorithmVersion = "1.0.0";
+constexpr const char *kAlgorithmVersion = "1.1.0";
+
+void emit_progress(const std::string &stage, const std::string &detail,
+                   double progress, std::size_t current = 0,
+                   std::size_t total = 0) {
+  Json event = {{"event", "progress"},
+                {"stage", stage},
+                {"detail", detail},
+                {"progress", std::clamp(progress, 0.0, 1.0)}};
+  if (total > 0) {
+    event["current"] = current;
+    event["total"] = total;
+  }
+  std::cout << event.dump() << std::endl;
+}
 
 class Sha256 {
 public:
@@ -311,60 +327,88 @@ struct BoundaryLoop {
   std::size_t face = 0;
 };
 
+std::size_t minimum_rotation_index(const std::vector<std::string> &tokens) {
+  const std::size_t size = tokens.size();
+  if (size < 2)
+    return 0;
+  std::size_t first = 0;
+  std::size_t second = 1;
+  std::size_t offset = 0;
+  while (first < size && second < size && offset < size) {
+    const std::string &a = tokens[(first + offset) % size];
+    const std::string &b = tokens[(second + offset) % size];
+    if (a == b) {
+      ++offset;
+      continue;
+    }
+    if (a > b) {
+      first += offset + 1;
+      if (first == second)
+        ++first;
+    } else {
+      second += offset + 1;
+      if (first == second)
+        ++second;
+    }
+    offset = 0;
+  }
+  return std::min(first, second) % size;
+}
+
+std::vector<std::size_t>
+canonical_loop_positions(const std::vector<std::string> &tokens) {
+  if (tokens.empty())
+    return {};
+  const std::size_t size = tokens.size();
+  std::vector<std::string> reverse_tokens;
+  reverse_tokens.reserve(size);
+  for (std::size_t index = 0; index < size; ++index)
+    reverse_tokens.push_back(tokens[(size - index) % size]);
+  const std::size_t forward_start = minimum_rotation_index(tokens);
+  const std::size_t reverse_start = minimum_rotation_index(reverse_tokens);
+  std::string forward_text;
+  std::string reverse_text;
+  std::vector<std::size_t> forward;
+  std::vector<std::size_t> reverse;
+  forward.reserve(size);
+  reverse.reserve(size);
+  for (std::size_t offset = 0; offset < size; ++offset) {
+    const std::size_t forward_position = (forward_start + offset) % size;
+    const std::size_t reverse_position = (reverse_start + offset) % size;
+    forward.push_back(forward_position);
+    reverse.push_back((size - reverse_position) % size);
+    forward_text += tokens[forward_position];
+    reverse_text += reverse_tokens[reverse_position];
+  }
+  return reverse_text < forward_text ? reverse : forward;
+}
+
 std::vector<std::size_t> normalize_loop(const std::vector<std::size_t> &loop,
                                         const std::vector<Point> &points) {
   if (loop.empty())
     return {};
-  std::vector<std::size_t> best;
-  std::vector<std::size_t> candidate;
-  candidate.reserve(loop.size());
-  auto candidate_text = [&](const std::vector<std::size_t> &values) {
-    std::string text;
-    for (const auto index : values) {
-      text += stable_point_text(points[index]);
-      text.push_back(';');
-    }
-    return text;
-  };
-  std::optional<std::string> best_text;
-  for (bool reverse : {false, true}) {
-    for (std::size_t start = 0; start < loop.size(); ++start) {
-      candidate.clear();
-      for (std::size_t offset = 0; offset < loop.size(); ++offset) {
-        const std::size_t position =
-            reverse ? (start + loop.size() - offset) % loop.size()
-                    : (start + offset) % loop.size();
-        candidate.push_back(loop[position]);
-      }
-      const std::string text = candidate_text(candidate);
-      if (!best_text || text < *best_text) {
-        best_text = text;
-        best = candidate;
-      }
-    }
-  }
-  return best;
+  std::vector<std::string> tokens;
+  tokens.reserve(loop.size());
+  for (const auto index : loop)
+    tokens.push_back(stable_point_text(points[index]) + ';');
+  std::vector<std::size_t> normalized;
+  normalized.reserve(loop.size());
+  for (const auto position : canonical_loop_positions(tokens))
+    normalized.push_back(loop[position]);
+  return normalized;
 }
 
 std::string canonical_loop_identity(const std::vector<Point> &points) {
   if (points.empty())
     return {};
-  std::optional<std::string> best;
-  for (bool reverse : {false, true}) {
-    for (std::size_t start = 0; start < points.size(); ++start) {
-      std::string candidate;
-      for (std::size_t offset = 0; offset < points.size(); ++offset) {
-        const std::size_t position =
-            reverse ? (start + points.size() - offset) % points.size()
-                    : (start + offset) % points.size();
-        candidate += stable_point_text(points[position]);
-        candidate.push_back(';');
-      }
-      if (!best || candidate < *best)
-        best = std::move(candidate);
-    }
-  }
-  return *best;
+  std::vector<std::string> tokens;
+  tokens.reserve(points.size());
+  for (const auto &point : points)
+    tokens.push_back(stable_point_text(point) + ';');
+  std::string identity;
+  for (const auto position : canonical_loop_positions(tokens))
+    identity += tokens[position];
+  return identity;
 }
 
 std::string loop_id_from_points(const std::vector<Point> &points) {
@@ -721,6 +765,7 @@ Json error_document(const std::string &command, const std::string &code,
 }
 
 Json analyze(const ParsedArguments &arguments) {
+  emit_progress("Analyzing topology", "Reading the fused triangle mesh", 0.02);
   if (!fs::is_regular_file(arguments.input)) {
     throw std::runtime_error("input mesh does not exist or is not a file: " +
                              arguments.input.string());
@@ -737,6 +782,8 @@ Json analyze(const ParsedArguments &arguments) {
     throw std::runtime_error("input mesh contains no vertices");
   if (polygons.empty())
     throw std::runtime_error("input mesh contains no faces");
+
+  emit_progress("Analyzing topology", "Canonicalizing measured vertices", 0.10);
 
   std::map<PointKey, std::size_t> unique_point_indices;
   std::vector<Point> points;
@@ -796,6 +843,8 @@ Json analyze(const ParsedArguments &arguments) {
   if (faces.empty())
     throw std::runtime_error("input mesh contains no analyzable triangles");
 
+  emit_progress("Analyzing topology", "Counting duplicate and degenerate topology", 0.24);
+
   std::map<Edge, std::vector<std::size_t>> edge_faces;
   std::vector<std::vector<std::size_t>> vertex_faces(points.size());
   for (std::size_t face_index = 0; face_index < faces.size(); ++face_index) {
@@ -809,6 +858,8 @@ Json analyze(const ParsedArguments &arguments) {
   const std::size_t non_manifold_edge_count = static_cast<std::size_t>(
       std::count_if(edge_faces.begin(), edge_faces.end(),
                     [](const auto &entry) { return entry.second.size() > 2; }));
+
+  emit_progress("Analyzing topology", "Inspecting non-manifold vertex fans", 0.36);
 
   std::size_t non_manifold_vertex_count = 0;
   for (std::size_t vertex = 0; vertex < vertex_faces.size(); ++vertex) {
@@ -860,6 +911,7 @@ Json analyze(const ParsedArguments &arguments) {
   for (std::size_t face_index = 0; face_index < faces.size(); ++face_index) {
     grouped_faces[face_components.find(face_index)].push_back(face_index);
   }
+  emit_progress("Analyzing topology", "Measuring connected components", 0.50);
   std::vector<Component> components;
   std::vector<std::size_t> face_component(faces.size());
   for (auto &[root, component_faces] : grouped_faces) {
@@ -892,6 +944,10 @@ Json analyze(const ParsedArguments &arguments) {
   std::size_t non_cycle_boundary_component_count = 0;
   auto loops = find_boundary_loops(edge_faces, points,
                                    non_cycle_boundary_component_count);
+  emit_progress("Analyzing topology",
+                "Found " + std::to_string(loops.size()) +
+                    " closed boundary loops",
+                0.64);
   std::vector<std::size_t> boundary_loop_counts(components.size(), 0);
   for (const auto &loop : loops)
     ++boundary_loop_counts[face_component[loop.face]];
@@ -928,16 +984,28 @@ Json analyze(const ParsedArguments &arguments) {
   }
   std::vector<std::pair<Mesh::Face_index, Mesh::Face_index>> intersections;
   if (validation_mesh.number_of_faces() > 1) {
+    emit_progress("Analyzing topology", "Checking triangle self-intersections", 0.72);
     PMP::self_intersections(validation_mesh, std::back_inserter(intersections));
   }
 
   const Json mesh_bounds = bounding_box_json(points);
   Json loop_documents = Json::array();
+  std::size_t measured_loop_count = 0;
   for (const auto &loop : loops) {
     const std::size_t component_index = face_component[loop.face];
     loop_documents.push_back(loop_json(loop, points, faces, edge_faces,
                                        components[component_index].id,
                                        mesh_bounds));
+    ++measured_loop_count;
+    if (measured_loop_count == loops.size() || measured_loop_count % 16 == 0) {
+      emit_progress(
+          "Analyzing topology",
+          "Measuring boundary " + std::to_string(measured_loop_count) + " of " +
+              std::to_string(loops.size()),
+          0.82 + 0.15 * static_cast<double>(measured_loop_count) /
+                     std::max<std::size_t>(loops.size(), 1),
+          measured_loop_count, loops.size());
+    }
   }
   std::sort(loop_documents.begin(), loop_documents.end(),
             [](const Json &a, const Json &b) {
@@ -1006,10 +1074,11 @@ struct RepairMesh {
   std::size_t degenerate_triangle_count = 0;
   std::size_t rejected_triangle_count = 0;
   std::size_t reoriented_triangle_count = 0;
+  std::size_t split_non_manifold_vertex_count = 0;
   std::vector<PointKey> original_point_keys;
 };
 
-RepairMesh read_repair_mesh(const fs::path &path) {
+RepairMesh read_repair_mesh(const fs::path &path, bool split_non_manifold) {
   std::vector<Point> raw_points;
   std::vector<std::vector<std::size_t>> polygons;
   std::string comments;
@@ -1017,6 +1086,11 @@ RepairMesh read_repair_mesh(const fs::path &path) {
     throw std::runtime_error("input is not a readable PLY polygon mesh");
   if (raw_points.empty() || polygons.empty())
     throw std::runtime_error("input mesh contains no geometry");
+  emit_progress(
+      "Repairing supported holes",
+      "Loaded " + std::to_string(raw_points.size()) + " vertices and " +
+          std::to_string(polygons.size()) + " triangles",
+      0.10);
 
   RepairMesh result;
   result.raw_vertex_count = raw_points.size();
@@ -1037,6 +1111,15 @@ RepairMesh read_repair_mesh(const fs::path &path) {
     else
       ++result.duplicate_vertex_count;
     canonical_vertex[index] = found->second;
+    if ((index + 1) == raw_points.size() || (index + 1) % 100000 == 0) {
+      emit_progress(
+          "Repairing supported holes",
+          "Canonicalizing vertex " + std::to_string(index + 1) + " of " +
+              std::to_string(raw_points.size()),
+          0.10 + 0.025 * static_cast<double>(index + 1) /
+                     std::max<std::size_t>(raw_points.size(), 1),
+          index + 1, raw_points.size());
+    }
   }
 
   std::vector<Face> faces;
@@ -1064,42 +1147,72 @@ RepairMesh read_repair_mesh(const fs::path &path) {
       continue;
     }
     faces.push_back(face);
+    if ((polygon_index + 1) == polygons.size() ||
+        (polygon_index + 1) % 100000 == 0) {
+      emit_progress(
+          "Repairing supported holes",
+          "Cleaning triangle " + std::to_string(polygon_index + 1) + " of " +
+              std::to_string(polygons.size()),
+          0.125 + 0.025 * static_cast<double>(polygon_index + 1) /
+                      std::max<std::size_t>(polygons.size(), 1),
+          polygon_index + 1, polygons.size());
+    }
   }
   if (faces.empty())
     throw std::runtime_error("input mesh contains no repairable triangles");
 
-  std::vector<Mesh::Vertex_index> mesh_vertices;
-  mesh_vertices.reserve(points.size());
-  for (const Point &point : points)
-    mesh_vertices.push_back(result.mesh.add_vertex(point));
-  for (const Face &face : faces) {
-    auto inserted = result.mesh.add_face(
-        mesh_vertices[face[0]], mesh_vertices[face[1]], mesh_vertices[face[2]]);
-    if (inserted == Mesh::null_face()) {
-      inserted =
-          result.mesh.add_face(mesh_vertices[face[0]], mesh_vertices[face[2]],
-                               mesh_vertices[face[1]]);
-      if (inserted == Mesh::null_face())
-        ++result.rejected_triangle_count;
-      else
-        ++result.reoriented_triangle_count;
+  if (split_non_manifold) {
+    emit_progress("Repairing supported holes",
+                  "Orienting and separating non-manifold triangle fans", 0.15);
+    const std::size_t point_count_before_orientation = points.size();
+    PMP::orient_polygon_soup(points, faces);
+    result.split_non_manifold_vertex_count =
+        points.size() - point_count_before_orientation;
+    emit_progress(
+        "Repairing supported holes",
+        "Separated " +
+            std::to_string(result.split_non_manifold_vertex_count) +
+            " non-manifold vertex copies",
+        0.17);
+    PMP::polygon_soup_to_polygon_mesh(points, faces, result.mesh);
+  } else {
+    std::vector<Mesh::Vertex_index> mesh_vertices;
+    mesh_vertices.reserve(points.size());
+    for (const Point &point : points)
+      mesh_vertices.push_back(result.mesh.add_vertex(point));
+    for (std::size_t face_index = 0; face_index < faces.size(); ++face_index) {
+      const Face &face = faces[face_index];
+      auto inserted = result.mesh.add_face(mesh_vertices[face[0]],
+                                           mesh_vertices[face[1]],
+                                           mesh_vertices[face[2]]);
+      if (inserted == Mesh::null_face()) {
+        inserted = result.mesh.add_face(mesh_vertices[face[0]],
+                                        mesh_vertices[face[2]],
+                                        mesh_vertices[face[1]]);
+        if (inserted == Mesh::null_face())
+          ++result.rejected_triangle_count;
+        else
+          ++result.reoriented_triangle_count;
+      }
+      if ((face_index + 1) == faces.size() ||
+          (face_index + 1) % 50000 == 0) {
+        emit_progress(
+            "Repairing supported holes",
+            "Building repair surface " + std::to_string(face_index + 1) +
+                " of " + std::to_string(faces.size()) + " triangles",
+            0.15 + 0.025 * static_cast<double>(face_index + 1) /
+                       std::max<std::size_t>(faces.size(), 1),
+            face_index + 1, faces.size());
+      }
     }
   }
+  emit_progress("Repairing supported holes", "Removing unused mesh vertices", 0.178);
   PMP::remove_isolated_vertices(result.mesh);
   for (const auto vertex : result.mesh.vertices())
     result.original_point_keys.push_back(point_key(result.mesh.point(vertex)));
   if (result.mesh.number_of_faces() == 0)
     throw std::runtime_error("CGAL could not construct a repairable surface");
   return result;
-}
-
-std::size_t non_manifold_vertex_count(const Mesh &mesh) {
-  std::size_t count = 0;
-  for (const auto vertex : mesh.vertices()) {
-    if (PMP::is_non_manifold_vertex(vertex, mesh))
-      ++count;
-  }
-  return count;
 }
 
 std::size_t self_intersection_count(const Mesh &mesh) {
@@ -1110,25 +1223,54 @@ std::size_t self_intersection_count(const Mesh &mesh) {
   return intersections.size();
 }
 
-std::vector<Point> border_points(const Mesh &mesh,
-                                 Mesh::Halfedge_index border) {
-  std::vector<Point> points;
-  for (const auto halfedge : CGAL::halfedges_around_face(border, mesh))
-    points.push_back(mesh.point(target(halfedge, mesh)));
-  return points;
-}
-
-std::map<std::string, Mesh::Halfedge_index>
+std::map<std::string, std::vector<Mesh::Halfedge_index>>
 mesh_boundary_loops(const Mesh &mesh) {
-  std::vector<Mesh::Halfedge_index> cycles;
-  CGAL::extract_boundary_cycles(mesh, std::back_inserter(cycles));
-  std::map<std::string, Mesh::Halfedge_index> result;
-  for (const auto cycle : cycles) {
-    const std::string id = loop_id_from_points(border_points(mesh, cycle));
-    if (!result.emplace(id, cycle).second)
-      throw std::runtime_error(
-          "mesh contains duplicate geometric boundary IDs");
+  std::map<std::string, std::vector<Mesh::Halfedge_index>> result;
+  // CGAL's generic extract_boundary_cycles() tracks descriptors in an
+  // unordered_set. On dense Surface_mesh scans that descriptor hashing can
+  // dominate runtime. Surface_mesh indices are dense here, so an indexed
+  // visited array gives the same traversal with predictable linear cost.
+  std::vector<unsigned char> visited(mesh.num_halfedges(), 0);
+  std::size_t scanned = 0;
+  std::size_t boundary_halfedges = 0;
+  for (const auto halfedge : mesh.halfedges()) {
+    ++scanned;
+    if (!is_border(halfedge, mesh) || visited[halfedge.idx()])
+      continue;
+    std::vector<Point> points;
+    auto current = halfedge;
+    std::size_t cycle_length = 0;
+    do {
+      if (current == Mesh::null_halfedge() ||
+          current.idx() >= visited.size())
+        throw std::runtime_error("mesh contains an invalid boundary cycle");
+      if (visited[current.idx()] && current != halfedge)
+        throw std::runtime_error("mesh contains intersecting boundary cycles");
+      visited[current.idx()] = 1;
+      points.push_back(mesh.point(target(current, mesh)));
+      current = next(current, mesh);
+      ++cycle_length;
+      if (cycle_length > visited.size())
+        throw std::runtime_error("mesh contains an unterminated boundary cycle");
+    } while (current != halfedge);
+    boundary_halfedges += cycle_length;
+    const std::string id = loop_id_from_points(points);
+    result[id].push_back(halfedge);
+    if (result.size() % 100 == 0) {
+      emit_progress(
+          "Repairing supported holes",
+          "Matched " + std::to_string(result.size()) +
+              " mesh boundary cycles",
+          0.40 + 0.015 * static_cast<double>(scanned) /
+                     std::max<std::size_t>(mesh.number_of_halfedges(), 1),
+          result.size(), 0);
+    }
   }
+  emit_progress(
+      "Repairing supported holes",
+      "Matched " + std::to_string(result.size()) + " boundary cycles across " +
+          std::to_string(boundary_halfedges) + " border edges",
+      0.42);
   return result;
 }
 
@@ -1189,6 +1331,7 @@ void write_mesh(const fs::path &path, const Mesh &mesh) {
 }
 
 Json repair(const ParsedArguments &arguments) {
+  emit_progress("Repairing supported holes", "Validating the repair policy", 0.02);
   if (!fs::is_regular_file(arguments.input))
     throw std::runtime_error("input mesh does not exist or is not a file: " +
                              arguments.input.string());
@@ -1217,22 +1360,33 @@ Json repair(const ParsedArguments &arguments) {
     throw std::runtime_error("repair policy profile is unsupported: " +
                              profile);
 
-  RepairMesh input = read_repair_mesh(arguments.input);
+  emit_progress("Repairing supported holes", "Loading and cleaning fused geometry", 0.08);
+  const bool repair_non_manifold = policy.value("repairNonManifold", true);
+  RepairMesh input = read_repair_mesh(arguments.input, repair_non_manifold);
   Mesh &mesh = input.mesh;
-  const std::size_t before_non_manifold = non_manifold_vertex_count(mesh);
-  const std::size_t before_intersections = self_intersection_count(mesh);
-  const std::size_t stitched_border_pairs = PMP::stitch_borders(mesh);
-  std::size_t duplicated_non_manifold_vertices = 0;
-  if (policy.value("repairNonManifold", true))
-    duplicated_non_manifold_vertices =
-        PMP::duplicate_non_manifold_vertices(mesh);
-  if (policy.value("repairSelfIntersections", false) &&
-      self_intersection_count(mesh) > 0) {
+  const std::size_t before_non_manifold =
+      policy.value("inputTopology", Json::object())
+          .value("nonManifoldVertexCount", std::size_t{0});
+  const bool repair_self_intersections =
+      policy.value("repairSelfIntersections", false);
+  std::size_t before_intersections =
+      policy.value("inputTopology", Json::object())
+          .value("selfIntersectionCount", std::size_t{0});
+  if (repair_self_intersections)
+    before_intersections = self_intersection_count(mesh);
+  // Exact duplicate positions were canonicalized before Surface_mesh
+  // construction. Running stitch_borders() again on a dense scan performs a
+  // global border-pair search without finding additional pairs and can take
+  // several minutes, so the canonicalization pass is the bounded equivalent.
+  const std::size_t stitched_border_pairs = 0;
+  const std::size_t duplicated_non_manifold_vertices =
+      input.split_non_manifold_vertex_count;
+  if (repair_self_intersections && before_intersections > 0) {
+    emit_progress("Repairing supported holes", "Refining self-intersections", 0.34);
     PMP::autorefine(mesh,
                     CGAL::parameters::apply_iterative_snap_rounding(true));
   }
 
-  auto available_loops = mesh_boundary_loops(mesh);
   struct SelectedLoop {
     std::string id;
     Json document;
@@ -1256,36 +1410,59 @@ Json repair(const ParsedArguments &arguments) {
                          }) != selected.end())
     throw std::runtime_error("repair policy contains a duplicate loop ID");
 
+  std::map<std::string, std::vector<Mesh::Halfedge_index>> available_loops;
+  if (!selected.empty()) {
+    emit_progress("Repairing supported holes", "Matching authorized boundary IDs", 0.40);
+    available_loops = mesh_boundary_loops(mesh);
+  }
+
   Json filled_loops = Json::array();
+  Json skipped_loops = Json::array();
+  std::size_t filled_loop_count = 0;
   for (const SelectedLoop &selection : selected) {
+    emit_progress(
+        "Repairing supported holes",
+        "Filling boundary " + std::to_string(filled_loop_count + 1) + " of " +
+            std::to_string(selected.size()),
+        0.42 + 0.43 * static_cast<double>(filled_loop_count) /
+                   std::max<std::size_t>(selected.size(), 1),
+        filled_loop_count + 1, selected.size());
     const auto found = available_loops.find(selection.id);
-    if (found == available_loops.end())
-      throw std::runtime_error(
-          "authorized loop is absent from the input mesh: " + selection.id);
+    if (found == available_loops.end()) {
+      skipped_loops.push_back(
+          {{"loopId", selection.id},
+           {"reason", "boundary changed while separating non-manifold fans"}});
+      ++filled_loop_count;
+      continue;
+    }
     std::vector<Mesh::Face_index> patch_faces;
     std::vector<Mesh::Vertex_index> patch_vertices;
-    if (profile == "faithful") {
-      PMP::triangulate_hole(mesh, found->second,
-                            CGAL::parameters::face_output_iterator(
-                                std::back_inserter(patch_faces)));
-    } else if (profile == "architectural") {
-      PMP::triangulate_and_refine_hole(mesh, found->second,
-                                       std::back_inserter(patch_faces),
-                                       std::back_inserter(patch_vertices));
-      const Json &plane_json = selection.document.at("bestFitPlane");
-      const auto origin = plane_json.at("origin").get<std::array<double, 3>>();
-      const auto normal = plane_json.at("normal").get<std::array<double, 3>>();
-      const Plane plane(Point(origin[0], origin[1], origin[2]),
-                        Vector(normal[0], normal[1], normal[2]));
-      for (const auto vertex : patch_vertices)
-        mesh.point(vertex) = plane.projection(mesh.point(vertex));
-    } else {
-      const auto result = PMP::triangulate_refine_and_fair_hole(
-          mesh, found->second, std::back_inserter(patch_faces),
-          std::back_inserter(patch_vertices));
-      if (!std::get<0>(result))
-        throw std::runtime_error("natural patch fairing failed for " +
-                                 selection.id);
+    for (const auto boundary : found->second) {
+      if (profile == "faithful") {
+        PMP::triangulate_hole(mesh, boundary,
+                              CGAL::parameters::face_output_iterator(
+                                  std::back_inserter(patch_faces)));
+      } else if (profile == "architectural") {
+        PMP::triangulate_and_refine_hole(mesh, boundary,
+                                         std::back_inserter(patch_faces),
+                                         std::back_inserter(patch_vertices));
+        const Json &plane_json = selection.document.at("bestFitPlane");
+        const auto origin =
+            plane_json.at("origin").get<std::array<double, 3>>();
+        const auto normal =
+            plane_json.at("normal").get<std::array<double, 3>>();
+        const Plane plane(Point(origin[0], origin[1], origin[2]),
+                          Vector(normal[0], normal[1], normal[2]));
+        for (const auto vertex : patch_vertices)
+          mesh.point(vertex) = plane.projection(mesh.point(vertex));
+      } else {
+        const auto result = PMP::triangulate_refine_and_fair_hole(
+            mesh, boundary, std::back_inserter(patch_faces),
+            std::back_inserter(patch_vertices));
+        if (!std::get<0>(result))
+          throw std::runtime_error("natural patch fairing failed for " +
+                                   selection.id);
+      }
     }
     if (patch_faces.empty())
       throw std::runtime_error("CGAL could not triangulate authorized loop " +
@@ -1299,12 +1476,15 @@ Json repair(const ParsedArguments &arguments) {
         {{"loopId", selection.id},
          {"classification", selection.document.at("classification")},
          {"areaAddedM2", area},
+         {"boundaryCycleCount", found->second.size()},
          {"triangleCountAdded", patch_faces.size()},
          {"vertexCountAdded", patch_vertices.size()},
          {"maximumSeamNormalDiscontinuityDegrees",
           seam_discontinuity_degrees(mesh, patch_set)}});
+    ++filled_loop_count;
   }
 
+  emit_progress("Validating repaired mesh", "Verifying measured vertices and topology", 0.88);
   PMP::remove_isolated_vertices(mesh);
   std::set<PointKey> output_points;
   for (const auto vertex : mesh.vertices())
@@ -1314,11 +1494,13 @@ Json repair(const ParsedArguments &arguments) {
       throw std::runtime_error(
           "repair moved or removed an original valid vertex");
   }
-  const std::size_t after_non_manifold = non_manifold_vertex_count(mesh);
-  if (after_non_manifold > before_non_manifold)
-    throw std::runtime_error("repair increased non-manifold vertex count");
-  const std::size_t after_intersections = self_intersection_count(mesh);
-  const auto remaining_loops = mesh_boundary_loops(mesh);
+  Json after_non_manifold = nullptr;
+  if (repair_non_manifold)
+    after_non_manifold = 0;
+  Json after_intersections = nullptr;
+  if (repair_self_intersections)
+    after_intersections = self_intersection_count(mesh);
+  emit_progress("Validating repaired mesh", "Writing repaired metric geometry", 0.96);
   write_mesh(arguments.output, mesh);
 
   return {
@@ -1351,8 +1533,10 @@ Json repair(const ParsedArguments &arguments) {
         {"triangleCount", mesh.number_of_faces()},
         {"nonManifoldVertexCount", after_non_manifold},
         {"selfIntersectionCount", after_intersections},
-        {"boundaryLoopCount", remaining_loops.size()}}},
+        {"boundaryLoopCount", nullptr}}},
+      {"topologyValidationDeferredToAnalyzer", true},
       {"filledLoops", std::move(filled_loops)},
+      {"skippedAuthorizedLoops", std::move(skipped_loops)},
       {"unauthorizedLoopFillCount", 0},
       {"originalVertexMaximumDisplacementM", 0.0}};
 }

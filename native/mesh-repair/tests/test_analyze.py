@@ -66,7 +66,7 @@ def run_analyze(executable: Path, workspace: Path, name: str,
     assert first_bytes == second_bytes, f"{name}: analysis is not byte-for-byte deterministic"
     document = json.loads(first_bytes)
     assert document["schemaVersion"] == 1
-    assert document["algorithmVersion"] == "1.0.0"
+    assert document["algorithmVersion"] == "1.1.0"
     assert document["status"] == "ok"
     assert document["inputMeshFingerprint"] == {
         "algorithm": "sha256",
@@ -88,7 +88,7 @@ def run_repair(executable: Path, workspace: Path, name: str, input_path: Path,
     report_path = workspace / f"{name}-repair.json"
     policy = {
         "schemaVersion": 1,
-        "algorithmVersion": "1.0.0",
+        "algorithmVersion": "1.1.0",
         "inputMeshFingerprint": topology["inputMeshFingerprint"],
         "profile": profile,
         "repairNonManifold": True,
@@ -112,7 +112,7 @@ def main() -> None:
                              text=True, check=False)
     assert version.returncode == 0, version.stderr
     version_document = json.loads(version.stdout)
-    assert version_document["algorithmVersion"] == "1.0.0"
+    assert version_document["algorithmVersion"] == "1.1.0"
     assert version_document["backend"]["name"] == "CGAL"
     assert version_document["backend"]["version"].startswith("6.")
 
@@ -203,7 +203,7 @@ def main() -> None:
     stale_output = workspace / "stale-output.ply"
     stale_policy.write_text(json.dumps({
         "schemaVersion": 1,
-        "algorithmVersion": "1.0.0",
+        "algorithmVersion": "1.1.0",
         "inputMeshFingerprint": {"algorithm": "sha256", "value": "0" * 64},
         "profile": "faithful",
         "selectedLoops": [selected_loop],

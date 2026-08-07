@@ -1689,6 +1689,10 @@
         <div class="job-overlay">
           <div><span>{activeJob.stage.replaceAll('_', ' ')}</span><strong>{Math.round(activeJob.progress * 100)}%</strong></div>
           <div class="progress"><i style={`width:${Math.round(activeJob.progress * 100)}%`}></i></div>
+          {#if activeJob.stageProgress != null}
+            <div class="stage-progress-meta"><span>Current stage</span><strong>{Math.round(activeJob.stageProgress * 100)}%</strong></div>
+            <div class="progress stage-progress"><i style={`width:${Math.round(activeJob.stageProgress * 100)}%`}></i></div>
+          {/if}
           {#if activeJob.iteration !== null}
             <div class="job-quality">
               <span>Iteration <strong>{activeJob.iteration.toLocaleString()} / {activeJob.totalIterations?.toLocaleString()}</strong></span>
@@ -1932,6 +1936,10 @@
             <h3>{activeJob.stage.replaceAll('_', ' ')}</h3>
             <p>{activeJob.error ?? activeJob.detail}</p>
             <div class="progress"><i style={`width:${Math.round(activeJob.progress * 100)}%`}></i></div>
+            {#if activeJob.stageProgress != null}
+              <div class="stage-progress-meta"><span>Current stage</span><strong>{Math.round(activeJob.stageProgress * 100)}%</strong></div>
+              <div class="progress stage-progress"><i style={`width:${Math.round(activeJob.stageProgress * 100)}%`}></i></div>
+            {/if}
             {#if activeJob.iteration !== null}
               <div class="job-quality">
                 <span>Iteration <strong>{activeJob.iteration.toLocaleString()} / {activeJob.totalIterations?.toLocaleString()}</strong></span>
@@ -2236,6 +2244,9 @@
   .progress { height: 5px; overflow: hidden; border-radius: 6px; background: #172a35; }
   .progress i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--mint)); transition: width .25s linear; }
   .job-card .progress { margin: 11px 0 8px; }
+  .stage-progress-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; color: #687f8a; font-size: 8px; text-transform: uppercase; letter-spacing: .05em; }
+  .job-card .progress.stage-progress, .job-overlay .progress.stage-progress { height: 3px; margin: 4px 0 8px; }
+  .progress.stage-progress i { background: linear-gradient(90deg, #7d91ff, var(--cyan)); }
   .job-quality { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; margin: 9px 0; color: #687f8a; font-size: 8px; }
   .job-quality strong { margin-left: 3px; color: #a9bec8; font-size: 9px; }
   .job-meta { justify-content: space-between; gap: 8px; margin-bottom: 11px; color: #687f8a; font-size: 9px; }

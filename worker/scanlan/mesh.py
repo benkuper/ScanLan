@@ -2021,6 +2021,29 @@ def build_mesh_artifacts(
         progress,
     )
     repair_summary = repair_report.get("repairSummary", {})
+    texture_progress = progress
+    if progress:
+        def texture_progress(
+            stage: str,
+            detail: str,
+            advance: int = 0,
+            point_count: int | None = None,
+            stage_progress: float | None = None,
+            *extra: Any,
+        ) -> None:
+            mapped_progress = stage_progress
+            if stage_progress is not None:
+                mapped_progress = 0.72 + 0.27 * min(
+                    1.0, max(0.0, (stage_progress - 0.50) / 0.47)
+                )
+            progress(
+                stage,
+                detail,
+                advance,
+                point_count,
+                mapped_progress,
+                *extra,
+            )
     normals = _vertex_normals(vertices, triangles)
     supplemental_frames = _load_supplemental_texture_frames(output_dir.parent, frames[0])
     texture_candidates = [*frames, *supplemental_frames]
@@ -2031,7 +2054,7 @@ def build_mesh_artifacts(
             normals,
             texture_frames,
             mesh_voxel_size,
-            progress,
+            texture_progress,
         )
     )
     texture_frames, photometric_pose_count = _photometric_refine_texture_poses(
@@ -2039,10 +2062,10 @@ def build_mesh_artifacts(
         triangles,
         texture_frames,
         mesh_voxel_size,
-        progress,
+        texture_progress,
     )
-    if progress:
-        progress(
+    if texture_progress:
+        texture_progress(
             "Texturing",
             f"Calibrating color across {len(texture_frames)} overlapping texture views",
             0,
@@ -2086,7 +2109,7 @@ def build_mesh_artifacts(
         texture_frames,
         mesh_voxel_size,
         calibration,
-        progress,
+        texture_progress,
     )
     atlas, uvs, page_resolution = _bake_shared_view_atlas(
         vertex_colors,
@@ -2095,7 +2118,7 @@ def build_mesh_artifacts(
         texture_frames,
         triangle_frames,
         calibration,
-        progress,
+        texture_progress,
     )
     display_axes = np.asarray(texture_frames[0].display_axes, dtype=np.float64)
     display_vertices = (vertices * display_axes).astype(np.float32)
