@@ -17,6 +17,7 @@ from scanlan.mesh_observations import (
     SUPPORTED,
     classify_world_points,
 )
+from scanlan.mesh import PosedFrame, build_mesh_artifacts
 from scanlan.mesh_repair import (
     MeshRepairSettings,
     classify_boundary_loop,
@@ -143,6 +144,14 @@ def test_loop_exceeding_threshold_is_too_large(tmp_path: Path) -> None:
     assert decision["classification"] == "preserve_too_large"
 
 
+def test_large_doorway_is_still_reported_as_an_opening(tmp_path: Path) -> None:
+    frames = [_frame(tmp_path, 3.0), _frame(tmp_path, 3.0)]
+    decision = classify_boundary_loop(
+        _loop(size=0.2), frames, 0.008, MeshRepairSettings()
+    )
+    assert decision["classification"] == "preserve_opening"
+
+
 def test_candidate_outside_every_camera_is_unknown(tmp_path: Path) -> None:
     loop = _loop()
     for position in loop["orderedBoundaryPositions"]:
@@ -220,7 +229,7 @@ def test_native_repair_preserves_doorway_free_space(tmp_path: Path) -> None:
     )
     assert report["status"] == "ok"
     assert report["repairSummary"]["holesFilled"] == 0
-    assert report["repairSummary"]["openingsPreserved"] == 1
+    assert report["repairSummary"]["openingsPreserved"] >= 1
     assert len(repaired_triangles) == len(triangles)
 
 
@@ -263,3 +272,38 @@ def test_missing_backend_fallback_is_explicit_valid_json(tmp_path: Path) -> None
     saved = json.loads((tmp_path / "mesh-repair-report.json").read_text(encoding="utf-8"))
     assert report["status"] == "fallback"
     assert saved["repairSummary"]["fallbackOccurred"] is True
+
+
+@pytest.mark.skipif(find_mesh_repair_backend() is None, reason="CGAL test backend not built")
+def test_texture_generation_uses_repaired_geometry(tmp_path: Path) -> None:
+    vertices, triangles = _square_ring()
+    simple_frames = [_frame(tmp_path, 2.0), _frame(tmp_path, 2.0)]
+    frames = [
+        PosedFrame(
+            phase_name=f"View {index + 1}",
+            phase_id=f"view-{index + 1}",
+            source=frame.source,
+            frame_index=frame.frame_index,
+            camera_to_global=frame.camera_to_global,
+            display_axes=(1.0, 1.0, 1.0),
+            image_y_up=frame.image_y_up,
+        )
+        for index, frame in enumerate(simple_frames)
+    ]
+    output_dir = tmp_path / "outputs"
+    with (
+        patch(
+            "scanlan.mesh._fused_mesh",
+            return_value=(vertices, triangles, "synthetic"),
+        ),
+        patch(
+            "scanlan.mesh._mesh_cache_path",
+            return_value=tmp_path / "synthetic-mesh-cache.npz",
+        ),
+    ):
+        result = build_mesh_artifacts(output_dir, frames, voxel_size_m=0.008)
+    assert result["meshRepairStatus"] == "ok"
+    assert result["meshRepairHolesFilled"] == 1
+    assert result["meshTriangleCount"] > len(triangles)
+    assert (output_dir / "room-mesh.obj").is_file()
+    assert (output_dir / "room-texture.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"

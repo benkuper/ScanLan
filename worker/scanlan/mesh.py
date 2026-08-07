@@ -2170,7 +2170,9 @@ def build_mesh_artifacts(
             repair_summary.get("unknownBoundariesPreserved", 0)
         ),
         "meshRepairCacheHit": bool(repair_report.get("repairedCacheHit", False)),
-        "meshRepairFingerprint": str(repair_report.get("rawMeshFingerprint", "")),
+        "meshRepairFingerprint": str(
+            repair_report.get("repairCacheFingerprint", "")
+        ),
         "watertightMeshOutputPath": (
             repair_report.get("watertightCopy", {}).get("path")
             if repair_report.get("watertightCopy", {}).get("status") == "ok"

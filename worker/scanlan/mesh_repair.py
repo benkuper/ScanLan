@@ -222,10 +222,10 @@ def classify_boundary_loop(
     residual = float(loop.get("planeRmsResidualM", math.inf))
     geometric = _geometric_classification(loop, mesh_voxel_size_m)
 
-    if diameter > max_diameter:
-        classification = "preserve_too_large"
-    elif free_space_ratio > settings.max_free_space_ratio:
+    if free_space_ratio > settings.max_free_space_ratio:
         classification = "preserve_opening"
+    elif diameter > max_diameter:
+        classification = "preserve_too_large"
     elif (
         support_ratio >= settings.min_support_ratio
         and supporting_views >= settings.min_supporting_views
@@ -509,6 +509,18 @@ def repair_mesh_geometry(
     settings.validate()
     final_report_path = output_dir / "mesh-repair-report.json"
     raw_fingerprint = _mesh_fingerprint(vertices, triangles)
+    settings_fingerprint = hashlib.sha256(
+        (
+            raw_fingerprint
+            + MESH_REPAIR_ALGORITHM_VERSION
+            + json.dumps(
+                settings.report_payload(mesh_voxel_size_m),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + f"{mesh_voxel_size_m:.17g}"
+        ).encode("utf-8")
+    ).hexdigest()[:24]
     disabled_classification = {
         "schemaVersion": MESH_REPAIR_REPORT_SCHEMA_VERSION,
         "algorithmVersion": MESH_REPAIR_ALGORITHM_VERSION,
@@ -517,6 +529,8 @@ def repair_mesh_geometry(
         "summary": {},
         "holes": [],
         "selectedLoopIds": [],
+        "rawMeshFingerprint": raw_fingerprint,
+        "repairCacheFingerprint": settings_fingerprint,
     }
     if not settings.enabled:
         disabled_classification["repairSummary"] = _repair_summary(
@@ -574,6 +588,7 @@ def repair_mesh_geometry(
         cached_report = json.loads(cached_report_path.read_text(encoding="utf-8"))
         if cached_report.get("status") == "ok":
             cached_report["repairedCacheHit"] = True
+            cached_report["repairCacheFingerprint"] = cache_key
             write_json(final_report_path, cached_report)
             repaired_vertices, repaired_triangles = _read_triangle_ply(repaired_path)
             return repaired_vertices, repaired_triangles, cached_report
@@ -651,6 +666,7 @@ def repair_mesh_geometry(
             "fallbackReason": str(error),
             "rawMeshFingerprint": raw_fingerprint,
             "depthDatasetFingerprint": dataset_fingerprint,
+            "repairCacheFingerprint": cache_key,
         }
         report["repairSummary"] = _repair_summary(report, None, fallback=True)
         write_json(final_report_path, report)
@@ -689,6 +705,7 @@ def repair_mesh_geometry(
             "depthDatasetFingerprint": dataset_fingerprint,
             "nativeRepair": native,
             "backendVersion": backend_version,
+            "repairCacheFingerprint": cache_key,
         }
         report["repairSummary"] = _repair_summary(report, None, fallback=True)
         write_json(final_report_path, report)
@@ -704,6 +721,7 @@ def repair_mesh_geometry(
         "nativeRepair": native,
         "validationTopology": validation["topology"],
         "repairedCacheHit": False,
+        "repairCacheFingerprint": cache_key,
         "reportPath": "outputs/mesh-repair-report.json",
         "backendVersion": backend_version,
     }
@@ -716,6 +734,7 @@ def repair_mesh_geometry(
         watertight_policy = {
             **policy,
             "profile": "faithful",
+            "repairSelfIntersections": True,
             "selectedLoops": [
                 {
                     "loopId": loop["loopId"],
@@ -742,13 +761,40 @@ def repair_mesh_geometry(
                 ],
                 watertight_report_path,
             )
+            watertight_validation_path = (
+                cache_root / f"watertight-validation-{cache_key}.json"
+            )
+            watertight_validation = _run_backend(
+                [
+                    str(backend),
+                    "analyze",
+                    "--input",
+                    str(watertight_path),
+                    "--report",
+                    str(watertight_validation_path),
+                    "--voxel-size-m",
+                    str(mesh_voxel_size_m),
+                ],
+                watertight_validation_path,
+            )
+            watertight_topology = watertight_validation["topology"]
+            if (
+                int(watertight_topology["boundaryLoopCount"]) != 0
+                or int(watertight_topology["nonManifoldVertexCount"]) != 0
+                or int(watertight_topology["selfIntersectionCount"]) != 0
+            ):
+                raise RuntimeError(
+                    "CGAL derivative did not pass closed-manifold validation"
+                )
             report["watertightCopy"] = {
                 "status": "ok",
                 "path": "outputs/room-mesh-watertight.ply",
                 "intentionalOpeningsMayBeSealed": True,
                 "nativeRepair": watertight_native,
+                "validationTopology": watertight_topology,
             }
         except Exception as error:
+            watertight_path.unlink(missing_ok=True)
             report["watertightCopy"] = {"status": "failed", "error": str(error)}
 
     write_json(cached_report_path, report)

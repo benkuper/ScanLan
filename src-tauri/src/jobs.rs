@@ -211,6 +211,10 @@ fn source_fingerprint(project_root: &Path, project: &ProjectSummary) -> String {
     project.schema_version.hash(&mut hasher);
     project.settings.capture_fps.hash(&mut hasher);
     project.settings.voxel_size_mm.hash(&mut hasher);
+    project.settings.repair_mesh.hash(&mut hasher);
+    project.settings.mesh_repair_profile.hash(&mut hasher);
+    project.settings.fill_inferred_mesh_holes.hash(&mut hasher);
+    project.settings.produce_watertight_mesh.hash(&mut hasher);
     for phase in &project.phases {
         phase.id.hash(&mut hasher);
         phase.frame_count.hash(&mut hasher);
@@ -293,7 +297,13 @@ fn stage_key(stage: &str) -> Option<&'static str> {
         Some("media")
     } else if stage.contains("splat") && (stage.contains("train") || stage.contains("initial")) {
         Some("splat")
-    } else if stage.contains("mesh") || stage.contains("textur") {
+    } else if stage.contains("mesh")
+        || stage.contains("textur")
+        || stage.contains("topology")
+        || stage.contains("opening")
+        || stage.contains("repairing")
+        || stage.contains("validating")
+    {
         Some("mesh")
     } else if stage.contains("preparing splat") || stage.contains("posed frame") {
         Some("dataset")
@@ -602,6 +612,7 @@ fn run_pipeline(
         return run_command(train, project_root, job, cancel, true);
     }
     let reconstruction = existing_runtime(resources, false)?;
+    let project = storage::read_project(project_root)?;
     let targets = job
         .targets
         .iter()
@@ -620,7 +631,22 @@ fn run_pipeline(
         .arg("--engine")
         .arg("auto")
         .arg("--targets")
-        .arg(targets);
+        .arg(targets)
+        .arg("--mesh-repair")
+        .arg(if project.settings.repair_mesh { "on" } else { "off" })
+        .arg("--mesh-repair-profile")
+        .arg(&project.settings.mesh_repair_profile)
+        .arg(if project.settings.fill_inferred_mesh_holes {
+            "--fill-inferred-holes"
+        } else {
+            "--no-fill-inferred-holes"
+        })
+        .arg(if project.settings.produce_watertight_mesh {
+            "--produce-watertight-copy"
+        } else {
+            "--no-produce-watertight-copy"
+        })
+        .arg("--mesh-repair-fallback");
     run_command(command, project_root, job, cancel, false)?;
     if job.targets.iter().any(|target| target == "gaussianSplat") {
         job.stage = "splat_training".to_string();

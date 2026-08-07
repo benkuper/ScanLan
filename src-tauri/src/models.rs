@@ -19,6 +19,14 @@ pub struct CaptureSettings {
     pub rgb_jpeg_quality: u8,
     pub max_rgb_dimension: u32,
     pub live_reconstruction: String,
+    #[serde(default = "default_repair_mesh")]
+    pub repair_mesh: bool,
+    #[serde(default = "default_mesh_repair_profile")]
+    pub mesh_repair_profile: String,
+    #[serde(default)]
+    pub fill_inferred_mesh_holes: bool,
+    #[serde(default)]
+    pub produce_watertight_mesh: bool,
 }
 
 fn default_sensor_kind() -> String {
@@ -45,6 +53,14 @@ fn default_live_reconstruction() -> String {
     "points".to_string()
 }
 
+fn default_repair_mesh() -> bool {
+    true
+}
+
+fn default_mesh_repair_profile() -> String {
+    "faithful".to_string()
+}
+
 impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
@@ -61,6 +77,10 @@ impl Default for CaptureSettings {
             rgb_jpeg_quality: default_rgb_jpeg_quality(),
             max_rgb_dimension: 0,
             live_reconstruction: default_live_reconstruction(),
+            repair_mesh: default_repair_mesh(),
+            mesh_repair_profile: default_mesh_repair_profile(),
+            fill_inferred_mesh_holes: false,
+            produce_watertight_mesh: false,
         }
     }
 }
@@ -162,6 +182,24 @@ pub struct ProjectSummary {
     pub processing_backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processing_duration_seconds: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_repair_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_repair_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_repair_report_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_repair_fallback: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_repair_defects_fixed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_repair_holes_filled: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_repair_openings_preserved: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_repair_unknown_preserved: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watertight_mesh_output_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,6 +243,15 @@ impl ProjectSummary {
             frames_used: None,
             processing_backend: None,
             processing_duration_seconds: None,
+            mesh_repair_profile: None,
+            mesh_repair_status: None,
+            mesh_repair_report_path: None,
+            mesh_repair_fallback: None,
+            mesh_repair_defects_fixed: None,
+            mesh_repair_holes_filled: None,
+            mesh_repair_openings_preserved: None,
+            mesh_repair_unknown_preserved: None,
+            watertight_mesh_output_path: None,
         }
     }
 

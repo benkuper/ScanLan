@@ -456,6 +456,22 @@ fn normalize_project(project: &mut ProjectSummary) -> bool {
         project.settings.voxel_size_mm = safe_voxel_size;
         changed = true;
     }
+    if !matches!(
+        project.settings.mesh_repair_profile.as_str(),
+        "faithful" | "architectural" | "natural"
+    ) {
+        project.settings.mesh_repair_profile = "faithful".to_string();
+        changed = true;
+    }
+    if project.settings.repair_mesh && project.mesh_repair_report_path.is_none() {
+        if let Some(artifact) = project.artifacts.textured_mesh.as_mut() {
+            if artifact.status == "ready" && !artifact.stale {
+                artifact.status = "stale".to_string();
+                artifact.stale = true;
+                changed = true;
+            }
+        }
+    }
     if project.processing_status == "failed" {
         if project.processing_error.is_none() {
             project.processing_error = Some(
@@ -1020,6 +1036,12 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
     }
     if !matches!(settings.live_reconstruction.as_str(), "points" | "mesh") {
         return Err("Unknown live reconstruction mode".to_string());
+    }
+    if !matches!(
+        settings.mesh_repair_profile.as_str(),
+        "faithful" | "architectural" | "natural"
+    ) {
+        return Err("Unknown mesh repair profile".to_string());
     }
     Ok(())
 }
@@ -1868,7 +1890,26 @@ pub fn update_project_settings(
     settings.max_depth_m = settings.max_depth_m.clamp(0.5, 8.0);
     settings.voxel_size_mm = settings.voxel_size_mm.clamp(1, 40);
     validate_sensor_settings(&mut settings)?;
+    let mesh_repair_changed = project.settings.repair_mesh != settings.repair_mesh
+        || project.settings.mesh_repair_profile != settings.mesh_repair_profile
+        || project.settings.fill_inferred_mesh_holes != settings.fill_inferred_mesh_holes
+        || project.settings.produce_watertight_mesh != settings.produce_watertight_mesh;
     project.settings = settings;
+    if mesh_repair_changed {
+        if let Some(artifact) = project.artifacts.textured_mesh.as_mut() {
+            artifact.status = "stale".to_string();
+            artifact.stale = true;
+        }
+        project.mesh_repair_profile = None;
+        project.mesh_repair_status = None;
+        project.mesh_repair_report_path = None;
+        project.mesh_repair_fallback = None;
+        project.mesh_repair_defects_fixed = None;
+        project.mesh_repair_holes_filled = None;
+        project.mesh_repair_openings_preserved = None;
+        project.mesh_repair_unknown_preserved = None;
+        project.watertight_mesh_output_path = None;
+    }
     storage::write_project(&project)?;
     write_sensor_preference(&app, &project.settings)?;
     *state

@@ -50,6 +50,7 @@
     CloudTransform,
     DepthFieldOfView,
     LiveReconstructionMode,
+    MeshRepairProfile,
     MeshViewMode,
     PackedPreviewFrame,
     PreviewMesh,
@@ -1106,6 +1107,7 @@
       }
       return;
     }
+    if (settingsDirty && !(await persistSettings())) return;
     const targets: ArtifactTarget[] = [];
     if (buildPointCloud) targets.push('pointCloud');
     if (buildTexturedMesh) targets.push('texturedMesh');
@@ -1832,6 +1834,35 @@
           {/if}
         </section>
 
+        {#if buildTexturedMesh && !mediaOnlyProject}
+          <section class="panel settings mesh-repair-settings">
+            <div class="section-title"><span>MESH REPAIR</span><strong>DEPTH-AWARE</strong></div>
+            <label class="toggle"><input type="checkbox" checked={project.settings.repairMesh} on:change={(event) => updateSetting('repairMesh', inputChecked(event))} disabled={processing}/><span></span><div><strong>Repair mesh before texturing</strong><small>Fixes topology and fills only holes supported by captured depth</small></div></label>
+            {#if project.settings.repairMesh}
+              <label>Repair profile
+                <select value={project.settings.meshRepairProfile} on:change={(event) => updateSetting('meshRepairProfile', inputValue(event) as MeshRepairProfile)} disabled={processing}>
+                  <option value="faithful">Faithful · preserve measured geometry</option>
+                  <option value="architectural">Architectural · planar wall patches</option>
+                  <option value="natural">Natural · smoothly faired patches</option>
+                </select>
+              </label>
+              <p>{project.settings.meshRepairProfile === 'architectural' ? 'Projects new wall and floor patch vertices onto their fitted plane.' : project.settings.meshRepairProfile === 'natural' ? 'Fairs new patch vertices for rounded and organic surfaces.' : 'Triangulates supported holes with no smoothing of measured vertices.'} Doorways and depth-confirmed free space stay open.</p>
+              <label class="toggle"><input type="checkbox" checked={project.settings.fillInferredMeshHoles} on:change={(event) => updateSetting('fillInferredMeshHoles', inputChecked(event))} disabled={processing}/><span></span><div><strong>Fill inferred holes</strong><small>More complete, but may fill boundaries without direct depth support</small></div></label>
+              <label class="toggle"><input type="checkbox" checked={project.settings.produceWatertightMesh} on:change={(event) => updateSetting('produceWatertightMesh', inputChecked(event))} disabled={processing}/><span></span><div><strong>Also produce watertight copy</strong><small>Separate PLY for fabrication; intentional openings may be sealed</small></div></label>
+            {/if}
+            {#if artifactReady('texturedMesh') && project.meshRepairReportPath}
+              <div class="repair-result" class:warning={project.meshRepairFallback}>
+                <span>{project.meshRepairFallback ? 'UNREPAIRED FALLBACK' : `${project.meshRepairProfile?.toUpperCase()} COMPLETE`}</span>
+                <div><strong>{project.meshRepairHolesFilled ?? 0}</strong><small>holes filled</small></div>
+                <div><strong>{project.meshRepairOpeningsPreserved ?? 0}</strong><small>openings preserved</small></div>
+                <div><strong>{project.meshRepairUnknownPreserved ?? 0}</strong><small>unknown preserved</small></div>
+                <div><strong>{project.meshRepairDefectsFixed ?? 0}</strong><small>defects fixed</small></div>
+                <small class="report-path" title={project.meshRepairReportPath}>{project.meshRepairReportPath}</small>
+              </div>
+            {/if}
+          </section>
+        {/if}
+
         {#if mediaOnlyProject}
           <section class="panel pipeline-note">
             <strong>Photo/video source</strong>
@@ -2165,6 +2196,15 @@
   .target-list label > i { max-width: 80px; color: var(--mint); font-size: 8px; font-style: normal; font-weight: 800; text-align: right; }
   .target-list .iterations { grid-template-columns: auto 1fr auto; min-height: auto; }
   .iterations input { height: 18px; padding: 0; accent-color: var(--cyan); }
+  .mesh-repair-settings > p { margin: -3px 0 1px; color: #718894; font-size: 9px; line-height: 1.55; }
+  .repair-result { display: grid; grid-template-columns: 1fr repeat(4, auto); align-items: center; gap: 11px; padding: 10px; border: 1px solid rgba(98,214,186,.22); border-radius: 8px; background: rgba(98,214,186,.05); }
+  .repair-result.warning { border-color: rgba(239,179,102,.28); background: rgba(239,179,102,.05); }
+  .repair-result > span { color: var(--mint); font-size: 8px; font-weight: 850; }
+  .repair-result.warning > span { color: var(--amber); }
+  .repair-result > div { display: grid; gap: 2px; text-align: right; }
+  .repair-result strong { color: #bdd0d7; font-size: 11px; }
+  .repair-result small { color: #647c87; font-size: 7px; }
+  .repair-result .report-path { grid-column: 1 / -1; overflow: hidden; color: #58717d; font-family: ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
   .pipeline-note > strong { font-size: 12px; }
   .pipeline-note div { display: flex; justify-content: space-between; padding-top: 9px; }
   .pipeline-note .texture-progress { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid rgba(99,199,231,.2); border-radius: 9px; background: rgba(99,199,231,.045); }

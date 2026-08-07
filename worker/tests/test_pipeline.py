@@ -307,6 +307,12 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue((root / "outputs" / "room-mesh.obj").exists())
             self.assertTrue((root / "outputs" / "room-mesh.mtl").exists())
             self.assertTrue((root / "outputs" / "room-texture.png").exists())
+            self.assertIn(result["meshRepairStatus"], {"ok", "fallback"})
+            with (root / "outputs" / "mesh-repair-report.json").open(
+                "r", encoding="utf-8"
+            ) as handle:
+                repair_report = json.load(handle)
+            self.assertEqual(repair_report["status"], result["meshRepairStatus"])
             mesh_preview = (root / "outputs" / "room-mesh.preview.bin").read_bytes()
             current_dataset = root / "outputs" / "cache" / "datasets" / "current.json"
             self.assertFalse(current_dataset.exists())
@@ -357,6 +363,8 @@ class PipelineTests(unittest.TestCase):
 
             cached_result = reconstruct_project(root, engine="numpy")
             self.assertTrue(cached_result["meshCacheHit"])
+            if result["meshRepairStatus"] == "ok":
+                self.assertTrue(cached_result["meshRepairCacheHit"])
             self.assertEqual(cached_result["meshTriangleCount"], result["meshTriangleCount"])
 
     def test_rebuild_includes_localized_supplemental_texture_photo(self) -> None:

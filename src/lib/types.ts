@@ -5,6 +5,7 @@ export type SensorConnection = 'usb' | 'network';
 export type DepthFieldOfView = 'narrow' | 'wide';
 export type MeshViewMode = 'surface' | 'surface-wireframe' | 'wireframe' | 'shaded';
 export type LiveReconstructionMode = 'points' | 'mesh';
+export type MeshRepairProfile = 'faithful' | 'architectural' | 'natural';
 
 export interface CaptureSettings {
   captureFps: number;
@@ -21,6 +22,10 @@ export interface CaptureSettings {
   /** Zero keeps the sensor's native RGB dimensions. */
   maxRgbDimension: number;
   liveReconstruction: LiveReconstructionMode;
+  repairMesh: boolean;
+  meshRepairProfile: MeshRepairProfile;
+  fillInferredMeshHoles: boolean;
+  produceWatertightMesh: boolean;
 }
 
 export type ArtifactStatus = 'ready' | 'building' | 'stale' | 'failed';
@@ -94,6 +99,15 @@ export interface ProjectSummary {
   framesUsed?: number;
   processingBackend?: string;
   processingDurationSeconds?: number;
+  meshRepairProfile?: MeshRepairProfile;
+  meshRepairStatus?: string;
+  meshRepairReportPath?: string;
+  meshRepairFallback?: boolean;
+  meshRepairDefectsFixed?: number;
+  meshRepairHolesFilled?: number;
+  meshRepairOpeningsPreserved?: number;
+  meshRepairUnknownPreserved?: number;
+  watertightMeshOutputPath?: string;
 }
 
 export interface ProjectCatalogEntry {

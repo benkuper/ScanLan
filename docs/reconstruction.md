@@ -39,6 +39,8 @@ Normal room-scale settings use weighted TSDF fusion. Fine spacing uses a memory-
 
 ## Triangle mesh
 
+Before texturing, the optional CGAL repair pass analyzes topology and projects candidate hole samples into the original RGB-D frames. It fills measured dropouts only when multi-view depth supports the proposed surface and preserves free-space openings, occluded cavities, oversized scan boundaries, and unknown holes. Faithful, Architectural, and Natural profiles control only authorized patch geometry; an optional watertight PLY remains a separate derivative. See [mesh-repair.md](mesh-repair.md).
+
 The mesh is extracted from the same final CUDA/CPU TSDF used by the point output, so a combined point+mesh build does not fuse the room twice. Geometry uses every accepted depth keyframe; texturing retains up to 24 views by greedily maximizing surface coverage and projected source-pixel density. The surface is cleaned, simplified to a bounded triangle budget, welded, and indexed. Azure/Femto texturing uses calibrated native RGB whenever its bounded encoder produced the frame; a missing native image switches that frame to depth-aligned RGB with depth-camera calibration. Kinect always uses the SDK’s exact depth-aligned color rather than a hard-coded approximation of unavailable reusable color calibration:
 
 - project geometry through depth and RGB calibration;
