@@ -11,6 +11,7 @@ import numpy as np
 from .dataset import build_posed_dataset, dataset_fingerprint
 from .io import phase_roots, read_phase, read_project, save_binary_ply, save_preview, write_json
 from .mesh import PosedFrame, build_mesh_artifacts
+from .mesh_repair import MeshRepairSettings, settings_from_project
 from .numpy_engine import reconstruct_known_poses
 
 Engine = Literal["auto", "numpy", "open3d"]
@@ -107,9 +108,11 @@ def reconstruct_project(
     engine: Engine = "auto",
     device: Device = "auto",
     targets: tuple[str, ...] = ("point_cloud", "textured_mesh"),
+    mesh_repair_settings: MeshRepairSettings | None = None,
 ) -> dict:
     project_root = project_root.resolve()
     project = read_project(project_root)
+    mesh_repair_settings = mesh_repair_settings or settings_from_project(project)
     # Live tracking rejection marks a pose estimate as unsafe; it does not make
     # the archived RGB-D pixels unusable.  Keep those consecutive frames for
     # production odometry so a lost live tracker cannot turn a smooth recording
@@ -229,6 +232,7 @@ def reconstruct_project(
                 voxel_size_m=voxel_size_m,
                 prebuilt_mesh=artifact_context.get("fused_mesh"),
                 prebuilt_mesh_method=artifact_context.get("fused_mesh_method"),
+                repair_settings=mesh_repair_settings,
             )
             if "textured_mesh" in targets
             else {
@@ -294,11 +298,34 @@ def reconstruct_project(
                     fingerprint
                     + ":"
                     + str(result.get("supplementalTextureFingerprint", "none"))
+                    + ":"
+                    + str(result.get("meshRepairProfile", "disabled"))
+                    + ":"
+                    + str(result.get("meshRepairFingerprint", ""))
                 ).encode("utf-8")
             ).hexdigest()[:24]
             project["meshTriangleCount"] = result["meshTriangleCount"]
             project["meshOutputPath"] = result.get("meshOutputPath")
             project["cameraFrameCount"] = result["cameraFrameCount"]
+            project["meshRepairProfile"] = result.get("meshRepairProfile")
+            project["meshRepairStatus"] = result.get("meshRepairStatus")
+            project["meshRepairReportPath"] = result.get("meshRepairReportPath")
+            project["meshRepairFallback"] = result.get("meshRepairFallback", False)
+            project["meshRepairDefectsFixed"] = result.get(
+                "meshRepairDefectsFixed", 0
+            )
+            project["meshRepairHolesFilled"] = result.get(
+                "meshRepairHolesFilled", 0
+            )
+            project["meshRepairOpeningsPreserved"] = result.get(
+                "meshRepairOpeningsPreserved", 0
+            )
+            project["meshRepairUnknownPreserved"] = result.get(
+                "meshRepairUnknownPreserved", 0
+            )
+            project["watertightMeshOutputPath"] = result.get(
+                "watertightMeshOutputPath"
+            )
             artifacts["texturedMesh"] = {
                 "path": "outputs/room-mesh.obj",
                 "status": "ready",

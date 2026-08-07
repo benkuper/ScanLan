@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 from scanlan.io import CameraModel, FrameRecord, PhaseData, RgbCameraModel
 from scanlan.mesh_observations import (
@@ -14,7 +17,12 @@ from scanlan.mesh_observations import (
     SUPPORTED,
     classify_world_points,
 )
-from scanlan.mesh_repair import MeshRepairSettings, classify_boundary_loop
+from scanlan.mesh_repair import (
+    MeshRepairSettings,
+    classify_boundary_loop,
+    find_mesh_repair_backend,
+    repair_mesh_geometry,
+)
 
 
 def _frame(root: Path, depth_m: float | None, *, depthless: bool = False) -> SimpleNamespace:
@@ -58,6 +66,32 @@ def _loop(size: float = 0.03, z: float = 2.0) -> dict:
         "distanceFromMeshBoundingBoxBoundaryM": 0.2,
         "vertexCount": 4,
     }
+
+
+def _square_ring(z: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
+    vertices = np.asarray(
+        [
+            [-0.5, -0.5, z],
+            [0.5, -0.5, z],
+            [0.5, 0.5, z],
+            [-0.5, 0.5, z],
+            [-0.03, -0.03, z],
+            [0.03, -0.03, z],
+            [0.03, 0.03, z],
+            [-0.03, 0.03, z],
+        ],
+        dtype=np.float32,
+    )
+    triangles: list[list[int]] = []
+    for index in range(4):
+        following = (index + 1) % 4
+        triangles.extend(
+            [
+                [index, following, 4 + following],
+                [index, 4 + following, 4 + index],
+            ]
+        )
+    return vertices, np.asarray(triangles, dtype=np.int64)
 
 
 def test_arbitrary_point_depth_classifications(tmp_path: Path) -> None:
@@ -136,3 +170,96 @@ def test_inferred_fill_requires_explicit_opt_in(tmp_path: Path) -> None:
         MeshRepairSettings(fill_inferred_holes=True),
     )
     assert decision["classification"] == "fill_inferred"
+
+
+def test_disabled_repair_preserves_geometry_and_writes_report(tmp_path: Path) -> None:
+    vertices, triangles = _square_ring()
+    repaired_vertices, repaired_triangles, report = repair_mesh_geometry(
+        tmp_path,
+        vertices,
+        triangles,
+        [],
+        0.008,
+        MeshRepairSettings(enabled=False),
+    )
+    assert np.array_equal(repaired_vertices, vertices)
+    assert np.array_equal(repaired_triangles, triangles)
+    assert report["status"] == "disabled"
+    assert (tmp_path / "mesh-repair-report.json").is_file()
+
+
+@pytest.mark.skipif(find_mesh_repair_backend() is None, reason="CGAL test backend not built")
+def test_supported_wall_hole_is_filled_by_native_backend(tmp_path: Path) -> None:
+    vertices, triangles = _square_ring()
+    frames = [_frame(tmp_path, 2.0), _frame(tmp_path, 2.0)]
+    repaired_vertices, repaired_triangles, report = repair_mesh_geometry(
+        tmp_path,
+        vertices,
+        triangles,
+        frames,
+        0.008,
+        MeshRepairSettings(),
+    )
+    assert report["status"] == "ok"
+    assert report["repairSummary"]["holesFilled"] == 1
+    assert len(repaired_vertices) >= len(vertices)
+    assert len(repaired_triangles) > len(triangles)
+
+
+@pytest.mark.skipif(find_mesh_repair_backend() is None, reason="CGAL test backend not built")
+def test_native_repair_preserves_doorway_free_space(tmp_path: Path) -> None:
+    vertices, triangles = _square_ring()
+    frames = [_frame(tmp_path, 3.0), _frame(tmp_path, 3.0)]
+    _, repaired_triangles, report = repair_mesh_geometry(
+        tmp_path,
+        vertices,
+        triangles,
+        frames,
+        0.008,
+        MeshRepairSettings(),
+    )
+    assert report["status"] == "ok"
+    assert report["repairSummary"]["holesFilled"] == 0
+    assert report["repairSummary"]["openingsPreserved"] == 1
+    assert len(repaired_triangles) == len(triangles)
+
+
+@pytest.mark.skipif(find_mesh_repair_backend() is None, reason="CGAL test backend not built")
+def test_profile_change_reuses_raw_mesh_but_invalidates_repair_cache(tmp_path: Path) -> None:
+    vertices, triangles = _square_ring()
+    frames = [_frame(tmp_path, 2.0), _frame(tmp_path, 2.0)]
+    repair_mesh_geometry(
+        tmp_path,
+        vertices,
+        triangles,
+        frames,
+        0.008,
+        MeshRepairSettings(profile="faithful"),
+    )
+    repair_mesh_geometry(
+        tmp_path,
+        vertices,
+        triangles,
+        frames,
+        0.008,
+        MeshRepairSettings(profile="architectural"),
+    )
+    cache = tmp_path / "cache" / "mesh-repair"
+    assert len(list(cache.glob("raw-*.ply"))) == 1
+    assert len(list(cache.glob("repaired-*.ply"))) == 2
+
+
+def test_missing_backend_fallback_is_explicit_valid_json(tmp_path: Path) -> None:
+    vertices, triangles = _square_ring()
+    with patch("scanlan.mesh_repair.find_mesh_repair_backend", return_value=None):
+        _, _, report = repair_mesh_geometry(
+            tmp_path,
+            vertices,
+            triangles,
+            [],
+            0.008,
+            MeshRepairSettings(),
+        )
+    saved = json.loads((tmp_path / "mesh-repair-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "fallback"
+    assert saved["repairSummary"]["fallbackOccurred"] is True

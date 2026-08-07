@@ -24,6 +24,7 @@ from .io import (
     write_json,
 )
 from .mesh_observations import project_world_points_to_depth
+from .mesh_repair import MeshRepairSettings, repair_mesh_geometry
 
 
 MAX_TEXTURE_FRAMES = 24
@@ -1939,7 +1940,8 @@ def build_mesh_artifacts(
     voxel_size_m: float = 0.015,
     prebuilt_mesh: Any | None = None,
     prebuilt_mesh_method: str | None = None,
-) -> dict[str, bool | int | float | str]:
+    repair_settings: MeshRepairSettings | None = None,
+) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not frames:
         write_json(output_dir / "camera-poses.json", [])
@@ -2008,6 +2010,17 @@ def build_mesh_artifacts(
                 None,
                 0.58,
             )
+    repair_settings = repair_settings or MeshRepairSettings()
+    vertices, triangles, repair_report = repair_mesh_geometry(
+        output_dir,
+        vertices,
+        triangles,
+        frames,
+        mesh_voxel_size,
+        repair_settings,
+        progress,
+    )
+    repair_summary = repair_report.get("repairSummary", {})
     normals = _vertex_normals(vertices, triangles)
     supplemental_frames = _load_supplemental_texture_frames(output_dir.parent, frames[0])
     texture_candidates = [*frames, *supplemental_frames]
@@ -2141,6 +2154,28 @@ def build_mesh_artifacts(
         "meshTexturePath": "outputs/room-texture.png",
         "meshFusionMethod": fusion_method,
         "meshCacheHit": mesh_cache_hit,
+        "meshRepairEnabled": repair_settings.enabled,
+        "meshRepairProfile": repair_settings.profile,
+        "meshRepairStatus": repair_report.get("status", "unknown"),
+        "meshRepairReportPath": "outputs/mesh-repair-report.json",
+        "meshRepairFallback": bool(repair_summary.get("fallbackOccurred", False)),
+        "meshRepairDefectsFixed": int(
+            repair_summary.get("topologyDefectsFixed", 0)
+        ),
+        "meshRepairHolesFilled": int(repair_summary.get("holesFilled", 0)),
+        "meshRepairOpeningsPreserved": int(
+            repair_summary.get("openingsPreserved", 0)
+        ),
+        "meshRepairUnknownPreserved": int(
+            repair_summary.get("unknownBoundariesPreserved", 0)
+        ),
+        "meshRepairCacheHit": bool(repair_report.get("repairedCacheHit", False)),
+        "meshRepairFingerprint": str(repair_report.get("rawMeshFingerprint", "")),
+        "watertightMeshOutputPath": (
+            repair_report.get("watertightCopy", {}).get("path")
+            if repair_report.get("watertightCopy", {}).get("status") == "ok"
+            else None
+        ),
         "textureCandidateFrameCount": len(texture_candidates),
         "supplementalTextureFrameCount": len(supplemental_frames),
         "supplementalTextureFingerprint": supplemental_fingerprint,

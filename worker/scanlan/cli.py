@@ -4,9 +4,11 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from .io import read_project, write_json
+from .mesh_repair import settings_from_project
 from .reconstruct import reconstruct_project
 
 
@@ -22,6 +24,27 @@ def parser() -> argparse.ArgumentParser:
         "--targets",
         default="point_cloud,textured_mesh",
         help="Comma-separated point_cloud,textured_mesh,gaussian_splat targets",
+    )
+    reconstruct.add_argument("--mesh-repair", choices=["on", "off"], default=None)
+    reconstruct.add_argument(
+        "--mesh-repair-profile",
+        choices=["faithful", "architectural", "natural"],
+        default=None,
+    )
+    reconstruct.add_argument(
+        "--fill-inferred-holes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    reconstruct.add_argument(
+        "--produce-watertight-copy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    reconstruct.add_argument(
+        "--mesh-repair-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
 
     realtime = commands.add_parser(
@@ -87,7 +110,39 @@ def main(argv: list[str] | None = None) -> int:
             unknown = set(targets) - {"point_cloud", "textured_mesh", "gaussian_splat"}
             if unknown:
                 raise ValueError(f"Unknown artifact targets: {', '.join(sorted(unknown))}")
-            result = reconstruct_project(arguments.project, arguments.engine, arguments.device, targets)
+            project = read_project(arguments.project)
+            repair_settings = settings_from_project(project)
+            overrides = {
+                "enabled": (
+                    arguments.mesh_repair == "on"
+                    if arguments.mesh_repair is not None
+                    else repair_settings.enabled
+                ),
+                "profile": arguments.mesh_repair_profile or repair_settings.profile,
+                "fill_inferred_holes": (
+                    arguments.fill_inferred_holes
+                    if arguments.fill_inferred_holes is not None
+                    else repair_settings.fill_inferred_holes
+                ),
+                "produce_watertight_copy": (
+                    arguments.produce_watertight_copy
+                    if arguments.produce_watertight_copy is not None
+                    else repair_settings.produce_watertight_copy
+                ),
+                "allow_unrepaired_fallback": (
+                    arguments.mesh_repair_fallback
+                    if arguments.mesh_repair_fallback is not None
+                    else repair_settings.allow_unrepaired_fallback
+                ),
+            }
+            repair_settings = replace(repair_settings, **overrides)
+            result = reconstruct_project(
+                arguments.project,
+                arguments.engine,
+                arguments.device,
+                targets,
+                repair_settings,
+            )
         print(json.dumps(result))
         return 0
     except Exception as error:  # CLI boundary: preserve a useful project status before exiting.

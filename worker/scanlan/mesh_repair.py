@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
+import os
+import subprocess
+import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -14,6 +20,7 @@ from .mesh_observations import (
     SUPPORTED,
     classify_world_points,
 )
+from .io import write_json
 
 
 MESH_REPAIR_REPORT_SCHEMA_VERSION = 1
@@ -56,6 +63,16 @@ class MeshRepairSettings:
             mesh_voxel_size_m
         )
         return payload
+
+
+def settings_from_project(project: dict[str, Any]) -> MeshRepairSettings:
+    values = project.get("settings", {})
+    return MeshRepairSettings(
+        enabled=bool(values.get("repairMesh", True)),
+        profile=str(values.get("meshRepairProfile", "faithful")),  # type: ignore[arg-type]
+        fill_inferred_holes=bool(values.get("fillInferredMeshHoles", False)),
+        produce_watertight_copy=bool(values.get("produceWatertightMesh", False)),
+    )
 
 
 def _plane_axes(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -275,3 +292,465 @@ def classify_topology_report(
         "selectedLoopIds": selected,
         "summary": summary,
     }
+
+
+def _mesh_fingerprint(vertices: np.ndarray, triangles: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    digest.update(np.asarray(vertices, dtype="<f4").tobytes())
+    digest.update(np.asarray(triangles, dtype="<i8").tobytes())
+    return digest.hexdigest()
+
+
+def _depth_dataset_fingerprint(frames: list[Any]) -> str:
+    digest = hashlib.sha256()
+    for frame in frames:
+        if frame.depthless:
+            continue
+        source = frame.source
+        camera = source.camera
+        record = source.frames[frame.frame_index]
+        stat = record.depth_path.stat()
+        digest.update(str(record.depth_path.resolve()).encode("utf-8"))
+        digest.update(np.asarray([stat.st_size, stat.st_mtime_ns], dtype="<i8").tobytes())
+        digest.update(
+            np.asarray(
+                [
+                    camera.width,
+                    camera.height,
+                    camera.fx,
+                    camera.fy,
+                    camera.cx,
+                    camera.cy,
+                    camera.depth_scale,
+                    camera.max_depth_m,
+                ],
+                dtype="<f8",
+            ).tobytes()
+        )
+        digest.update(np.asarray(frame.camera_to_global, dtype="<f8").tobytes())
+        digest.update(bytes((int(frame.image_y_up),)))
+    return digest.hexdigest()
+
+
+def _write_triangle_ply(path: Path, vertices: np.ndarray, triangles: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    vertices = np.asarray(vertices, dtype=np.float64)
+    triangles = np.asarray(triangles, dtype=np.int64)
+    with temporary.open("w", encoding="ascii", newline="\n") as handle:
+        handle.write(
+            "ply\n"
+            "format ascii 1.0\n"
+            "comment ScanLan metric triangle mesh\n"
+            f"element vertex {len(vertices)}\n"
+            "property double x\n"
+            "property double y\n"
+            "property double z\n"
+            f"element face {len(triangles)}\n"
+            "property list uchar int vertex_indices\n"
+            "end_header\n"
+        )
+        for x, y, z in vertices:
+            handle.write(f"{x:.17g} {y:.17g} {z:.17g}\n")
+        for a, b, c in triangles:
+            handle.write(f"3 {a} {b} {c}\n")
+    os.replace(temporary, path)
+
+
+def _read_triangle_ply(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with path.open("r", encoding="ascii") as handle:
+        header: list[str] = []
+        for line in handle:
+            line = line.strip()
+            header.append(line)
+            if line == "end_header":
+                break
+        if not header or header[0] != "ply" or "format ascii 1.0" not in header:
+            raise RuntimeError("The repaired mesh is not an ASCII PLY file")
+        vertex_count = 0
+        face_count = 0
+        for line in header:
+            fields = line.split()
+            if fields[:2] == ["element", "vertex"]:
+                vertex_count = int(fields[2])
+            elif fields[:2] == ["element", "face"]:
+                face_count = int(fields[2])
+        if vertex_count <= 0 or face_count <= 0:
+            raise RuntimeError("The repaired PLY contains no triangle mesh")
+        vertices = np.asarray(
+            [[float(value) for value in handle.readline().split()[:3]] for _ in range(vertex_count)],
+            dtype=np.float32,
+        )
+        faces: list[list[int]] = []
+        for _ in range(face_count):
+            values = [int(value) for value in handle.readline().split()]
+            if not values or values[0] != 3 or len(values) < 4:
+                raise RuntimeError("The repaired PLY contains a non-triangle face")
+            faces.append(values[1:4])
+    triangles = np.asarray(faces, dtype=np.int64)
+    if int(triangles.max(initial=-1)) >= len(vertices):
+        raise RuntimeError("The repaired PLY references an invalid vertex")
+    return vertices, triangles
+
+
+def find_mesh_repair_backend() -> Path | None:
+    executable_name = "scanlan-mesh-repair.exe" if os.name == "nt" else "scanlan-mesh-repair"
+    candidates: list[Path] = []
+    configured = os.environ.get("SCANLAN_MESH_REPAIR")
+    if configured:
+        candidates.append(Path(configured))
+    runtime_root = Path(sys.executable).resolve().parent
+    candidates.extend(
+        [
+            runtime_root / executable_name,
+            runtime_root / "mesh-repair" / executable_name,
+        ]
+    )
+    repository_root = Path(__file__).resolve().parents[2]
+    candidates.extend(
+        [
+            repository_root / "build" / "mesh-repair-cgal" / "Release" / executable_name,
+            repository_root / "build" / "mesh-repair" / "Release" / executable_name,
+            repository_root / "build" / "mesh-repair" / executable_name,
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _run_backend(arguments: list[str], report_path: Path, timeout_seconds: int = 600) -> dict[str, Any]:
+    completed = subprocess.run(
+        arguments,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    report: dict[str, Any] = {}
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            report = {}
+    if completed.returncode != 0:
+        message = str(report.get("error", {}).get("message", "")).strip()
+        if not message:
+            message = completed.stderr.strip() or "Native mesh repair failed"
+        raise RuntimeError(message)
+    if report.get("status") not in {"ok", "classified"}:
+        raise RuntimeError("Native mesh repair returned an invalid report")
+    return report
+
+
+def _backend_version(backend: Path) -> dict[str, Any]:
+    completed = subprocess.run(
+        [str(backend), "version", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "Mesh-repair backend did not start")
+    try:
+        version = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Mesh-repair backend returned an invalid version response") from error
+    if (
+        version.get("schemaVersion") != MESH_REPAIR_REPORT_SCHEMA_VERSION
+        or version.get("algorithmVersion") != MESH_REPAIR_ALGORITHM_VERSION
+        or version.get("backend", {}).get("name") != "CGAL"
+    ):
+        raise RuntimeError("The bundled mesh-repair backend is incompatible with this worker")
+    return version
+
+
+def _repair_summary(
+    classification: dict[str, Any], native: dict[str, Any] | None, *, fallback: bool
+) -> dict[str, Any]:
+    decisions = classification.get("summary", {})
+    operations = native.get("operations", {}) if native else {}
+    defects_fixed = sum(
+        int(operations.get(name, 0))
+        for name in (
+            "duplicateVerticesRemoved",
+            "duplicateTrianglesRemoved",
+            "degenerateTrianglesRemoved",
+            "topologicallyIncompatibleTrianglesRemoved",
+            "coincidentBorderPairsStitched",
+            "nonManifoldVerticesDuplicated",
+        )
+    )
+    return {
+        "topologyDefectsFixed": defects_fixed,
+        "holesFilled": len(native.get("filledLoops", [])) if native else 0,
+        "openingsPreserved": int(decisions.get("preserve_opening", 0)),
+        "occludedBoundariesPreserved": int(decisions.get("preserve_occluded", 0)),
+        "unknownBoundariesPreserved": int(decisions.get("preserve_unknown", 0)),
+        "largeBoundariesPreserved": int(decisions.get("preserve_too_large", 0)),
+        "fallbackOccurred": fallback,
+    }
+
+
+def repair_mesh_geometry(
+    output_dir: Path,
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    frames: list[Any],
+    mesh_voxel_size_m: float,
+    settings: MeshRepairSettings,
+    progress: Any | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Analyze, classify, and repair geometry before any texture projection."""
+
+    settings.validate()
+    final_report_path = output_dir / "mesh-repair-report.json"
+    raw_fingerprint = _mesh_fingerprint(vertices, triangles)
+    disabled_classification = {
+        "schemaVersion": MESH_REPAIR_REPORT_SCHEMA_VERSION,
+        "algorithmVersion": MESH_REPAIR_ALGORITHM_VERSION,
+        "status": "disabled",
+        "settings": settings.report_payload(mesh_voxel_size_m),
+        "summary": {},
+        "holes": [],
+        "selectedLoopIds": [],
+    }
+    if not settings.enabled:
+        disabled_classification["repairSummary"] = _repair_summary(
+            disabled_classification, None, fallback=False
+        )
+        write_json(final_report_path, disabled_classification)
+        return vertices, triangles, disabled_classification
+
+    backend = find_mesh_repair_backend()
+    if backend is None:
+        report = {
+            **disabled_classification,
+            "status": "fallback",
+            "fallbackReason": "The bundled CGAL mesh-repair backend was not found",
+        }
+        report["repairSummary"] = _repair_summary(report, None, fallback=True)
+        write_json(final_report_path, report)
+        if settings.allow_unrepaired_fallback:
+            return vertices, triangles, report
+        raise RuntimeError(report["fallbackReason"])
+    try:
+        backend_version = _backend_version(backend)
+    except Exception as error:
+        report = {
+            **disabled_classification,
+            "status": "fallback",
+            "fallbackReason": str(error),
+        }
+        report["repairSummary"] = _repair_summary(report, None, fallback=True)
+        write_json(final_report_path, report)
+        if settings.allow_unrepaired_fallback:
+            return vertices, triangles, report
+        raise
+
+    cache_root = output_dir / "cache" / "mesh-repair"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    raw_path = cache_root / f"raw-{raw_fingerprint[:24]}.ply"
+    if not raw_path.is_file():
+        _write_triangle_ply(raw_path, vertices, triangles)
+    dataset_fingerprint = _depth_dataset_fingerprint(frames)
+    cache_digest = hashlib.sha256()
+    cache_digest.update(raw_fingerprint.encode("ascii"))
+    cache_digest.update(MESH_REPAIR_ALGORITHM_VERSION.encode("ascii"))
+    cache_digest.update(
+        json.dumps(
+            settings.report_payload(mesh_voxel_size_m), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    )
+    cache_digest.update(np.asarray([mesh_voxel_size_m], dtype="<f8").tobytes())
+    cache_digest.update(dataset_fingerprint.encode("ascii"))
+    cache_key = cache_digest.hexdigest()[:24]
+    repaired_path = cache_root / f"repaired-{cache_key}.ply"
+    cached_report_path = cache_root / f"report-{cache_key}.json"
+    if repaired_path.is_file() and cached_report_path.is_file():
+        cached_report = json.loads(cached_report_path.read_text(encoding="utf-8"))
+        if cached_report.get("status") == "ok":
+            cached_report["repairedCacheHit"] = True
+            write_json(final_report_path, cached_report)
+            repaired_vertices, repaired_triangles = _read_triangle_ply(repaired_path)
+            return repaired_vertices, repaired_triangles, cached_report
+
+    topology_path = cache_root / f"topology-{raw_fingerprint[:24]}.json"
+    if progress:
+        progress("Analyzing topology", "Finding mesh defects and boundary loops", 0, None, 0.60)
+    topology = _run_backend(
+        [
+            str(backend),
+            "analyze",
+            "--input",
+            str(raw_path),
+            "--report",
+            str(topology_path),
+            "--voxel-size-m",
+            str(mesh_voxel_size_m),
+        ],
+        topology_path,
+    )
+    if progress:
+        progress(
+            "Checking openings against depth",
+            f"Projecting {len(topology.get('boundaryLoops', []))} boundaries into original depth frames",
+            0,
+            None,
+            0.66,
+        )
+    classification = classify_topology_report(topology, frames, mesh_voxel_size_m, settings)
+    selected_by_id = {
+        decision["loopId"]: decision
+        for decision in classification["holes"]
+        if decision["classification"] in {"fill_measured", "fill_inferred"}
+    }
+    policy = {
+        "schemaVersion": MESH_REPAIR_REPORT_SCHEMA_VERSION,
+        "algorithmVersion": MESH_REPAIR_ALGORITHM_VERSION,
+        "inputMeshFingerprint": topology["inputMeshFingerprint"],
+        "profile": settings.profile if settings.profile != "watertight" else "faithful",
+        "repairNonManifold": settings.repair_non_manifold,
+        "repairSelfIntersections": settings.repair_self_intersections,
+        "selectedLoops": [selected_by_id[key] for key in sorted(selected_by_id)],
+    }
+    policy_path = cache_root / f"policy-{cache_key}.json"
+    native_report_path = cache_root / f"native-{cache_key}.json"
+    write_json(policy_path, policy)
+    if progress:
+        progress(
+            "Repairing supported holes",
+            f"Repairing {len(selected_by_id)} depth-supported boundaries with the {settings.profile} profile",
+            0,
+            None,
+            0.72,
+        )
+    try:
+        native = _run_backend(
+            [
+                str(backend),
+                "repair",
+                "--input",
+                str(raw_path),
+                "--policy",
+                str(policy_path),
+                "--output",
+                str(repaired_path),
+                "--report",
+                str(native_report_path),
+            ],
+            native_report_path,
+        )
+    except Exception as error:
+        report = {
+            **classification,
+            "status": "fallback",
+            "fallbackReason": str(error),
+            "rawMeshFingerprint": raw_fingerprint,
+            "depthDatasetFingerprint": dataset_fingerprint,
+        }
+        report["repairSummary"] = _repair_summary(report, None, fallback=True)
+        write_json(final_report_path, report)
+        if settings.allow_unrepaired_fallback:
+            return vertices, triangles, report
+        raise
+
+    if progress:
+        progress("Validating repaired mesh", "Rechecking topology before texturing", 0, None, 0.78)
+    validation_path = cache_root / f"validation-{cache_key}.json"
+    try:
+        validation = _run_backend(
+            [
+                str(backend),
+                "analyze",
+                "--input",
+                str(repaired_path),
+                "--report",
+                str(validation_path),
+                "--voxel-size-m",
+                str(mesh_voxel_size_m),
+            ],
+            validation_path,
+        )
+        if int(validation["topology"]["nonManifoldVertexCount"]) > int(
+            topology["topology"]["nonManifoldVertexCount"]
+        ):
+            raise RuntimeError("Mesh repair increased non-manifold topology")
+    except Exception as error:
+        repaired_path.unlink(missing_ok=True)
+        report = {
+            **classification,
+            "status": "fallback",
+            "fallbackReason": f"Repaired mesh validation failed: {error}",
+            "rawMeshFingerprint": raw_fingerprint,
+            "depthDatasetFingerprint": dataset_fingerprint,
+            "nativeRepair": native,
+            "backendVersion": backend_version,
+        }
+        report["repairSummary"] = _repair_summary(report, None, fallback=True)
+        write_json(final_report_path, report)
+        if settings.allow_unrepaired_fallback:
+            return vertices, triangles, report
+        raise
+
+    report = {
+        **classification,
+        "status": "ok",
+        "rawMeshFingerprint": raw_fingerprint,
+        "depthDatasetFingerprint": dataset_fingerprint,
+        "nativeRepair": native,
+        "validationTopology": validation["topology"],
+        "repairedCacheHit": False,
+        "reportPath": "outputs/mesh-repair-report.json",
+        "backendVersion": backend_version,
+    }
+    report["repairSummary"] = _repair_summary(report, native, fallback=False)
+
+    if settings.produce_watertight_copy and topology.get("boundaryLoops"):
+        watertight_path = output_dir / "room-mesh-watertight.ply"
+        watertight_policy_path = cache_root / f"watertight-policy-{cache_key}.json"
+        watertight_report_path = cache_root / f"watertight-native-{cache_key}.json"
+        watertight_policy = {
+            **policy,
+            "profile": "faithful",
+            "selectedLoops": [
+                {
+                    "loopId": loop["loopId"],
+                    "classification": "fill_inferred",
+                    "bestFitPlane": loop["bestFitPlane"],
+                }
+                for loop in topology["boundaryLoops"]
+            ],
+        }
+        write_json(watertight_policy_path, watertight_policy)
+        try:
+            watertight_native = _run_backend(
+                [
+                    str(backend),
+                    "repair",
+                    "--input",
+                    str(raw_path),
+                    "--policy",
+                    str(watertight_policy_path),
+                    "--output",
+                    str(watertight_path),
+                    "--report",
+                    str(watertight_report_path),
+                ],
+                watertight_report_path,
+            )
+            report["watertightCopy"] = {
+                "status": "ok",
+                "path": "outputs/room-mesh-watertight.ply",
+                "intentionalOpeningsMayBeSealed": True,
+                "nativeRepair": watertight_native,
+            }
+        except Exception as error:
+            report["watertightCopy"] = {"status": "failed", "error": str(error)}
+
+    write_json(cached_report_path, report)
+    write_json(final_report_path, report)
+    repaired_vertices, repaired_triangles = _read_triangle_ply(repaired_path)
+    return repaired_vertices, repaired_triangles, report
