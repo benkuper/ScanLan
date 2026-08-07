@@ -23,6 +23,7 @@ from .io import (
     load_source_rgb,
     write_json,
 )
+from .mesh_observations import project_world_points_to_depth
 
 
 MAX_TEXTURE_FRAMES = 24
@@ -764,27 +765,12 @@ def _frame_observations(
         tolerance = np.maximum(tolerance, np.maximum(rgb_z, 0.0) * 0.004 + 0.008)
         valid &= in_buffer & np.isfinite(observed)
     else:
-        camera = frame.source.camera
-        source_frame = frame.source.frames[frame.frame_index]
-        depth_m = load_depth(source_frame, camera).astype(np.float32) / camera.depth_scale
-        z = camera_points[:, 2]
-        safe_z = np.where(z > 1e-8, z, 1.0)
-        depth_u = camera.fx * camera_points[:, 0] / safe_z + camera.cx
-        depth_v = camera.fy * camera_points[:, 1] / safe_z + camera.cy
-        depth_x = np.rint(depth_u).astype(np.int64)
-        depth_y = np.rint(depth_v).astype(np.int64)
-        in_depth = (
-            (z > 0.25)
-            & (z <= camera.max_depth_m)
-            & (depth_x >= 0)
-            & (depth_x < camera.width)
-            & (depth_y >= 0)
-            & (depth_y < camera.height)
+        projection = project_world_points_to_depth(points, frame, voxel_size_m)
+        observed = projection.observed_depth_m
+        residual[projection.in_view] = np.abs(
+            observed[projection.in_view] - projection.camera_points[projection.in_view, 2]
         )
-        observed = np.zeros(len(points), dtype=np.float32)
-        observed[in_depth] = depth_m[depth_y[in_depth], depth_x[in_depth]]
-        residual[in_depth] = np.abs(observed[in_depth] - z[in_depth])
-        valid &= in_depth & (observed > 0.0)
+        valid &= projection.in_view & (observed > 0.0)
 
     to_camera = camera_center - points
     distances = np.linalg.norm(to_camera, axis=1)
