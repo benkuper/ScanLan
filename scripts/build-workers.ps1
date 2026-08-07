@@ -6,6 +6,8 @@ $KinectSource = Join-Path $ProjectRoot "native/kinect-capture"
 $KinectBuild = Join-Path $BuildRoot "kinect-capture"
 $ModernCaptureSource = Join-Path $ProjectRoot "native/modern-capture"
 $ModernCaptureBuild = Join-Path $BuildRoot "modern-capture"
+$MeshRepairSource = Join-Path $ProjectRoot "native/mesh-repair"
+$MeshRepairBuild = Join-Path $BuildRoot "mesh-repair-cgal"
 $WorkerVenv = Join-Path $BuildRoot "worker-venv"
 $CudaWheelRoot = Join-Path $BuildRoot "open3d-cuda-wheel"
 $WorkerBuildStamp = Join-Path $ProjectRoot "worker/dist/scanlan-worker.build.json"
@@ -50,6 +52,7 @@ function Reset-StaleCMakeBuild {
 
 Reset-StaleCMakeBuild -SourceDirectory $KinectSource -BuildDirectory $KinectBuild
 Reset-StaleCMakeBuild -SourceDirectory $ModernCaptureSource -BuildDirectory $ModernCaptureBuild
+Reset-StaleCMakeBuild -SourceDirectory $MeshRepairSource -BuildDirectory $MeshRepairBuild
 
 $CMakeCommand = Get-Command cmake -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
 if (-not $CMakeCommand) {
@@ -77,6 +80,18 @@ if ($LASTEXITCODE -ne 0) { throw "Kinect capture worker build failed." }
 if ($LASTEXITCODE -ne 0) { throw "Modern sensor worker configuration failed." }
 & $CMakeCommand --build $ModernCaptureBuild --config Release
 if ($LASTEXITCODE -ne 0) { throw "Modern sensor worker build failed." }
+
+$VcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { Join-Path $BuildRoot "vcpkg" }
+$VcpkgToolchain = Join-Path $VcpkgRoot "scripts/buildsystems/vcpkg.cmake"
+if (-not (Test-Path -LiteralPath $VcpkgToolchain)) {
+  throw "vcpkg was not found. Set VCPKG_ROOT or clone vcpkg into build/vcpkg and run bootstrap-vcpkg.bat."
+}
+& $CMakeCommand -S $MeshRepairSource -B $MeshRepairBuild -A x64 `
+  "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain" `
+  "-DVCPKG_TARGET_TRIPLET=x64-windows"
+if ($LASTEXITCODE -ne 0) { throw "CGAL mesh-repair worker configuration failed." }
+& $CMakeCommand --build $MeshRepairBuild --config Release
+if ($LASTEXITCODE -ne 0) { throw "CGAL mesh-repair worker build failed." }
 
 $ReconstructionDirectory = Join-Path $ProjectRoot "worker/dist/scanlan-worker"
 $ReconstructionExe = Join-Path $ReconstructionDirectory "scanlan-worker.exe"
@@ -191,10 +206,20 @@ if ($NeedsWorkerBuild) {
   Write-Host "Reconstruction worker is up to date."
 }
 
+$MeshRepairRuntime = Join-Path $MeshRepairBuild "Release"
+$MeshRepairExe = Join-Path $MeshRepairRuntime "scanlan-mesh-repair.exe"
+if (-not (Test-Path -LiteralPath $MeshRepairExe)) {
+  throw "The CGAL mesh-repair executable was not produced."
+}
+Copy-Item -LiteralPath $MeshRepairExe -Destination $ReconstructionDirectory -Force
+Get-ChildItem -LiteralPath $MeshRepairRuntime -Filter "*.dll" -File |
+  Copy-Item -Destination $ReconstructionDirectory -Force
+
 $KinectExe = Join-Path $KinectBuild "Release/kinect2-capture-worker.exe"
 $ModernCaptureExe = Join-Path $ModernCaptureBuild "Release/rgbd-capture-worker.exe"
 Write-Host "Kinect worker: $KinectExe"
 Write-Host "Azure Kinect / Femto Mega worker: $ModernCaptureExe"
 Write-Host "Reconstruction worker: $ReconstructionExe"
+Write-Host "Mesh repair worker: $MeshRepairExe"
 Write-Host "Reconstruction backend: $(if ($CudaWheel) { 'CUDA-capable Open3D' } else { 'CPU Open3D' })"
 Write-Host "All workers will be discovered and bundled automatically."

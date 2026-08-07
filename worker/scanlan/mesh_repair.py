@@ -404,6 +404,7 @@ def find_mesh_repair_backend() -> Path | None:
         [
             runtime_root / executable_name,
             runtime_root / "mesh-repair" / executable_name,
+            runtime_root.parent / "mesh-repair" / executable_name,
         ]
     )
     repository_root = Path(__file__).resolve().parents[2]
