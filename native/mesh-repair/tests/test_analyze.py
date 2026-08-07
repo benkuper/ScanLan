@@ -81,6 +81,28 @@ def assert_close(actual: float, expected: float, tolerance: float = 1e-9) -> Non
     assert math.isclose(actual, expected, rel_tol=tolerance, abs_tol=tolerance), (actual, expected)
 
 
+def run_repair(executable: Path, workspace: Path, name: str, input_path: Path,
+               topology: dict, selected_loops: list[dict], profile: str = "faithful") -> tuple[dict, Path]:
+    policy_path = workspace / f"{name}-policy.json"
+    output_path = workspace / f"{name}-repaired.ply"
+    report_path = workspace / f"{name}-repair.json"
+    policy = {
+        "schemaVersion": 1,
+        "algorithmVersion": "1.0.0",
+        "inputMeshFingerprint": topology["inputMeshFingerprint"],
+        "profile": profile,
+        "repairNonManifold": True,
+        "repairSelfIntersections": False,
+        "selectedLoops": selected_loops,
+    }
+    policy_path.write_text(json.dumps(policy, indent=2), encoding="utf-8")
+    command = [str(executable), "repair", "--input", str(input_path), "--policy",
+               str(policy_path), "--output", str(output_path), "--report", str(report_path)]
+    repaired = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert repaired.returncode == 0, repaired.stderr
+    return json.loads(report_path.read_text(encoding="utf-8")), output_path
+
+
 def main() -> None:
     executable = Path(sys.argv[1]).resolve()
     workspace = Path(sys.argv[2]).resolve()
@@ -119,6 +141,84 @@ def main() -> None:
     assert_close(loop["planeRmsResidualM"], 0.0)
     assert loop["loopId"].startswith("loop-")
     assert len(loop["orderedBoundaryPositions"]) == 4
+
+    selected_loop = {
+        "loopId": loop["loopId"],
+        "classification": "fill_measured",
+        "bestFitPlane": loop["bestFitPlane"],
+    }
+    repair_report, repaired_path = run_repair(
+        executable, workspace, "missing-face-cube", workspace / "missing-face-cube.ply",
+        missing, [selected_loop],
+    )
+    assert repair_report["status"] == "ok"
+    assert repair_report["profile"] == "faithful"
+    assert repair_report["originalVertexMaximumDisplacementM"] <= 1e-6
+    assert repair_report["unauthorizedLoopFillCount"] == 0
+    assert [entry["loopId"] for entry in repair_report["filledLoops"]] == [loop["loopId"]]
+    assert repair_report["filledLoops"][0]["triangleCountAdded"] == 2
+    validation_input = workspace / "repaired-cube-validation.ply"
+    validation_input.write_bytes(repaired_path.read_bytes())
+    validation_report = workspace / "repaired-cube-native-analysis.json"
+    validated = subprocess.run(
+        [str(executable), "analyze", "--input", str(validation_input), "--report",
+         str(validation_report), "--voxel-size-m", "0.008"],
+        capture_output=True, text=True, check=False,
+    )
+    assert validated.returncode == 0, validated.stderr
+    repaired_topology = json.loads(validation_report.read_text(encoding="utf-8"))
+    assert repaired_topology["topology"]["boundaryLoopCount"] == 0
+    assert repaired_topology["topology"]["nonManifoldVertexCount"] == 0
+    assert repaired_topology["mesh"]["triangleCount"] == 12
+
+    no_fill_report, no_fill_path = run_repair(
+        executable, workspace, "unauthorized-hole", workspace / "missing-face-cube.ply",
+        missing, [],
+    )
+    assert no_fill_report["filledLoops"] == []
+    no_fill_analysis = workspace / "unauthorized-hole-analysis.json"
+    no_fill = subprocess.run(
+        [str(executable), "analyze", "--input", str(no_fill_path), "--report",
+         str(no_fill_analysis), "--voxel-size-m", "0.008"],
+        capture_output=True, text=True, check=False,
+    )
+    assert no_fill.returncode == 0, no_fill.stderr
+    assert json.loads(no_fill_analysis.read_text(encoding="utf-8"))["topology"]["boundaryLoopCount"] == 1
+
+    architectural_report, _ = run_repair(
+        executable, workspace, "architectural-hole", workspace / "missing-face-cube.ply",
+        missing, [selected_loop], profile="architectural",
+    )
+    assert architectural_report["filledLoops"][0]["triangleCountAdded"] >= 2
+
+    natural_report, _ = run_repair(
+        executable, workspace, "natural-hole", workspace / "missing-face-cube.ply",
+        missing, [selected_loop], profile="natural",
+    )
+    assert natural_report["filledLoops"][0]["triangleCountAdded"] >= 2
+    assert natural_report["originalVertexMaximumDisplacementM"] <= 1e-6
+
+    stale_policy = workspace / "stale-policy.json"
+    stale_report = workspace / "stale-repair.json"
+    stale_output = workspace / "stale-output.ply"
+    stale_policy.write_text(json.dumps({
+        "schemaVersion": 1,
+        "algorithmVersion": "1.0.0",
+        "inputMeshFingerprint": {"algorithm": "sha256", "value": "0" * 64},
+        "profile": "faithful",
+        "selectedLoops": [selected_loop],
+    }), encoding="utf-8")
+    stale = subprocess.run(
+        [str(executable), "repair", "--input", str(workspace / "missing-face-cube.ply"),
+         "--policy", str(stale_policy), "--output", str(stale_output), "--report",
+         str(stale_report)],
+        capture_output=True, text=True, check=False,
+    )
+    assert stale.returncode != 0
+    assert not stale_output.exists()
+    stale_document = json.loads(stale_report.read_text(encoding="utf-8"))
+    assert stale_document["status"] == "error"
+    assert stale_document["error"]["code"] == "repair_failed"
 
     duplicate = run_analyze(executable, workspace, "duplicate-triangle", cube_vertices,
                             cube_faces + [cube_faces[0]])

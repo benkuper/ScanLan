@@ -4,6 +4,7 @@
   "builtin-baseline": "17f35ad2418007a895ced8a4cece4ab34068a58d",
   "dependencies": [
     "cgal",
+    "eigen3",
     "nlohmann-json"
   ]
 }

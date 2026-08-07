@@ -5,7 +5,9 @@ project(scanlan_mesh_repair VERSION 0.1.0 LANGUAGES CXX)
 include(CTest)
 
 find_package(CGAL 6 CONFIG REQUIRED)
+find_package(Eigen3 CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+include(CGAL_Eigen3_support)
 
 add_executable(scanlan-mesh-repair
   src/main.cpp
@@ -14,6 +16,7 @@ add_executable(scanlan-mesh-repair
 target_compile_features(scanlan-mesh-repair PRIVATE cxx_std_20)
 target_link_libraries(scanlan-mesh-repair PRIVATE
   CGAL::CGAL
+  CGAL::Eigen3_support
   nlohmann_json::nlohmann_json
 )
 
