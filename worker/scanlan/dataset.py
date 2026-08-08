@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from .mesh import PosedFrame
 
 
-DATASET_VERSION = "metric-rgbd-pinhole-720-v6-display-world"
+DATASET_VERSION = "hybrid-rgbd-media-pinhole-720-v7"
 CANONICAL_MAX_DIMENSION = 720
 MAX_CANONICAL_FRAMES = 600
 
@@ -101,15 +101,44 @@ def dataset_fingerprint(frames: list[PosedFrame]) -> str:
     digest.update(SEED_VERSION.encode("ascii"))
     seen_phases: set[Path] = set()
     for frame in frames:
+        digest.update(b"media" if frame.depthless else b"rgbd")
+        digest.update(frame.phase_id.encode("utf-8"))
+        digest.update(np.asarray(frame.camera_to_global, dtype="<f8").tobytes())
+        digest.update(np.asarray(frame.display_axes, dtype="<f8").tobytes())
+        if frame.depthless:
+            if frame.image_path is None or not frame.image_path.is_file():
+                raise FileNotFoundError("Localized media frame has no readable image")
+            stat = frame.image_path.stat()
+            digest.update(frame.image_path.name.encode("utf-8"))
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(str(stat.st_mtime_ns).encode("ascii"))
+            camera = frame.rgb_camera_override
+            if camera is None:
+                raise ValueError("Localized media frame has no calibrated camera")
+            digest.update(
+                json.dumps(
+                    {
+                        "width": camera.width,
+                        "height": camera.height,
+                        "fx": camera.fx,
+                        "fy": camera.fy,
+                        "cx": camera.cx,
+                        "cy": camera.cy,
+                        "model": camera.model,
+                        "distortion": camera.distortion,
+                        "inliers": frame.localization_inliers,
+                        "rmse": frame.localization_rmse_px,
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            continue
         if frame.source.root not in seen_phases:
             _hash_file(digest, frame.source.root / "phase.json")
             _hash_file(digest, frame.source.root / "frames.csv")
             seen_phases.add(frame.source.root)
         record = frame.source.frames[frame.frame_index]
-        digest.update(frame.phase_id.encode("utf-8"))
         digest.update(str(record.index).encode("ascii"))
-        digest.update(np.asarray(frame.camera_to_global, dtype="<f8").tobytes())
-        digest.update(np.asarray(frame.display_axes, dtype="<f8").tobytes())
         for path in (record.depth_path, record.color_path, record.rgb_path):
             if path is not None and path.is_file():
                 stat = path.stat()
@@ -144,6 +173,13 @@ def _display_world_matrix(
     return display_from_global @ np.asarray(world_from_camera, dtype=np.float64)
 
 
+def _localization_pose_confidence(frame: PosedFrame) -> float:
+    """Map explainable PnP evidence to a conservative training weight."""
+    inlier_score = min(1.0, max(0.0, frame.localization_inliers / 120.0))
+    rmse_score = min(1.0, max(0.0, (4.0 - frame.localization_rmse_px) / 3.5))
+    return round(max(0.2, 0.55 * inlier_score + 0.45 * rmse_score), 4)
+
+
 def build_posed_dataset(
     cache_root: Path,
     frames: list[PosedFrame],
@@ -172,103 +208,132 @@ def build_posed_dataset(
     records: list[dict[str, Any]] = []
     seed_batches: list[GaussianSeeds] = []
     for output_index, frame in enumerate(training_frames):
-        source_frame = frame.source.frames[frame.frame_index]
-        rgb_camera = frame_rgb_camera(source_frame, frame.source)
-        rgb_from_depth = frame_rgb_from_depth(source_frame, frame.source)
-        image = load_source_rgb(source_frame, frame.source)
+        source_frame = None if frame.depthless else frame.source.frames[frame.frame_index]
+        if frame.depthless:
+            if frame.image_path is None or frame.rgb_camera_override is None:
+                raise ValueError("Localized media needs an image and calibrated camera")
+            rgb_camera = frame.rgb_camera_override
+            with Image.open(frame.image_path) as source:
+                image = np.asarray(source.convert("RGB"), dtype=np.uint8).copy()
+        else:
+            assert source_frame is not None
+            rgb_camera = frame_rgb_camera(source_frame, frame.source)
+            image = load_source_rgb(source_frame, frame.source)
         if image.shape[:2] != (rgb_camera.height, rgb_camera.width):
             image = np.asarray(
                 Image.fromarray(image).resize((rgb_camera.width, rgb_camera.height), Image.Resampling.LANCZOS),
                 dtype=np.uint8,
             )
-        depth = load_depth(source_frame, frame.source.camera)
         dataset_camera = scaled_pinhole_camera(
             rgb_camera,
             CANONICAL_MAX_DIMENSION,
         )
-        depth_rgb, uv_map, visibility = rgb_depth_zbuffer(
-            depth,
-            frame.source,
-            source_frame,
-            output_camera=dataset_camera,
-        )
-        mask = robust_depth_mask(depth_rgb)
-        world_from_depth = _display_world_matrix(
-            world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
-            frame.display_axes,
-        )
-        seeds = seed_rgbd_gaussians(
-            depth,
-            image,
-            uv_map,
-            visibility,
-            frame.source.camera,
-            world_from_depth,
-        )
-        if len(seeds.points):
-            seed_batches.append(seeds)
-            if len(seed_batches) >= 8:
-                seed_batches[:] = [
-                    compact_seed_batches(
-                        seed_batches,
-                        limit=MAX_INITIAL_GAUSSIANS * 2,
-                    )
-                ]
+        depth_rgb = None
+        mask = None
+        if frame.depthless:
+            world_from_rgb = _display_world_matrix(
+                world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
+                frame.display_axes,
+            )
+        else:
+            assert source_frame is not None
+            rgb_from_depth = frame_rgb_from_depth(source_frame, frame.source)
+            depth = load_depth(source_frame, frame.source.camera)
+            depth_rgb, uv_map, visibility = rgb_depth_zbuffer(
+                depth,
+                frame.source,
+                source_frame,
+                output_camera=dataset_camera,
+            )
+            mask = robust_depth_mask(depth_rgb)
+            world_from_depth = _display_world_matrix(
+                world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
+                frame.display_axes,
+            )
+            seeds = seed_rgbd_gaussians(
+                depth,
+                image,
+                uv_map,
+                visibility,
+                frame.source.camera,
+                world_from_depth,
+            )
+            if len(seeds.points):
+                seed_batches.append(seeds)
+                if len(seed_batches) >= 8:
+                    seed_batches[:] = [
+                        compact_seed_batches(
+                            seed_batches,
+                            limit=MAX_INITIAL_GAUSSIANS * 2,
+                        )
+                    ]
+            world_from_rgb = _display_world_matrix(
+                world_from_rgb_camera(
+                    frame.camera_to_global,
+                    frame.image_y_up,
+                    rgb_from_depth,
+                ),
+                frame.display_axes,
+            )
         image, rgb_valid = undistort_rgb_to_pinhole(
             image,
             rgb_camera,
             dataset_camera,
         )
-        mask &= rgb_valid
+        if mask is not None:
+            mask &= rgb_valid
         stem = f"{output_index:06}"
         Image.fromarray(image).save(
             temporary / "images" / f"{stem}.jpg",
             quality=95,
             optimize=True,
         )
-        _save_depth_png(temporary / "depths" / f"{stem}.png", depth_rgb)
-        Image.fromarray(mask.astype(np.uint8) * 255).save(
-            temporary / "masks" / f"{stem}.png",
-            compress_level=3,
-        )
-        world_from_rgb = _display_world_matrix(
-            world_from_rgb_camera(
-                frame.camera_to_global,
-                frame.image_y_up,
-                rgb_from_depth,
+        record: dict[str, Any] = {
+            "image": f"images/{stem}.jpg",
+            "worldFromRgbCamera": [round(float(value), 10) for value in world_from_rgb.reshape(-1)],
+            "intrinsics": {
+                "width": dataset_camera.width,
+                "height": dataset_camera.height,
+                "fx": dataset_camera.fx,
+                "fy": dataset_camera.fy,
+                "cx": dataset_camera.cx,
+                "cy": dataset_camera.cy,
+                "model": "pinhole",
+                "distortion": [],
+            },
+            "timestampUs": (
+                0
+                if source_frame is None
+                else source_frame.rgb_timestamp_us
+                if frame_uses_native_rgb(source_frame) and source_frame.rgb_timestamp_us is not None
+                else source_frame.timestamp_us
             ),
-            frame.display_axes,
-        )
-        records.append(
-            {
-                "image": f"images/{stem}.jpg",
-                "depth": f"depths/{stem}.png",
-                "depthMask": f"masks/{stem}.png",
-                "worldFromRgbCamera": [round(float(value), 10) for value in world_from_rgb.reshape(-1)],
-                "intrinsics": {
-                    "width": dataset_camera.width,
-                    "height": dataset_camera.height,
-                    "fx": dataset_camera.fx,
-                    "fy": dataset_camera.fy,
-                    "cx": dataset_camera.cx,
-                    "cy": dataset_camera.cy,
-                    "model": "pinhole",
-                    "distortion": [],
-                },
-                "timestampUs": (
-                    source_frame.rgb_timestamp_us
-                    if frame_uses_native_rgb(source_frame) and source_frame.rgb_timestamp_us is not None
-                    else source_frame.timestamp_us
-                ),
-                "phaseId": frame.phase_id,
-                "frameIndex": source_frame.index,
-                "metric": True,
-            }
-        )
+            "phaseId": frame.phase_id,
+            "frameIndex": output_index if source_frame is None else source_frame.index,
+            "metric": not frame.depthless,
+            "metricAnchor": not frame.depthless,
+            "sourceType": "high_quality_media" if frame.depthless else "rgbd",
+            "poseConfidence": _localization_pose_confidence(frame) if frame.depthless else 1.0,
+        }
+        if depth_rgb is not None and mask is not None:
+            _save_depth_png(temporary / "depths" / f"{stem}.png", depth_rgb)
+            Image.fromarray(mask.astype(np.uint8) * 255).save(
+                temporary / "masks" / f"{stem}.png",
+                compress_level=3,
+            )
+            record.update(
+                depth=f"depths/{stem}.png",
+                depthMask=f"masks/{stem}.png",
+            )
+        records.append(record)
         if progress:
             progress(
                 "Preparing splat data",
-                f"Reprojected calibrated RGB depth {output_index + 1} of {len(training_frames)}",
+                (
+                    f"Prepared localized high-quality view {output_index + 1} of {len(training_frames)}"
+                    if frame.depthless
+                    else f"Reprojected calibrated RGB depth {output_index + 1} of {len(training_frames)}"
+                ),
                 0,
                 None,
                 (output_index + 1) / len(training_frames),
@@ -283,8 +348,11 @@ def build_posed_dataset(
         scales=seeds.scales,
         quaternions=seeds.quaternions,
     )
+    hybrid = any(frame.depthless for frame in training_frames)
+    rgbd_frame_count = sum(not frame.depthless for frame in training_frames)
+    media_frame_count = len(training_frames) - rgbd_frame_count
     payload: dict[str, Any] = {
-        "schemaVersion": 3,
+        "schemaVersion": 4 if hybrid else 3,
         "fingerprint": fingerprint,
         "coordinateConvention": {
             "handedness": "right",
@@ -295,14 +363,23 @@ def build_posed_dataset(
             "matrixStorage": "row-major",
         },
         "metric": True,
+        "sourceMode": "hybrid" if hybrid else "rgbd",
         "sourceFrameCount": len(frames),
         "trainingFrameCount": len(training_frames),
+        "rgbdTrainingFrameCount": rgbd_frame_count,
+        "mediaTrainingFrameCount": media_frame_count,
         "frames": records,
         "initialization": "initialization.ply",
         "initializationParameters": "initialization-2dgs.npz",
         "gaussianRepresentation": "2d_surface_discs",
         "seedVersion": SEED_VERSION,
         "initialGaussianCount": int(len(seeds.points)),
+        "poseRefinement": hybrid,
+        "appearanceOptimization": hybrid,
+        "appearanceAnchorIndex": next(
+            (index for index, record in enumerate(records) if record["metricAnchor"]),
+            0,
+        ),
     }
     write_json(temporary / "dataset.json", payload)
     datasets_root.mkdir(parents=True, exist_ok=True)

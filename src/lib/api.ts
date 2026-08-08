@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ArtifactJob, ArtifactTarget, AvailableSensor, BoundingBoxClip, CaptureSettings, CaptureStatus, CloudTransform, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
+import type { ArtifactJob, ArtifactTarget, AvailableSensor, BoundingBoxClip, BuildReusePolicy, CaptureSettings, CaptureStatus, CloudTransform, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
 
 const inTauri = () => typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
 
@@ -55,6 +55,14 @@ export async function importMediaSources(
 ): Promise<ProjectSummary> {
   requireDesktop();
   return invoke<ProjectSummary>('import_media_sources', { projectPath, mediaPaths });
+}
+
+export async function removeMediaSource(
+  projectPath: string,
+  mediaSourceId: string
+): Promise<ProjectSummary> {
+  requireDesktop();
+  return invoke<ProjectSummary>('remove_media_source', { projectPath, mediaSourceId });
 }
 
 export async function updateProjectSettings(
@@ -234,11 +242,16 @@ export async function loadLiveReconstructionMesh(afterFrame: number): Promise<{ 
 export async function startArtifactJob(
   projectPath: string,
   targets: ArtifactTarget[],
-  iterations = 30_000
+  iterations = 30_000,
+  reusePolicy: BuildReusePolicy = { mediaRestart: 'reuse', rebuildRgbd: false }
 ): Promise<ArtifactJob> {
   requireDesktop();
   return invoke<ArtifactJob>('start_artifact_job', {
-    projectPath, targets, iterations
+    projectPath,
+    targets,
+    iterations,
+    mediaRestart: reusePolicy.mediaRestart,
+    rebuildRgbd: reusePolicy.rebuildRgbd
   });
 }
 

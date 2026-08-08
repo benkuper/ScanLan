@@ -236,7 +236,19 @@ def _camera_payload(frame: PosedFrame, textured: bool) -> dict[str, Any]:
     }
 
 
-def _load_supplemental_texture_frames(
+def write_camera_pose_manifest(
+    output_dir: Path,
+    frames: list[PosedFrame],
+) -> None:
+    """Publish metric RGB-D cameras before appearance-source localization."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(
+        output_dir / "camera-poses.json",
+        [_camera_payload(frame, False) for frame in frames],
+    )
+
+
+def load_supplemental_observation_frames(
     project_root: Path,
     reference_frame: PosedFrame,
 ) -> list[PosedFrame]:
@@ -811,6 +823,68 @@ def _frame_observations(
     uvs = np.column_stack((rgb_u, rgb_v))
     uvs[~valid] = np.nan
     return colors, weights, loose_weights.astype(np.float32), uvs.astype(np.float32)
+
+
+def enhance_point_colors_from_media(
+    points: np.ndarray,
+    colors: np.ndarray,
+    frames: list[PosedFrame],
+    voxel_size_m: float,
+    progress: Callable[..., None] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Recolor fixed metric points from the sharpest visible localized media."""
+    media_frames = _select_texture_frames([frame for frame in frames if frame.depthless])
+    if not media_frames or not len(points):
+        return colors, {"mediaPointColorFrameCount": 0, "mediaPointColorCoveragePercent": 0.0}
+    points = np.asarray(points, dtype=np.float32)
+    output = np.asarray(colors, dtype=np.uint8).copy()
+    # Point clouds do not carry stable normals. Visibility, image border,
+    # distance, source resolution and localization confidence still provide a
+    # useful winner-takes-sharpest-view score without altering metric geometry.
+    neutral_normals = np.zeros_like(points, dtype=np.float32)
+    indices = np.arange(len(points), dtype=np.int64)
+    best_weights = np.zeros(len(points), dtype=np.float32)
+    best_colors = np.zeros((len(points), 3), dtype=np.float32)
+    for frame_index, frame in enumerate(media_frames):
+        # Published point clouds already use ScanLan display-world axes, while
+        # localized cameras are stored in reconstruction-world axes.
+        projection_frame = replace(
+            frame,
+            camera_to_global=np.diag([*frame.display_axes, 1.0])
+            @ np.asarray(frame.camera_to_global, dtype=np.float64),
+            display_axes=(1.0, 1.0, 1.0),
+        )
+        sampled, strict_weights, _, _ = _frame_observations(
+            points,
+            neutral_normals,
+            projection_frame,
+            voxel_size_m,
+            indices,
+        )
+        inlier_confidence = min(1.0, max(0.2, frame.localization_inliers / 120.0))
+        rmse_confidence = min(
+            1.0,
+            max(0.2, (4.0 - frame.localization_rmse_px) / 3.5),
+        )
+        view_weights = strict_weights * (0.55 * inlier_confidence + 0.45 * rmse_confidence)
+        better = view_weights > best_weights
+        best_weights[better] = view_weights[better]
+        best_colors[better] = sampled[better]
+        if progress:
+            progress(
+                "Coloring point cloud",
+                f"Projected high-quality view {frame_index + 1} of {len(media_frames)}",
+                0,
+                len(points),
+                (frame_index + 1) / len(media_frames),
+            )
+    covered = best_weights > 0.0
+    if np.any(covered):
+        output[covered] = _linear_to_srgb(best_colors[covered])
+    return output, {
+        "mediaPointColorFrameCount": len(media_frames),
+        "mediaPointColorCoveragePercent": round(100.0 * float(np.mean(covered)), 2),
+    }
 
 
 def _calibration_vertex_indices(vertex_count: int) -> np.ndarray:
@@ -2357,7 +2431,7 @@ def build_mesh_artifacts(
                 *extra,
             )
     normals = _vertex_normals(vertices, triangles)
-    supplemental_frames = _load_supplemental_texture_frames(output_dir.parent, frames[0])
+    supplemental_frames = load_supplemental_observation_frames(output_dir.parent, frames[0])
     texture_candidates = [*frames, *supplemental_frames]
     texture_frames = _select_texture_frames_for_mesh(texture_candidates, vertices, normals)
     texture_frames, refined_pose_count, mean_pose_translation, mean_pose_rotation = (

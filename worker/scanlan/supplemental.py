@@ -51,18 +51,40 @@ def write_localization_progress(
     localized_photos: int = 0,
     failed_photos: int = 0,
 ) -> None:
+    payload = {
+        "schemaVersion": 1,
+        "status": status,
+        "stage": stage,
+        "detail": detail,
+        "progress": round(float(np.clip(progress, 0.0, 1.0)), 5),
+        "processedPhotos": processed_photos,
+        "totalPhotos": total_photos,
+        "localizedPhotos": localized_photos,
+        "failedPhotos": failed_photos,
+    }
     write_json(
         project_root / "outputs" / "photo-localization-progress.json",
+        payload,
+    )
+    # Artifact jobs poll the standard reconstruction progress file. Mirror the
+    # same measured localization work there so hybrid builds remain observable;
+    # standalone photo localization continues to use its richer manifest.
+    write_json(
+        project_root / "outputs" / "progress.json",
         {
-            "schemaVersion": 1,
-            "status": status,
-            "stage": stage,
+            "stage": "media_localization" if status != "failed" else "failed",
             "detail": detail,
-            "progress": round(float(np.clip(progress, 0.0, 1.0)), 5),
-            "processedPhotos": processed_photos,
-            "totalPhotos": total_photos,
-            "localizedPhotos": localized_photos,
-            "failedPhotos": failed_photos,
+            "progress": payload["progress"],
+            "stageProgress": payload["progress"],
+            "etaSeconds": None,
+            "stageEtaSeconds": None,
+            "computeBackend": "Depth-backed feature localization / PnP",
+            "metrics": {
+                "processedMedia": processed_photos,
+                "totalMedia": total_photos,
+                "localizedMedia": localized_photos,
+                "rejectedMedia": failed_photos,
+            },
         },
     )
 
@@ -72,6 +94,11 @@ def _photo_id(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     except OSError:
         return hashlib.sha256(str(path).encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _reference_fingerprint(path: Path) -> str:
+    """Identify the metric camera map used to validate a localized image."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:24]
 
 
 def _photo_quality(
@@ -443,8 +470,16 @@ def _copy_normalized_photo(project_root: Path, source_path: Path, rgb: np.ndarra
     return destination
 
 
-def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) -> dict[str, Any]:
+def localize_supplemental_photos(
+    project_root: Path,
+    photo_paths: list[Path],
+    observation_metadata: dict[Path, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     cv2 = _opencv()
+    metadata_by_path = {
+        str(Path(path).resolve()): value
+        for path, value in (observation_metadata or {}).items()
+    }
     total_photo_count = len(photo_paths)
     write_localization_progress(
         project_root,
@@ -479,7 +514,7 @@ def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) ->
     for photo_path in photo_paths:
         queued_path = Path(photo_path)
         queued_id = _photo_id(queued_path)
-        if queued_id not in photos_by_id:
+        if queued_id not in photos_by_id and queued_id not in attempts_by_id:
             attempts_by_id[queued_id] = {
                 "id": queued_id,
                 "name": queued_path.stem,
@@ -500,6 +535,53 @@ def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) ->
     pose_path = project_root / "outputs" / "camera-poses.json"
     if not pose_path.is_file():
         raise RuntimeError("Build the RGB-D mesh once before localizing supplemental photos")
+    reference_fingerprint = _reference_fingerprint(pose_path)
+    pending_paths: list[Path] = []
+    cached_localized: list[dict[str, Any]] = []
+    cached_failures: list[dict[str, str]] = []
+    for photo_path in photo_paths:
+        source_id = _photo_id(Path(photo_path))
+        cached_photo = photos_by_id.get(source_id)
+        cached_attempt = attempts_by_id.get(source_id)
+        if (
+            cached_photo is not None
+            and cached_photo.get("referenceFingerprint") == reference_fingerprint
+        ):
+            cached_localized.append(cached_photo)
+        elif (
+            cached_attempt is not None
+            and cached_attempt.get("status") == "rejected"
+            and cached_attempt.get("referenceFingerprint") == reference_fingerprint
+        ):
+            cached_failures.append(cached_attempt)
+        else:
+            pending_paths.append(Path(photo_path))
+    if not pending_paths:
+        write_localization_progress(
+            project_root,
+            status="complete",
+            stage="complete",
+            detail=(
+                f"Reused camera analysis for {len(cached_localized)} localized and "
+                f"{len(cached_failures)} rejected media observations"
+            ),
+            progress=1.0,
+            processed_photos=total_photo_count,
+            total_photos=total_photo_count,
+            localized_photos=len(cached_localized),
+            failed_photos=len(cached_failures),
+        )
+        return {
+            "localizedPhotoCount": len(cached_localized),
+            "failedPhotoCount": len(cached_failures),
+            "localized": cached_localized,
+            "failures": cached_failures,
+            "manifestPath": str(manifest_path),
+            "cacheHit": True,
+            "referenceFingerprint": reference_fingerprint,
+        }
+    photo_paths = pending_paths
+    total_photo_count = len(photo_paths)
     camera_poses = json.loads(pose_path.read_text(encoding="utf-8"))
     selected_candidates = _localization_pose_candidates(camera_poses)
     if not selected_candidates:
@@ -551,6 +633,7 @@ def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) ->
     failures: list[dict[str, str]] = []
     retrieval_matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
     matcher = cv2.BFMatcher(cv2.NORM_L2)
+    previous_video_pose_by_source: dict[str, np.ndarray] = {}
 
     for photo_index, source_path in enumerate(photo_paths):
         source_path = Path(source_path)
@@ -590,6 +673,7 @@ def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) ->
             source_path = source_path.resolve(strict=True)
             source_id = _photo_id(source_path)
             source_name = source_path.stem
+            metadata = metadata_by_path.get(str(source_path), {})
             rgb, width, height, exif_focal = _normalized_photo(source_path)
             feature_rgb, feature_scale = _scaled_feature_image(rgb)
             feature_height, feature_width = feature_rgb.shape[:2]
@@ -607,9 +691,33 @@ def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) ->
                 )
                 for reference in retrieval_descriptors
             ]
+            temporal_source = (
+                str(metadata.get("sourcePath", ""))
+                if metadata.get("sourceType") == "video"
+                else ""
+            )
+            prior_pose = previous_video_pose_by_source.get(temporal_source)
+            maximum_retrieval_score = max(retrieval_scores, default=1)
             candidate_indices = sorted(
                 range(len(retrieval_scores)),
-                key=lambda index: retrieval_scores[index],
+                key=lambda index: (
+                    retrieval_scores[index]
+                    + (
+                        0.35
+                        * maximum_retrieval_score
+                        * math.exp(
+                            -float(
+                                np.linalg.norm(
+                                    reference_sources[index][2][:3, 3]
+                                    - prior_pose[:3, 3]
+                                )
+                            )
+                            / 1.25
+                        )
+                        if prior_pose is not None
+                        else 0.0
+                    )
+                ),
                 reverse=True,
             )[:MAX_RETRIEVAL_CANDIDATES]
             if not candidate_indices:
@@ -795,7 +903,14 @@ def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) ->
                 "referenceDistanceMeters": round(reference_distance_m, 4),
                 "qualityScore": quality_score,
                 "qualityLabel": quality_label,
+                "sourceType": metadata.get("sourceType", "photo"),
+                "sourceTimestampSeconds": metadata.get("timestampSeconds"),
+                "sourceSharpness": metadata.get("sharpness"),
+                "temporalPriorUsed": prior_pose is not None,
+                "referenceFingerprint": reference_fingerprint,
             }
+            if temporal_source:
+                previous_video_pose_by_source[temporal_source] = world_from_camera
             photos_by_id[photo_id] = payload
             attempts_by_id[photo_id] = {**payload, "status": "localized"}
             localized.append(payload)
@@ -809,6 +924,7 @@ def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) ->
                 "qualityScore": 0,
                 "qualityLabel": "Rejected",
                 "error": str(error),
+                "referenceFingerprint": reference_fingerprint,
             }
             failures.append(failure)
             if source_id not in photos_by_id:
@@ -866,4 +982,6 @@ def localize_supplemental_photos(project_root: Path, photo_paths: list[Path]) ->
         "localized": localized,
         "failures": failures,
         "manifestPath": str(manifest_path),
+        "cacheHit": False,
+        "referenceFingerprint": reference_fingerprint,
     }

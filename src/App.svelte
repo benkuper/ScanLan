@@ -26,6 +26,7 @@
     loadPreviewMesh,
     openProject,
     removeCapture,
+    removeMediaSource,
     removeSupplementalPhoto,
     resumeArtifactJob,
     runtimeInfo,
@@ -50,6 +51,8 @@
     CloudTransform,
     DepthFieldOfView,
     LiveReconstructionMode,
+    MediaRestartStage,
+    MediaSourceSummary,
     MeshRepairProfile,
     MeshViewMode,
     PackedPreviewFrame,
@@ -110,6 +113,8 @@
   let buildTexturedMesh = true;
   let buildGaussianSplat = false;
   let splatIterations = 30_000;
+  let mediaRestartStage: MediaRestartStage = 'reuse';
+  let rebuildRgbdPreparation = false;
 
   let busy = false;
   let discovering = false;
@@ -169,6 +174,7 @@
   $: completedCaptures = project?.phases.filter((capture) => capture.status === 'complete').length ?? 0;
   $: totalFrames = project?.phases.reduce((sum, capture) => sum + capture.frameCount, 0) ?? 0;
   $: mediaSourceCount = project?.mediaSources.length ?? 0;
+  $: if (mediaSourceCount === 0) mediaRestartStage = 'reuse';
   $: mediaOnlyProject = mediaSourceCount > 0 && completedCaptures === 0;
   $: if (mediaOnlyProject) {
     buildPointCloud = false;
@@ -233,6 +239,13 @@
     const minutes = Math.floor(seconds / 60);
     const remainder = Math.round(seconds % 60);
     return minutes ? `${minutes}m ${remainder}s` : `${remainder}s`;
+  }
+
+  function formatByteSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   }
 
   function formatProjectDate(value: string): string {
@@ -1222,11 +1235,27 @@
         previewSplat = null;
         lastBuildSplatSignature = '';
       }
-      activeJob = await startArtifactJob(project.path, targets, splatIterations);
+      activeJob = await startArtifactJob(project.path, targets, splatIterations, {
+        mediaRestart: mediaRestartStage,
+        rebuildRgbd: rebuildRgbdPreparation
+      });
       workspace = 'reconstruct';
-      message = mediaOnlyProject
+      const restartDetail = mediaRestartStage === 'decode'
+        ? ' Media decoding and analysis will be rebuilt.'
+        : mediaRestartStage === 'analysis'
+          ? ' Decoded media will be reused; camera analysis will be rebuilt.'
+          : rebuildRgbdPreparation
+            ? mediaSourceCount > 0
+              ? ' Decoded media will be reused; RGB-D tracking and downstream analysis will be rebuilt.'
+              : ' RGB-D tracking, fusion, and downstream outputs will be rebuilt.'
+            : mediaSourceCount > 0
+              ? ' Valid decoded and analyzed data will be reused.'
+              : ' Valid reconstruction caches will be reused.';
+      message = (mediaOnlyProject
         ? 'Started photo/video camera solving and photoreal Gaussian reconstruction.'
-        : 'Started quality-gated RGB-D reconstruction.';
+        : mediaSourceCount > 0
+          ? 'Started metric RGB-D reconstruction with high-resolution media enhancement.'
+          : 'Started quality-gated RGB-D reconstruction.') + restartDetail;
     } catch (error) {
       message = errorText(error);
     } finally {
@@ -1254,11 +1283,37 @@
         packedPreviewFrame = null;
       }
       project = await importMediaSources(project.path, paths);
-      buildPointCloud = false;
-      buildTexturedMesh = false;
+      buildPointCloud = completedCaptures > 0;
+      buildTexturedMesh = completedCaptures > 0;
       buildGaussianSplat = true;
       workspace = 'reconstruct';
-      message = `Imported ${paths.length} source${paths.length === 1 ? '' : 's'}. Ready to solve cameras and train a photoreal 3D Gaussian splat.`;
+      message = completedCaptures > 0
+        ? `Imported ${paths.length} high-resolution source${paths.length === 1 ? '' : 's'}. They will enhance point colors, mesh textures, and splat appearance.`
+        : `Imported ${paths.length} source${paths.length === 1 ? '' : 's'}. Ready to solve cameras and train a photoreal 3D Gaussian splat.`;
+    } catch (error) {
+      message = errorText(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function removeImportedMediaSource(source: MediaSourceSummary): Promise<void> {
+    if (!project || busy || processing || capturing) return;
+    const invalidation = readyArtifacts > 0
+      ? ' Existing reconstruction outputs will be marked stale.'
+      : '';
+    if (!window.confirm(`Remove ${source.name} from this project? ScanLan's imported copy will be deleted; the original file remains untouched.${invalidation}`)) return;
+    busy = true;
+    try {
+      project = await removeMediaSource(project.path, source.id);
+      previewPoints = [];
+      previewMesh = null;
+      previewSplat = null;
+      lastBuildSplatSignature = '';
+      captureDraftFrame = completedCaptures > 0
+        ? parsePointPacket(await loadCaptureDraft(project.path).catch(() => new ArrayBuffer(0)))
+        : null;
+      message = `${source.name} removed. ${project.mediaSources.length} imported source${project.mediaSources.length === 1 ? '' : 's'} remaining.${invalidation}`;
     } catch (error) {
       message = errorText(error);
     } finally {
@@ -1815,21 +1870,30 @@
             </div>
           {/if}
           <p>{activeJob.detail}</p>
+          <div class="job-meta">
+            <span>{activeJob.computeBackend ?? 'Waiting for worker'}</span>
+            <span>{activeJob.elapsedSeconds != null ? `${formatDuration(activeJob.elapsedSeconds)} elapsed` : ''}</span>
+          </div>
         </div>
       {/if}
     </section>
 
     <aside>
       {#if !project}
-        <section class="panel"><div class="spinner"></div><h2>Starting ScanLan</h2><p>{message}</p></section>
+        <details class="panel collapsible-panel" open>
+          <summary><span>SCANLAN</span><strong>STARTING</strong></summary>
+          <div class="collapsible-body startup-panel"><div class="spinner"></div><h2>Starting ScanLan</h2><p>{message}</p></div>
+        </details>
       {:else if workspace === 'capture'}
-        <section class="panel panel-heading">
+        <header class="workspace-heading">
           <div><span>RGB-D SOURCE</span><h2>{liveSensor ? sensor?.sensorName ?? 'Live camera' : 'Camera & live fusion'}</h2></div>
           <button class="icon-button" on:click={discoverSensors} disabled={discovering || selectingSensor || capturing || processing} title="Refresh cameras">↻</button>
-        </section>
+        </header>
 
-        <section class="panel settings">
-          <label>Capture source
+        <details class="panel collapsible-panel" open>
+          <summary><span>CAPTURE SETTINGS</span><strong>{project.settings.sensorKind.replaceAll('_', ' ').toUpperCase()}</strong></summary>
+          <div class="collapsible-body settings">
+            <label>Capture source
             <select value={currentSensorKey} on:change={chooseSensor} disabled={capturing || processing || discovering || selectingSensor}>
               {#if !sensors.some((item) => sensorKey(item) === currentSensorKey)}
                 <option value={currentSensorKey}>{project.settings.sensorKind.replaceAll('_', ' ')} · configured</option>
@@ -1893,8 +1957,9 @@
             {#if project.settings.sensorConnection === 'network'}
               <label>Camera address<input value={project.settings.sensorAddress} placeholder="192.168.1.10" on:change={(event) => updateSetting('sensorAddress', inputValue(event))} disabled={capturing || processing}/></label>
             {/if}
-          {/if}
-        </section>
+            {/if}
+          </div>
+        </details>
 
         <details class="panel advanced-settings" open>
           <summary><span>RGB CAMERA</span><strong>{project.settings.sensorKind === 'kinect_v2' ? 'FIXED BY SDK' : 'SENSOR + ARCHIVE'}</strong></summary>
@@ -2003,70 +2068,82 @@
         </details>
 
         {#if !capturing}
-          <section class="panel connection-card" class:connected={selectedSensorConnected} class:warning={!selectedSensorConnected}>
-            <div class="tracking-title"><i></i><div>
-              <strong>{selectedSensorConnected ? 'Connected' : project.settings.sensorKind === 'kinect_v2' ? 'Ready to open' : 'Camera not connected'}</strong>
-              <small>{selectedSensor?.name ?? project.settings.sensorKind.replaceAll('_', ' ')}</small>
-            </div></div>
-            <p>{selectedSensorConnected
-              ? previewing
-                ? `${sensor?.sensorStatus ?? 'Live point-cloud preview is active.'} Capture starts recording immediately.`
-                : `${selectedSensor?.connection.toUpperCase()}${selectedSensor?.serial ? ` · ${selectedSensor.serial}` : ''} · Starting live point-cloud preview…`
-              : project.settings.sensorKind === 'kinect_v2'
-                ? 'Kinect v2 has no passive connection query; it is verified when capture starts.'
-                : 'Plug in the selected camera or refresh the source list. Connection state is checked automatically.'}</p>
-          </section>
+          <details class="panel collapsible-panel connection-card" class:connected={selectedSensorConnected} class:warning={!selectedSensorConnected} open>
+            <summary><span>DEVICE</span><strong class:good={selectedSensorConnected}>{selectedSensorConnected ? 'CONNECTED' : project.settings.sensorKind === 'kinect_v2' ? 'READY TO OPEN' : 'NOT CONNECTED'}</strong></summary>
+            <div class="collapsible-body status-body">
+              <div class="tracking-title"><i></i><div>
+                <strong>{selectedSensorConnected ? 'Connected' : project.settings.sensorKind === 'kinect_v2' ? 'Ready to open' : 'Camera not connected'}</strong>
+                <small>{selectedSensor?.name ?? project.settings.sensorKind.replaceAll('_', ' ')}</small>
+              </div></div>
+              <p>{selectedSensorConnected
+                ? previewing
+                  ? `${sensor?.sensorStatus ?? 'Live point-cloud preview is active.'} Capture starts recording immediately.`
+                  : `${selectedSensor?.connection.toUpperCase()}${selectedSensor?.serial ? ` · ${selectedSensor.serial}` : ''} · Starting live point-cloud preview…`
+                : project.settings.sensorKind === 'kinect_v2'
+                  ? 'Kinect v2 has no passive connection query; it is verified when capture starts.'
+                  : 'Plug in the selected camera or refresh the source list. Connection state is checked automatically.'}</p>
+            </div>
+          </details>
         {/if}
 
         {#if liveSensor && sensor}
-          <section class="panel tracking-card" class:warning={!sensor.tracking}>
-            <div class="tracking-title"><i></i><div><strong>{sensor.trackingStatus}</strong><small>{sensor.liveReconstructionBackend ?? 'Realtime engine'}</small></div></div>
-            <div class="mini-grid">
-              <div><span>Sensor</span><strong>{sensor.streamFps.toFixed(1)} fps</strong></div>
-              <div><span>{capturing ? 'Raw archive' : 'Recording'}</span><strong>{capturing ? sensor.frameCount : 'OFF'}</strong></div>
-              <div><span>{capturing ? 'Tracked' : 'Frames seen'}</span><strong>{capturing ? Math.max(0, sensor.liveProcessedFrameCount - sensor.liveRejectedFrameCount) : sensor.liveProcessedFrameCount}</strong></div>
-              <div><span>Rejected</span><strong>{sensor.liveRejectedFrameCount}</strong></div>
-              <div><span>Source drops</span><strong>{sensor.sourceDropCount}</strong></div>
+          <details class="panel collapsible-panel tracking-card" class:warning={!sensor.tracking} open>
+            <summary><span>LIVE TRACKING</span><strong class:good={sensor.tracking}>{sensor.tracking ? 'LOCKED' : 'SEARCHING'}</strong></summary>
+            <div class="collapsible-body status-body">
+              <div class="tracking-title"><i></i><div><strong>{sensor.trackingStatus}</strong><small>{sensor.liveReconstructionBackend ?? 'Realtime engine'}</small></div></div>
+              <div class="mini-grid">
+                <div><span>Sensor</span><strong>{sensor.streamFps.toFixed(1)} fps</strong></div>
+                <div><span>{capturing ? 'Raw archive' : 'Recording'}</span><strong>{capturing ? sensor.frameCount : 'OFF'}</strong></div>
+                <div><span>{capturing ? 'Tracked' : 'Frames seen'}</span><strong>{capturing ? Math.max(0, sensor.liveProcessedFrameCount - sensor.liveRejectedFrameCount) : sensor.liveProcessedFrameCount}</strong></div>
+                <div><span>Rejected</span><strong>{sensor.liveRejectedFrameCount}</strong></div>
+                <div><span>Source drops</span><strong>{sensor.sourceDropCount}</strong></div>
+              </div>
+              <p>Raw RGB-D stays recoverable for the offline pass. Rejected live poses never enter the fused map; hold a previously scanned view steady to relocalize.</p>
             </div>
-            <p>Raw RGB-D stays recoverable for the offline pass. Rejected live poses never enter the fused map; hold a previously scanned view steady to relocalize.</p>
-          </section>
+          </details>
         {/if}
 
         <button class:stop={capturing} class="capture-button" on:click={captureAction} disabled={busy || selectingSensor || processing || photoLocalizationActive || (!capturing && (mediaSourceCount > 0 || (runtime && !runtime.sensorWorkerAvailable)))}>
           <i></i><span>{capturing ? 'Stop & save take' : busy ? 'Starting recording…' : 'Start capture'}</span>
         </button>
-        <button class="ghost full" on:click={addMediaSource} disabled={busy || capturing || processing || completedCaptures > 0 || !runtime?.splatWorkerAvailable}>Import photos or video for Gaussian splatting…</button>
+        <button class="ghost full" on:click={addMediaSource} disabled={busy || capturing || processing || !runtime?.splatWorkerAvailable}>Import high-quality photos or video…</button>
 
-        <section class="panel takes">
-          <div class="section-title"><span>RECORDED TAKES</span><strong>{totalFrames.toLocaleString()} raw frames</strong></div>
-          {#if project.phases.length === 0}
-            <p class="empty-copy">No RGB-D takes yet. Tracking runs at sensor rate; the archive rate only controls frames kept for the production pass.</p>
-          {:else}
-            {#each project.phases as capture, index}
-              <article>
-                <span class="take-number">{String(index + 1).padStart(2, '0')}</span>
-                <div><strong>{capture.name}</strong><small>{capture.frameCount.toLocaleString()} raw frames · {formatDuration(capture.durationSeconds)}</small></div>
-                <button on:click={() => removeCaptureAction(capture.id, capture.name)} disabled={busy || capturing || processing}>Delete</button>
-              </article>
-            {/each}
-          {/if}
-        </section>
+        <details class="panel collapsible-panel takes" open>
+          <summary><span>RECORDED TAKES</span><strong>{totalFrames.toLocaleString()} RAW FRAMES</strong></summary>
+          <div class="collapsible-body">
+            {#if project.phases.length === 0}
+              <p class="empty-copy">No RGB-D takes yet. Tracking runs at sensor rate; the archive rate only controls frames kept for the production pass.</p>
+            {:else}
+              {#each project.phases as capture, index}
+                <article>
+                  <span class="take-number">{String(index + 1).padStart(2, '0')}</span>
+                  <div><strong>{capture.name}</strong><small>{capture.frameCount.toLocaleString()} raw frames · {formatDuration(capture.durationSeconds)}</small></div>
+                  <button on:click={() => removeCaptureAction(capture.id, capture.name)} disabled={busy || capturing || processing}>Delete</button>
+                </article>
+              {/each}
+            {/if}
+          </div>
+        </details>
 
       {:else if workspace === 'reconstruct'}
-        <section class="panel panel-heading"><div><span>PRODUCTION PASS</span><h2>Reconstruction outputs</h2></div><strong class="take-total">{mediaOnlyProject ? `${mediaSourceCount} media source${mediaSourceCount === 1 ? '' : 's'}` : `${completedCaptures} take${completedCaptures === 1 ? '' : 's'}`}</strong></section>
+        <header class="workspace-heading"><div><span>PRODUCTION PASS</span><h2>Reconstruction outputs</h2></div><strong class="take-total">{mediaOnlyProject ? `${mediaSourceCount} media source${mediaSourceCount === 1 ? '' : 's'}` : `${completedCaptures} take${completedCaptures === 1 ? '' : 's'}`}</strong></header>
 
-        <section class="panel target-list">
-          <label class:active={buildPointCloud}><input type="checkbox" bind:checked={buildPointCloud} disabled={processing || mediaOnlyProject}/><span class="target-icon">P</span><div><strong>Metric point cloud</strong><small>{mediaOnlyProject ? 'Requires calibrated RGB-D capture' : 'Filtered colored PLY · quickest'}</small></div><i>{artifactReady('pointCloud') ? 'READY' : ''}</i></label>
-          <label class:active={buildTexturedMesh}><input type="checkbox" bind:checked={buildTexturedMesh} disabled={processing || mediaOnlyProject}/><span class="target-icon">M</span><div><strong>Textured triangle mesh</strong><small>{mediaOnlyProject ? 'Requires calibrated RGB-D capture' : 'TSDF surface · OBJ/MTL/PNG'}</small></div><i>{artifactReady('texturedMesh') ? 'READY' : ''}</i></label>
-          <label class:active={buildGaussianSplat}><input type="checkbox" bind:checked={buildGaussianSplat} disabled={processing || !runtime?.splatWorkerAvailable}/><span class="target-icon">G</span><div><strong>{mediaOnlyProject ? 'Photoreal 3D Gaussian splat' : '2D Gaussian surface'}</strong><small>{mediaOnlyProject ? 'COLMAP cameras · anisotropic 3DGS · SH degree 3' : 'Depth-aware discs · metric PLY'}</small></div><i>{artifactReady('gaussianSplat') ? 'READY' : runtime?.splatWorkerAvailable ? '' : 'CUDA RUNTIME MISSING'}</i></label>
-          {#if buildGaussianSplat}
-            <label class="iterations"><span>Training iterations</span><input type="range" min="5000" max="60000" step="5000" bind:value={splatIterations} disabled={processing}/><strong>{Number(splatIterations).toLocaleString()}</strong></label>
-          {/if}
-        </section>
+        <details class="panel collapsible-panel" open>
+          <summary><span>OUTPUTS</span><strong>{readyArtifacts} READY</strong></summary>
+          <div class="collapsible-body target-list">
+            <label class:active={buildPointCloud}><input type="checkbox" bind:checked={buildPointCloud} disabled={processing || mediaOnlyProject}/><span class="target-icon">P</span><div><strong>Metric point cloud</strong><small>{mediaOnlyProject ? 'Requires calibrated RGB-D capture' : 'Filtered colored PLY · quickest'}</small></div><i>{artifactReady('pointCloud') ? 'READY' : ''}</i></label>
+            <label class:active={buildTexturedMesh}><input type="checkbox" bind:checked={buildTexturedMesh} disabled={processing || mediaOnlyProject}/><span class="target-icon">M</span><div><strong>Textured triangle mesh</strong><small>{mediaOnlyProject ? 'Requires calibrated RGB-D capture' : 'TSDF surface · OBJ/MTL/PNG'}</small></div><i>{artifactReady('texturedMesh') ? 'READY' : ''}</i></label>
+            <label class:active={buildGaussianSplat}><input type="checkbox" bind:checked={buildGaussianSplat} disabled={processing || !runtime?.splatWorkerAvailable}/><span class="target-icon">G</span><div><strong>{mediaOnlyProject ? 'Photoreal 3D Gaussian splat' : '2D Gaussian surface'}</strong><small>{mediaOnlyProject ? 'COLMAP cameras · anisotropic 3DGS · SH degree 3' : 'Depth-aware discs · metric PLY'}</small></div><i>{artifactReady('gaussianSplat') ? 'READY' : runtime?.splatWorkerAvailable ? '' : 'CUDA RUNTIME MISSING'}</i></label>
+            {#if buildGaussianSplat}
+              <label class="iterations"><span>Training iterations</span><input type="range" min="5000" max="60000" step="5000" bind:value={splatIterations} disabled={processing}/><strong>{Number(splatIterations).toLocaleString()}</strong></label>
+            {/if}
+          </div>
+        </details>
 
         {#if buildTexturedMesh && !mediaOnlyProject}
-          <section class="panel settings mesh-repair-settings">
-            <div class="section-title"><span>MESH REPAIR</span><strong>DEPTH-AWARE</strong></div>
+          <details class="panel collapsible-panel" open>
+            <summary><span>MESH REPAIR</span><strong>DEPTH-AWARE</strong></summary>
+            <div class="collapsible-body settings mesh-repair-settings">
             <label class="toggle"><input type="checkbox" checked={project.settings.repairMesh} on:change={(event) => updateSetting('repairMesh', inputChecked(event))} disabled={processing}/><span></span><div><strong>Repair mesh before texturing</strong><small>Fixes topology and fills only holes supported by captured depth</small></div></label>
             {#if project.settings.repairMesh}
               <label>Repair profile
@@ -2089,23 +2166,37 @@
                 <div><strong>{project.meshRepairDefectsFixed ?? 0}</strong><small>defects fixed</small></div>
                 <small class="report-path" title={project.meshRepairReportPath}>{project.meshRepairReportPath}</small>
               </div>
-            {/if}
-          </section>
+              {/if}
+            </div>
+          </details>
         {/if}
 
-        {#if mediaOnlyProject}
-          <section class="panel pipeline-note">
-            <strong>Photo/video source</strong>
-            <p>ScanLan selects sharp, non-duplicate video frames, solves and bundle-adjusts cameras with COLMAP, undistorts every registered view, then trains exposure-compensated 3D Gaussians. Weak or disconnected camera solutions fail visibly.</p>
-            <div><span>Imported</span><strong>{mediaSourceCount} source{mediaSourceCount === 1 ? '' : 's'}</strong></div>
-            <button class="ghost full" on:click={addMediaSource} disabled={busy || processing}>Add more photos or video…</button>
-          </section>
+        {#if mediaSourceCount > 0}
+          <details class="panel collapsible-panel" open>
+            <summary><span>MEDIA SOURCES</span><strong>{mediaSourceCount} IMPORTED</strong></summary>
+            <div class="collapsible-body pipeline-note">
+              <p>{mediaOnlyProject ? 'Sharp, non-duplicate frames are registered and bundle-adjusted before Gaussian training.' : 'High-resolution frames are localized against metric RGB-D landmarks, then enhance point colors, mesh textures, and splat appearance.'}</p>
+              <div class="media-source-list">
+                {#each project.mediaSources as source (source.id)}
+                  <article class="media-source">
+                    <span class="media-kind">{source.kind.toUpperCase()}</span>
+                    <div class="media-source-copy">
+                      <strong title={source.name}>{source.name}</strong>
+                      <small>{formatByteSize(source.byteSize)} · imported {formatProjectDate(source.createdAt)}</small>
+                    </div>
+                    <button on:click={() => removeImportedMediaSource(source)} disabled={busy || processing || capturing} aria-label={`Remove ${source.name}`}>Remove</button>
+                  </article>
+                {/each}
+              </div>
+              <button class="ghost full" on:click={addMediaSource} disabled={busy || processing}>Add more photos or video…</button>
+            </div>
+          </details>
         {/if}
 
         {#if !mediaOnlyProject}
-          <section class="panel pipeline-note">
-            <strong>High-resolution texture photos</strong>
-            <p>After an initial mesh build, add overlapping DSLR or phone photos. ScanLan detects depth-backed feature matches, validates each camera pose, and uses accepted photos during the next mesh rebuild.</p>
+          <details class="panel collapsible-panel" open>
+            <summary><span>TEXTURE PHOTOS</span><strong>{localizedTexturePhotoCount} READY</strong></summary>
+            <div class="collapsible-body pipeline-note">
             {#if texturePhotoProgress}
               <div class="texture-progress" class:error={texturePhotoProgress.status === 'failed'}>
                 <div class="texture-progress-title">
@@ -2145,20 +2236,34 @@
                 {/each}
               </div>
             {/if}
-            <button class="ghost full" on:click={addTexturePhotos} disabled={busy || processing || photoLocalizationActive || !project?.artifacts.texturedMesh}>{photoLocalizationActive ? 'Localization running…' : 'Add and localize photos…'}</button>
-          </section>
-
-          <section class="panel pipeline-note">
-            <strong>One trajectory, three representations</strong>
-            <p>All outputs share the same quality-gated RGB-D poses. The final pass stabilizes the trajectory, fuses a weighted TSDF, and only then builds the selected representations.</p>
-            <div><span>Source</span><strong>{totalFrames.toLocaleString()} archived frames</strong></div>
-            <div><span>Compute</span><strong>{runtime?.reconstructionWorkerAvailable ? 'CUDA preferred' : 'Runtime missing'}</strong></div>
-          </section>
+              <button class="ghost full" on:click={addTexturePhotos} disabled={busy || processing || photoLocalizationActive || !project?.artifacts.texturedMesh}>{photoLocalizationActive ? 'Localization running…' : 'Add and localize photos…'}</button>
+            </div>
+          </details>
         {/if}
 
+        <details class="panel collapsible-panel" open>
+          <summary><span>REBUILD START</span><strong>{rebuildRgbdPreparation ? 'RGB-D SOURCE' : mediaRestartStage === 'decode' ? 'MEDIA DECODE' : mediaRestartStage === 'analysis' ? 'MEDIA ANALYSIS' : 'REUSE CACHE'}</strong></summary>
+          <div class="collapsible-body settings rebuild-policy">
+            {#if mediaSourceCount > 0}
+              <label>Start media preparation from
+                <select bind:value={mediaRestartStage} disabled={processing}>
+                  <option value="reuse">Cached analysis · fastest</option>
+                  <option value="analysis">Camera analysis · keep decoded frames</option>
+                  <option value="decode">Media decode · discard prepared frames</option>
+                </select>
+              </label>
+            {/if}
+            {#if completedCaptures > 0}
+              <label class="toggle"><input type="checkbox" bind:checked={rebuildRgbdPreparation} disabled={processing}/><span></span><div><strong>Re-run RGB-D tracking and fusion</strong><small>Discard cached poses and geometry, while keeping decoded media</small></div></label>
+            {/if}
+            <p class="cache-policy-note">Later-stage data is discarded automatically from the selected start point. Changed sources or settings still invalidate incompatible cached data.</p>
+          </div>
+        </details>
+
         {#if activeJob}
-          <section class="panel job-card" class:error={activeJob.status === 'failed'}>
-            <div class="section-title"><span>{activeJob.status.toUpperCase()}</span><strong>{Math.round(activeJob.progress * 100)}%</strong></div>
+          <details class="panel collapsible-panel job-card" class:error={activeJob.status === 'failed'} open>
+            <summary><span>{activeJob.status.toUpperCase()}</span><strong>{Math.round(activeJob.progress * 100)}%</strong></summary>
+            <div class="collapsible-body">
             <h3>{activeJob.stage.replaceAll('_', ' ')}</h3>
             <p>{activeJob.error ?? activeJob.detail}</p>
             <div class="progress"><i style={`width:${Math.round(activeJob.progress * 100)}%`}></i></div>
@@ -2173,29 +2278,37 @@
                 <span>Rolling <strong>{activeJob.smoothedLoss?.toFixed(4) ?? 'warming up'}</strong></span>
               </div>
             {/if}
-            <div class="job-meta"><span>{activeJob.computeBackend ?? 'Waiting for worker'}</span><span>{activeJob.etaSeconds ? `~${formatDuration(activeJob.etaSeconds)}` : ''}</span></div>
+            <div class="job-meta"><span>{activeJob.computeBackend ?? 'Waiting for worker'}</span><span>{activeJob.stageEtaSeconds ? `stage ~${formatDuration(activeJob.stageEtaSeconds)}` : activeJob.etaSeconds ? `~${formatDuration(activeJob.etaSeconds)}` : ''}</span></div>
             {#if processing}
               <button class="ghost full" on:click={cancelBuild}>Cancel safely</button>
             {:else if activeJob.resumable && ['failed', 'cancelled'].includes(activeJob.status)}
               <div class="button-row"><button class="primary" on:click={() => startBuild(true)}>Resume checkpoint</button><button class="ghost" on:click={discardBuild}>Discard</button></div>
-            {/if}
-          </section>
+              {/if}
+            </div>
+          </details>
         {/if}
 
-        <button class="primary full build-button" on:click={() => startBuild(false)} disabled={busy || processing || photoLocalizationActive || (completedCaptures === 0 && mediaSourceCount === 0) || (!buildPointCloud && !buildTexturedMesh && !buildGaussianSplat)}>{processing ? 'Reconstruction running…' : photoLocalizationActive ? 'Localizing texture photos…' : readyArtifacts ? 'Rebuild selected outputs' : mediaOnlyProject ? 'Solve cameras & build AAA splat' : 'Build selected outputs'}</button>
+        <button class="primary full build-button" on:click={() => startBuild(false)} disabled={busy || processing || photoLocalizationActive || (completedCaptures === 0 && mediaSourceCount === 0) || (!buildPointCloud && !buildTexturedMesh && !buildGaussianSplat)}>{processing ? 'Reconstruction running…' : photoLocalizationActive ? 'Localizing texture photos…' : readyArtifacts ? 'Rebuild selected outputs' : mediaOnlyProject ? 'Solve cameras & build AAA splat' : mediaSourceCount > 0 ? 'Build hybrid high-quality outputs' : 'Build selected outputs'}</button>
 
       {:else}
-        <section class="panel panel-heading"><div><span>RESULT</span><h2>Edit & export</h2></div><strong class="take-total">{readyArtifacts} ready</strong></section>
-        <section class="panel view-switcher">
-          <button class:active={renderMode === 'points'} disabled={!artifactReady('pointCloud')} on:click={() => loadResult('points')}><span>P</span><div><strong>Points</strong><small>{formatCount(project.pointCount)}</small></div></button>
-          <button class:active={renderMode === 'mesh'} disabled={!artifactReady('texturedMesh')} on:click={() => loadResult('mesh')}><span>M</span><div><strong>Mesh</strong><small>{formatCount(project.meshTriangleCount)} tris</small></div></button>
-          <button class:active={renderMode === 'splat'} disabled={!artifactReady('gaussianSplat')} on:click={() => loadResult('splat')}><span>G</span><div><strong>2DGS</strong><small>Metric surface</small></div></button>
-        </section>
+        <header class="inspector-heading"><div><span>RESULT</span><h2>Edit & export</h2></div><strong class="take-total">{readyArtifacts} ready</strong></header>
+        <details class="panel collapsible-panel" open>
+          <summary><span>REPRESENTATION</span><strong>{renderMode === 'points' ? 'POINTS' : renderMode === 'mesh' ? 'MESH' : '2DGS'}</strong></summary>
+          <div class="collapsible-body view-switcher">
+            <button class:active={renderMode === 'points'} disabled={!artifactReady('pointCloud')} on:click={() => loadResult('points')}><span>P</span><div><strong>Points</strong><small>{formatCount(project.pointCount)}</small></div></button>
+            <button class:active={renderMode === 'mesh'} disabled={!artifactReady('texturedMesh')} on:click={() => loadResult('mesh')}><span>M</span><div><strong>Mesh</strong><small>{formatCount(project.meshTriangleCount)} tris</small></div></button>
+            <button class:active={renderMode === 'splat'} disabled={!artifactReady('gaussianSplat')} on:click={() => loadResult('splat')}><span>G</span><div><strong>2DGS</strong><small>Metric surface</small></div></button>
+          </div>
+        </details>
         {#if renderMode === 'mesh'}
-          <section class="panel settings"><label>Mesh display<select bind:value={meshViewMode}><option value="surface">Textured</option><option value="surface-wireframe">Texture + wire</option><option value="wireframe">Wireframe</option><option value="shaded">Shaded</option></select></label></section>
+          <details class="panel collapsible-panel" open>
+            <summary><span>DISPLAY</span><strong>{meshViewMode.replaceAll('-', ' ').toUpperCase()}</strong></summary>
+            <div class="collapsible-body settings"><label>Mesh display<select bind:value={meshViewMode}><option value="surface">Textured</option><option value="surface-wireframe">Texture + wire</option><option value="wireframe">Wireframe</option><option value="shaded">Shaded</option></select></label></div>
+          </details>
         {/if}
-        <section class="panel edit-tools">
-            <div class="section-title"><span>MODEL POSE</span><strong class:edited={hasEditPose}>{hasEditPose ? 'EDITED' : 'ORIGINAL'}</strong></div>
+        <details class="panel collapsible-panel edit-tools" open>
+          <summary><span>MODEL POSE</span><strong class:edited={hasEditPose}>{hasEditPose ? 'EDITED' : 'ORIGINAL'}</strong></summary>
+          <div class="collapsible-body edit-tools-body">
             <div class="edit-actions">
               <button class:active={floorPickMode} disabled={!canEditModel} on:click={() => { floorPickMode = !floorPickMode; editMode = false; clipEditMode = false; }}>{floorPickMode ? 'Cancel floor pick' : 'Pick floor'}</button>
               <button class:active={editMode} disabled={!canEditModel} on:click={() => { editMode = !editMode; floorPickMode = false; clipEditMode = false; }}>{editMode ? 'Close gizmo' : 'Transform gizmo'}</button>
@@ -2227,49 +2340,55 @@
               <button class="save-pose" class:dirty={transformDirty} disabled={!transformDirty} on:click={saveTransform}>{transformDirty ? 'Save pose' : 'Pose saved'}</button>
             {/if}
             <button class="reset-pose" disabled={!hasEditPose} on:click={resetEditPose}>Reset pose</button>
-            <p>{transformSaveMode === 'manual' ? 'Manipulations stay in memory until Save pose, so you can edit without persistence work between tools.' : 'Each completed manipulation is saved automatically.'} The current pose is shared by point-cloud, mesh, and Gaussian exports.</p>
-          </section>
-        <section class="panel edit-tools clip-tools">
-          <div class="section-title"><span>BOUNDING BOX</span><strong class:edited={clippingEnabled}>{clippingEnabled ? 'CLIPPING' : 'OFF'}</strong></div>
-          <div class="edit-actions">
-            <button class:active={clippingEnabled} disabled={!canClipModel && !clipBounds} on:click={() => setClippingEnabled(!clippingEnabled)}>{clippingEnabled ? 'Disable clipping' : 'Enable clipping'}</button>
-            <button class:active={clipEditMode} disabled={!clippingEnabled || !clipBounds} on:click={() => { clipEditMode = !clipEditMode; editMode = false; floorPickMode = false; }}>{clipEditMode ? 'Close box gizmo' : 'Edit box'}</button>
           </div>
-          <button class="reset-pose" disabled={!canClipModel} on:click={fitBoundingBox}>Fit to transformed result</button>
-          {#if clippingEnabled && clipBounds}
-            {#if clipEditMode}
-              <div class="gizmo-modes">
-                <button class:active={clipGizmoMode === 'translate'} on:click={() => setClipGizmoMode('translate')}>Move <kbd>W</kbd></button>
-                <button class:active={clipGizmoMode === 'scale'} on:click={() => setClipGizmoMode('scale')}>Resize <kbd>R</kbd></button>
+        </details>
+        <details class="panel collapsible-panel edit-tools clip-tools" open>
+          <summary><span>BOUNDING BOX</span><strong class:edited={clippingEnabled}>{clippingEnabled ? 'CLIPPING' : 'OFF'}</strong></summary>
+          <div class="collapsible-body edit-tools-body">
+            <div class="edit-actions">
+              <button class:active={clippingEnabled} disabled={!canClipModel && !clipBounds} on:click={() => setClippingEnabled(!clippingEnabled)}>{clippingEnabled ? 'Disable clipping' : 'Enable clipping'}</button>
+              <button class:active={clipEditMode} disabled={!clippingEnabled || !clipBounds} on:click={() => { clipEditMode = !clipEditMode; editMode = false; floorPickMode = false; }}>{clipEditMode ? 'Close box gizmo' : 'Edit box'}</button>
+            </div>
+            <button class="reset-pose" disabled={!canClipModel} on:click={fitBoundingBox}>Fit to transformed result</button>
+            {#if clippingEnabled && clipBounds}
+              {#if clipEditMode}
+                <div class="gizmo-modes">
+                  <button class:active={clipGizmoMode === 'translate'} on:click={() => setClipGizmoMode('translate')}>Move <kbd>W</kbd></button>
+                  <button class:active={clipGizmoMode === 'scale'} on:click={() => setClipGizmoMode('scale')}>Resize <kbd>R</kbd></button>
+                </div>
+              {/if}
+              <div class="clip-grid">
+                <span></span><small>MIN</small><small>MAX</small>
+                <b>X</b><input aria-label="Minimum X" type="number" step="0.01" value={clipBounds.min[0]} on:change={(event) => setClipCoordinate('min', 0, inputValue(event))}><input aria-label="Maximum X" type="number" step="0.01" value={clipBounds.max[0]} on:change={(event) => setClipCoordinate('max', 0, inputValue(event))}>
+                <b>Y</b><input aria-label="Minimum Y" type="number" step="0.01" value={clipBounds.min[1]} on:change={(event) => setClipCoordinate('min', 1, inputValue(event))}><input aria-label="Maximum Y" type="number" step="0.01" value={clipBounds.max[1]} on:change={(event) => setClipCoordinate('max', 1, inputValue(event))}>
+                <b>Z</b><input aria-label="Minimum Z" type="number" step="0.01" value={clipBounds.min[2]} on:change={(event) => setClipCoordinate('min', 2, inputValue(event))}><input aria-label="Maximum Z" type="number" step="0.01" value={clipBounds.max[2]} on:change={(event) => setClipCoordinate('max', 2, inputValue(event))}>
               </div>
             {/if}
-            <div class="clip-grid">
-              <span></span><small>MIN</small><small>MAX</small>
-              <b>X</b><input aria-label="Minimum X" type="number" step="0.01" value={clipBounds.min[0]} on:change={(event) => setClipCoordinate('min', 0, inputValue(event))}><input aria-label="Maximum X" type="number" step="0.01" value={clipBounds.max[0]} on:change={(event) => setClipCoordinate('max', 0, inputValue(event))}>
-              <b>Y</b><input aria-label="Minimum Y" type="number" step="0.01" value={clipBounds.min[1]} on:change={(event) => setClipCoordinate('min', 1, inputValue(event))}><input aria-label="Maximum Y" type="number" step="0.01" value={clipBounds.max[1]} on:change={(event) => setClipCoordinate('max', 1, inputValue(event))}>
-              <b>Z</b><input aria-label="Minimum Z" type="number" step="0.01" value={clipBounds.min[2]} on:change={(event) => setClipCoordinate('min', 2, inputValue(event))}><input aria-label="Maximum Z" type="number" step="0.01" value={clipBounds.max[2]} on:change={(event) => setClipCoordinate('max', 2, inputValue(event))}>
-            </div>
-          {/if}
-          <p>The box is world-axis aligned after the model pose. Only geometry inside it is exported.</p>
-        </section>
-        <section class="panel result-stats">
-          <div><span>Points</span><strong>{formatCount(project.pointCount)}</strong></div>
-          <div><span>Triangles</span><strong>{formatCount(project.meshTriangleCount)}</strong></div>
-          <div><span>Frames used</span><strong>{project.framesUsed ?? '—'}</strong></div>
-          <div><span>Confidence</span><strong>{project.confidenceLabel ?? '—'}</strong></div>
-          <p>{project.confidenceDetail ?? 'Build an output to see trajectory and coverage quality.'}</p>
-        </section>
-        <section class="panel export-list">
-          <button class:exporting={exporting === 'points'} aria-busy={exporting === 'points'} on:click={exportPointCloud} disabled={Boolean(exporting) || !artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>Metric colored vertices</small></div><i>{exporting === 'points' ? 'Exporting…' : 'Export…'}</i></button>
-          <button class:exporting={exporting === 'mesh'} aria-busy={exporting === 'mesh'} on:click={exportMesh} disabled={Boolean(exporting) || !artifactReady('texturedMesh')}><span>M</span><div><strong>Textured OBJ bundle</strong><small>OBJ + MTL + PNG</small></div><i>{exporting === 'mesh' ? 'Exporting…' : 'Export…'}</i></button>
-          <button class:exporting={exporting === 'splat'} aria-busy={exporting === 'splat'} on:click={exportSplat} disabled={Boolean(exporting) || !artifactReady('gaussianSplat')}><span>G</span><div><strong>2D Gaussian PLY</strong><small>Aligned metric splat + sidecars</small></div><i>{exporting === 'splat' ? 'Exporting…' : 'Export…'}</i></button>
-          {#if exporting}
-            <div class="export-feedback" role="status" aria-live="polite">
-              <div><strong>{exporting === 'points' ? 'Exporting point cloud' : exporting === 'mesh' ? 'Exporting textured mesh' : 'Exporting 2D Gaussian surface'}</strong><small>Applying the saved pose{clippingEnabled ? ' and clipping bounds' : ''}, then writing to disk.</small></div>
-              <span class="export-progress"><i></i></span>
-            </div>
-          {/if}
-        </section>
+          </div>
+        </details>
+        <details class="panel collapsible-panel" open>
+          <summary><span>OUTPUT STATS</span><strong>{project.confidenceLabel ?? '—'}</strong></summary>
+          <div class="collapsible-body result-stats">
+            <div><span>Points</span><strong>{formatCount(project.pointCount)}</strong></div>
+            <div><span>Triangles</span><strong>{formatCount(project.meshTriangleCount)}</strong></div>
+            <div><span>Frames used</span><strong>{project.framesUsed ?? '—'}</strong></div>
+            <div><span>Confidence</span><strong>{project.confidenceLabel ?? '—'}</strong></div>
+          </div>
+        </details>
+        <details class="panel collapsible-panel" open>
+          <summary><span>EXPORT</span><strong>{readyArtifacts} AVAILABLE</strong></summary>
+          <div class="collapsible-body export-list">
+            <button class:exporting={exporting === 'points'} aria-busy={exporting === 'points'} on:click={exportPointCloud} disabled={Boolean(exporting) || !artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>Metric colored vertices</small></div><i>{exporting === 'points' ? 'Exporting…' : 'Export…'}</i></button>
+            <button class:exporting={exporting === 'mesh'} aria-busy={exporting === 'mesh'} on:click={exportMesh} disabled={Boolean(exporting) || !artifactReady('texturedMesh')}><span>M</span><div><strong>Textured OBJ bundle</strong><small>OBJ + MTL + PNG</small></div><i>{exporting === 'mesh' ? 'Exporting…' : 'Export…'}</i></button>
+            <button class:exporting={exporting === 'splat'} aria-busy={exporting === 'splat'} on:click={exportSplat} disabled={Boolean(exporting) || !artifactReady('gaussianSplat')}><span>G</span><div><strong>2D Gaussian PLY</strong><small>Aligned metric splat + sidecars</small></div><i>{exporting === 'splat' ? 'Exporting…' : 'Export…'}</i></button>
+            {#if exporting}
+              <div class="export-feedback" role="status" aria-live="polite">
+                <div><strong>{exporting === 'points' ? 'Exporting point cloud' : exporting === 'mesh' ? 'Exporting textured mesh' : 'Exporting 2D Gaussian surface'}</strong><small>Applying the saved pose{clippingEnabled ? ' and clipping bounds' : ''}, then writing to disk.</small></div>
+                <span class="export-progress"><i></i></span>
+              </div>
+            {/if}
+          </div>
+        </details>
       {/if}
     </aside>
   </main>
@@ -2286,55 +2405,56 @@
 <style>
   :global(*) { box-sizing: border-box; }
   :global(html, body, #app) { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-  :global(body) { background: #071019; color: #dce9ee; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  :global(body) { background: #101216; color: #d7dbe1; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   :global(button), :global(input), :global(select) { font: inherit; }
   :global(button) { color: inherit; }
 
-  .app-shell { --panel: #0c1823; --panel-soft: #101f2b; --line: rgba(155, 199, 215, 0.13); --muted: #78909d; --cyan: #63c7e7; --mint: #62d6ba; --amber: #efb366; display: grid; grid-template-rows: 68px 68px minmax(0, 1fr) 38px; width: 100%; height: 100%; background: radial-gradient(circle at 45% -20%, rgba(40, 112, 139, .15), transparent 42%), #071019; }
-  .topbar { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(220px, 1fr) auto auto; align-items: center; gap: 24px; padding: 0 24px; border-bottom: 1px solid var(--line); background: rgba(7, 16, 25, .9); }
-  .brand, .project-title, .runtime-state, .panel-heading, .tracking-title, .section-title, .job-meta, .button-row { display: flex; align-items: center; }
+  .app-shell { --panel: #191c21; --panel-soft: #1e2228; --line: #2b3038; --muted: #8a929d; --cyan: #6c9eff; --mint: #54b78d; --amber: #d2a04f; display: grid; grid-template-rows: 64px 58px minmax(0, 1fr) 34px; gap: 8px; width: 100%; height: 100%; padding: 8px; background: #101216; }
+  .topbar { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(220px, 1fr) auto auto; align-items: center; gap: 24px; padding: 0 16px; border: 1px solid var(--line); border-radius: 6px; background: #15181d; }
+  .brand, .project-title, .runtime-state, .tracking-title, .job-meta, .button-row { display: flex; align-items: center; }
   .brand { gap: 11px; }
-  .brand-mark { display: grid; place-items: center; width: 35px; height: 35px; border: 1px solid rgba(99,199,231,.45); border-radius: 10px; background: linear-gradient(145deg, rgba(99,199,231,.18), rgba(98,214,186,.06)); color: #80d7ef; font-size: 12px; font-weight: 850; letter-spacing: .06em; }
+  .brand-mark { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid #3a4658; border-radius: 5px; background: #20252c; color: var(--cyan); font-size: 12px; font-weight: 850; letter-spacing: .06em; }
   .brand div, .project-title { display: grid; gap: 2px; }
   .brand strong { font-size: 16px; letter-spacing: .01em; }
   .brand small, .project-title span { color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
-  .project-title { justify-items: start; min-width: 0; padding: 8px 10px; border-radius: 8px; background: transparent; text-align: left; }
-  .project-title:hover:not(:disabled) { background: rgba(99,199,231,.06); }
+  .project-title { justify-items: start; min-width: 0; padding: 8px 10px; border-radius: 4px; background: transparent; text-align: left; }
+  .project-title:hover:not(:disabled) { background: #20242a; }
   .project-title strong { max-width: 360px; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
   .header-actions { display: flex; gap: 7px; }
   .runtime-state { gap: 8px; }
-  .runtime-state span { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: #708590; font-size: 10px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; }
+  .runtime-state span { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 4px; color: #777f8a; font-size: 10px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; }
   .runtime-state span i { width: 6px; height: 6px; border-radius: 50%; background: #53636b; }
-  .runtime-state span.ready { color: #a8c4cf; }
-  .runtime-state span.ready i { background: var(--mint); box-shadow: 0 0 10px rgba(98,214,186,.5); }
+  .runtime-state span.ready { color: #b2b8c1; }
+  .runtime-state span.ready i { background: var(--mint); }
   button { border: 0; cursor: pointer; }
   button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .43; }
-  .ghost { padding: 10px 13px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.02); color: #a9bfca; font-size: 12px; font-weight: 700; }
-  .ghost:hover:not(:disabled) { border-color: rgba(99,199,231,.38); background: rgba(99,199,231,.07); }
+  .ghost { padding: 10px 13px; border: 1px solid var(--line); border-radius: 5px; background: #1b1f24; color: #b6bbc3; font-size: 12px; font-weight: 700; }
+  .ghost:hover:not(:disabled) { border-color: #46536a; background: #22272e; }
   .ghost.compact { white-space: nowrap; }
   .ghost.full, .primary.full { width: 100%; }
-  .primary { padding: 11px 15px; border-radius: 9px; background: linear-gradient(135deg, #3ba8cc, #42bda2); color: #041018; font-size: 12px; font-weight: 850; }
+  .primary { padding: 11px 15px; border-radius: 5px; background: #4f82e8; color: #f7f9fc; font-size: 12px; font-weight: 800; }
+  .primary:hover:not(:disabled) { background: #5b8df0; }
 
-  .modal-backdrop { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(2, 8, 13, .72); backdrop-filter: blur(8px); }
+  .modal-backdrop { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(5, 6, 8, .82); }
   .modal-dismiss { position: absolute; inset: 0; width: 100%; height: 100%; background: transparent; cursor: default; }
-  .project-manager { position: relative; z-index: 1; display: grid; grid-template-rows: auto auto auto minmax(150px, 1fr) auto auto; gap: 14px; width: min(780px, calc(100vw - 48px)); max-height: min(760px, calc(100vh - 48px)); padding: 20px; overflow: hidden; border: 1px solid rgba(155,199,215,.2); border-radius: 16px; background: linear-gradient(150deg, #10202c, #091722); box-shadow: 0 30px 90px rgba(0,0,0,.5); }
+  .project-manager { position: relative; z-index: 1; display: grid; grid-template-rows: auto auto auto minmax(150px, 1fr) auto auto; gap: 14px; width: min(780px, calc(100vw - 48px)); max-height: min(760px, calc(100vh - 48px)); padding: 20px; overflow: hidden; border: 1px solid #343a44; border-radius: 8px; background: #191d22; box-shadow: 0 24px 70px rgba(0,0,0,.45); }
   .project-manager > header { display: flex; align-items: center; justify-content: space-between; }
   .project-manager > header div { display: grid; gap: 4px; }
   .project-manager > header span, .current-project-editor span, .new-project-form span { color: var(--cyan); font-size: 9px; font-weight: 850; letter-spacing: .11em; }
-  .dialog-close { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.025); color: #91a9b4; font-size: 19px; }
-  .current-project-editor { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(260px, 1.2fr); align-items: end; gap: 16px; padding: 13px; border: 1px solid rgba(99,199,231,.2); border-radius: 11px; background: rgba(99,199,231,.055); }
+  .dialog-close { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 5px; background: #20242a; color: #a0a7b0; font-size: 19px; }
+  .current-project-editor { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(260px, 1.2fr); align-items: end; gap: 16px; padding: 13px; border: 1px solid #343b47; border-radius: 6px; background: #1d2229; }
   .current-project-editor > div, .new-project-form > div { display: grid; gap: 4px; }
   .current-project-editor small, .new-project-form small { color: #758d98; font-size: 9px; line-height: 1.4; }
   .current-project-editor form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
   .current-project-editor .primary { height: 36px; padding-top: 0; padding-bottom: 0; }
   .project-library-heading { display: flex; justify-content: space-between; color: #8da4ae; font-size: 10px; }
   .project-library-heading span { color: #617985; }
-  .project-library { min-height: 150px; overflow-y: auto; border: 1px solid var(--line); border-radius: 11px; background: #08151f; scrollbar-color: #263d49 transparent; }
+  .project-library { min-height: 150px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; background: #14171b; scrollbar-color: #343a43 transparent; }
   .project-library.loading { opacity: .7; }
   .project-library article { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 13px; border-bottom: 1px solid var(--line); }
   .project-library article:last-child { border-bottom: 0; }
-  .project-library article.active { background: rgba(98,214,186,.055); }
-  .project-library-icon { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid rgba(99,199,231,.18); border-radius: 10px; background: rgba(99,199,231,.07); color: #7ccce5; font-size: 10px; font-weight: 850; }
+  .project-library article.active { background: #1d2525; }
+  .project-library-icon { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid #353c48; border-radius: 5px; background: #20252c; color: var(--cyan); font-size: 10px; font-weight: 850; }
   .project-library-copy { min-width: 0; }
   .project-library-copy > div { display: flex; align-items: center; gap: 8px; }
   .project-library-copy strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
@@ -2343,95 +2463,100 @@
   .project-library-copy p { margin-top: 4px; }
   .project-library-actions { display: flex; gap: 6px; }
   .project-library-actions button { padding: 7px 10px; font-size: 9px; }
-  .danger { border: 1px solid rgba(226,120,103,.2); border-radius: 8px; background: rgba(226,120,103,.06); color: #c88d84; font-size: 9px; font-weight: 750; }
-  .danger:hover:not(:disabled) { border-color: rgba(226,120,103,.4); background: rgba(226,120,103,.11); }
+  .danger { border: 1px solid #4b3434; border-radius: 5px; background: #271d1e; color: #d38a81; font-size: 9px; font-weight: 750; }
+  .danger:hover:not(:disabled) { border-color: #704747; background: #322223; }
   .project-library-empty { display: grid; place-items: center; align-content: center; min-height: 150px; color: #718994; font-size: 10px; }
   .project-library-empty .spinner { width: 18px; height: 18px; margin-bottom: 8px; }
   .new-project-form { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(180px, 1fr) auto auto; align-items: end; gap: 8px; padding-top: 2px; }
   .new-project-form .primary, .new-project-form .ghost { height: 36px; padding-top: 0; padding-bottom: 0; }
-  .new-project-button { width: 100%; min-height: 40px; border: 1px dashed rgba(99,199,231,.25); border-radius: 9px; background: rgba(99,199,231,.035); color: var(--cyan); font-size: 10px; font-weight: 800; }
-  .new-project-button:hover:not(:disabled) { border-color: rgba(99,199,231,.45); background: rgba(99,199,231,.075); }
+  .new-project-button { width: 100%; min-height: 40px; border: 1px dashed #3a465a; border-radius: 5px; background: #1b2026; color: var(--cyan); font-size: 10px; font-weight: 800; }
+  .new-project-button:hover:not(:disabled) { border-color: #53688b; background: #202630; }
   .project-manager-error { color: #df9388; font-size: 10px; }
 
-  .workflow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; padding: 0 24px; border-bottom: 1px solid var(--line); background: #09131d; }
+  .workflow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden; padding: 0 12px; border: 1px solid var(--line); border-radius: 6px; background: #13161a; }
   .workflow button { position: relative; display: flex; align-items: center; gap: 12px; padding: 0 18px; background: transparent; color: #708792; text-align: left; }
   .workflow button::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: transparent; content: ''; }
-  .workflow button.active { color: #d6e7ed; background: rgba(99,199,231,.045); }
-  .workflow button.active::after { background: var(--cyan); box-shadow: 0 -3px 12px rgba(99,199,231,.28); }
+  .workflow button.active { color: #e2e5e9; background: #191d23; }
+  .workflow button.active::after { background: var(--cyan); }
   .workflow button > span { color: #49606b; font-family: ui-monospace, monospace; font-size: 11px; font-weight: 800; }
   .workflow button.done > span { color: var(--mint); }
   .workflow button div { display: grid; gap: 3px; }
   .workflow button strong { font-size: 12px; }
   .workflow button small { color: #607783; font-size: 10px; }
 
-  main { display: grid; grid-template-columns: minmax(0, 1fr) 390px; min-height: 0; }
-  .viewport { position: relative; min-width: 0; min-height: 0; padding: 14px; border-right: 1px solid var(--line); }
-  .viewport :global(.viewer) { border-radius: 14px; }
-  aside { min-height: 0; padding: 14px; overflow-x: hidden; overflow-y: auto; background: #09131d; scrollbar-color: #263d49 transparent; }
-  .panel { margin-bottom: 12px; padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(150deg, rgba(17,34,46,.94), rgba(11,24,35,.94)); box-shadow: 0 12px 35px rgba(0,0,0,.08); }
-  .panel-heading { justify-content: space-between; gap: 12px; padding: 10px 3px 13px; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
-  .panel-heading > div { display: grid; gap: 4px; }
-  .panel-heading span, .section-title span { color: var(--cyan); font-size: 9px; font-weight: 850; letter-spacing: .11em; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 390px; gap: 8px; min-height: 0; }
+  .viewport { position: relative; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: #0b0d10; }
+  .viewport :global(.viewer) { border: 0; border-radius: 0; }
+  aside { min-height: 0; padding: 0 3px 0 0; overflow-x: hidden; overflow-y: auto; background: transparent; scrollbar-color: #343a43 transparent; }
+  .panel { margin-bottom: 8px; padding: 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+  .workspace-heading, .inspector-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 58px; margin-bottom: 8px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+  .workspace-heading > div, .inspector-heading > div { display: grid; gap: 4px; }
+  .workspace-heading span, .inspector-heading span { color: var(--cyan); font-size: 9px; font-weight: 850; letter-spacing: .11em; }
   h2, h3, p { margin: 0; }
   h2 { font-size: 18px; letter-spacing: -.02em; }
   h3 { margin: 8px 0 4px; font-size: 14px; text-transform: capitalize; }
-  .icon-button { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.025); color: var(--cyan); font-size: 18px; }
+  .icon-button { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 5px; background: #1b1f24; color: var(--cyan); font-size: 18px; }
 
   .settings { display: grid; gap: 13px; }
   .settings label { display: grid; gap: 6px; color: #8ba2ad; font-size: 10px; font-weight: 720; letter-spacing: .03em; }
-  .advanced-settings { padding: 0; overflow: hidden; }
-  .advanced-settings summary { display: flex; align-items: center; justify-content: space-between; padding: 14px 15px; cursor: pointer; list-style: none; }
-  .advanced-settings summary::-webkit-details-marker { display: none; }
-  .advanced-settings summary::after { margin-left: 9px; color: #617985; font-size: 11px; content: '›'; transform: rotate(90deg); transition: transform .15s; }
-  .advanced-settings:not([open]) summary::after { transform: rotate(0deg); }
-  .advanced-settings summary span { color: var(--cyan); font-size: 9px; font-weight: 850; letter-spacing: .11em; }
-  .advanced-settings summary strong { margin-left: auto; color: #8199a5; font-size: 9px; }
+  .advanced-settings, .collapsible-panel { padding: 0; overflow: hidden; }
+  .advanced-settings summary, .collapsible-panel > summary { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 0 13px; cursor: pointer; list-style: none; }
+  .advanced-settings summary::-webkit-details-marker, .collapsible-panel > summary::-webkit-details-marker { display: none; }
+  .advanced-settings summary::after, .collapsible-panel > summary::after { width: 12px; margin-left: 9px; color: #747c87; font-size: 12px; content: '›'; transform: rotate(90deg); transition: transform .15s; }
+  .advanced-settings:not([open]) summary::after, .collapsible-panel:not([open]) > summary::after { transform: rotate(0deg); }
+  .advanced-settings summary:hover, .collapsible-panel > summary:hover { background: #1e2228; }
+  .advanced-settings summary span, .collapsible-panel > summary span { color: var(--cyan); font-size: 9px; font-weight: 850; letter-spacing: .11em; }
+  .advanced-settings summary strong, .collapsible-panel > summary strong { margin-left: auto; color: #8c949f; font-size: 9px; }
+  .collapsible-panel > summary strong.edited { color: var(--amber); }
+  .collapsible-panel > summary strong.good { color: var(--mint); }
+  .collapsible-body { padding: 13px; border-top: 1px solid var(--line); }
+  .startup-panel, .status-body { display: grid; gap: 10px; }
   .advanced-settings > p { padding: 0 15px 15px; color: #708792; font-size: 10px; line-height: 1.55; }
-  .advanced-body { display: grid; gap: 13px; padding: 0 15px 15px; border-top: 1px solid var(--line); padding-top: 14px; }
+  .advanced-body { display: grid; gap: 13px; padding: 14px 13px 13px; border-top: 1px solid var(--line); }
   .advanced-body > label, .advanced-body .setting-grid label { display: grid; gap: 6px; color: #8ba2ad; font-size: 10px; font-weight: 720; letter-spacing: .03em; }
   .advanced-body > p { color: #708792; font-size: 10px; line-height: 1.55; }
-  .compact-settings { padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: rgba(5,15,23,.32); }
+  .compact-settings { padding: 10px; border: 1px solid var(--line); border-radius: 5px; background: #16191e; }
   .slider-control > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .slider-control output { color: #c9dde5; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; font-weight: 800; letter-spacing: 0; }
   .slider-control input[type='range'] { height: 18px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; accent-color: var(--cyan); cursor: ew-resize; }
   .setting-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 10px; }
-  select, input { width: 100%; min-width: 0; height: 36px; padding: 0 10px; outline: none; border: 1px solid rgba(147,193,211,.16); border-radius: 8px; background: #091722; color: #c8dce4; font-size: 11px; }
-  select:focus, input:focus { border-color: rgba(99,199,231,.55); box-shadow: 0 0 0 2px rgba(99,199,231,.08); }
+  select, input { width: 100%; min-width: 0; height: 36px; padding: 0 10px; outline: none; border: 1px solid #343a43; border-radius: 5px; background: #14171b; color: #d2d6dc; font-size: 11px; }
+  select:focus, input:focus { border-color: #5d82c8; box-shadow: 0 0 0 2px rgba(108,158,255,.12); }
   .unit-input { position: relative; }
   .unit-input input { padding-right: 35px; }
   .unit-input span { position: absolute; top: 50%; right: 10px; color: #637b86; transform: translateY(-50%); }
   .toggle { grid-template-columns: auto auto 1fr; align-items: center; cursor: pointer; }
   .toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; }
-  .toggle > span { position: relative; width: 34px; height: 19px; border-radius: 20px; background: #263945; transition: .2s; }
+  .toggle > span { position: relative; width: 34px; height: 19px; border-radius: 10px; background: #343a43; transition: .2s; }
   .toggle > span::after { position: absolute; top: 3px; left: 3px; width: 13px; height: 13px; border-radius: 50%; background: #8499a3; transition: .2s; content: ''; }
-  .toggle input:checked + span { background: rgba(98,214,186,.28); }
+  .toggle input:checked + span { background: #315f4d; }
   .toggle input:checked + span::after { left: 18px; background: var(--mint); }
   .toggle div { display: grid; gap: 2px; }
   .toggle strong { color: #bfd1d8; font-size: 11px; }
   .toggle small { color: #657c87; font-size: 9px; font-weight: 500; }
+  .rebuild-policy .cache-policy-note { color: #718894; font-size: 9px; line-height: 1.5; }
 
-  .capture-button { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; height: 50px; margin-bottom: 12px; border-radius: 12px; background: linear-gradient(135deg, #49c7a9, #4bb5d3); color: #041119; font-size: 13px; font-weight: 900; box-shadow: 0 10px 30px rgba(56,176,169,.16); }
+  .capture-button { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; height: 48px; margin-bottom: 9px; border-radius: 5px; background: #3ca178; color: #07140f; font-size: 13px; font-weight: 900; }
   .capture-button i { width: 11px; height: 11px; border: 2px solid currentColor; border-radius: 50%; }
-  .capture-button.stop { background: linear-gradient(135deg, #e27867, #e9a159); color: #1c0b07; }
+  .capture-button.stop { background: #cf685b; color: #1b0907; }
   .capture-button.stop i { border-radius: 2px; background: currentColor; }
   .tracking-card.warning { border-color: rgba(239,179,102,.3); }
   .connection-card.connected { border-color: rgba(98,214,186,.28); }
   .connection-card.warning { border-color: rgba(239,179,102,.24); }
   .tracking-title { gap: 10px; }
-  .tracking-title > i { width: 9px; height: 9px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 12px rgba(98,214,186,.5); }
+  .tracking-title > i { width: 8px; height: 8px; border-radius: 50%; background: var(--mint); }
   .tracking-card.warning .tracking-title > i { background: var(--amber); }
-  .connection-card.warning .tracking-title > i { background: var(--amber); box-shadow: 0 0 12px rgba(239,179,102,.35); }
+  .connection-card.warning .tracking-title > i { background: var(--amber); }
   .tracking-title div { display: grid; gap: 3px; }
   .tracking-title strong { font-size: 11px; }
   .tracking-title small { color: var(--muted); font-size: 9px; }
-  .tracking-card > p, .connection-card > p, .empty-copy, .pipeline-note p, .job-card p, .result-stats p { margin-top: 11px; color: #708792; font-size: 10px; line-height: 1.55; }
-  .mini-grid, .result-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin-top: 12px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--line); }
-  .mini-grid div, .result-stats > div { display: grid; gap: 3px; padding: 9px; background: #0b1924; }
+  .status-body > p, .empty-copy, .pipeline-note p, .job-card p { color: #79818c; font-size: 10px; line-height: 1.55; }
+  .mini-grid, .result-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin-top: 12px; overflow: hidden; border: 1px solid var(--line); border-radius: 5px; background: var(--line); }
+  .mini-grid div, .result-stats > div { display: grid; gap: 3px; padding: 9px; background: #171a1f; }
   .mini-grid span, .result-stats span, .pipeline-note div span { color: #617985; font-size: 9px; }
   .mini-grid strong, .result-stats strong, .pipeline-note div strong { font-size: 11px; }
 
-  .section-title { justify-content: space-between; }
-  .section-title > strong, .take-total { color: #8199a5; font-size: 10px; }
+  .take-total { color: #8199a5; font-size: 10px; }
   .takes article { display: grid; grid-template-columns: 28px 1fr auto; align-items: center; gap: 9px; padding: 11px 0; border-bottom: 1px solid var(--line); }
   .takes article:last-child { padding-bottom: 0; border-bottom: 0; }
   .take-number { color: #4d6570; font-family: ui-monospace, monospace; font-size: 10px; }
@@ -2441,10 +2566,10 @@
   .takes article button { padding: 5px 7px; background: transparent; color: #997b7a; font-size: 9px; }
 
   .target-list { display: grid; gap: 8px; }
-  .target-list > label { display: grid; grid-template-columns: auto 34px 1fr auto; align-items: center; gap: 9px; min-height: 58px; padding: 9px; border: 1px solid var(--line); border-radius: 9px; background: #0a1823; cursor: pointer; }
-  .target-list > label.active { border-color: rgba(99,199,231,.33); background: rgba(49,124,151,.09); }
+  .target-list > label { display: grid; grid-template-columns: auto 34px 1fr auto; align-items: center; gap: 9px; min-height: 58px; padding: 9px; border: 1px solid var(--line); border-radius: 5px; background: #171a1f; cursor: pointer; }
+  .target-list > label.active { border-color: #465d88; background: #1c222c; }
   .target-list > label > input[type=checkbox] { width: 14px; height: 14px; accent-color: var(--cyan); }
-  .target-icon, .view-switcher button > span, .export-list button > span { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 8px; background: rgba(99,199,231,.08); color: var(--cyan); font-size: 10px; font-weight: 900; }
+  .target-icon, .view-switcher button > span, .export-list button > span { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 4px; background: #242a34; color: var(--cyan); font-size: 10px; font-weight: 900; }
   .target-list label div { display: grid; gap: 3px; }
   .target-list label div strong { font-size: 11px; }
   .target-list label div small { color: #687f8a; font-size: 9px; }
@@ -2452,18 +2577,25 @@
   .target-list .iterations { grid-template-columns: auto 1fr auto; min-height: auto; }
   .iterations input { height: 18px; padding: 0; accent-color: var(--cyan); }
   .mesh-repair-settings > p { margin: -3px 0 1px; color: #718894; font-size: 9px; line-height: 1.55; }
-  .repair-result { display: grid; grid-template-columns: 1fr repeat(4, auto); align-items: center; gap: 11px; padding: 10px; border: 1px solid rgba(98,214,186,.22); border-radius: 8px; background: rgba(98,214,186,.05); }
-  .repair-result.warning { border-color: rgba(239,179,102,.28); background: rgba(239,179,102,.05); }
+  .repair-result { display: grid; grid-template-columns: 1fr repeat(4, auto); align-items: center; gap: 11px; padding: 10px; border: 1px solid #345345; border-radius: 5px; background: #19231f; }
+  .repair-result.warning { border-color: #58482f; background: #241f18; }
   .repair-result > span { color: var(--mint); font-size: 8px; font-weight: 850; }
   .repair-result.warning > span { color: var(--amber); }
   .repair-result > div { display: grid; gap: 2px; text-align: right; }
   .repair-result strong { color: #bdd0d7; font-size: 11px; }
   .repair-result small { color: #647c87; font-size: 7px; }
   .repair-result .report-path { grid-column: 1 / -1; overflow: hidden; color: #58717d; font-family: ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
-  .pipeline-note > strong { font-size: 12px; }
   .pipeline-note div { display: flex; justify-content: space-between; padding-top: 9px; }
-  .pipeline-note .texture-progress { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid rgba(99,199,231,.2); border-radius: 9px; background: rgba(99,199,231,.045); }
-  .pipeline-note .texture-progress.error { border-color: rgba(226,120,103,.3); background: rgba(226,120,103,.045); }
+  .pipeline-note .media-source-list { display: grid; max-height: 310px; margin-top: 10px; padding: 0; overflow-y: auto; border-top: 1px solid var(--line); scrollbar-color: #263d49 transparent; }
+  .pipeline-note .media-source { display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-width: 0; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .pipeline-note .media-source .media-kind { padding: 4px 3px; border-radius: 5px; background: rgba(98,214,186,.1); color: var(--mint); font-size: 7px; font-weight: 850; text-align: center; }
+  .pipeline-note .media-source .media-source-copy { display: grid; min-width: 0; gap: 3px; padding: 0; }
+  .pipeline-note .media-source-copy strong, .pipeline-note .media-source-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pipeline-note .media-source-copy strong { font-size: 10px; }
+  .pipeline-note .media-source-copy small { color: #657d88; font-size: 8px; }
+  .pipeline-note .media-source > button { padding: 4px 2px; background: transparent; color: #987b7b; font-size: 8px; }
+  .pipeline-note .texture-progress { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid #35445b; border-radius: 5px; background: #1a2029; }
+  .pipeline-note .texture-progress.error { border-color: #5a3837; background: #251c1d; }
   .pipeline-note .texture-progress-title { display: flex; align-items: center; padding: 0; text-transform: capitalize; }
   .pipeline-note .texture-progress-title span { color: #8aa3ae; }
   .pipeline-note .texture-progress-title strong { color: var(--cyan); font-size: 10px; }
@@ -2488,12 +2620,12 @@
   .pipeline-note .texture-photo > button { padding: 4px 2px; background: transparent; color: #987b7b; font-size: 8px; }
   .pipeline-note > .ghost { margin-top: 11px; }
   .job-card.error { border-color: rgba(226,120,103,.35); }
-  .progress { height: 5px; overflow: hidden; border-radius: 6px; background: #172a35; }
-  .progress i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--mint)); transition: width .25s linear; }
+  .progress { height: 4px; overflow: hidden; border-radius: 2px; background: #30353d; }
+  .progress i { display: block; height: 100%; border-radius: inherit; background: var(--cyan); transition: width .25s linear; }
   .job-card .progress { margin: 11px 0 8px; }
   .stage-progress-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; color: #687f8a; font-size: 8px; text-transform: uppercase; letter-spacing: .05em; }
   .job-card .progress.stage-progress, .job-overlay .progress.stage-progress { height: 3px; margin: 4px 0 8px; }
-  .progress.stage-progress i { background: linear-gradient(90deg, #7d91ff, var(--cyan)); }
+  .progress.stage-progress i { background: #8a76e8; }
   .job-quality { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; margin: 9px 0; color: #687f8a; font-size: 8px; }
   .job-quality strong { margin-left: 3px; color: #a9bec8; font-size: 9px; }
   .job-meta { justify-content: space-between; gap: 8px; margin-bottom: 11px; color: #687f8a; font-size: 9px; }
@@ -2502,58 +2634,55 @@
   .build-button { height: 47px; }
 
   .view-switcher { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
-  .view-switcher button { display: grid; justify-items: center; gap: 7px; padding: 10px 4px; border: 1px solid var(--line); border-radius: 9px; background: #0a1823; }
-  .view-switcher button.active { border-color: rgba(99,199,231,.4); background: rgba(99,199,231,.09); }
+  .view-switcher button { display: grid; justify-items: center; gap: 7px; padding: 10px 4px; border: 1px solid var(--line); border-radius: 5px; background: #171a1f; }
+  .view-switcher button.active { border-color: #506b9d; background: #202736; }
   .view-switcher button div { display: grid; gap: 2px; text-align: center; }
   .view-switcher button strong { font-size: 10px; }
   .view-switcher button small { color: #687f8a; font-size: 8px; }
-  .edit-tools { display: grid; gap: 9px; }
-  .edit-tools .section-title strong.edited { color: var(--amber); }
+  .edit-tools { display: block; }
+  .edit-tools-body { display: grid; gap: 9px; }
   .edit-actions, .gizmo-modes { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
   .gizmo-modes { grid-template-columns: repeat(3, 1fr); }
   .clip-tools .gizmo-modes { grid-template-columns: repeat(2, 1fr); }
   .edit-options { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding-top: 2px; }
   .edit-options label { display: grid; gap: 5px; color: #78909d; font-size: 9px; font-weight: 700; }
   .edit-options select { height: 32px; padding: 0 8px; font-size: 9px; }
-  .edit-tools button { min-height: 35px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: #0a1823; color: #9eb5bf; font-size: 9px; font-weight: 750; }
-  .edit-tools button:hover:not(:disabled), .edit-tools button.active { border-color: rgba(99,199,231,.42); background: rgba(99,199,231,.09); color: #d2e5ec; }
-  .edit-tools button.active { box-shadow: inset 0 0 0 1px rgba(99,199,231,.08); }
-  .edit-tools .save-pose.dirty { border-color: rgba(98,214,186,.4); background: rgba(98,214,186,.1); color: var(--mint); }
+  .edit-tools button { min-height: 35px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 5px; background: #171a1f; color: #adb3bc; font-size: 9px; font-weight: 750; }
+  .edit-tools button:hover:not(:disabled), .edit-tools button.active { border-color: #506b9d; background: #202736; color: #e0e4ea; }
+  .edit-tools .save-pose.dirty { border-color: #416c59; background: #1c2a24; color: var(--mint); }
   .edit-tools kbd { margin-left: 3px; padding: 1px 4px; border: 1px solid rgba(155,199,215,.16); border-radius: 4px; color: var(--cyan); font-family: ui-monospace, monospace; font-size: 8px; }
   .edit-tools .reset-pose { min-height: 30px; color: #7f97a2; }
-  .edit-tools > p { color: #687f8a; font-size: 9px; line-height: 1.45; }
   .clip-grid { display: grid; grid-template-columns: 18px 1fr 1fr; align-items: center; gap: 5px; }
   .clip-grid small { color: #617985; font-size: 7px; font-weight: 800; letter-spacing: .08em; text-align: center; }
   .clip-grid b { color: var(--amber); font-size: 9px; text-align: center; }
-  .clip-grid input { width: 100%; min-width: 0; padding: 6px; border: 1px solid var(--line); border-radius: 6px; background: #081620; color: #b8cbd3; font-size: 9px; font-variant-numeric: tabular-nums; }
-  .result-stats { padding: 0; }
-  .result-stats p { grid-column: 1 / -1; margin: 0; padding: 10px; background: #0b1924; }
+  .clip-grid input { width: 100%; min-width: 0; padding: 6px; border: 1px solid var(--line); border-radius: 4px; background: #14171b; color: #c8cdd4; font-size: 9px; font-variant-numeric: tabular-nums; }
+  .collapsible-body.result-stats { margin-top: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; }
   .export-list { display: grid; gap: 7px; }
-  .export-list button { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 9px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0a1823; text-align: left; }
+  .export-list button { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 9px; padding: 10px; border: 1px solid var(--line); border-radius: 5px; background: #171a1f; text-align: left; }
   .export-list button:hover:not(:disabled) { border-color: rgba(99,199,231,.36); }
   .export-list button.exporting { border-color: rgba(99,199,231,.36); background: rgba(99,199,231,.07); }
   .export-list button div { display: grid; gap: 3px; }
   .export-list button strong { font-size: 10px; }
   .export-list button small { color: #687f8a; font-size: 8px; }
   .export-list button > i { color: var(--cyan); font-size: 9px; font-style: normal; }
-  .export-feedback { display: grid; gap: 8px; padding: 9px 10px; border: 1px solid rgba(99,199,231,.18); border-radius: 8px; background: rgba(99,199,231,.045); }
+  .export-feedback { display: grid; gap: 8px; padding: 9px 10px; border: 1px solid #35445b; border-radius: 5px; background: #1a2029; }
   .export-feedback > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   .export-feedback strong { color: #a9c3cd; font-size: 9px; }
   .export-feedback small { color: #687f8a; font-size: 8px; text-align: right; }
   .export-progress { display: block; height: 3px; overflow: hidden; border-radius: 4px; background: #172a35; }
-  .export-progress i { display: block; width: 35%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--mint)); animation: export-slide 1.1s ease-in-out infinite; }
+  .export-progress i { display: block; width: 35%; height: 100%; border-radius: inherit; background: var(--cyan); animation: export-slide 1.1s ease-in-out infinite; }
 
-  .live-metrics { position: absolute; top: 26px; right: 26px; display: grid; grid-template-columns: repeat(3, minmax(80px, 1fr)); gap: 1px; overflow: hidden; border: 1px solid rgba(141,195,214,.16); border-radius: 9px; background: rgba(5,14,22,.72); box-shadow: 0 12px 35px rgba(0,0,0,.22); backdrop-filter: blur(12px); }
-  .live-metrics div { display: grid; gap: 3px; padding: 8px 10px; background: rgba(10,26,37,.78); }
+  .live-metrics { position: absolute; top: 24px; right: 24px; display: grid; grid-template-columns: repeat(3, minmax(80px, 1fr)); gap: 1px; overflow: hidden; border: 1px solid #31363e; border-radius: 5px; background: #31363e; }
+  .live-metrics div { display: grid; gap: 3px; padding: 8px 10px; background: #171b20; }
   .live-metrics span { color: #6f8792; font-size: 8px; text-transform: uppercase; }
   .live-metrics strong { font-size: 10px; }
   .live-metrics strong.good { color: var(--mint); }
-  .job-overlay { position: absolute; right: 26px; bottom: 26px; width: min(420px, calc(100% - 52px)); padding: 13px; border: 1px solid rgba(141,195,214,.17); border-radius: 10px; background: rgba(5,14,22,.82); backdrop-filter: blur(12px); }
+  .job-overlay { position: absolute; right: 24px; bottom: 24px; width: min(420px, calc(100% - 48px)); padding: 13px; border: 1px solid #31363e; border-radius: 5px; background: #171b20; }
   .job-overlay > div:first-child { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 10px; text-transform: capitalize; }
   .job-overlay .job-quality { justify-content: flex-start; }
   .job-overlay p { margin-top: 8px; color: #78909c; font-size: 9px; }
 
-  footer { display: flex; align-items: center; gap: 8px; padding: 0 24px; border-top: 1px solid var(--line); background: #08121b; color: #758c97; font-size: 9px; }
+  footer { display: flex; align-items: center; gap: 8px; padding: 0 14px; border: 1px solid var(--line); border-radius: 6px; background: #14171b; color: #858c96; font-size: 9px; }
   footer strong { color: #9bb1bb; font-size: 9px; letter-spacing: .08em; }
   footer p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   footer.error p { color: #d8988e; }

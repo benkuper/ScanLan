@@ -42,6 +42,7 @@ pub fn run() {
             commands::supplemental_photo_progress,
             commands::remove_supplemental_photo,
             commands::import_media_sources,
+            commands::remove_media_source,
             jobs::start_artifact_job,
             jobs::artifact_job_status,
             jobs::latest_artifact_job,

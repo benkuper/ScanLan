@@ -1,3 +1,8 @@
+param(
+  [ValidateSet("Native", "Redistributable")]
+  [string]$PycolmapMode = "Native"
+)
+
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -53,8 +58,10 @@ $CudaArchitecture = (& $Python -c "import torch; print('.'.join(map(str, torch.c
 $TorchBuild = (& $Python -c "import torch; print(torch.__version__)").Trim()
 $ExpectedGsplatFeatures = "$GsplatFeatureSchema;torch=$TorchBuild;arch=$CudaArchitecture"
 $env:TORCH_CUDA_ARCH_LIST = $CudaArchitecture
-& $Python -m pip install --upgrade "numpy==1.26.4" "Pillow==11.1.0" "pycolmap==4.1.1" "av==18.0.0" "ninja>=1.10" "jaxtyping" "rich>=12" "backports.tarfile" "pyinstaller==6.16.0"
+& $Python -m pip install --upgrade "numpy==1.26.4" "Pillow==11.1.0" "av==18.0.0" "ninja>=1.10" "jaxtyping" "rich>=12" "backports.tarfile" "pyinstaller==6.16.0"
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat support dependencies could not be installed." }
+& (Join-Path $PSScriptRoot "build-pycolmap-cuda.ps1") -Mode $PycolmapMode
+if ($LASTEXITCODE -ne 0) { throw "CUDA-enabled PyCOLMAP could not be built or validated." }
 $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
 $VisualStudioRoot = if (Test-Path -LiteralPath $VsWhere) {
   & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath

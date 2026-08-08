@@ -850,16 +850,6 @@ pub fn import_media_sources(
     if active_path != project.path {
         return Err("The selected project is no longer active".to_string());
     }
-    if project
-        .phases
-        .iter()
-        .any(|phase| phase.status == "complete" && phase.frame_count > 0)
-    {
-        return Err(
-            "Start a new project to reconstruct a splat from photos/video; this project already contains RGB-D captures"
-                .to_string(),
-        );
-    }
     let photo_extensions = ["jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp"];
     let video_extensions = ["mp4", "mov", "m4v", "avi", "mkv", "webm", "mts", "m2ts"];
     let mut validated = Vec::with_capacity(media_paths.len());
@@ -921,10 +911,7 @@ pub fn import_media_sources(
         });
     }
     project.media_sources.extend(imported);
-    if let Some(splat) = project.artifacts.gaussian_splat.as_mut() {
-        splat.stale = true;
-        splat.status = "stale".to_string();
-    }
+    mark_all_artifacts_stale(&mut project);
     project.processing_status = "idle".to_string();
     project.processing_error = None;
     if let Err(error) = storage::write_project(&project) {
@@ -932,6 +919,105 @@ pub fn import_media_sources(
             fs::remove_file(copied).ok();
         }
         return Err(error);
+    }
+    *state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())? = project.clone();
+    Ok(project)
+}
+
+fn mark_all_artifacts_stale(project: &mut ProjectSummary) {
+    for artifact in [
+        &mut project.artifacts.point_cloud,
+        &mut project.artifacts.textured_mesh,
+        &mut project.artifacts.gaussian_splat,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        artifact.stale = true;
+        artifact.status = "stale".to_string();
+    }
+}
+
+fn managed_media_source_path(project_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(relative_path);
+    let components = relative.components().collect::<Vec<_>>();
+    let is_managed_media_file = matches!(
+        components.as_slice(),
+        [std::path::Component::Normal(directory), std::path::Component::Normal(_file)]
+            if *directory == std::ffi::OsStr::new("media")
+    );
+    if relative.is_absolute() || !is_managed_media_file {
+        return Err("The imported media source has an unsafe managed path".to_string());
+    }
+    Ok(project_root.join(relative))
+}
+
+#[tauri::command]
+pub fn remove_media_source(
+    project_path: String,
+    media_source_id: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectSummary, String> {
+    if state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .is_some()
+    {
+        return Err("Stop the active capture before removing imported media".to_string());
+    }
+
+    let project_root = PathBuf::from(&project_path);
+    let mut project = storage::read_project(&project_root)?;
+    if project.active_job.is_some() || project.processing_status == "processing" {
+        return Err("Wait for reconstruction to finish before removing imported media".to_string());
+    }
+    let active_path = state
+        .project
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?
+        .path
+        .clone();
+    if active_path != project.path {
+        return Err("The selected project is no longer active".to_string());
+    }
+
+    let source_index = project
+        .media_sources
+        .iter()
+        .position(|source| source.id == media_source_id)
+        .ok_or_else(|| "The imported media source no longer exists".to_string())?;
+    let source_path =
+        managed_media_source_path(&project_root, &project.media_sources[source_index].path)?;
+    let temporary = project_root
+        .join("media")
+        .join(format!(".{}.removing", Uuid::new_v4()));
+    let moved_source = if source_path.is_file() {
+        fs::rename(&source_path, &temporary).map_err(|error| {
+            format!("Could not prepare the imported media for removal: {error}")
+        })?;
+        true
+    } else if source_path.exists() {
+        return Err("The imported media path is not a file".to_string());
+    } else {
+        false
+    };
+
+    project.media_sources.remove(source_index);
+    mark_all_artifacts_stale(&mut project);
+    project.processing_status = "idle".to_string();
+    project.processing_error = None;
+    if let Err(error) = storage::write_project(&project) {
+        if moved_source {
+            fs::rename(&temporary, &source_path).ok();
+        }
+        return Err(error);
+    }
+    if moved_source {
+        fs::remove_file(&temporary).ok();
     }
     *state
         .project
@@ -5026,9 +5112,7 @@ fn export_gaussian_splat_blocking(
                         );
                         convention.insert(
                             "worldAxes".to_string(),
-                            serde_json::Value::String(
-                                "unity_x_right_y_up_z_forward".to_string(),
-                            ),
+                            serde_json::Value::String("unity_x_right_y_up_z_forward".to_string()),
                         );
                         convention.insert(
                             "conversionBakedIntoPly".to_string(),
@@ -5052,16 +5136,34 @@ mod tests {
     use super::{
         append_sensor_args, clipped_binary_ply, clipped_obj, compact_splat_preview,
         convert_3dgs_ply_to_splat, gaussian_edit_matrix, gaussian_splat_preview_is_live,
-        matrix_product, normalize_project, pack_preview_mesh, quaternion_matrix,
-        read_supplemental_photo_manifest, save_live_reconstruction_preview, transformed_cloud_ply,
-        transformed_gaussian_ply, transformed_normal, transformed_obj, transformed_position,
-        unity_compatible_gaussian_ply, unity_compatible_obj, unity_compatible_ply,
-        valid_packed_preview_mesh, validate_sensor_settings, LiveGeometryFrame,
-        RealtimeEngineSnapshot,
+        managed_media_source_path, matrix_product, normalize_project, pack_preview_mesh,
+        quaternion_matrix, read_supplemental_photo_manifest, save_live_reconstruction_preview,
+        transformed_cloud_ply, transformed_gaussian_ply, transformed_normal, transformed_obj,
+        transformed_position, unity_compatible_gaussian_ply, unity_compatible_obj,
+        unity_compatible_ply, valid_packed_preview_mesh, validate_sensor_settings,
+        LiveGeometryFrame, RealtimeEngineSnapshot,
     };
     use crate::models::{BoundingBoxClip, CaptureSettings, CloudTransform, ProjectSummary};
     use std::sync::{Arc, Mutex};
     use std::{fs, process::Command};
+
+    #[test]
+    fn managed_media_source_paths_cannot_escape_the_project_media_directory() {
+        let root = std::env::temp_dir().join("scanlan-media-path-test");
+        assert_eq!(
+            managed_media_source_path(&root, "media/source.mp4").unwrap(),
+            root.join("media").join("source.mp4")
+        );
+        for unsafe_path in [
+            "../source.mp4",
+            "media/../source.mp4",
+            "other/source.mp4",
+            "media/nested/source.mp4",
+            "source.mp4",
+        ] {
+            assert!(managed_media_source_path(&root, unsafe_path).is_err());
+        }
+    }
 
     #[test]
     fn legacy_supplemental_photos_are_visible_as_localized_attempts() {
@@ -5414,7 +5516,11 @@ mod tests {
         assert!(String::from_utf8_lossy(&clipped[..payload_start]).contains("element vertex 1"));
         assert_eq!(clipped.len() - payload_start, 15);
         assert_eq!(
-            f32::from_le_bytes(clipped[payload_start..payload_start + 4].try_into().unwrap()),
+            f32::from_le_bytes(
+                clipped[payload_start..payload_start + 4]
+                    .try_into()
+                    .unwrap()
+            ),
             12.0
         );
     }
@@ -5450,9 +5556,23 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(positions.iter().all(|position| position[0] >= -0.500_001));
-        assert!(positions.iter().any(|position| (position[0] + 0.5).abs() < 1e-6));
-        assert_eq!(clipped.lines().filter(|line| line.starts_with("f ")).count(), 2);
-        assert!(clipped.lines().filter(|line| line.starts_with("vt ")).count() >= 4);
+        assert!(positions
+            .iter()
+            .any(|position| (position[0] + 0.5).abs() < 1e-6));
+        assert_eq!(
+            clipped
+                .lines()
+                .filter(|line| line.starts_with("f "))
+                .count(),
+            2
+        );
+        assert!(
+            clipped
+                .lines()
+                .filter(|line| line.starts_with("vt "))
+                .count()
+                >= 4
+        );
     }
 
     #[test]

@@ -540,6 +540,10 @@ pub struct ArtifactJob {
     pub targets: Vec<String>,
     #[serde(default)]
     pub source_kind: String,
+    #[serde(default)]
+    pub media_restart: String,
+    #[serde(default)]
+    pub rebuild_rgbd: bool,
     pub stage: String,
     #[serde(default)]
     pub detail: String,

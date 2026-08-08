@@ -158,12 +158,20 @@ export interface RuntimeInfo {
 
 export type ArtifactTarget = 'pointCloud' | 'texturedMesh' | 'gaussianSplat';
 export type ArtifactJobStatus = 'queued' | 'running' | 'cancelling' | 'cancelled' | 'failed' | 'complete';
+export type MediaRestartStage = 'reuse' | 'analysis' | 'decode';
+
+export interface BuildReusePolicy {
+  mediaRestart: MediaRestartStage;
+  rebuildRgbd: boolean;
+}
 
 export interface ArtifactJob {
   id: string;
   projectPath: string;
   targets: ArtifactTarget[];
-  sourceKind: 'rgbd' | 'media';
+  sourceKind: 'rgbd' | 'media' | 'hybrid';
+  mediaRestart: MediaRestartStage | '';
+  rebuildRgbd: boolean;
   stage: string;
   detail: string;
   progress: number;

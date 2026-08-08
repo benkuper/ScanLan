@@ -24,12 +24,14 @@ def load_dataset(path: Path) -> tuple[Path, dict[str, Any]]:
     if not manifest.is_file():
         raise FileNotFoundError(f"Gaussian dataset is missing: {manifest}")
     dataset = json.loads(manifest.read_text(encoding="utf-8"))
-    if int(dataset.get("schemaVersion", 0)) != 3:
-        raise ValueError("ScanLan Gaussian training requires canonical dataset schema 3")
+    schema = int(dataset.get("schemaVersion", 0))
+    if schema not in (3, 4):
+        raise ValueError("ScanLan Gaussian training requires canonical dataset schema 3 or 4")
     frames = dataset.get("frames")
     if not isinstance(frames, list) or not frames:
         raise ValueError("ScanLan Gaussian training requires calibrated registered frames")
     metric = bool(dataset.get("metric", False))
+    depth_frame_count = 0
     for index, frame in enumerate(frames):
         intrinsics = frame.get("intrinsics") if isinstance(frame, dict) else None
         if (
@@ -61,13 +63,25 @@ def load_dataset(path: Path) -> tuple[Path, dict[str, Any]]:
             or not all(math.isfinite(float(value)) for value in pose)
         ):
             raise ValueError(f"Canonical frame {index} has an invalid camera pose")
-        required_fields = ["image"]
-        if metric:
-            required_fields.extend(("depth", "depthMask"))
-        elif bool(frame.get("depth")) != bool(frame.get("depthMask")):
+        has_depth = bool(frame.get("depth"))
+        has_mask = bool(frame.get("depthMask"))
+        if has_depth != has_mask:
             raise ValueError(
                 f"Canonical frame {index} must provide both depth and depthMask or neither"
             )
+        if schema == 3 and metric and not has_depth:
+            raise ValueError(f"Canonical metric frame {index} is missing registered depth")
+        if bool(frame.get("metricAnchor", False)) and not has_depth:
+            raise ValueError(f"Canonical frame {index} is a metric anchor without depth")
+        if has_depth:
+            depth_frame_count += 1
+        if schema == 4:
+            confidence = float(frame.get("poseConfidence", 0.0))
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                raise ValueError(f"Canonical frame {index} has invalid pose confidence")
+        required_fields = ["image"]
+        if has_depth:
+            required_fields.extend(("depth", "depthMask"))
         for field in required_fields:
             relative = Path(str(frame.get(field, "")))
             if not relative.parts or relative.is_absolute() or ".." in relative.parts:
@@ -76,6 +90,8 @@ def load_dataset(path: Path) -> tuple[Path, dict[str, Any]]:
                 raise FileNotFoundError(
                     f"Canonical frame {index} is missing {field}: {relative}"
                 )
+    if metric and depth_frame_count == 0:
+        raise ValueError("Canonical metric dataset has no registered depth anchors")
     initialization = Path(str(dataset.get("initialization", "")))
     if (
         not initialization.parts

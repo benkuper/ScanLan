@@ -71,6 +71,12 @@ def parser() -> argparse.ArgumentParser:
     )
     localize.add_argument("project", type=Path)
     localize.add_argument("photos", type=Path, nargs="+")
+    localize_media = commands.add_parser(
+        "localize-media",
+        help="Pose decoded photo/video observations against an RGB-D reconstruction",
+    )
+    localize_media.add_argument("project", type=Path)
+    localize_media.add_argument("manifest", type=Path)
 
     return root
 
@@ -101,13 +107,41 @@ def main(argv: list[str] | None = None) -> int:
 
             replay_archive(arguments.capture, sys.stdout.buffer)
             return 0
-        if arguments.command == "localize-photos":
+        if arguments.command in {"localize-photos", "localize-media"}:
             from .supplemental import localize_supplemental_photos
 
-            result = localize_supplemental_photos(arguments.project, arguments.photos)
+            if arguments.command == "localize-media":
+                manifest_path = arguments.manifest.resolve(strict=True)
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if int(manifest.get("schemaVersion", 0)) != 1:
+                    raise ValueError("Media observation manifest must use schema 1")
+                photos = []
+                observation_metadata = {}
+                for frame in manifest.get("frames", []):
+                    relative = Path(str(frame.get("image", "")))
+                    if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError("Media observation manifest contains an unsafe image path")
+                    photo = (manifest_path.parent / relative).resolve(strict=True)
+                    if not photo.is_relative_to(manifest_path.parent):
+                        raise ValueError("Media observation image escapes its immutable cache")
+                    photos.append(photo)
+                    observation_metadata[photo] = frame
+            else:
+                photos = arguments.photos
+                observation_metadata = None
+            result = localize_supplemental_photos(
+                arguments.project,
+                photos,
+                observation_metadata,
+            )
         else:
             targets = tuple(value.strip() for value in arguments.targets.split(",") if value.strip())
-            unknown = set(targets) - {"point_cloud", "textured_mesh", "gaussian_splat"}
+            unknown = set(targets) - {
+                "point_cloud",
+                "textured_mesh",
+                "gaussian_splat",
+                "localization_map",
+            }
             if unknown:
                 raise ValueError(f"Unknown artifact targets: {', '.join(sorted(unknown))}")
             project = read_project(arguments.project)
@@ -154,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                 write_json(arguments.project / "project.json", project)
             except Exception:
                 pass
-        elif arguments.command == "localize-photos":
+        elif arguments.command in {"localize-photos", "localize-media"}:
             try:
                 from .supplemental import write_localization_progress
 
@@ -175,7 +209,11 @@ def main(argv: list[str] | None = None) -> int:
                     detail=str(error),
                     progress=float(previous.get("progress", 0.0)),
                     processed_photos=int(previous.get("processedPhotos", 0)),
-                    total_photos=len(arguments.photos),
+                    total_photos=(
+                        len(arguments.photos)
+                        if arguments.command == "localize-photos"
+                        else int(previous.get("totalPhotos", 0))
+                    ),
                     localized_photos=int(previous.get("localizedPhotos", 0)),
                     failed_photos=int(previous.get("failedPhotos", 0)),
                 )

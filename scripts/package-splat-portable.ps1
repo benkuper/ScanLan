@@ -28,7 +28,9 @@ function Copy-Required([string]$Source, [string]$Destination) {
 Push-Location $ProjectRoot
 try {
   if (-not $SkipPrepare) {
-    Invoke-Checked "Splat runtime preparation" { npm.cmd run prepare:splat }
+    Invoke-Checked "Splat runtime preparation" {
+      & (Join-Path $ProjectRoot "scripts/build-splat-runtime.ps1") -PycolmapMode Redistributable
+    }
   }
   Invoke-Checked "Portable release build" {
     npm.cmd run tauri -- build --no-bundle --config src-tauri/tauri.splat.conf.json

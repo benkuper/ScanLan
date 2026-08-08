@@ -62,7 +62,9 @@ from scanlan.mesh import (
 )
 from scanlan.reconstruct import reconstruct_project
 from scanlan.supplemental import (
+    _photo_id,
     _photo_quality,
+    _reference_fingerprint,
     _solve_photo_pose,
     _world_from_depth_pose,
     localize_supplemental_photos,
@@ -123,6 +125,35 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(manifest["attempts"]), 1)
             self.assertEqual(manifest["attempts"][0]["name"], "detail")
             self.assertEqual(manifest["attempts"][0]["status"], "queued")
+
+    def test_supplemental_camera_analysis_is_reused_for_the_same_reference_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "decoded-frame.jpg"
+            source.write_bytes(b"stable-decoded-frame")
+            pose_path = root / "outputs" / "camera-poses.json"
+            pose_path.parent.mkdir(parents=True)
+            pose_path.write_text('{"schemaVersion":1,"frames":[]}', encoding="utf-8")
+            photo_id = _photo_id(source)
+            fingerprint = _reference_fingerprint(pose_path)
+            cached = {
+                "id": photo_id,
+                "name": "decoded-frame",
+                "path": "supplemental/cached.png",
+                "sourcePath": str(source),
+                "status": "localized",
+                "referenceFingerprint": fingerprint,
+            }
+            write_json(
+                root / "supplemental-photos.json",
+                {"schemaVersion": 1, "photos": [cached], "attempts": [cached]},
+            )
+
+            with patch("scanlan.supplemental._opencv", return_value=object()):
+                result = localize_supplemental_photos(root, [source])
+
+            self.assertTrue(result["cacheHit"])
+            self.assertEqual(result["localizedPhotoCount"], 1)
 
     def test_legacy_display_pose_recovers_canonical_depth_camera(self) -> None:
         pose = {
@@ -403,10 +434,28 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(result["supplementalTextureFrameCount"], 1)
             self.assertNotEqual(result["supplementalTextureFingerprint"], "none")
+            self.assertEqual(result["mediaPointColorFrameCount"], 1)
+            self.assertGreater(result["mediaPointColorCoveragePercent"], 0.0)
             rebuilt_poses = json.loads(
                 (root / "outputs" / "camera-poses.json").read_text(encoding="utf-8")
             )
             self.assertTrue(any(pose["supplementalPhoto"] for pose in rebuilt_poses))
+
+            reconstruct_project(root, engine="numpy", targets=("gaussian_splat",))
+            current = root / "outputs" / "cache" / "datasets" / "current.json"
+            pointer = json.loads(current.read_text(encoding="utf-8"))
+            dataset = json.loads(
+                (current.parent / pointer["path"] / "dataset.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(dataset["schemaVersion"], 4)
+            self.assertEqual(dataset["sourceMode"], "hybrid")
+            self.assertEqual(dataset["mediaTrainingFrameCount"], 1)
+            media_frame = next(
+                frame for frame in dataset["frames"] if frame["sourceType"] == "high_quality_media"
+            )
+            self.assertNotIn("depth", media_frame)
+            self.assertFalse(media_frame["metricAnchor"])
+            self.assertGreater(media_frame["poseConfidence"], 0.0)
 
     def test_gaussian_target_builds_the_canonical_posed_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

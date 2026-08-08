@@ -26,7 +26,7 @@ from .pose import (
 FRAME_REUSE_PER_LOAD = 4
 LOSS_EMA_ALPHA = 0.005
 RGBD_GAUSSIAN_MULTIPLIER = 3
-TRAINER_VERSION = "photo-video-3dgs-and-rgbd-2dgs-v4"
+TRAINER_VERSION = "photo-video-shared-camera-3dgs-rgbd-hybrid-2dgs-v6"
 RGBD_SURFACE_SCALE_MULTIPLIER = 1.3
 RGBD_SURFACE_OPACITY = 0.45
 MAX_METRIC_ITERATIONS = 2_000
@@ -287,6 +287,39 @@ def _finish_training_step(
         )
 
 
+def _reset_opacity_if_due(
+    strategy: Any,
+    parameters: Any,
+    optimizers: dict[str, Any],
+    strategy_state: dict[str, Any],
+    step: int,
+    reset: Any | None = None,
+) -> bool:
+    """Apply the opacity reset intended by gsplat 1.5.3's default strategy.
+
+    gsplat 1.5.3 has a chained-comparison typo in its reset condition, so its
+    nominal 3,000-step opacity reset never runs. Without that reset, early
+    floaters survive and continue to seed aggressive growth.
+    """
+    if (
+        strategy is None
+        or step <= 0
+        or step % int(strategy.reset_every) != 0
+    ):
+        return False
+    if reset is None:
+        from gsplat.strategy.ops import reset_opa
+
+        reset = reset_opa
+    reset(
+        params=parameters,
+        optimizers=optimizers,
+        state=strategy_state,
+        value=float(strategy.prune_opa) * 2.0,
+    )
+    return True
+
+
 def _cache_local_frame_order(
     frame_count: int,
     epoch: int,
@@ -299,6 +332,36 @@ def _cache_local_frame_order(
     blocks = [
         np.tile(shuffled[start : start + cache_size], FRAME_REUSE_PER_LOAD)
         for start in range(0, frame_count, cache_size)
+    ]
+    return np.concatenate(blocks)
+
+
+def _training_frame_order(
+    frames: list[dict[str, Any]],
+    epoch: int,
+    cache_size: int,
+) -> np.ndarray:
+    """Give metric anchors and high-quality views equal training exposure."""
+    metric = np.asarray(
+        [index for index, frame in enumerate(frames) if frame.get("depth")],
+        dtype=np.int64,
+    )
+    appearance = np.asarray(
+        [index for index, frame in enumerate(frames) if not frame.get("depth")],
+        dtype=np.int64,
+    )
+    if not len(metric) or not len(appearance):
+        return _cache_local_frame_order(len(frames), epoch, cache_size)
+    generator = np.random.default_rng(epoch)
+    metric = generator.permutation(metric)
+    appearance = generator.permutation(appearance)
+    group_size = max(len(metric), len(appearance))
+    balanced = np.column_stack(
+        (np.resize(metric, group_size), np.resize(appearance, group_size))
+    ).reshape(-1)
+    blocks = [
+        np.tile(balanced[start : start + cache_size], FRAME_REUSE_PER_LOAD)
+        for start in range(0, len(balanced), cache_size)
     ]
     return np.concatenate(blocks)
 
@@ -426,6 +489,7 @@ def train_dataset(
     if len(frames) < 2:
         raise ValueError("At least two registered RGB views are required for Gaussian training")
     uses_depth = any(frame.get("depth") for frame in frames)
+    hybrid = dataset.get("sourceMode") == "hybrid"
     pose_refinement_enabled = bool(
         dataset.get("poseRefinement", False)
         or (
@@ -434,7 +498,8 @@ def train_dataset(
         )
     )
     appearance_optimization_enabled = bool(
-        dataset.get("appearanceOptimization", False) and not dataset.get("metric")
+        dataset.get("appearanceOptimization", False)
+        and (not dataset.get("metric") or hybrid)
     )
     appearance_anchor_index = int(dataset.get("appearanceAnchorIndex", 0))
     appearance_anchor_index = min(max(appearance_anchor_index, 0), len(frames) - 1)
@@ -451,7 +516,7 @@ def train_dataset(
     )
     uses_2dgs = bool(dataset.get("metric"))
     requested_iterations = iterations
-    if metric_seeded:
+    if metric_seeded and not hybrid:
         # Dense RGB-D already supplies the measured surface and appearance. A
         # short bounded pass is enough to validate it and conservatively refine
         # camera poses; longer runs add no surface detail in fixed-surface mode.
@@ -561,6 +626,12 @@ def train_dataset(
         pose_offset_values.to(device),
         requires_grad=pose_refinement_enabled,
     )
+    pose_anchor_mask = torch.tensor(
+        [bool(frame.get("metricAnchor", False)) for frame in frames],
+        dtype=torch.bool,
+        device=device,
+    )
+    pose_refinement_mask = (~pose_anchor_mask).to(torch.float32).unsqueeze(-1)
     appearance_offset_values = torch.zeros((len(frames), 6), dtype=torch.float32)
     if checkpoint is not None and checkpoint.get("appearanceOffsets") is not None:
         restored_appearance_offsets = checkpoint["appearanceOffsets"]
@@ -577,9 +648,9 @@ def train_dataset(
         "means": 0.0 if metric_seeded else 1.6e-4 * scene_scale,
         "scales": 0.0 if metric_seeded else 5e-3,
         "quats": 0.0 if metric_seeded else 1e-3,
-        "opacities": 0.0 if metric_seeded else 5e-2,
-        "sh0": 0.0 if metric_seeded else 2.5e-3,
-        "shN": 0.0 if metric_seeded else 1.25e-4,
+        "opacities": 1e-2 if hybrid and metric_seeded else 0.0 if metric_seeded else 5e-2,
+        "sh0": 2.5e-3 if hybrid and metric_seeded else 0.0 if metric_seeded else 2.5e-3,
+        "shN": 1.25e-4 if hybrid and metric_seeded else 0.0 if metric_seeded else 1.25e-4,
     }
     optimizers = {
         name: torch.optim.Adam(
@@ -685,7 +756,7 @@ def train_dataset(
     last_loss = 0.0
     smoothed_loss: float | None = None
     frame_epoch = -1
-    frame_order = np.arange(len(frames), dtype=np.int64)
+    frame_order = _training_frame_order(frames, 0, host_cache_size)
     densification_stopped_at: int | None = None
 
     def publish_live_preview() -> None:
@@ -714,11 +785,11 @@ def train_dataset(
         if (output_root / "cancel.flag").exists():
             save_checkpoint(step - 1)
             raise RuntimeError("Gaussian training cancelled; checkpoint saved")
-        next_epoch = step // (len(frames) * FRAME_REUSE_PER_LOAD)
+        next_epoch = step // len(frame_order)
         if next_epoch != frame_epoch:
             frame_epoch = next_epoch
-            frame_order = _cache_local_frame_order(
-                len(frames),
+            frame_order = _training_frame_order(
+                frames,
                 frame_epoch,
                 host_cache_size,
             )
@@ -744,7 +815,9 @@ def train_dataset(
             appearance_optimizer.zero_grad(set_to_none=True)
         refined_view = frame["view"]
         if pose_active:
-            correction = pose_delta_matrix(pose_offsets[frame_index])
+            correction = pose_delta_matrix(
+                pose_offsets[frame_index] * pose_refinement_mask[frame_index]
+            )
             refined_camera_to_world = frame["cameraToWorld"] @ correction
             refined_view = torch.linalg.inv(refined_camera_to_world)
         with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -816,8 +889,13 @@ def train_dataset(
                 if rgb_mask is not None and torch.any(rgb_mask)
                 else rgb_residual.mean()
             )
-            loss = 0.8 * rgb_l1 + 0.2 * (
-                1.0 - _ssim(predicted_for_loss, frame["rgb"], rgb_mask)
+            observation_confidence = min(
+                1.0,
+                max(0.05, float(frames[frame_index].get("poseConfidence", 1.0))),
+            )
+            loss = observation_confidence * (
+                0.8 * rgb_l1
+                + 0.2 * (1.0 - _ssim(predicted_for_loss, frame["rgb"], rgb_mask))
             )
             if appearance_active:
                 loss = loss + 1e-4 * appearance_regularization_value
@@ -883,6 +961,13 @@ def train_dataset(
             appearance_optimizer,
             appearance_active,
         )
+        _reset_opacity_if_due(
+            strategy,
+            parameters,
+            optimizers,
+            strategy_state,
+            step,
+        )
         learning_rate_decay = _exponential_lr_gamma(iterations) ** (step + 1)
         optimizers["means"].param_groups[0]["lr"] = (
             learning_rates["means"] * learning_rate_decay
@@ -905,6 +990,8 @@ def train_dataset(
             )
         if pose_active:
             constrain_pose_offsets_(pose_offsets)
+            with torch.no_grad():
+                pose_offsets[pose_anchor_mask].zero_()
         if appearance_active:
             _constrain_appearance_offsets_(appearance_offsets, appearance_anchor_index)
         last_loss = float(loss.detach())

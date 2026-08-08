@@ -10,7 +10,13 @@ import numpy as np
 
 from .dataset import build_posed_dataset, dataset_fingerprint
 from .io import phase_roots, read_phase, read_project, save_binary_ply, save_preview, write_json
-from .mesh import PosedFrame, build_mesh_artifacts
+from .mesh import (
+    PosedFrame,
+    build_mesh_artifacts,
+    enhance_point_colors_from_media,
+    load_supplemental_observation_frames,
+    write_camera_pose_manifest,
+)
 from .mesh_repair import MeshRepairSettings, settings_from_project
 from .numpy_engine import reconstruct_known_poses
 
@@ -208,14 +214,28 @@ def reconstruct_project(
 
         output_dir = project_root / "outputs"
         posed_frames = artifact_context.get("posed_frames", [])
+        # Hybrid jobs need calibrated metric reference cameras before their
+        # high-resolution media can be localized. Publishing this lightweight
+        # manifest must not require building a provisional mesh first.
+        write_camera_pose_manifest(output_dir, posed_frames)
         # The canonical RGB/depth dataset and Gaussian initialization are only
         # consumed by the splat trainer.  Building them for a mesh-only job used
         # to reproject and compress every captured frame before meshing could
         # even begin, despite the mesh path reading its selected source frames
         # directly.
         needs_dataset = "gaussian_splat" in targets
+        supplemental_frames = (
+            load_supplemental_observation_frames(project_root, posed_frames[0])
+            if posed_frames
+            else []
+        )
+        dataset_frames = (
+            [*posed_frames, *supplemental_frames]
+            if needs_dataset and posed_frames
+            else posed_frames
+        )
         dataset = (
-            build_posed_dataset(output_dir / "cache", posed_frames, reporter.update)
+            build_posed_dataset(output_dir / "cache", dataset_frames, reporter.update)
             if needs_dataset
             else None
         )
@@ -249,7 +269,18 @@ def reconstruct_project(
             0.0,
         )
         output_path = output_dir / "room-cloud.ply"
+        point_color_metrics: dict[str, object] = {
+            "mediaPointColorFrameCount": 0,
+            "mediaPointColorCoveragePercent": 0.0,
+        }
         if "point_cloud" in targets:
+            colors, point_color_metrics = enhance_point_colors_from_media(
+                points,
+                colors,
+                supplemental_frames,
+                voxel_size_m,
+                reporter.update,
+            )
             save_binary_ply(output_path, points, colors)
             save_preview(output_dir / "preview.json", points, colors)
         result = {
@@ -268,13 +299,16 @@ def reconstruct_project(
             **mesh,
             "targets": list(targets),
             "datasetFingerprint": source_fingerprint,
+            **point_color_metrics,
         }
 
         # Gaussian training is a separate worker launched by the desktop job
         # orchestrator. Keep the overall project active while that selected
         # target is still pending so live splat previews remain available.
         project["processingStatus"] = (
-            "processing" if "gaussian_splat" in targets else "complete"
+            "processing"
+            if "gaussian_splat" in targets or "localization_map" in targets
+            else "complete"
         )
         project.pop("processingError", None)
         project["schemaVersion"] = 3
@@ -338,16 +372,27 @@ def reconstruct_project(
         project["confidenceLabel"] = result["confidenceLabel"]
         project["confidenceDetail"] = result["confidenceDetail"]
         project["framesUsed"] = result["framesUsed"]
-        reporter.update(
-            "Complete",
-            f"3D model ready · {result['meshTriangleCount']:,} textured triangles · "
-            f"{quality['score']}/100 {quality['label'].lower()} confidence",
-            max(0, reporter.total_units - reporter.processed_units),
-            len(points),
-            1.0,
-            0,
-            round(perf_counter() - reporter.started),
-        )
+        if "localization_map" in targets:
+            reporter.update(
+                "media_localization",
+                "Metric RGB-D anchor map ready; localizing high-quality media",
+                max(0, reporter.total_units - reporter.processed_units),
+                len(points),
+                0.0,
+                0,
+                None,
+            )
+        else:
+            reporter.update(
+                "Complete",
+                f"3D model ready · {result['meshTriangleCount']:,} textured triangles · "
+                f"{quality['score']}/100 {quality['label'].lower()} confidence",
+                max(0, reporter.total_units - reporter.processed_units),
+                len(points),
+                1.0,
+                0,
+                round(perf_counter() - reporter.started),
+            )
         result["processingSeconds"] = round(perf_counter() - reporter.started, 2)
         result["stageTimingsSeconds"] = reporter.stage_timings(include_current=False)
         project["processingBackend"] = result["computeBackend"]

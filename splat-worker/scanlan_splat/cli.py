@@ -6,7 +6,13 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .media import MediaPreparationOptions, prepare_media_dataset
+from .media import (
+    MediaPreparationOptions,
+    _write_json_atomic,
+    prepare_media_dataset,
+    prepare_media_observations,
+)
+from .runtime import pycolmap_feature_runtime
 from .train import train_dataset
 
 
@@ -44,6 +50,31 @@ def _cuda_smoke_test() -> None:
         raise RuntimeError("gsplat CUDA backward smoke test produced invalid gradients")
 
 
+def _publish_failure(project_root: Path, error: Exception) -> None:
+    """Leave a structured failure for the desktop process instead of only stderr."""
+    progress_path = project_root / "outputs" / "splat-progress.json"
+    try:
+        payload = (
+            json.loads(progress_path.read_text(encoding="utf-8"))
+            if progress_path.is_file()
+            else {}
+        )
+        payload.update(
+            {
+                "stage": "failed",
+                "detail": str(error),
+                "error": str(error),
+                "etaSeconds": None,
+                "stageEtaSeconds": None,
+            }
+        )
+        _write_json_atomic(progress_path, payload)
+    except Exception:
+        # Preserve the original worker failure even if status publication also
+        # encounters an unexpected filesystem error.
+        pass
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="scanlan-splat")
     root.add_argument("--version", action="version", version=__version__)
@@ -56,9 +87,15 @@ def parser() -> argparse.ArgumentParser:
     prepare = commands.add_parser("prepare-media")
     prepare.add_argument("--project", type=Path, required=True)
     prepare.add_argument("--source", type=Path, action="append", default=[])
-    prepare.add_argument("--video-fps", type=float, default=2.0)
-    prepare.add_argument("--maximum-video-frames", type=int, default=600)
-    prepare.add_argument("--maximum-image-dimension", type=int, default=4096)
+    prepare.add_argument("--video-fps", type=float, default=1.0)
+    prepare.add_argument("--maximum-video-frames", type=int, default=240)
+    prepare.add_argument("--maximum-image-dimension", type=int, default=2560)
+    observations = commands.add_parser("extract-media")
+    observations.add_argument("--project", type=Path, required=True)
+    observations.add_argument("--source", type=Path, action="append", default=[])
+    observations.add_argument("--video-fps", type=float, default=1.0)
+    observations.add_argument("--maximum-video-frames", type=int, default=240)
+    observations.add_argument("--maximum-image-dimension", type=int, default=2560)
     diagnostics = commands.add_parser("diagnostics")
     diagnostics.add_argument("--require-cuda", action="store_true")
     return root
@@ -74,17 +111,46 @@ def main(argv: list[str] | None = None) -> int:
             cuda_available = torch.cuda.is_available()
             if arguments.require_cuda and cuda_available:
                 _cuda_smoke_test()
-            print(json.dumps({"version": __version__, "cuda": cuda_available, "cudaSmokeTest": cuda_available and arguments.require_cuda, "device": torch.cuda.get_device_name(0) if cuda_available else None, "torch": torch.__version__, "gsplat": getattr(gsplat, "__version__", "unknown")}))
-            return 2 if arguments.require_cuda and not cuda_available else 0
-        if arguments.command == "prepare-media":
-            result = prepare_media_dataset(
+            feature_runtime = pycolmap_feature_runtime()
+            print(
+                json.dumps(
+                    {
+                        "version": __version__,
+                        "cuda": cuda_available,
+                        "cudaSmokeTest": cuda_available and arguments.require_cuda,
+                        "device": torch.cuda.get_device_name(0) if cuda_available else None,
+                        "cudaCapability": (
+                            ".".join(map(str, torch.cuda.get_device_capability(0)))
+                            if cuda_available
+                            else None
+                        ),
+                        "torch": torch.__version__,
+                        "gsplat": getattr(gsplat, "__version__", "unknown"),
+                        "pycolmap": feature_runtime,
+                    }
+                )
+            )
+            return (
+                2
+                if arguments.require_cuda
+                and (not cuda_available or not feature_runtime["cudaValidated"])
+                else 0
+            )
+        if arguments.command in {"prepare-media", "extract-media"}:
+            media_options = MediaPreparationOptions(
+                video_fps=max(0.1, min(arguments.video_fps, 30.0)),
+                maximum_video_frames=max(3, min(arguments.maximum_video_frames, 5_000)),
+                maximum_image_dimension=max(720, min(arguments.maximum_image_dimension, 8_192)),
+            )
+            prepare = (
+                prepare_media_observations
+                if arguments.command == "extract-media"
+                else prepare_media_dataset
+            )
+            result = prepare(
                 arguments.project.resolve(),
                 arguments.source,
-                MediaPreparationOptions(
-                    video_fps=max(0.1, min(arguments.video_fps, 30.0)),
-                    maximum_video_frames=max(3, min(arguments.maximum_video_frames, 5_000)),
-                    maximum_image_dimension=max(720, min(arguments.maximum_image_dimension, 8_192)),
-                ),
+                media_options,
             )
             print(json.dumps(result))
             return 0
@@ -97,6 +163,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result))
         return 0
     except Exception as error:
+        project_root = getattr(arguments, "project", None)
+        if isinstance(project_root, Path):
+            _publish_failure(project_root.resolve(), error)
         print(f"scanlan-splat: {error}", file=sys.stderr)
         return 1
 

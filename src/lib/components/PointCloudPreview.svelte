@@ -131,8 +131,8 @@
     }, 250);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color('#07111c');
-    scene.fog = new THREE.FogExp2('#07111c', 0.055);
+    scene.background = new THREE.Color('#0b0d10');
+    scene.fog = new THREE.FogExp2('#0b0d10', 0.055);
 
     const perspectiveCamera = new THREE.PerspectiveCamera(48, 1, 0.01, 100);
     const orthographicCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 100);
@@ -248,27 +248,21 @@
     viewCubeRenderer.setSize(118, 118, false);
     viewCubeRenderer.outputColorSpace = THREE.SRGBColorSpace;
 
-    const makeFaceTexture = (label: string, axis: string, topColor: string, bottomColor: string) => {
+    const makeFaceTexture = (label: string, axis: string, color: string) => {
       const textureCanvas = document.createElement('canvas');
       textureCanvas.width = 256;
       textureCanvas.height = 256;
       const context = textureCanvas.getContext('2d')!;
-      const gradient = context.createLinearGradient(0, 0, 0, 256);
-      gradient.addColorStop(0, topColor);
-      gradient.addColorStop(1, bottomColor);
-      context.fillStyle = gradient;
+      context.fillStyle = color;
       context.fillRect(0, 0, 256, 256);
       context.strokeStyle = 'rgba(172, 229, 247, 0.5)';
       context.lineWidth = 10;
       context.strokeRect(5, 5, 246, 246);
       context.textAlign = 'center';
       context.textBaseline = 'middle';
-      context.shadowColor = 'rgba(0, 0, 0, 0.5)';
-      context.shadowBlur = 7;
       context.fillStyle = '#f0fbfe';
       context.font = '850 58px Inter, Segoe UI, sans-serif';
       context.fillText(axis, 128, 112);
-      context.shadowBlur = 4;
       context.fillStyle = 'rgba(232, 248, 252, 0.9)';
       context.font = `800 ${label.length > 5 ? 22 : 25}px Inter, Segoe UI, sans-serif`;
       context.fillText(label, 128, 171);
@@ -286,8 +280,8 @@
       ['BACK', '-Z', '#306797', '#17385f'],
       ['FRONT', '+Z', '#397fb5', '#1e4c78']
     ] as const;
-    const viewCubeTextures = viewCubeFaceSpecs.map(([label, axis, topColor, bottomColor]) =>
-      makeFaceTexture(label, axis, topColor, bottomColor)
+    const viewCubeTextures = viewCubeFaceSpecs.map(([label, axis, color]) =>
+      makeFaceTexture(label, axis, color)
     );
     const viewCubeMaterials = viewCubeTextures.map((map) => new THREE.MeshBasicMaterial({ map }));
     const viewCubeGeometry = new THREE.BoxGeometry(1.42, 1.42, 1.42);
@@ -415,7 +409,7 @@
     viewCubeCanvas.addEventListener('pointercancel', handleViewCubePointerUp);
     viewCubeCanvas.addEventListener('pointerleave', handleViewCubePointerLeave);
 
-    const grid = new THREE.GridHelper(12, 24, '#19384a', '#102a39');
+    const grid = new THREE.GridHelper(12, 24, '#30343a', '#202328');
     grid.position.y = -0.015;
     scene.add(grid);
     const fillLight = new THREE.HemisphereLight('#d9f3ff', '#17232b', 1.15);
@@ -1355,41 +1349,41 @@
 </div>
 
 <style>
-  .viewer { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; border-radius: 22px; background: #07111c; box-shadow: inset 0 0 0 1px rgba(139, 193, 216, 0.08); }
+  .viewer { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; border: 1px solid #292e35; border-radius: 6px; background: #0b0d10; }
   .scene-canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; cursor: grab; }
   .scene-canvas:active { cursor: grabbing; }
   .point-pick .scene-canvas, .point-pick .scene-canvas:active { cursor: crosshair; }
   .clip-edit .scene-canvas { cursor: default; }
   .view-cube-shell { position: absolute; z-index: 7; top: 14px; right: 14px; width: 118px; height: 118px; pointer-events: none; transition: top 180ms ease; }
   .view-cube-shell.live-offset { top: 82px; }
-  .view-cube-canvas { position: relative; display: block; width: 118px; height: 118px; cursor: grab; filter: drop-shadow(0 10px 12px rgba(0, 0, 0, 0.36)); pointer-events: auto; touch-action: none; }
+  .view-cube-canvas { position: relative; display: block; width: 118px; height: 118px; cursor: grab; pointer-events: auto; touch-action: none; }
   .view-cube-canvas:active { cursor: grabbing; }
-  .projection-toggle { position: absolute; z-index: 1; top: 1px; left: 1px; min-width: 37px; height: 27px; padding: 0 7px; border: 1px solid rgba(139, 210, 234, 0.23); border-radius: 14px; background: rgba(7, 23, 34, 0.72); box-shadow: 0 6px 16px rgba(0, 0, 0, 0.28); color: #7899a7; font: 800 7px/1 Inter, Segoe UI, sans-serif; letter-spacing: 0.06em; cursor: pointer; pointer-events: auto; backdrop-filter: blur(10px); }
-  .projection-toggle.orthographic { border-color: rgba(98, 214, 186, 0.34); color: #6ed7bd; }
-  .projection-toggle:hover { border-color: rgba(103, 201, 231, 0.52); background: rgba(19, 52, 67, 0.82); color: #cef4fc; }
+  .projection-toggle { position: absolute; z-index: 1; top: 1px; left: 1px; min-width: 37px; height: 27px; padding: 0 7px; border: 1px solid #343a43; border-radius: 4px; background: #171b20; color: #8e98a5; font: 800 7px/1 Inter, Segoe UI, sans-serif; letter-spacing: 0.06em; cursor: pointer; pointer-events: auto; }
+  .projection-toggle.orthographic { border-color: #416c59; color: #67c49f; }
+  .projection-toggle:hover { border-color: #52698f; background: #202630; color: #d2d8e1; }
   .projection-toggle:focus-visible { outline: 2px solid rgba(99, 199, 231, 0.75); outline-offset: 2px; }
-  .view-home { position: absolute; z-index: 1; top: 1px; right: 1px; display: grid; place-items: center; width: 27px; height: 27px; padding: 0; border: 1px solid rgba(139, 210, 234, 0.23); border-radius: 50%; background: rgba(7, 23, 34, 0.72); box-shadow: 0 6px 16px rgba(0, 0, 0, 0.28); color: #80cfe7; cursor: pointer; pointer-events: auto; backdrop-filter: blur(10px); }
+  .view-home { position: absolute; z-index: 1; top: 1px; right: 1px; display: grid; place-items: center; width: 27px; height: 27px; padding: 0; border: 1px solid #343a43; border-radius: 4px; background: #171b20; color: #79a5f5; cursor: pointer; pointer-events: auto; }
   .view-home svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-  .view-home:hover { border-color: rgba(103, 201, 231, 0.52); background: rgba(19, 52, 67, 0.82); color: #cef4fc; }
+  .view-home:hover { border-color: #52698f; background: #202630; color: #d2d8e1; }
   .view-home:focus-visible { outline: 2px solid rgba(99, 199, 231, 0.75); outline-offset: 2px; }
-  .viewer-hud { position: absolute; display: flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid rgba(157, 204, 223, 0.12); border-radius: 10px; background: rgba(5, 15, 25, 0.68); color: #adc3d0; font-size: 11px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; backdrop-filter: blur(12px); pointer-events: none; }
+  .viewer-hud { position: absolute; display: flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid #30353d; border-radius: 4px; background: #171b20; color: #b5bbc4; font-size: 11px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; pointer-events: none; }
   .top-left { top: 16px; left: 16px; }
   .bottom-right { right: 16px; bottom: 16px; text-transform: none; letter-spacing: 0; }
   .floor-hint { left: 50%; bottom: 16px; transform: translateX(-50%); border-color: rgba(240, 183, 107, 0.35); color: #f0c68f; }
-  .pulse { width: 7px; height: 7px; border-radius: 50%; background: #58d5b5; box-shadow: 0 0 0 4px rgba(88, 213, 181, 0.1); }
+  .pulse { width: 7px; height: 7px; border-radius: 50%; background: #54b78d; }
   .processing .pulse { background: #f0b76b; animation: pulse 1.1s infinite; }
   .viewer-hud.live .pulse { animation: pulse 1.1s infinite; }
   .empty-state { position: absolute; inset: 0; display: grid; place-content: center; gap: 8px; color: #6c8593; text-align: center; pointer-events: none; }
   .empty-state strong { color: #a9bec8; font-size: 15px; }
   .empty-state span { font-size: 11px; }
-  .asset-loading { position: absolute; z-index: 5; left: 50%; top: 50%; width: min(320px, calc(100% - 40px)); padding: 22px 24px; display: grid; justify-items: center; gap: 9px; transform: translate(-50%, -50%); border: 1px solid rgba(112, 186, 215, 0.28); border-radius: 16px; background: rgba(5, 14, 23, 0.94); box-shadow: 0 22px 70px rgba(0, 0, 0, 0.42); color: #b7ccd7; text-align: center; pointer-events: none; }
+  .asset-loading { position: absolute; z-index: 5; left: 50%; top: 50%; width: min(320px, calc(100% - 40px)); padding: 22px 24px; display: grid; justify-items: center; gap: 9px; transform: translate(-50%, -50%); border: 1px solid #343a43; border-radius: 6px; background: #171b20; color: #c4c9d0; text-align: center; pointer-events: none; }
   .asset-loading strong { color: #d4e7ef; font-size: 14px; }
   .asset-loading span { color: #78909d; font-size: 10px; }
   .asset-loading-spinner { width: 25px; height: 25px; border: 2px solid rgba(104, 195, 227, 0.2); border-top-color: #68c3e3; border-radius: 50%; animation: loading-spin 0.8s linear infinite; }
   .asset-loading-track { width: 100%; height: 3px; margin-top: 4px; overflow: hidden; border-radius: 3px; background: rgba(104, 195, 227, 0.12); }
-  .asset-loading-track i { display: block; width: 38%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, transparent, #68c3e3, transparent); animation: loading-track 1.15s ease-in-out infinite; }
+  .asset-loading-track i { display: block; width: 38%; height: 100%; border-radius: inherit; background: #6c9eff; animation: loading-track 1.15s ease-in-out infinite; }
   .asset-loading-track.determinate i { background: #68c3e3; animation: none; transition: width 120ms linear; }
-  .processing-scan { position: absolute; inset: 0; background: linear-gradient(180deg, transparent 0%, rgba(72, 177, 209, 0.08) 48%, rgba(103, 220, 197, 0.28) 50%, rgba(72, 177, 209, 0.08) 52%, transparent 100%); transform: translateY(-100%); animation: scan 2.4s ease-in-out infinite; pointer-events: none; }
+  .processing-scan { display: none; }
   @keyframes scan { to { transform: translateY(100%); } }
   @keyframes pulse { 50% { opacity: 0.4; transform: scale(0.8); } }
   @keyframes loading-spin { to { transform: rotate(360deg); } }

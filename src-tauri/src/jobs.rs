@@ -263,6 +263,20 @@ fn stage_plan(job: &ArtifactJob) -> Vec<(&'static str, f32)> {
             ("publish", 0.05),
         ];
     }
+    if job.source_kind == "hybrid" {
+        return vec![
+            ("prepare", 0.05),
+            ("track", 0.12),
+            ("trajectory", 0.10),
+            ("fuse", 0.08),
+            ("cloud", 0.18),
+            ("media", 0.18),
+            ("dataset", 0.08),
+            ("mesh", 0.18),
+            ("splat", 0.55),
+            ("publish", 0.05),
+        ];
+    }
     let wants_mesh = job.targets.iter().any(|target| target == "texturedMesh");
     let wants_splat = job.targets.iter().any(|target| target == "gaussianSplat");
     let mut plan = vec![
@@ -340,7 +354,7 @@ fn planned_progress(job: &ArtifactJob, stage_progress: Option<f32>) -> Option<f3
     Some(((completed_weight + plan[index].1 * fraction) / total_weight).clamp(0.0, 1.0))
 }
 
-fn update_job_eta(job: &mut ArtifactJob) {
+fn update_job_elapsed(job: &mut ArtifactJob) {
     let now = Utc::now();
     let Some(started) = job
         .started_at
@@ -354,20 +368,6 @@ fn update_job_eta(job: &mut ArtifactJob) {
         .num_seconds()
         .max(0) as u32;
     job.elapsed_seconds = Some(elapsed);
-    if job.progress >= 0.995 {
-        job.eta_seconds = Some(0);
-    } else if job.progress >= 0.02 && elapsed >= 2 {
-        let candidate = (elapsed as f32 * (1.0 - job.progress) / job.progress).round() as u32;
-        job.eta_seconds = Some(
-            match job.eta_seconds.filter(|value| *value > 0) {
-                Some(previous) => {
-                    ((previous as f32 * 0.8) + (candidate as f32 * 0.2)).round() as u32
-                }
-                None => candidate,
-            }
-            .max(1),
-        );
-    }
 }
 
 fn merge_progress(project_root: &Path, job: &mut ArtifactJob, splat: bool) {
@@ -448,13 +448,22 @@ fn merge_progress(project_root: &Path, job: &mut ArtifactJob, splat: bool) {
                 })
                 .flatten()
         });
+    // Only workers observe actual work units and throughput.  In particular,
+    // overall weighted progress includes stage weights that are not a clock,
+    // so extrapolating it produced ETAs that grew forever while an opaque
+    // COLMAP call was still making progress.  Preserve an absent worker ETA as
+    // absent instead of inventing one in the desktop process.
+    job.eta_seconds = value
+        .get("etaSeconds")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32);
     job.compute_backend = value
         .get("computeBackend")
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| splat.then(|| "CUDA AMP / gsplat".to_string()))
         .or_else(|| job.compute_backend.clone());
-    update_job_eta(job);
+    update_job_elapsed(job);
     job.updated_at = Utc::now().to_rfc3339();
     let _ = write_job(project_root, job);
 }
@@ -527,6 +536,10 @@ fn run_command(
                 merge_progress(project_root, job, splat);
                 return Ok(());
             }
+            merge_progress(project_root, job, splat);
+            if job.stage == "failed" && !job.detail.trim().is_empty() {
+                return Err(job.detail.clone());
+            }
             return Err(format!(
                 "Artifact worker exited with {status}; see {}",
                 log_path.display()
@@ -567,6 +580,113 @@ fn existing_runtime(resources: Option<&Path>, splat: bool) -> Result<PathBuf, St
         })
 }
 
+fn current_media_observation_manifest(project_root: &Path) -> Result<PathBuf, String> {
+    let observations_root = project_root
+        .join("outputs")
+        .join("cache")
+        .join("media-observations");
+    let pointer_path = observations_root.join("current.json");
+    let pointer: Value = serde_json::from_reader(
+        File::open(&pointer_path)
+            .map_err(|error| format!("Media observation pointer is missing: {error}"))?,
+    )
+    .map_err(|error| format!("Media observation pointer is invalid: {error}"))?;
+    let relative = Path::new(
+        pointer
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Media observation pointer has no path".to_string())?,
+    );
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("Media observation pointer contains an unsafe path".to_string());
+    }
+    let manifest = observations_root.join(relative).join("observations.json");
+    if !manifest.is_file() {
+        return Err(format!(
+            "Media observation manifest is missing: {}",
+            manifest.display()
+        ));
+    }
+    Ok(manifest)
+}
+
+fn remove_cache_directory(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if !path.is_dir() {
+        return Err(format!("Expected a cache directory at {}", path.display()));
+    }
+    fs::remove_dir_all(path)
+        .map_err(|error| format!("Could not discard cache {}: {error}", path.display()))
+}
+
+fn is_media_observation_record(value: &Value) -> bool {
+    value
+        .get("sourcePath")
+        .and_then(Value::as_str)
+        .is_some_and(|source| {
+            source
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .contains("/outputs/cache/media-observations/")
+        })
+}
+
+fn discard_media_localizations(project_root: &Path) -> Result<(), String> {
+    let manifest_path = project_root.join("supplemental-photos.json");
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let mut manifest: Value =
+        serde_json::from_reader(File::open(&manifest_path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("Supplemental-photo manifest is invalid: {error}"))?;
+    let mut changed = false;
+    for collection in ["photos", "attempts"] {
+        if let Some(records) = manifest.get_mut(collection).and_then(Value::as_array_mut) {
+            let before = records.len();
+            records.retain(|record| !is_media_observation_record(record));
+            changed |= records.len() != before;
+        }
+    }
+    if changed {
+        storage::write_json(&manifest_path, &manifest)?;
+    }
+    fs::remove_file(
+        project_root
+            .join("outputs")
+            .join("photo-localization-progress.json"),
+    )
+    .ok();
+    Ok(())
+}
+
+fn invalidate_pipeline_cache(project_root: &Path, job: &ArtifactJob) -> Result<(), String> {
+    let cache_root = project_root.join("outputs").join("cache");
+    let media_restart = if job.media_restart.is_empty() {
+        "reuse"
+    } else {
+        job.media_restart.as_str()
+    };
+    if matches!(media_restart, "analysis" | "decode") || job.rebuild_rgbd {
+        remove_cache_directory(&cache_root.join("datasets"))?;
+        discard_media_localizations(project_root)?;
+    }
+    if media_restart == "decode" {
+        remove_cache_directory(&cache_root.join("media-observations"))?;
+    }
+    if job.rebuild_rgbd {
+        for directory in ["local-phases", "meshes", "mesh-repair"] {
+            remove_cache_directory(&cache_root.join(directory))?;
+        }
+    }
+    Ok(())
+}
+
 fn run_pipeline(
     resources: Option<&Path>,
     project_root: &Path,
@@ -576,6 +696,9 @@ fn run_pipeline(
     resume: bool,
 ) -> Result<(), String> {
     fs::remove_file(project_root.join("outputs").join("cancel.flag")).ok();
+    if !resume {
+        invalidate_pipeline_cache(project_root, job)?;
+    }
     if job.source_kind == "media" {
         let splat_worker = existing_runtime(resources, true)?;
         job.stage = "media_preparation".to_string();
@@ -624,29 +747,60 @@ fn run_pipeline(
         })
         .collect::<Vec<_>>()
         .join(",");
-    let mut command = worker_command(&reconstruction);
-    command
-        .arg("reconstruct")
-        .arg(project_root)
-        .arg("--engine")
-        .arg("auto")
-        .arg("--targets")
-        .arg(targets)
-        .arg("--mesh-repair")
-        .arg(if project.settings.repair_mesh { "on" } else { "off" })
-        .arg("--mesh-repair-profile")
-        .arg(&project.settings.mesh_repair_profile)
-        .arg(if project.settings.fill_inferred_mesh_holes {
-            "--fill-inferred-holes"
-        } else {
-            "--no-fill-inferred-holes"
-        })
-        .arg(if project.settings.produce_watertight_mesh {
-            "--produce-watertight-copy"
-        } else {
-            "--no-produce-watertight-copy"
-        })
-        .arg("--mesh-repair-fallback");
+    let reconstruction_command = |selected_targets: &str| {
+        let mut command = worker_command(&reconstruction);
+        command
+            .arg("reconstruct")
+            .arg(project_root)
+            .arg("--engine")
+            .arg("auto")
+            .arg("--targets")
+            .arg(selected_targets)
+            .arg("--mesh-repair")
+            .arg(if project.settings.repair_mesh {
+                "on"
+            } else {
+                "off"
+            })
+            .arg("--mesh-repair-profile")
+            .arg(&project.settings.mesh_repair_profile)
+            .arg(if project.settings.fill_inferred_mesh_holes {
+                "--fill-inferred-holes"
+            } else {
+                "--no-fill-inferred-holes"
+            })
+            .arg(if project.settings.produce_watertight_mesh {
+                "--produce-watertight-copy"
+            } else {
+                "--no-produce-watertight-copy"
+            })
+            .arg("--mesh-repair-fallback");
+        command
+    };
+    if job.source_kind == "hybrid" {
+        // First publish only the metric trajectory and RGB-D anchor cameras.
+        // The final reconstruction below reuses its caches after media poses
+        // have been validated and made available to all artifact builders.
+        let base = reconstruction_command("localization_map");
+        run_command(base, project_root, job, cancel, false)?;
+
+        let splat_worker = existing_runtime(resources, true)?;
+        let mut extract = worker_command(&splat_worker);
+        extract
+            .arg("extract-media")
+            .arg("--project")
+            .arg(project_root);
+        run_command(extract, project_root, job, cancel, true)?;
+
+        let observation_manifest = current_media_observation_manifest(project_root)?;
+        let mut localize = worker_command(&reconstruction);
+        localize
+            .arg("localize-media")
+            .arg(project_root)
+            .arg(observation_manifest);
+        run_command(localize, project_root, job, cancel, false)?;
+    }
+    let command = reconstruction_command(&targets);
     run_command(command, project_root, job, cancel, false)?;
     if job.targets.iter().any(|target| target == "gaussianSplat") {
         job.stage = "splat_training".to_string();
@@ -752,6 +906,7 @@ fn spawn_job(
         fs::remove_file(project_root.join("outputs").join("build-preview.json")).ok();
     }
     if !resume && job.targets.iter().any(|target| target == "gaussianSplat") {
+        fs::remove_file(project_root.join("outputs").join("splat-checkpoint.pt")).ok();
         fs::remove_file(
             project_root
                 .join("outputs")
@@ -832,6 +987,8 @@ pub fn start_artifact_job(
     project_path: String,
     targets: Vec<String>,
     iterations: Option<u32>,
+    media_restart: Option<String>,
+    rebuild_rgbd: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ArtifactJob, String> {
     let root = PathBuf::from(project_path);
@@ -856,7 +1013,9 @@ pub fn start_artifact_job(
         .lock()
         .map_err(|_| "Photo localization state is unavailable".to_string())?
     {
-        return Err("Wait for texture-photo localization to finish before reconstructing".to_string());
+        return Err(
+            "Wait for texture-photo localization to finish before reconstructing".to_string(),
+        );
     }
     if targets.is_empty() {
         return Err("Choose at least one artifact target".to_string());
@@ -899,14 +1058,24 @@ pub fn start_artifact_job(
         .any(|phase| phase.status == "complete" && phase.frame_count > 0);
     let has_media = !project.media_sources.is_empty();
     if !has_rgbd && !has_media {
-        return Err("Capture RGB-D data or import overlapping photos/video before reconstruction".to_string());
+        return Err(
+            "Capture RGB-D data or import overlapping photos/video before reconstruction"
+                .to_string(),
+        );
     }
-    if !has_rgbd
-        && targets
-            .iter()
-            .any(|target| target != "gaussianSplat")
-    {
+    if !has_rgbd && targets.iter().any(|target| target != "gaussianSplat") {
         return Err("Photo/video projects currently produce Gaussian splats; disable point-cloud and mesh outputs".to_string());
+    }
+    let media_restart = media_restart.unwrap_or_else(|| "reuse".to_string());
+    if !matches!(media_restart.as_str(), "reuse" | "analysis" | "decode") {
+        return Err("Unknown media restart stage".to_string());
+    }
+    if !has_media && media_restart != "reuse" {
+        return Err("This project has no imported media preparation to restart".to_string());
+    }
+    let rebuild_rgbd = rebuild_rgbd.unwrap_or(false);
+    if rebuild_rgbd && !has_rgbd {
+        return Err("This project has no RGB-D reconstruction cache to discard".to_string());
     }
     let fingerprint = source_fingerprint(&root, &project);
     let now = Utc::now().to_rfc3339();
@@ -915,7 +1084,16 @@ pub fn start_artifact_job(
         id: id.clone(),
         project_path: root.to_string_lossy().into_owned(),
         targets,
-        source_kind: if has_rgbd { "rgbd" } else { "media" }.to_string(),
+        source_kind: if has_rgbd && has_media {
+            "hybrid"
+        } else if has_rgbd {
+            "rgbd"
+        } else {
+            "media"
+        }
+        .to_string(),
+        media_restart,
+        rebuild_rgbd,
         stage: "queued".to_string(),
         detail: "Preparing durable artifact job".to_string(),
         progress: 0.0,
@@ -1099,7 +1277,9 @@ pub fn resume_artifact_job(
         .lock()
         .map_err(|_| "Photo localization state is unavailable".to_string())?
     {
-        return Err("Wait for texture-photo localization to finish before reconstructing".to_string());
+        return Err(
+            "Wait for texture-photo localization to finish before reconstructing".to_string(),
+        );
     }
     let mut job = read_job(&root, &job_id)?;
     if !matches!(job.status.as_str(), "failed" | "cancelled") || !job.resumable {
@@ -1153,6 +1333,8 @@ mod tests {
             project_path: "project".to_string(),
             targets: targets.iter().map(|value| (*value).to_string()).collect(),
             source_kind: "rgbd".to_string(),
+            media_restart: "reuse".to_string(),
+            rebuild_rgbd: false,
             stage: stage.to_string(),
             detail: String::new(),
             progress: 0.0,
@@ -1205,6 +1387,75 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_jobs_plan_metric_anchors_media_and_all_output_builders() {
+        let mut hybrid = job(
+            &["pointCloud", "texturedMesh", "gaussianSplat"],
+            "media_localization",
+        );
+        hybrid.source_kind = "hybrid".to_string();
+        let plan = stage_plan(&hybrid);
+
+        for expected in [
+            "track",
+            "trajectory",
+            "cloud",
+            "media",
+            "dataset",
+            "mesh",
+            "splat",
+        ] {
+            assert!(plan.iter().any(|(key, _)| *key == expected));
+        }
+        assert_eq!(stage_key(&hybrid.stage), Some("media"));
+    }
+
+    #[test]
+    fn desktop_preserves_an_unknown_worker_eta() {
+        let root = std::env::temp_dir().join(format!(
+            "scanlan-unknown-worker-eta-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("outputs").join("jobs")).unwrap();
+        let mut media = job(&["gaussianSplat"], "media_decode");
+        media.source_kind = "media".to_string();
+        media.started_at = Some(Utc::now().to_rfc3339());
+        media.eta_seconds = Some(4_260);
+        fs::write(
+            progress_file(&root, true),
+            br#"{"stage":"media_decode","detail":"Scanning video","progress":0.03,"stageProgress":0.03,"etaSeconds":null,"stageEtaSeconds":null}"#,
+        )
+        .unwrap();
+
+        merge_progress(&root, &mut media, true);
+
+        assert_eq!(media.eta_seconds, None);
+        assert_eq!(media.stage_eta_seconds, None);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn desktop_uses_a_measured_worker_eta() {
+        let root = std::env::temp_dir().join(format!(
+            "scanlan-measured-worker-eta-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("outputs").join("jobs")).unwrap();
+        let mut training = job(&["gaussianSplat"], "splat_training");
+        training.started_at = Some(Utc::now().to_rfc3339());
+        fs::write(
+            progress_file(&root, true),
+            br#"{"stage":"splat_training","detail":"Training","progress":0.5,"stageProgress":0.5,"etaSeconds":37,"stageEtaSeconds":37}"#,
+        )
+        .unwrap();
+
+        merge_progress(&root, &mut training, true);
+
+        assert_eq!(training.eta_seconds, Some(37));
+        assert_eq!(training.stage_eta_seconds, Some(37));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn accelerator_lock_rejects_a_second_owner_and_recovers_after_drop() {
         let path = std::env::temp_dir().join(format!(
             "scanlan-accelerator-test-{}.lock",
@@ -1219,6 +1470,73 @@ mod tests {
             .expect("lock should become available when its owner exits");
         drop(second);
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn media_analysis_restart_keeps_decoded_views_and_discards_downstream_work() {
+        let root = std::env::temp_dir().join(format!(
+            "scanlan-media-restart-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = root.join("outputs").join("cache");
+        fs::create_dir_all(cache.join("media-observations").join("media-test")).unwrap();
+        fs::create_dir_all(cache.join("datasets").join("analysis-test")).unwrap();
+        let manual = serde_json::json!({
+            "id": "manual",
+            "sourcePath": root.join("detail.jpg").to_string_lossy()
+        });
+        let imported = serde_json::json!({
+            "id": "media",
+            "sourcePath": cache
+                .join("media-observations")
+                .join("media-test")
+                .join("images")
+                .join("video.jpg")
+                .to_string_lossy()
+        });
+        storage::write_json(
+            &root.join("supplemental-photos.json"),
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "photos": [manual.clone(), imported.clone()],
+                "attempts": [manual, imported]
+            }),
+        )
+        .unwrap();
+        let mut rebuild = job(&["gaussianSplat"], "queued");
+        rebuild.source_kind = "hybrid".to_string();
+        rebuild.media_restart = "analysis".to_string();
+
+        invalidate_pipeline_cache(&root, &rebuild).unwrap();
+
+        assert!(cache.join("media-observations").is_dir());
+        assert!(!cache.join("datasets").exists());
+        let manifest: Value =
+            serde_json::from_reader(File::open(root.join("supplemental-photos.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["photos"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["photos"][0]["id"], "manual");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn media_decode_restart_discards_decoded_views_too() {
+        let root = std::env::temp_dir().join(format!(
+            "scanlan-media-decode-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = root.join("outputs").join("cache");
+        fs::create_dir_all(cache.join("media-observations")).unwrap();
+        fs::create_dir_all(cache.join("datasets")).unwrap();
+        let mut rebuild = job(&["gaussianSplat"], "queued");
+        rebuild.source_kind = "media".to_string();
+        rebuild.media_restart = "decode".to_string();
+
+        invalidate_pipeline_cache(&root, &rebuild).unwrap();
+
+        assert!(!cache.join("media-observations").exists());
+        assert!(!cache.join("datasets").exists());
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -16,8 +16,10 @@ from scanlan_splat.train import (
     _finish_training_step,
     _metric_surface_scale_limit,
     _read_seed_parameters,
+    _reset_opacity_if_due,
     _rgbd_gaussian_limit,
     _ssim,
+    _training_frame_order,
     _training_limits,
     _update_smoothed_loss,
 )
@@ -103,6 +105,18 @@ class SeedParameterTests(unittest.TestCase):
                 4,
             )
 
+    def test_hybrid_frame_order_balances_metric_and_media_views(self) -> None:
+        frames = [
+            *({"depth": "depth.png"} for _ in range(2)),
+            *({"image": "media.jpg"} for _ in range(6)),
+        ]
+
+        order = _training_frame_order(frames, epoch=2, cache_size=4)
+        metric_exposures = int(np.count_nonzero(order < 2))
+        media_exposures = len(order) - metric_exposures
+
+        self.assertEqual(metric_exposures, media_exposures)
+
     def test_optimizer_steps_finish_before_densification_replaces_parameters(self) -> None:
         events: list[tuple[str, object | None]] = []
 
@@ -152,6 +166,32 @@ class SeedParameterTests(unittest.TestCase):
             (parameters, {"means": gaussian_optimizer}, strategy_state, 600, info),
         )
         self.assertEqual(strategy.kwargs, {"packed": True})
+
+    def test_opacity_reset_runs_on_the_configured_interval(self) -> None:
+        class Strategy:
+            reset_every = 3_000
+            prune_opa = 0.005
+
+        calls: list[dict[str, object]] = []
+        parameters = object()
+        optimizers = {"opacities": object()}
+        state = {"grad2d": object()}
+
+        self.assertFalse(
+            _reset_opacity_if_due(
+                Strategy(), parameters, optimizers, state, 2_999,
+                reset=lambda **kwargs: calls.append(kwargs),
+            )
+        )
+        self.assertTrue(
+            _reset_opacity_if_due(
+                Strategy(), parameters, optimizers, state, 3_000,
+                reset=lambda **kwargs: calls.append(kwargs),
+            )
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["params"], parameters)
+        self.assertEqual(calls[0]["value"], 0.01)
 
     def test_rgbd_sidecar_supplies_surface_scales_and_rotations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
