@@ -42,6 +42,9 @@ CALIBRATION_SAMPLE_LIMIT = 40_000
 CALIBRATION_GRID_SIZE = 16
 LABEL_SMOOTHNESS = 0.42
 LABEL_OPTIMIZATION_PASSES = 5
+PROJECTION_SEAM_FEATHER_PIXELS = 6.0
+PROJECTION_SEAM_MIN_NORMAL_DOT = 0.86
+PROJECTION_SEAM_MAX_LINEAR_OFFSET = 0.35
 POSE_REFINEMENT_ITERATIONS = 3
 MESH_CACHE_VERSION = "all-keyframe-shared-tsdf-v2"
 
@@ -1209,16 +1212,14 @@ def _sample_spatial_bias(
     return upper * (1.0 - fy) + lower * fy
 
 
-def _triangle_neighbors(
-    vertices: np.ndarray,
+def _shared_triangle_edges(
     triangles: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    triangle_ids = np.repeat(np.arange(len(triangles), dtype=np.int64), 3)
     edges = np.concatenate(
         (triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]), axis=0
     )
-    # Concatenation groups by edge kind, whereas triangle ids above group by
-    # triangle. Tile to preserve that edge-to-face correspondence.
+    # Concatenation groups by edge kind, so tile triangle ids to preserve the
+    # edge-to-face correspondence.
     triangle_ids = np.tile(np.arange(len(triangles), dtype=np.int64), 3)
     edges = np.sort(edges, axis=1)
     order = np.lexsort((edges[:, 1], edges[:, 0]))
@@ -1230,6 +1231,14 @@ def _triangle_neighbors(
     distinct = first != second
     first, second = first[distinct], second[distinct]
     shared_edges = sorted_edges[:-1][shared][distinct]
+    return first, second, shared_edges
+
+
+def _triangle_neighbors(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    first, second, shared_edges = _shared_triangle_edges(triangles)
     if not len(first):
         return first, second, np.empty(0, dtype=np.float32)
     face_normals = np.cross(
@@ -1633,6 +1642,278 @@ def _best_page_grid(images: list[np.ndarray], page_count: int) -> tuple[int, int
     return best[1], best[2], best[3], best[4]
 
 
+def _project_texture_page_points(
+    points: np.ndarray,
+    frame: PosedFrame,
+    page_size: tuple[int, int],
+    source_size: tuple[int, int],
+) -> np.ndarray:
+    world_from_camera = world_from_depth_opencv(frame.camera_to_global, frame.image_y_up)
+    camera_from_world = np.linalg.inv(world_from_camera)
+    camera_points = points @ camera_from_world[:3, :3].T + camera_from_world[:3, 3]
+    rgb_from_depth = _texture_rgb_from_depth(frame)
+    rgb_points = camera_points @ rgb_from_depth[:3, :3].T + rgb_from_depth[:3, 3]
+    projected_u, projected_v, _ = project_rgb(rgb_points, _texture_camera(frame))
+    page_width, page_height = page_size
+    source_width, source_height = source_size
+    return np.column_stack(
+        (
+            projected_u * (page_width - 1) / max(source_width - 1, 1),
+            projected_v * (page_height - 1) / max(source_height - 1, 1),
+        )
+    )
+
+
+def _projection_edge_offsets(
+    first_image: np.ndarray,
+    second_image: np.ndarray,
+    first_edge: np.ndarray,
+    second_edge: np.ndarray,
+) -> np.ndarray:
+    first_length = float(np.linalg.norm(first_edge[1] - first_edge[0]))
+    second_length = float(np.linalg.norm(second_edge[1] - second_edge[0]))
+    sample_count = max(
+        9,
+        min(
+            129,
+            int(math.ceil(max(first_length, second_length) / 2.0)) + 1,
+        ),
+    )
+    along = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)[:, None]
+    first_uv = first_edge[0] * (1.0 - along) + first_edge[1] * along
+    second_uv = second_edge[0] * (1.0 - along) + second_edge[1] * along
+    first_uv[:, 0] = np.clip(first_uv[:, 0], 0.0, first_image.shape[1] - 1.0)
+    first_uv[:, 1] = np.clip(first_uv[:, 1], 0.0, first_image.shape[0] - 1.0)
+    second_uv[:, 0] = np.clip(second_uv[:, 0], 0.0, second_image.shape[1] - 1.0)
+    second_uv[:, 1] = np.clip(second_uv[:, 1], 0.0, second_image.shape[0] - 1.0)
+    offsets = _bilinear_linear_rgb(
+        second_image, second_uv[:, 0], second_uv[:, 1]
+    ) - _bilinear_linear_rgb(first_image, first_uv[:, 0], first_uv[:, 1])
+
+    # Camera misregistration can turn fine texture into a high-frequency color
+    # difference.  Only carry its low-frequency tone across the boundary; this
+    # avoids ghosting the sharp source detail that the shared-page atlas keeps.
+    kernel = np.asarray([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
+    kernel /= kernel.sum()
+    for _ in range(3):
+        padded = np.pad(offsets, ((2, 2), (0, 0)), mode="edge")
+        offsets = sum(
+            kernel[index] * padded[index : index + sample_count]
+            for index in range(len(kernel))
+        )
+    return np.clip(
+        offsets,
+        -PROJECTION_SEAM_MAX_LINEAR_OFFSET,
+        PROJECTION_SEAM_MAX_LINEAR_OFFSET,
+    )
+
+
+def _projection_edge_is_featherable(
+    image: np.ndarray,
+    edge: np.ndarray,
+    face_uvs: np.ndarray,
+) -> bool:
+    if not np.all(np.isfinite(edge)) or not np.all(np.isfinite(face_uvs)):
+        return False
+    direction = edge[1] - edge[0]
+    length_squared = float(np.dot(direction, direction))
+    if length_squared < 2.25:
+        return False
+    length = math.sqrt(length_squared)
+    centroid = np.mean(face_uvs, axis=0)
+    interior_side = float(
+        direction[0] * (centroid[1] - edge[0, 1])
+        - direction[1] * (centroid[0] - edge[0, 0])
+    )
+    if abs(interior_side) < 1e-6:
+        return False
+    interior_sign = 1.0 if interior_side > 0.0 else -1.0
+    radius = PROJECTION_SEAM_FEATHER_PIXELS
+    minimum = np.floor(np.min(edge, axis=0) - radius - 1.0).astype(np.int64)
+    maximum = np.ceil(np.max(edge, axis=0) + radius + 1.0).astype(np.int64)
+    left = max(0, int(minimum[0]))
+    top = max(0, int(minimum[1]))
+    right = min(image.shape[1] - 1, int(maximum[0]))
+    bottom = min(image.shape[0] - 1, int(maximum[1]))
+    if right < left or bottom < top:
+        return False
+    return True
+
+
+def _apply_projection_edge_feather(
+    image: np.ndarray,
+    edge: np.ndarray,
+    face_uvs: np.ndarray,
+    offsets: np.ndarray,
+) -> bool:
+    if not _projection_edge_is_featherable(image, edge, face_uvs):
+        return False
+    direction = edge[1] - edge[0]
+    length_squared = float(np.dot(direction, direction))
+    length = math.sqrt(length_squared)
+    centroid = np.mean(face_uvs, axis=0)
+    interior_side = float(
+        direction[0] * (centroid[1] - edge[0, 1])
+        - direction[1] * (centroid[0] - edge[0, 0])
+    )
+    interior_sign = 1.0 if interior_side > 0.0 else -1.0
+    radius = PROJECTION_SEAM_FEATHER_PIXELS
+    minimum = np.floor(np.min(edge, axis=0) - radius - 1.0).astype(np.int64)
+    maximum = np.ceil(np.max(edge, axis=0) + radius + 1.0).astype(np.int64)
+    left = max(0, int(minimum[0]))
+    top = max(0, int(minimum[1]))
+    right = min(image.shape[1] - 1, int(maximum[0]))
+    bottom = min(image.shape[0] - 1, int(maximum[1]))
+
+    yy, xx = np.mgrid[top : bottom + 1, left : right + 1]
+    relative_x = xx.astype(np.float32) - float(edge[0, 0])
+    relative_y = yy.astype(np.float32) - float(edge[0, 1])
+    along = np.clip(
+        (relative_x * float(direction[0]) + relative_y * float(direction[1]))
+        / length_squared,
+        0.0,
+        1.0,
+    )
+    closest_x = float(edge[0, 0]) + along * float(direction[0])
+    closest_y = float(edge[0, 1]) + along * float(direction[1])
+    distance = np.sqrt(
+        np.square(xx.astype(np.float32) - closest_x)
+        + np.square(yy.astype(np.float32) - closest_y)
+    )
+    signed_distance = (
+        float(direction[0]) * relative_y - float(direction[1]) * relative_x
+    ) / length
+    mask = (distance <= radius) & (signed_distance * interior_sign >= -0.75)
+    if not np.any(mask):
+        return False
+
+    pixel_x = xx[mask]
+    pixel_y = yy[mask]
+    edge_position = along[mask] * (len(offsets) - 1)
+    offset_left = np.floor(edge_position).astype(np.int64)
+    offset_right = np.minimum(offset_left + 1, len(offsets) - 1)
+    offset_fraction = (edge_position - offset_left)[:, None]
+    local_offsets = (
+        offsets[offset_left] * (1.0 - offset_fraction)
+        + offsets[offset_right] * offset_fraction
+    )
+    fade = np.clip(1.0 - distance[mask] / radius, 0.0, 1.0)
+    fade = fade * fade * (3.0 - 2.0 * fade)
+    linear = _SRGB_LINEAR_LUT[image[pixel_y, pixel_x]]
+    image[pixel_y, pixel_x] = _linear_to_srgb(
+        linear + 0.5 * fade[:, None] * local_offsets
+    )
+    return True
+
+
+def _feather_projection_seams(
+    page_images: list[np.ndarray],
+    source_sizes: list[tuple[int, int]],
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    frames: list[PosedFrame],
+    triangle_frames: np.ndarray,
+) -> int:
+    """Tone-match a narrow band where smooth neighboring faces change cameras."""
+    first, second, shared_edges = _shared_triangle_edges(triangles)
+    if not len(first):
+        return 0
+    face_normals = np.cross(
+        vertices[triangles[:, 1]] - vertices[triangles[:, 0]],
+        vertices[triangles[:, 2]] - vertices[triangles[:, 0]],
+    )
+    face_normals /= np.maximum(
+        np.linalg.norm(face_normals, axis=1, keepdims=True), 1e-12
+    )
+    normal_agreement = np.sum(face_normals[first] * face_normals[second], axis=1)
+    labels_first = triangle_frames[first]
+    labels_second = triangle_frames[second]
+    eligible = (
+        (labels_first >= 0)
+        & (labels_second >= 0)
+        & (labels_first != labels_second)
+        & (normal_agreement >= PROJECTION_SEAM_MIN_NORMAL_DOT)
+    )
+    first = first[eligible]
+    second = second[eligible]
+    shared_edges = shared_edges[eligible]
+    labels_first = labels_first[eligible]
+    labels_second = labels_second[eligible]
+    if not len(first):
+        return 0
+
+    applied = 0
+    frame_pairs = np.column_stack((labels_first, labels_second))
+    for first_label, second_label in np.unique(frame_pairs, axis=0):
+        group = (labels_first == first_label) & (labels_second == second_label)
+        group_first = first[group]
+        group_second = second[group]
+        group_edges = shared_edges[group]
+        first_index = int(first_label)
+        second_index = int(second_label)
+        first_image = page_images[first_index]
+        second_image = page_images[second_index]
+        first_edge_uvs = _project_texture_page_points(
+            vertices[group_edges].reshape(-1, 3).astype(np.float64, copy=False),
+            frames[first_index],
+            (first_image.shape[1], first_image.shape[0]),
+            source_sizes[first_index],
+        ).reshape(-1, 2, 2)
+        second_edge_uvs = _project_texture_page_points(
+            vertices[group_edges].reshape(-1, 3).astype(np.float64, copy=False),
+            frames[second_index],
+            (second_image.shape[1], second_image.shape[0]),
+            source_sizes[second_index],
+        ).reshape(-1, 2, 2)
+        first_face_uvs = _project_texture_page_points(
+            vertices[triangles[group_first]]
+            .reshape(-1, 3)
+            .astype(np.float64, copy=False),
+            frames[first_index],
+            (first_image.shape[1], first_image.shape[0]),
+            source_sizes[first_index],
+        ).reshape(-1, 3, 2)
+        second_face_uvs = _project_texture_page_points(
+            vertices[triangles[group_second]]
+            .reshape(-1, 3)
+            .astype(np.float64, copy=False),
+            frames[second_index],
+            (second_image.shape[1], second_image.shape[0]),
+            source_sizes[second_index],
+        ).reshape(-1, 3, 2)
+        for edge_index in range(len(group_edges)):
+            first_edge = first_edge_uvs[edge_index]
+            second_edge = second_edge_uvs[edge_index]
+            first_face = first_face_uvs[edge_index]
+            second_face = second_face_uvs[edge_index]
+            if not _projection_edge_is_featherable(
+                first_image, first_edge, first_face
+            ) or not _projection_edge_is_featherable(
+                second_image, second_edge, second_face
+            ):
+                continue
+            offsets = _projection_edge_offsets(
+                first_image,
+                second_image,
+                first_edge,
+                second_edge,
+            )
+            first_applied = _apply_projection_edge_feather(
+                first_image,
+                first_edge,
+                first_face,
+                offsets,
+            )
+            second_applied = _apply_projection_edge_feather(
+                second_image,
+                second_edge,
+                second_face,
+                -offsets,
+            )
+            applied += int(first_applied and second_applied)
+    return applied
+
+
 def _bake_shared_view_atlas(
     vertex_colors: np.ndarray,
     vertices: np.ndarray,
@@ -1643,22 +1924,22 @@ def _bake_shared_view_atlas(
     progress: Callable[..., None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Pack corrected source images once and share their pixels across face patches."""
-    images = [_load_texture_image(frame) for frame in frames]
+    page_images = [_load_texture_image(frame) for frame in frames]
+    source_sizes = [(image.shape[1], image.shape[0]) for image in page_images]
     missing_triangles = np.flatnonzero(triangle_frames < 0)
     if len(missing_triangles) == len(triangles):
         return _bake_triangle_atlas(vertex_colors, triangles)
-    page_count = len(images) + (1 if len(missing_triangles) else 0)
-    layout_images = images + (
+    page_count = len(page_images) + (1 if len(missing_triangles) else 0)
+    layout_images = page_images + (
         [np.empty((1024, 1024, 3), dtype=np.uint8)] if len(missing_triangles) else []
     )
     columns, rows, cell_width, cell_height = _best_page_grid(layout_images, page_count)
     width = columns * cell_width
     height = rows * cell_height
-    atlas = np.full((height, width, 3), 24, dtype=np.uint8)
-    uvs = np.zeros((len(triangles), 3, 2), dtype=np.float32)
     effective_page_resolutions: list[int] = []
+    page_origins: list[tuple[int, int]] = []
 
-    for frame_index, (frame, image) in enumerate(zip(frames, images, strict=True)):
+    for frame_index, image in enumerate(page_images):
         column = frame_index % columns
         row = frame_index // columns
         scale = min(
@@ -1678,9 +1959,39 @@ def _bake_shared_view_atlas(
                 ),
                 dtype=np.uint8,
             )
-        corrected = _apply_frame_calibration(image, calibration, frame_index)
+        page_images[frame_index] = _apply_frame_calibration(
+            image, calibration, frame_index
+        )
         origin_x = column * cell_width + (cell_width - target_width) // 2
         origin_y = row * cell_height + (cell_height - target_height) // 2
+        page_origins.append((origin_x, origin_y))
+
+    seam_count = _feather_projection_seams(
+        page_images,
+        source_sizes,
+        vertices,
+        triangles,
+        frames,
+        triangle_frames,
+    )
+    if progress and seam_count:
+        progress(
+            "Texturing",
+            f"Softened {seam_count:,} smooth projection-patch boundaries",
+            0,
+            None,
+            0.72,
+        )
+
+    atlas = np.full((height, width, 3), 24, dtype=np.uint8)
+    uvs = np.zeros((len(triangles), 3, 2), dtype=np.float32)
+    for frame_index, (frame, corrected) in enumerate(
+        zip(frames, page_images, strict=True)
+    ):
+        column = frame_index % columns
+        row = frame_index // columns
+        target_height, target_width = corrected.shape[:2]
+        origin_x, origin_y = page_origins[frame_index]
         padding = min(
             ATLAS_PAGE_PADDING,
             origin_x - column * cell_width,
@@ -1711,10 +2022,11 @@ def _bake_shared_view_atlas(
             rgb_from_depth = _texture_rgb_from_depth(frame)
             rgb_points = camera_points @ rgb_from_depth[:3, :3].T + rgb_from_depth[:3, 3]
             projected_u, projected_v, _ = project_rgb(rgb_points, _texture_camera(frame))
-            projected_u = np.clip(projected_u, 0.0, images[frame_index].shape[1] - 1.0)
-            projected_v = np.clip(projected_v, 0.0, images[frame_index].shape[0] - 1.0)
-            atlas_x = origin_x + projected_u * (target_width - 1) / max(images[frame_index].shape[1] - 1, 1)
-            atlas_y = origin_y + projected_v * (target_height - 1) / max(images[frame_index].shape[0] - 1, 1)
+            source_width, source_height = source_sizes[frame_index]
+            projected_u = np.clip(projected_u, 0.0, source_width - 1.0)
+            projected_v = np.clip(projected_v, 0.0, source_height - 1.0)
+            atlas_x = origin_x + projected_u * (target_width - 1) / max(source_width - 1, 1)
+            atlas_y = origin_y + projected_v * (target_height - 1) / max(source_height - 1, 1)
             frame_uvs = np.column_stack(
                 ((atlas_x + 0.5) / width, 1.0 - (atlas_y + 0.5) / height)
             ).reshape(-1, 3, 2)
@@ -2205,7 +2517,7 @@ def build_mesh_artifacts(
         "supplementalTextureFrameCount": len(supplemental_frames),
         "supplementalTextureFingerprint": supplemental_fingerprint,
         "textureSource": "coherent_best_view_shared_image_atlas",
-        "textureBlend": "single_source_patches_linear_rgb_overlap_and_spatial_seam_corrected",
+        "textureBlend": "single_source_patches_with_local_linear_rgb_seam_tone_feather",
         "textureDirectCoveragePercent": round(direct_texture_coverage, 2),
         "textureCoveragePercent": round(texture_coverage, 2),
         "textureDirectTriangleCoveragePercent": round(direct_triangle_coverage, 2),

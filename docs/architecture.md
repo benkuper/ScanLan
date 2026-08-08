@@ -43,6 +43,8 @@ Tauri validates message sizes and stores only the newest point and mesh packets 
 
 Archival depth/aligned-color writes and native-RGB JPEG compression happen behind bounded queues. The camera loop moves frame buffers into the queue and immediately returns to acquisition. If storage cannot keep up, the oldest pending archive frame is discarded and the drop is persisted in phase metadata.
 
+Modern-camera RGB controls are applied before video streaming starts. Exposure is represented in microseconds across backends (Femto Mega converts to its 100 microsecond property units), while white balance is Kelvin. Orbbec integer properties are clamped and snapped to the range/step reported by the connected firmware and adjustments are logged. Manual Femto IMU requests select an exact advertised stream profile; a missing profile is a startup error rather than a silent fallback. The requested RGB and IMU configuration is persisted in `phase.json` for capture provenance.
+
 `live.json` is a tiny, atomically replaced sensor heartbeat. During capture the UI reads its monotonic `frameCount`; it does not rescan `frames.csv`. The complete CSV is counted only during recovery or abnormal termination.
 
 ## Tracking state machine

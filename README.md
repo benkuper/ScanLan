@@ -61,6 +61,10 @@ Azure Kinect pairs 30 fps depth with its highest compatible 2048×1536 RGB mode.
 
 The archive rate is independent of the sensor/tracking rate. For example, a 10 fps archive still tracks a 30 fps camera stream.
 
+The Capture workspace exposes the modern cameras' sensor-side RGB controls: compatible stream resolution, automatic or locked exposure/gain, automatic or locked white balance, brightness, contrast, saturation, sharpness, backlight compensation where supported, and 50/60 Hz anti-flicker. Native-RGB archive size and JPEG quality are separate controls; for maximum texture detail use native size and quality 95-100. Kinect v2 remains fixed at 1920x1080 color because Kinect for Windows SDK 2.0 exposes its color-camera settings as read-only values.
+
+Femto Mega also exposes exact accelerometer and gyroscope rate/range profiles. A faster rate improves temporal sampling but costs bandwidth and CPU. A narrower full-scale range provides finer quantization; a wider range such as +/-8 g prevents clipping but does not increase precision. Azure Kinect's SDK provides a factory-calibrated IMU stream without configurable rate or range, and Kinect v2 has no accessible IMU.
+
 ## Windows setup
 
 Install:

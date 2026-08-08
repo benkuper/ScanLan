@@ -1006,6 +1006,46 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
     };
     settings.sensor_id = settings.sensor_id.trim().to_string();
     if !matches!(
+        settings.rgb_resolution.as_str(),
+        "auto" | "720p" | "1080p" | "1440p" | "1536p" | "2160p" | "3072p"
+    ) {
+        return Err("Unknown RGB resolution".to_string());
+    }
+    settings.rgb_exposure_us = settings.rgb_exposure_us.clamp(100, 200_000);
+    settings.rgb_gain = settings.rgb_gain.clamp(0, 255);
+    settings.rgb_white_balance_k =
+        ((settings.rgb_white_balance_k.clamp(2_000, 12_500) + 5) / 10) * 10;
+    settings.rgb_brightness = settings.rgb_brightness.clamp(0, 255);
+    settings.rgb_contrast = settings.rgb_contrast.clamp(0, 60);
+    settings.rgb_saturation = settings.rgb_saturation.clamp(0, 80);
+    settings.rgb_sharpness = settings.rgb_sharpness.clamp(0, 15);
+    if !matches!(settings.rgb_powerline_hz, 0 | 50 | 60) {
+        return Err(
+            "RGB anti-flicker frequency must be camera default, 50 Hz, or 60 Hz".to_string(),
+        );
+    }
+    if !matches!(
+        settings.imu_accel_rate_hz,
+        0 | 50 | 100 | 200 | 500 | 1_000 | 2_000
+    ) {
+        return Err("Unsupported accelerometer sample rate".to_string());
+    }
+    if !matches!(settings.imu_accel_range_g, 0 | 2 | 4 | 8 | 16) {
+        return Err("Unsupported accelerometer range".to_string());
+    }
+    if !matches!(
+        settings.imu_gyro_rate_hz,
+        0 | 50 | 100 | 200 | 500 | 1_000 | 2_000
+    ) {
+        return Err("Unsupported gyroscope sample rate".to_string());
+    }
+    if !matches!(
+        settings.imu_gyro_range_dps,
+        0 | 125 | 250 | 500 | 1_000 | 2_000
+    ) {
+        return Err("Unsupported gyroscope range".to_string());
+    }
+    if !matches!(
         settings.sensor_kind.as_str(),
         "kinect_v2" | "azure_kinect" | "femto_mega"
     ) {
@@ -1017,6 +1057,29 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
     if !matches!(settings.depth_field_of_view.as_str(), "narrow" | "wide") {
         return Err("Depth field of view must be narrow or wide".to_string());
     }
+    if !matches!(settings.sensor_fps, 0 | 5 | 15 | 25 | 30) {
+        return Err("Sensor rate must be automatic, 5, 15, 25, or 30 fps".to_string());
+    }
+    if settings.sensor_kind == "azure_kinect" && settings.sensor_fps == 25 {
+        return Err("Azure Kinect supports 5, 15, or 30 fps sensor rates".to_string());
+    }
+    if settings.depth_field_of_view == "wide" && !settings.depth_binned && settings.sensor_fps > 15
+    {
+        return Err("Wide full-resolution depth supports at most 15 fps".to_string());
+    }
+    let effective_sensor_fps = if settings.sensor_fps > 0 {
+        settings.sensor_fps
+    } else if settings.depth_field_of_view == "wide" && !settings.depth_binned {
+        15
+    } else {
+        30
+    };
+    let exposure_limit_us = match effective_sensor_fps {
+        0..=5 => 190_000,
+        6..=15 => 60_000,
+        _ => 30_000,
+    };
+    settings.rgb_exposure_us = settings.rgb_exposure_us.min(exposure_limit_us);
     if settings.sensor_kind != "femto_mega" && settings.sensor_connection == "network" {
         return Err("Network capture is currently supported only by Orbbec Femto Mega".to_string());
     }
@@ -1033,6 +1096,18 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
         settings.sensor_connection = "usb".to_string();
         settings.sensor_address.clear();
         settings.use_imu = false;
+    }
+    if settings.sensor_kind == "azure_kinect"
+        && matches!(settings.rgb_resolution.as_str(), "2160p" | "3072p")
+        && effective_sensor_fps > 15
+    {
+        return Err("Azure Kinect 2160p/3072p RGB requires a 5 or 15 fps sensor rate".to_string());
+    }
+    if settings.sensor_kind == "femto_mega" && settings.rgb_resolution == "3072p" {
+        return Err("Femto Mega does not expose a 4096x3072 RGB mode".to_string());
+    }
+    if settings.sensor_fps > 0 {
+        settings.capture_fps = settings.capture_fps.min(settings.sensor_fps);
     }
     if !matches!(settings.live_reconstruction.as_str(), "points" | "mesh") {
         return Err("Unknown live reconstruction mode".to_string());
@@ -1169,7 +1244,35 @@ fn append_sensor_args(command: &mut Command, settings: &CaptureSettings) {
         .arg("--connection")
         .arg(&settings.sensor_connection)
         .arg("--depth-fov")
-        .arg(&settings.depth_field_of_view);
+        .arg(&settings.depth_field_of_view)
+        .arg("--sensor-fps")
+        .arg(settings.sensor_fps.to_string())
+        .arg("--rgb-resolution")
+        .arg(&settings.rgb_resolution)
+        .arg("--rgb-auto-exposure")
+        .arg(settings.rgb_auto_exposure.to_string())
+        .arg("--rgb-exposure-us")
+        .arg(settings.rgb_exposure_us.to_string())
+        .arg("--rgb-gain")
+        .arg(settings.rgb_gain.to_string())
+        .arg("--rgb-auto-white-balance")
+        .arg(settings.rgb_auto_white_balance.to_string())
+        .arg("--rgb-white-balance-k")
+        .arg(settings.rgb_white_balance_k.to_string())
+        .arg("--rgb-color-adjustments")
+        .arg(settings.rgb_color_adjustments_enabled.to_string())
+        .arg("--rgb-brightness")
+        .arg(settings.rgb_brightness.to_string())
+        .arg("--rgb-contrast")
+        .arg(settings.rgb_contrast.to_string())
+        .arg("--rgb-saturation")
+        .arg(settings.rgb_saturation.to_string())
+        .arg("--rgb-sharpness")
+        .arg(settings.rgb_sharpness.to_string())
+        .arg("--rgb-backlight-compensation")
+        .arg(settings.rgb_backlight_compensation.to_string())
+        .arg("--rgb-powerline-hz")
+        .arg(settings.rgb_powerline_hz.to_string());
     if settings.depth_binned {
         command.arg("--depth-binned");
     }
@@ -1180,7 +1283,16 @@ fn append_sensor_args(command: &mut Command, settings: &CaptureSettings) {
         command.arg("--address").arg(&settings.sensor_address);
     }
     if settings.use_imu {
-        command.arg("--imu");
+        command
+            .arg("--imu")
+            .arg("--imu-accel-rate")
+            .arg(settings.imu_accel_rate_hz.to_string())
+            .arg("--imu-accel-range")
+            .arg(settings.imu_accel_range_g.to_string())
+            .arg("--imu-gyro-rate")
+            .arg(settings.imu_gyro_rate_hz.to_string())
+            .arg("--imu-gyro-range")
+            .arg(settings.imu_gyro_range_dps.to_string());
     }
 }
 
@@ -4938,17 +5050,18 @@ fn export_gaussian_splat_blocking(
 #[cfg(test)]
 mod tests {
     use super::{
-        clipped_binary_ply, clipped_obj, compact_splat_preview, convert_3dgs_ply_to_splat,
-        gaussian_edit_matrix, gaussian_splat_preview_is_live, matrix_product, normalize_project,
-        pack_preview_mesh, quaternion_matrix, read_supplemental_photo_manifest,
-        save_live_reconstruction_preview, transformed_cloud_ply, transformed_gaussian_ply,
-        transformed_normal, transformed_obj, transformed_position, unity_compatible_gaussian_ply,
-        unity_compatible_obj, unity_compatible_ply, valid_packed_preview_mesh,
-        validate_sensor_settings, LiveGeometryFrame, RealtimeEngineSnapshot,
+        append_sensor_args, clipped_binary_ply, clipped_obj, compact_splat_preview,
+        convert_3dgs_ply_to_splat, gaussian_edit_matrix, gaussian_splat_preview_is_live,
+        matrix_product, normalize_project, pack_preview_mesh, quaternion_matrix,
+        read_supplemental_photo_manifest, save_live_reconstruction_preview, transformed_cloud_ply,
+        transformed_gaussian_ply, transformed_normal, transformed_obj, transformed_position,
+        unity_compatible_gaussian_ply, unity_compatible_obj, unity_compatible_ply,
+        valid_packed_preview_mesh, validate_sensor_settings, LiveGeometryFrame,
+        RealtimeEngineSnapshot,
     };
     use crate::models::{BoundingBoxClip, CaptureSettings, CloudTransform, ProjectSummary};
-    use std::fs;
     use std::sync::{Arc, Mutex};
+    use std::{fs, process::Command};
 
     #[test]
     fn legacy_supplemental_photos_are_visible_as_localized_attempts() {
@@ -5525,6 +5638,81 @@ mod tests {
             ..CaptureSettings::default()
         };
         assert!(validate_sensor_settings(&mut settings).is_ok());
+    }
+
+    #[test]
+    fn modern_sensor_configuration_is_forwarded_to_the_worker() {
+        let settings = CaptureSettings {
+            sensor_kind: "femto_mega".to_string(),
+            rgb_resolution: "1080p".to_string(),
+            rgb_auto_exposure: false,
+            rgb_exposure_us: 8_300,
+            rgb_gain: 30,
+            imu_accel_rate_hz: 200,
+            imu_accel_range_g: 4,
+            imu_gyro_rate_hz: 500,
+            imu_gyro_range_dps: 500,
+            ..CaptureSettings::default()
+        };
+        let mut command = Command::new("sensor-worker");
+        append_sensor_args(&mut command, &settings);
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for expected in [
+            "--sensor-fps",
+            "0",
+            "--rgb-resolution",
+            "1080p",
+            "--rgb-exposure-us",
+            "8300",
+            "--rgb-gain",
+            "30",
+            "--imu-accel-rate",
+            "200",
+            "--imu-accel-range",
+            "4",
+            "--imu-gyro-rate",
+            "500",
+            "--imu-gyro-range",
+        ] {
+            assert!(arguments.iter().any(|argument| argument == expected));
+        }
+    }
+
+    #[test]
+    fn legacy_capture_settings_receive_camera_control_defaults() {
+        let mut value = serde_json::to_value(CaptureSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "sensorFps",
+            "rgbResolution",
+            "rgbAutoExposure",
+            "rgbExposureUs",
+            "rgbGain",
+            "rgbAutoWhiteBalance",
+            "rgbWhiteBalanceK",
+            "rgbColorAdjustmentsEnabled",
+            "rgbBrightness",
+            "rgbContrast",
+            "rgbSaturation",
+            "rgbSharpness",
+            "rgbBacklightCompensation",
+            "rgbPowerlineHz",
+            "imuAccelRateHz",
+            "imuAccelRangeG",
+            "imuGyroRateHz",
+            "imuGyroRangeDps",
+        ] {
+            object.remove(field);
+        }
+        let settings: CaptureSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.rgb_resolution, "auto");
+        assert!(settings.rgb_auto_exposure);
+        assert!(settings.rgb_auto_white_balance);
+        assert_eq!(settings.rgb_exposure_us, 8_330);
+        assert_eq!(settings.imu_accel_rate_hz, 0);
     }
 
     #[test]

@@ -28,3 +28,7 @@ rgbd-capture-worker.exe --phase C:\Scans\Room\phases\take-1 --id take-1 --name "
 ```
 
 Add `--depth-binned` for 2×2 depth sampling. `--fps` controls the archive only; the binary `SCANRGBD` stream remains at sensor rate. Create `stop.flag` in the phase directory to flush and stop.
+
+RGB sensor controls use `--sensor-fps 0|5|15|25|30`, `--rgb-resolution auto|720p|1080p|1440p|1536p|2160p|3072p`, `--rgb-auto-exposure true|false`, `--rgb-exposure-us`, `--rgb-gain`, `--rgb-auto-white-balance true|false`, and `--rgb-white-balance-k`. Enable deterministic image processing with `--rgb-color-adjustments true` and pass brightness, contrast, saturation, and sharpness values; Azure additionally accepts backlight compensation. `--rgb-powerline-hz 50|60` selects anti-flicker. Azure's 3072p mode and its 2160p mode in ScanLan require a 5/15 fps sensor rate; 25 fps is Femto-only and 3072p is Azure-only. Unsupported resolution/profile combinations fail before capture. `--rgb-quality` and `--max-rgb-dimension` affect only the archived JPEG, not the sensor stream.
+
+Femto IMU selection uses `--imu-accel-rate`, `--imu-accel-range`, `--imu-gyro-rate`, and `--imu-gyro-range`; zero selects the first device-default profile. Requested nonzero values must match an SDK profile exactly. Acceleration ranges are 2/4/8/16 g, gyro ranges are 125/250/500/1000/2000 degrees per second, and rates are expressed in Hz. Azure Kinect ignores these profile flags because its Sensor SDK does not expose IMU rate/range controls.

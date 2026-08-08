@@ -593,6 +593,119 @@ class PipelineTests(unittest.TestCase):
             self.assertGreater(int(np.ptp(atlas[..., 0])), 200)
             self.assertTrue(np.all((uvs > 0.0) & (uvs < 1.0)))
 
+    def test_shared_view_atlas_feathers_only_the_projection_seam(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            camera = CameraModel(64, 64, 30.0, 30.0, 31.5, 31.5, 1000.0, 4.0)
+            rgb_camera = RgbCameraModel(
+                64, 64, 30.0, 30.0, 31.5, 31.5, "pinhole", ()
+            )
+            source_colors = (
+                np.asarray([180, 80, 60], dtype=np.uint8),
+                np.asarray([100, 110, 150], dtype=np.uint8),
+            )
+            frames: list[PosedFrame] = []
+            for frame_index, source_color in enumerate(source_colors):
+                depth_path = root / f"depth-{frame_index}.u16"
+                color_path = root / f"color-{frame_index}.rgb"
+                np.full((64, 64), 2000, dtype="<u2").tofile(depth_path)
+                np.broadcast_to(source_color, (64, 64, 3)).tofile(color_path)
+                record = FrameRecord(
+                    frame_index,
+                    frame_index,
+                    frame_index,
+                    depth_path,
+                    color_path,
+                    None,
+                    None,
+                    np.eye(4),
+                )
+                phase = PhaseData(
+                    root,
+                    {},
+                    camera,
+                    rgb_camera,
+                    np.eye(4),
+                    [record],
+                    [],
+                )
+                frames.append(
+                    PosedFrame(
+                        "test",
+                        f"test-{frame_index}",
+                        phase,
+                        0,
+                        np.eye(4),
+                        (1, 1, 1),
+                        False,
+                    )
+                )
+            vertices = np.asarray(
+                [[-1, -1, 2], [1, -1, 2], [-1, 1, 2], [1, 1, 2]],
+                dtype=np.float32,
+            )
+            triangles = np.asarray([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+            calibration = TextureCalibration(
+                np.ones((2, 3), dtype=np.float32),
+                np.zeros((2, 3), dtype=np.float32),
+                np.zeros((2, 16, 16, 3), dtype=np.float32),
+                0,
+                1,
+                4,
+            )
+
+            atlas, uvs, _ = _bake_shared_view_atlas(
+                np.full((4, 3), 128, dtype=np.uint8),
+                vertices,
+                triangles,
+                frames,
+                np.asarray([0, 1], dtype=np.int16),
+                calibration,
+            )
+
+            def atlas_color(uv: np.ndarray) -> np.ndarray:
+                x = min(atlas.shape[1] - 1, int(uv[0] * atlas.shape[1]))
+                y = min(atlas.shape[0] - 1, int((1.0 - uv[1]) * atlas.shape[0]))
+                return atlas[y, x].astype(np.int16)
+
+            first_seam = atlas_color((uvs[0, 1] + uvs[0, 2]) * 0.5)
+            second_seam = atlas_color((uvs[1, 0] + uvs[1, 2]) * 0.5)
+            self.assertLess(float(np.linalg.norm(first_seam - second_seam)), 8.0)
+            np.testing.assert_allclose(atlas_color(uvs[0, 0]), source_colors[0], atol=1)
+            np.testing.assert_allclose(atlas_color(uvs[1, 1]), source_colors[1], atol=1)
+
+            folded_vertices = vertices.copy()
+            folded_vertices[3, 2] = 3.0
+            folded_atlas, folded_uvs, _ = _bake_shared_view_atlas(
+                np.full((4, 3), 128, dtype=np.uint8),
+                folded_vertices,
+                triangles,
+                frames,
+                np.asarray([0, 1], dtype=np.int16),
+                calibration,
+            )
+
+            def folded_color(uv: np.ndarray) -> np.ndarray:
+                x = min(
+                    folded_atlas.shape[1] - 1,
+                    int(uv[0] * folded_atlas.shape[1]),
+                )
+                y = min(
+                    folded_atlas.shape[0] - 1,
+                    int((1.0 - uv[1]) * folded_atlas.shape[0]),
+                )
+                return folded_atlas[y, x].astype(np.int16)
+
+            folded_first = folded_color(
+                (folded_uvs[0, 1] + folded_uvs[0, 2]) * 0.5
+            )
+            folded_second = folded_color(
+                (folded_uvs[1, 0] + folded_uvs[1, 2]) * 0.5
+            )
+            self.assertGreater(
+                float(np.linalg.norm(folded_first - folded_second)), 80.0
+            )
+
     @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV is optional in source test environments")
     def test_supplemental_photo_pnp_recovers_metric_camera_pose(self) -> None:
         import cv2

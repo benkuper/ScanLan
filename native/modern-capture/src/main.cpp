@@ -18,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -54,10 +55,28 @@ struct Options {
     std::string address;
     std::string depth_fov = "narrow";
     bool depth_binned = false;
+    int sensor_fps = 0;
     int fps = 10;
     float max_depth_m = 4.5F;
     int rgb_quality = 92;
     std::uint32_t max_rgb_dimension = 0;
+    std::string rgb_resolution = "auto";
+    bool rgb_auto_exposure = true;
+    int rgb_exposure_us = 8330;
+    int rgb_gain = 0;
+    bool rgb_auto_white_balance = true;
+    int rgb_white_balance_k = 4500;
+    bool rgb_color_adjustments = false;
+    int rgb_brightness = 128;
+    int rgb_contrast = 5;
+    int rgb_saturation = 32;
+    int rgb_sharpness = 2;
+    bool rgb_backlight_compensation = false;
+    int rgb_powerline_hz = 0;
+    int imu_accel_rate_hz = 0;
+    int imu_accel_range_g = 0;
+    int imu_gyro_rate_hz = 0;
+    int imu_gyro_range_dps = 0;
 };
 
 struct DepthModeInfo {
@@ -67,10 +86,19 @@ struct DepthModeInfo {
 };
 
 DepthModeInfo requested_depth_mode(const Options &options) {
+    const auto rate = [&options](int maximum) {
+        if(options.sensor_fps == 0) return maximum;
+        if(options.sensor_fps > maximum) {
+            throw std::runtime_error(
+                options.depth_fov + std::string(" full-resolution depth supports at most ")
+                + std::to_string(maximum) + " fps");
+        }
+        return options.sensor_fps;
+    };
     if(options.depth_fov == "wide") {
-        return options.depth_binned ? DepthModeInfo{512, 512, 30} : DepthModeInfo{1024, 1024, 15};
+        return options.depth_binned ? DepthModeInfo{512, 512, rate(30)} : DepthModeInfo{1024, 1024, rate(15)};
     }
-    return options.depth_binned ? DepthModeInfo{320, 288, 30} : DepthModeInfo{640, 576, 30};
+    return options.depth_binned ? DepthModeInfo{320, 288, rate(30)} : DepthModeInfo{640, 576, rate(30)};
 }
 
 struct CameraInfo {
@@ -104,6 +132,11 @@ struct SensorInfo {
 
 Options parse_options(int argc, char **argv) {
     Options options;
+    const auto parse_bool = [](const std::string &value, const std::string &argument) {
+        if(value == "true" || value == "1") return true;
+        if(value == "false" || value == "0") return false;
+        throw std::runtime_error(argument + " must be true or false");
+    };
     for(int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         const auto value = [&]() -> std::string {
@@ -124,10 +157,28 @@ Options parse_options(int argc, char **argv) {
         else if(argument == "--address") options.address = value();
         else if(argument == "--depth-fov") options.depth_fov = value();
         else if(argument == "--depth-binned") options.depth_binned = true;
+        else if(argument == "--sensor-fps") options.sensor_fps = std::stoi(value());
         else if(argument == "--fps") options.fps = std::stoi(value());
         else if(argument == "--max-depth") options.max_depth_m = std::stof(value());
         else if(argument == "--rgb-quality") options.rgb_quality = std::stoi(value());
         else if(argument == "--max-rgb-dimension") options.max_rgb_dimension = static_cast<std::uint32_t>(std::stoul(value()));
+        else if(argument == "--rgb-resolution") options.rgb_resolution = value();
+        else if(argument == "--rgb-auto-exposure") options.rgb_auto_exposure = parse_bool(value(), argument);
+        else if(argument == "--rgb-exposure-us") options.rgb_exposure_us = std::stoi(value());
+        else if(argument == "--rgb-gain") options.rgb_gain = std::stoi(value());
+        else if(argument == "--rgb-auto-white-balance") options.rgb_auto_white_balance = parse_bool(value(), argument);
+        else if(argument == "--rgb-white-balance-k") options.rgb_white_balance_k = std::stoi(value());
+        else if(argument == "--rgb-color-adjustments") options.rgb_color_adjustments = parse_bool(value(), argument);
+        else if(argument == "--rgb-brightness") options.rgb_brightness = std::stoi(value());
+        else if(argument == "--rgb-contrast") options.rgb_contrast = std::stoi(value());
+        else if(argument == "--rgb-saturation") options.rgb_saturation = std::stoi(value());
+        else if(argument == "--rgb-sharpness") options.rgb_sharpness = std::stoi(value());
+        else if(argument == "--rgb-backlight-compensation") options.rgb_backlight_compensation = parse_bool(value(), argument);
+        else if(argument == "--rgb-powerline-hz") options.rgb_powerline_hz = std::stoi(value());
+        else if(argument == "--imu-accel-rate") options.imu_accel_rate_hz = std::stoi(value());
+        else if(argument == "--imu-accel-range") options.imu_accel_range_g = std::stoi(value());
+        else if(argument == "--imu-gyro-rate") options.imu_gyro_rate_hz = std::stoi(value());
+        else if(argument == "--imu-gyro-range") options.imu_gyro_range_dps = std::stoi(value());
         else if(argument == "--imu") options.use_imu = true;
         else throw std::runtime_error("Unknown argument: " + argument);
     }
@@ -142,6 +193,12 @@ Options parse_options(int argc, char **argv) {
     if(options.depth_fov != "narrow" && options.depth_fov != "wide") {
         throw std::runtime_error("Depth field of view must be narrow or wide");
     }
+    if(options.rgb_resolution != "auto" && options.rgb_resolution != "720p"
+        && options.rgb_resolution != "1080p" && options.rgb_resolution != "1440p"
+        && options.rgb_resolution != "1536p" && options.rgb_resolution != "2160p"
+        && options.rgb_resolution != "3072p") {
+        throw std::runtime_error("Unsupported RGB resolution: " + options.rgb_resolution);
+    }
     if(options.sensor != "femto_mega" && options.connection == "network") {
         throw std::runtime_error("Network capture is supported only for Orbbec Femto Mega");
     }
@@ -149,7 +206,25 @@ Options parse_options(int argc, char **argv) {
         throw std::runtime_error("Femto Mega network capture requires --address IP[:PORT]");
     }
     options.fps = std::clamp(options.fps, 1, 30);
+    if(options.sensor_fps != 0 && options.sensor_fps != 5
+        && options.sensor_fps != 15 && options.sensor_fps != 25
+        && options.sensor_fps != 30) {
+        throw std::runtime_error("Sensor frame rate must be 0, 5, 15, 25, or 30 fps");
+    }
+    if(options.sensor == "azure_kinect" && options.sensor_fps == 25) {
+        throw std::runtime_error("Azure Kinect supports 5, 15, or 30 fps sensor rates");
+    }
     options.max_depth_m = std::clamp(options.max_depth_m, 0.5F, 8.0F);
+    options.rgb_exposure_us = std::clamp(options.rgb_exposure_us, 100, 200000);
+    options.rgb_gain = std::clamp(options.rgb_gain, 0, 255);
+    options.rgb_white_balance_k = std::clamp(options.rgb_white_balance_k, 2000, 12500);
+    options.rgb_brightness = std::clamp(options.rgb_brightness, 0, 255);
+    options.rgb_contrast = std::clamp(options.rgb_contrast, 0, 60);
+    options.rgb_saturation = std::clamp(options.rgb_saturation, 0, 80);
+    options.rgb_sharpness = std::clamp(options.rgb_sharpness, 0, 15);
+    if(options.rgb_powerline_hz != 0 && options.rgb_powerline_hz != 50 && options.rgb_powerline_hz != 60) {
+        throw std::runtime_error("RGB power-line frequency must be 0, 50, or 60 Hz");
+    }
     return options;
 }
 
@@ -305,7 +380,11 @@ void write_manifest(const Options &options, const SensorInfo &sensor, const Came
            << "\", \"address\": \"" << json_escape(sensor.address) << "\"},\n";
     if(imu_active) {
         output << "  \"imu\": {\"path\": \"imu.csv\", \"coordinateFrame\": \"depth_camera\", "
-               << "\"accelerationUnit\": \"m/s^2\", \"angularVelocityUnit\": \"rad/s\"},\n";
+               << "\"accelerationUnit\": \"m/s^2\", \"angularVelocityUnit\": \"rad/s\", "
+               << "\"requestedAccelRateHz\": " << options.imu_accel_rate_hz
+               << ", \"requestedAccelRangeG\": " << options.imu_accel_range_g
+               << ", \"requestedGyroRateHz\": " << options.imu_gyro_rate_hz
+               << ", \"requestedGyroRangeDps\": " << options.imu_gyro_range_dps << "},\n";
     }
     output << "  \"camera\": {\n"
            << "    \"width\": " << camera.width << ", \"height\": " << camera.height << ",\n"
@@ -313,7 +392,8 @@ void write_manifest(const Options &options, const SensorInfo &sensor, const Came
            << "    \"cx\": " << camera.cx << ", \"cy\": " << camera.cy << ",\n"
            << "    \"depth_scale\": 1000.0, \"max_depth_m\": " << options.max_depth_m << ",\n"
            << "    \"depth_field_of_view\": \"" << options.depth_fov << "\", "
-           << "\"depth_binned\": " << (options.depth_binned ? "true" : "false") << "\n"
+           << "\"depth_binned\": " << (options.depth_binned ? "true" : "false") << ", "
+           << "\"requested_sensor_fps\": " << options.sensor_fps << "\n"
            << "  },\n"
            << "  \"rgbCamera\": {\"width\": " << rgb_width
            << ", \"height\": " << rgb_height
@@ -332,7 +412,20 @@ void write_manifest(const Options &options, const SensorInfo &sensor, const Came
     }
     output << "],\n  \"sourceRgb\": {\"format\": \"jpeg\", \"quality\": " << options.rgb_quality
            << ", \"nativeResolution\": " << (rgb_resized ? "false" : "true")
-           << ", \"droppedFrames\": " << rgb_drops << "}\n"
+           << ", \"droppedFrames\": " << rgb_drops
+           << ", \"controls\": {\"requestedResolution\": \"" << json_escape(options.rgb_resolution)
+           << "\", \"autoExposure\": " << (options.rgb_auto_exposure ? "true" : "false")
+           << ", \"exposureUs\": " << options.rgb_exposure_us
+           << ", \"gain\": " << options.rgb_gain
+           << ", \"autoWhiteBalance\": " << (options.rgb_auto_white_balance ? "true" : "false")
+           << ", \"whiteBalanceK\": " << options.rgb_white_balance_k
+           << ", \"colorAdjustmentsEnabled\": " << (options.rgb_color_adjustments ? "true" : "false")
+           << ", \"brightness\": " << options.rgb_brightness
+           << ", \"contrast\": " << options.rgb_contrast
+           << ", \"saturation\": " << options.rgb_saturation
+           << ", \"sharpness\": " << options.rgb_sharpness
+           << ", \"backlightCompensation\": " << (options.rgb_backlight_compensation ? "true" : "false")
+           << ", \"powerlineHz\": " << options.rgb_powerline_hz << "}}\n"
            << "}\n";
     write_text_atomic(options.root / "phase.json", output.str());
 }
@@ -362,6 +455,11 @@ public:
         output_ << "timestamp_us,type,x,y,z,temperature_c\n";
     }
 
+    void observe(const char *type) {
+        if(std::string_view(type) == "accel") ++accel_samples_;
+        else if(std::string_view(type) == "gyro") ++gyro_samples_;
+    }
+
     void write(std::uint64_t timestamp_us, const char *type, float x, float y, float z, float temperature) {
         std::lock_guard lock(mutex_);
         output_ << timestamp_us << ',' << type << ',' << std::setprecision(9)
@@ -372,13 +470,15 @@ public:
 
     float rate_hz() const {
         const double elapsed = std::max(0.001, std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count());
-        return static_cast<float>(samples_.load() / elapsed);
+        return static_cast<float>(std::max(accel_samples_.load(), gyro_samples_.load()) / elapsed);
     }
 
 private:
     std::ofstream output_;
     mutable std::mutex mutex_;
     std::atomic<std::uint64_t> samples_{0};
+    std::atomic<std::uint64_t> accel_samples_{0};
+    std::atomic<std::uint64_t> gyro_samples_{0};
     std::chrono::steady_clock::time_point started_;
 };
 
@@ -412,6 +512,107 @@ k4a_depth_mode_t azure_depth_mode(const Options &options) {
     return options.depth_binned ? K4A_DEPTH_MODE_NFOV_2X2BINNED : K4A_DEPTH_MODE_NFOV_UNBINNED;
 }
 
+k4a_color_resolution_t azure_color_resolution(const Options &options, int native_fps) {
+    if(options.rgb_resolution == "auto") {
+        return native_fps <= 15 ? K4A_COLOR_RESOLUTION_2160P : K4A_COLOR_RESOLUTION_1536P;
+    }
+    if(options.rgb_resolution == "720p") return K4A_COLOR_RESOLUTION_720P;
+    if(options.rgb_resolution == "1080p") return K4A_COLOR_RESOLUTION_1080P;
+    if(options.rgb_resolution == "1440p") return K4A_COLOR_RESOLUTION_1440P;
+    if(options.rgb_resolution == "1536p") return K4A_COLOR_RESOLUTION_1536P;
+    if(options.rgb_resolution == "2160p" || options.rgb_resolution == "3072p") {
+        if(native_fps > 15) {
+            throw std::runtime_error(
+                "Azure Kinect 2160p/3072p RGB is unavailable at 30 fps; "
+                "select a 5/15 fps sensor rate or select 1536p RGB");
+        }
+        return options.rgb_resolution == "3072p"
+            ? K4A_COLOR_RESOLUTION_3072P : K4A_COLOR_RESOLUTION_2160P;
+    }
+    throw std::runtime_error("Unsupported Azure Kinect RGB resolution: " + options.rgb_resolution);
+}
+
+void set_azure_color_control(k4a_device_t device,
+                             k4a_color_control_command_t command,
+                             k4a_color_control_mode_t mode,
+                             std::int32_t value,
+                             const char *name) {
+    if(k4a_device_set_color_control(device, command, mode, value) != K4A_RESULT_SUCCEEDED) {
+        throw std::runtime_error(std::string("Azure Kinect rejected RGB ") + name
+            + " value " + std::to_string(value));
+    }
+}
+
+void reset_azure_color_control(k4a_device_t device,
+                               k4a_color_control_command_t command,
+                               const char *name) {
+    bool supports_auto = false;
+    std::int32_t minimum = 0;
+    std::int32_t maximum = 0;
+    std::int32_t step = 0;
+    std::int32_t default_value = 0;
+    k4a_color_control_mode_t default_mode = K4A_COLOR_CONTROL_MODE_MANUAL;
+    if(k4a_device_get_color_control_capabilities(
+           device, command, &supports_auto, &minimum, &maximum, &step,
+           &default_value, &default_mode) != K4A_RESULT_SUCCEEDED) {
+        throw std::runtime_error(std::string("Azure Kinect RGB ") + name
+            + " capabilities are unavailable");
+    }
+    set_azure_color_control(device, command, default_mode, default_value, name);
+}
+
+void apply_azure_color_controls(k4a_device_t device, const Options &options) {
+    set_azure_color_control(
+        device,
+        K4A_COLOR_CONTROL_EXPOSURE_TIME_ABSOLUTE,
+        options.rgb_auto_exposure ? K4A_COLOR_CONTROL_MODE_AUTO : K4A_COLOR_CONTROL_MODE_MANUAL,
+        options.rgb_exposure_us,
+        "exposure");
+    if(!options.rgb_auto_exposure) {
+        set_azure_color_control(
+            device, K4A_COLOR_CONTROL_GAIN, K4A_COLOR_CONTROL_MODE_MANUAL,
+            std::clamp(options.rgb_gain, 0, 255), "gain");
+    }
+    set_azure_color_control(
+        device,
+        K4A_COLOR_CONTROL_WHITEBALANCE,
+        options.rgb_auto_white_balance ? K4A_COLOR_CONTROL_MODE_AUTO : K4A_COLOR_CONTROL_MODE_MANUAL,
+        (options.rgb_white_balance_k / 10) * 10,
+        "white balance");
+    if(options.rgb_color_adjustments) {
+        set_azure_color_control(
+            device, K4A_COLOR_CONTROL_BRIGHTNESS, K4A_COLOR_CONTROL_MODE_MANUAL,
+            std::clamp(options.rgb_brightness, 0, 255), "brightness");
+        set_azure_color_control(
+            device, K4A_COLOR_CONTROL_CONTRAST, K4A_COLOR_CONTROL_MODE_MANUAL,
+            std::clamp(options.rgb_contrast, 0, 10), "contrast");
+        set_azure_color_control(
+            device, K4A_COLOR_CONTROL_SATURATION, K4A_COLOR_CONTROL_MODE_MANUAL,
+            std::clamp(options.rgb_saturation, 0, 63), "saturation");
+        set_azure_color_control(
+            device, K4A_COLOR_CONTROL_SHARPNESS, K4A_COLOR_CONTROL_MODE_MANUAL,
+            std::clamp(options.rgb_sharpness, 0, 4), "sharpness");
+        set_azure_color_control(
+            device, K4A_COLOR_CONTROL_BACKLIGHT_COMPENSATION, K4A_COLOR_CONTROL_MODE_MANUAL,
+            options.rgb_backlight_compensation ? 1 : 0, "backlight compensation");
+    } else {
+        reset_azure_color_control(device, K4A_COLOR_CONTROL_BRIGHTNESS, "brightness");
+        reset_azure_color_control(device, K4A_COLOR_CONTROL_CONTRAST, "contrast");
+        reset_azure_color_control(device, K4A_COLOR_CONTROL_SATURATION, "saturation");
+        reset_azure_color_control(device, K4A_COLOR_CONTROL_SHARPNESS, "sharpness");
+        reset_azure_color_control(
+            device, K4A_COLOR_CONTROL_BACKLIGHT_COMPENSATION, "backlight compensation");
+    }
+    if(options.rgb_powerline_hz != 0) {
+        set_azure_color_control(
+            device, K4A_COLOR_CONTROL_POWERLINE_FREQUENCY, K4A_COLOR_CONTROL_MODE_MANUAL,
+            options.rgb_powerline_hz == 50 ? 1 : 2, "power-line frequency");
+    } else {
+        reset_azure_color_control(
+            device, K4A_COLOR_CONTROL_POWERLINE_FREQUENCY, "power-line frequency");
+    }
+}
+
 int run_azure(const Options &options) {
     const auto device_count = k4a_device_get_installed_count();
     if(device_count == 0) throw std::runtime_error("Azure Kinect DK was not found");
@@ -439,15 +640,14 @@ int run_azure(const Options &options) {
         k4a_device_configuration_t config = K4A_DEVICE_CONFIG_INIT_DISABLE_ALL;
         const auto depth_mode = requested_depth_mode(options);
         config.depth_mode = azure_depth_mode(options);
-        config.camera_fps = depth_mode.native_fps == 15 ? K4A_FRAMES_PER_SECOND_15 : K4A_FRAMES_PER_SECOND_30;
+        config.camera_fps = depth_mode.native_fps == 5
+            ? K4A_FRAMES_PER_SECOND_5
+            : depth_mode.native_fps == 15
+                ? K4A_FRAMES_PER_SECOND_15
+                : K4A_FRAMES_PER_SECOND_30;
         config.synchronized_images_only = !options.probe;
         config.color_format = K4A_IMAGE_FORMAT_COLOR_BGRA32;
-        // Azure Kinect cannot synchronize 2160p color at 30 fps. Preserve the
-        // full-rate tracking path with its highest supported RGB mode, while
-        // the 15 fps wide/unbinned depth profile can retain native 4K color.
-        config.color_resolution = depth_mode.native_fps == 15
-            ? K4A_COLOR_RESOLUTION_2160P
-            : K4A_COLOR_RESOLUTION_1536P;
+        config.color_resolution = azure_color_resolution(options, depth_mode.native_fps);
         k4a_calibration_t calibration{};
         if(k4a_device_get_calibration(device, config.depth_mode, config.color_resolution, &calibration) != K4A_RESULT_SUCCEEDED) {
             throw std::runtime_error("Azure Kinect calibration is unavailable");
@@ -476,6 +676,7 @@ int run_azure(const Options &options) {
                 0, 0, 0, 1
             }
         };
+        apply_azure_color_controls(device, options);
         if(k4a_device_start_cameras(device, &config) != K4A_RESULT_SUCCEEDED) {
             throw std::runtime_error("Azure Kinect cameras could not start; close other camera applications and check USB 3/power");
         }
@@ -511,6 +712,8 @@ int run_azure(const Options &options) {
             while(k4a_device_get_imu_sample(device, &sample, 0) == K4A_WAIT_RESULT_SUCCEEDED) {
                 const auto accel = rotate_k4a(accel_to_depth, sample.acc_sample);
                 const auto gyro = rotate_k4a(gyro_to_depth, sample.gyro_sample);
+                imu->observe("accel");
+                imu->observe("gyro");
                 if(recording) {
                     imu->write(sample.acc_timestamp_usec, "accel", accel[0], accel[1], accel[2], sample.temperature);
                     imu->write(sample.gyro_timestamp_usec, "gyro", gyro[0], gyro[1], gyro[2], sample.temperature);
@@ -1050,6 +1253,191 @@ void complete_orbbec_narrow_color(
     }
 }
 
+std::pair<int, int> requested_rgb_dimensions(const std::string &resolution) {
+    if(resolution == "720p") return {1280, 720};
+    if(resolution == "1080p") return {1920, 1080};
+    if(resolution == "1440p") return {2560, 1440};
+    if(resolution == "1536p") return {2048, 1536};
+    if(resolution == "2160p") return {3840, 2160};
+    if(resolution == "3072p") return {4096, 3072};
+    return {0, 0};
+}
+
+int clamp_orbbec_property(const std::shared_ptr<ob::Device> &device,
+                          OBPropertyID property,
+                          int requested,
+                          const char *name) {
+    const auto range = device->getIntPropertyRange(property);
+    const int step = std::max(1, range.step);
+    const int clamped = std::clamp(requested, range.min, range.max);
+    const int value = range.min + ((clamped - range.min) / step) * step;
+    if(value != requested) {
+        std::cerr << "Femto Mega RGB " << name << " adjusted from " << requested
+                  << " to supported value " << value << " (range " << range.min
+                  << ".." << range.max << ", step " << step << ")\n";
+    }
+    return value;
+}
+
+void set_orbbec_bool(const std::shared_ptr<ob::Device> &device,
+                     OBPropertyID property,
+                     bool value,
+                     const char *name) {
+    if(!device->isPropertySupported(property, OB_PERMISSION_WRITE)) {
+        throw std::runtime_error(std::string("Femto Mega does not expose writable RGB ") + name);
+    }
+    device->setBoolProperty(property, value);
+}
+
+void set_orbbec_int(const std::shared_ptr<ob::Device> &device,
+                    OBPropertyID property,
+                    int value,
+                    const char *name) {
+    if(!device->isPropertySupported(property, OB_PERMISSION_WRITE)) {
+        throw std::runtime_error(std::string("Femto Mega does not expose writable RGB ") + name);
+    }
+    device->setIntProperty(property, clamp_orbbec_property(device, property, value, name));
+}
+
+void reset_orbbec_int(const std::shared_ptr<ob::Device> &device,
+                      OBPropertyID property,
+                      const char *name) {
+    if(!device->isPropertySupported(property, OB_PERMISSION_WRITE)) return;
+    const auto range = device->getIntPropertyRange(property);
+    device->setIntProperty(property, range.def);
+    std::cerr << "Femto Mega RGB " << name << " restored to device default "
+              << range.def << '\n';
+}
+
+void apply_orbbec_color_controls(const std::shared_ptr<ob::Device> &device,
+                                 const Options &options) {
+    set_orbbec_bool(
+        device, OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, options.rgb_auto_exposure, "auto exposure");
+    if(!options.rgb_auto_exposure) {
+        // Femto Mega reports exposure in 100 us units, while ScanLan's public
+        // setting stays in microseconds to match Azure Kinect.
+        set_orbbec_int(
+            device, OB_PROP_COLOR_EXPOSURE_INT,
+            std::max(1, static_cast<int>(std::lround(options.rgb_exposure_us / 100.0))),
+            "exposure");
+        set_orbbec_int(device, OB_PROP_COLOR_GAIN_INT, options.rgb_gain, "gain");
+    }
+    set_orbbec_bool(
+        device, OB_PROP_COLOR_AUTO_WHITE_BALANCE_BOOL,
+        options.rgb_auto_white_balance, "auto white balance");
+    if(!options.rgb_auto_white_balance) {
+        set_orbbec_int(
+            device, OB_PROP_COLOR_WHITE_BALANCE_INT,
+            options.rgb_white_balance_k, "white balance");
+    }
+    if(options.rgb_color_adjustments) {
+        set_orbbec_int(device, OB_PROP_COLOR_BRIGHTNESS_INT, options.rgb_brightness, "brightness");
+        set_orbbec_int(device, OB_PROP_COLOR_CONTRAST_INT, options.rgb_contrast, "contrast");
+        set_orbbec_int(device, OB_PROP_COLOR_SATURATION_INT, options.rgb_saturation, "saturation");
+        set_orbbec_int(device, OB_PROP_COLOR_SHARPNESS_INT, options.rgb_sharpness, "sharpness");
+    } else {
+        reset_orbbec_int(device, OB_PROP_COLOR_BRIGHTNESS_INT, "brightness");
+        reset_orbbec_int(device, OB_PROP_COLOR_CONTRAST_INT, "contrast");
+        reset_orbbec_int(device, OB_PROP_COLOR_SATURATION_INT, "saturation");
+        reset_orbbec_int(device, OB_PROP_COLOR_SHARPNESS_INT, "sharpness");
+    }
+    if(options.rgb_powerline_hz != 0) {
+        set_orbbec_int(
+            device, OB_PROP_COLOR_POWER_LINE_FREQUENCY_INT,
+            options.rgb_powerline_hz == 50 ? 1 : 2, "power-line frequency");
+    } else {
+        reset_orbbec_int(
+            device, OB_PROP_COLOR_POWER_LINE_FREQUENCY_INT, "power-line frequency");
+    }
+}
+
+int imu_sample_rate_hz(OBIMUSampleRate rate) {
+    switch(rate) {
+        case OB_SAMPLE_RATE_50_HZ: return 50;
+        case OB_SAMPLE_RATE_100_HZ: return 100;
+        case OB_SAMPLE_RATE_200_HZ: return 200;
+        case OB_SAMPLE_RATE_500_HZ: return 500;
+        case OB_SAMPLE_RATE_1_KHZ: return 1000;
+        case OB_SAMPLE_RATE_2_KHZ: return 2000;
+        default: return 0;
+    }
+}
+
+int accel_range_g(OBAccelFullScaleRange range) {
+    switch(range) {
+        case OB_ACCEL_FS_2g: return 2;
+        case OB_ACCEL_FS_4g: return 4;
+        case OB_ACCEL_FS_8g: return 8;
+        case OB_ACCEL_FS_16g: return 16;
+        default: return 0;
+    }
+}
+
+int gyro_range_dps(OBGyroFullScaleRange range) {
+    switch(range) {
+        case OB_GYRO_FS_125dps: return 125;
+        case OB_GYRO_FS_250dps: return 250;
+        case OB_GYRO_FS_500dps: return 500;
+        case OB_GYRO_FS_1000dps: return 1000;
+        case OB_GYRO_FS_2000dps: return 2000;
+        default: return 0;
+    }
+}
+
+std::shared_ptr<ob::StreamProfile> select_accel_profile(
+    const std::shared_ptr<ob::Sensor> &sensor, const Options &options) {
+    auto profiles = sensor->getStreamProfileList();
+    std::vector<std::string> available;
+    for(std::uint32_t index = 0; index < profiles->getCount(); ++index) {
+        auto profile = profiles->getProfile(index)->as<ob::AccelStreamProfile>();
+        const int rate = imu_sample_rate_hz(profile->getSampleRate());
+        const int range = accel_range_g(profile->getFullScaleRange());
+        available.push_back(std::to_string(rate) + "Hz/+-" + std::to_string(range) + "g");
+        if((options.imu_accel_rate_hz == 0 || rate == options.imu_accel_rate_hz)
+            && (options.imu_accel_range_g == 0 || range == options.imu_accel_range_g)) {
+            return profile;
+        }
+    }
+    std::ostringstream message;
+    message << "Femto Mega has no accelerometer profile matching "
+            << (options.imu_accel_rate_hz == 0 ? std::string("default rate") : std::to_string(options.imu_accel_rate_hz) + " Hz")
+            << " and "
+            << (options.imu_accel_range_g == 0 ? std::string("default range") : std::string("+-") + std::to_string(options.imu_accel_range_g) + "g")
+            << "; available: ";
+    for(std::size_t index = 0; index < available.size(); ++index) {
+        if(index) message << ", ";
+        message << available[index];
+    }
+    throw std::runtime_error(message.str());
+}
+
+std::shared_ptr<ob::StreamProfile> select_gyro_profile(
+    const std::shared_ptr<ob::Sensor> &sensor, const Options &options) {
+    auto profiles = sensor->getStreamProfileList();
+    std::vector<std::string> available;
+    for(std::uint32_t index = 0; index < profiles->getCount(); ++index) {
+        auto profile = profiles->getProfile(index)->as<ob::GyroStreamProfile>();
+        const int rate = imu_sample_rate_hz(profile->getSampleRate());
+        const int range = gyro_range_dps(profile->getFullScaleRange());
+        available.push_back(std::to_string(rate) + "Hz/+-" + std::to_string(range) + "dps");
+        if((options.imu_gyro_rate_hz == 0 || rate == options.imu_gyro_rate_hz)
+            && (options.imu_gyro_range_dps == 0 || range == options.imu_gyro_range_dps)) {
+            return profile;
+        }
+    }
+    std::ostringstream message;
+    message << "Femto Mega has no gyroscope profile matching "
+            << (options.imu_gyro_rate_hz == 0 ? std::string("default rate") : std::to_string(options.imu_gyro_rate_hz) + " Hz")
+            << " and "
+            << (options.imu_gyro_range_dps == 0 ? std::string("default range") : std::string("+-") + std::to_string(options.imu_gyro_range_dps) + "dps")
+            << "; available: ";
+    for(std::size_t index = 0; index < available.size(); ++index) {
+        if(index) message << ", ";
+        message << available[index];
+    }
+    throw std::runtime_error(message.str());
+}
+
 std::shared_ptr<ob::Config> femto_video_config(const std::shared_ptr<ob::Pipeline> &pipeline,
                                                const Options &options) {
     auto config = std::make_shared<ob::Config>();
@@ -1059,10 +1447,17 @@ std::shared_ptr<ob::Config> femto_video_config(const std::shared_ptr<ob::Pipelin
     std::shared_ptr<ob::StreamProfile> best_depth;
     long best_fps_delta = LONG_MAX;
     long best_pixels = 0;
+    const auto [requested_rgb_width, requested_rgb_height] =
+        requested_rgb_dimensions(options.rgb_resolution);
     for(std::uint32_t color_index = 0; color_index < color_profiles->getCount(); ++color_index) {
         auto color = color_profiles->getProfile(color_index);
         auto color_video = color->as<ob::VideoStreamProfile>();
         if(color_video->getFormat() != OB_FORMAT_MJPG) continue;
+        if(options.sensor_fps > 0
+            && static_cast<int>(color_video->getFps()) != requested.native_fps) continue;
+        if(requested_rgb_width > 0
+            && (static_cast<int>(color_video->getWidth()) != requested_rgb_width
+                || static_cast<int>(color_video->getHeight()) != requested_rgb_height)) continue;
         auto depth_profiles = pipeline->getD2CDepthProfileList(color, ALIGN_D2C_HW_MODE);
         for(std::uint32_t depth_index = 0; depth_index < depth_profiles->getCount(); ++depth_index) {
             auto depth = depth_profiles->getProfile(depth_index);
@@ -1083,7 +1478,9 @@ std::shared_ptr<ob::Config> femto_video_config(const std::shared_ptr<ob::Pipelin
     }
     if(!best_color || !best_depth) {
         throw std::runtime_error("Femto Mega has no compatible MJPEG hardware depth-to-color profile for "
-            + std::to_string(requested.width) + "x" + std::to_string(requested.height));
+            + std::to_string(requested.width) + "x" + std::to_string(requested.height)
+            + " depth and " + (options.rgb_resolution == "auto" ? std::string("automatic") : options.rgb_resolution)
+            + " RGB resolution");
     }
     config->enableStream(best_color);
     config->enableStream(best_depth);
@@ -1138,6 +1535,7 @@ int run_orbbec(const Options &options) {
     if(sensor.name.find("Femto Mega") == std::string::npos) {
         throw std::runtime_error("Selected Orbbec device is not a Femto Mega: " + sensor.name);
     }
+    apply_orbbec_color_controls(device, options);
     auto config = femto_video_config(pipeline, options);
     pipeline->start(config);
     auto first = pipeline->waitForFrameset(5000);
@@ -1198,16 +1596,18 @@ int run_orbbec(const Options &options) {
             if(!accel_sensor || !gyro_sensor) throw std::runtime_error("Femto Mega IMU sensors are unavailable");
             ImuCsv *writer = imu.get();
             auto target_profile = depth_profile;
-            auto accel_profile = accel_sensor->getStreamProfileList()->getProfile(0);
-            auto gyro_profile = gyro_sensor->getStreamProfileList()->getProfile(0);
+            auto accel_profile = select_accel_profile(accel_sensor, options);
+            auto gyro_profile = select_gyro_profile(gyro_sensor, options);
             accel_sensor->start(accel_profile, [writer, target_profile, &recording](std::shared_ptr<ob::Frame> raw) {
                 auto frame = raw->as<ob::AccelFrame>();
                 const auto value = rotate_ob(frame->getStreamProfile()->getExtrinsicTo(target_profile), frame->getValue());
+                writer->observe("accel");
                 if(recording.load()) writer->write(frame->getTimeStampUs(), "accel", value[0], value[1], value[2], frame->getTemperature());
             });
             gyro_sensor->start(gyro_profile, [writer, target_profile, &gyro_integrator, &recording](std::shared_ptr<ob::Frame> raw) {
                 auto frame = raw->as<ob::GyroFrame>();
                 const auto value = rotate_ob(frame->getStreamProfile()->getExtrinsicTo(target_profile), frame->getValue());
+                writer->observe("gyro");
                 if(recording.load()) writer->write(frame->getTimeStampUs(), "gyro", value[0], value[1], value[2], frame->getTemperature());
                 gyro_integrator.add(frame->getTimeStampUs(), value[0], value[1], value[2]);
             });
@@ -1219,6 +1619,11 @@ int run_orbbec(const Options &options) {
             imu.reset();
             accel_sensor.reset();
             gyro_sensor.reset();
+            const bool custom_profile = options.imu_accel_rate_hz != 0
+                || options.imu_accel_range_g != 0
+                || options.imu_gyro_rate_hz != 0
+                || options.imu_gyro_range_dps != 0;
+            if(custom_profile) throw;
         }
     }
     write_manifest(options, sensor, camera, rgb_camera, created_at, 0, 0, imu_active, 0);

@@ -57,6 +57,7 @@
     PreviewPoint,
     ProjectCatalogEntry,
     ProjectSummary,
+    RgbResolution,
     RuntimeInfo,
     SensorKind
   } from './lib/types';
@@ -659,6 +660,51 @@
     }, 250);
   }
 
+  function updateDepthFieldOfView(value: DepthFieldOfView): void {
+    const settings = project?.settings;
+    if (!settings) return;
+    if (settings.sensorKind !== 'kinect_v2'
+      && value === 'wide' && !settings.depthBinned
+      && settings.sensorFps > 15) {
+      updateSetting('sensorFps', 0);
+    }
+    if (settings.sensorKind === 'azure_kinect'
+      && (settings.rgbResolution === '2160p' || settings.rgbResolution === '3072p')
+      && settings.sensorFps === 0
+      && (value !== 'wide' || settings.depthBinned)) {
+      updateSetting('rgbResolution', 'auto');
+    }
+    updateSetting('depthFieldOfView', value);
+  }
+
+  function updateDepthBinning(value: boolean): void {
+    const settings = project?.settings;
+    if (!settings) return;
+    if (settings.sensorKind !== 'kinect_v2'
+      && settings.depthFieldOfView === 'wide' && !value
+      && settings.sensorFps > 15) {
+      updateSetting('sensorFps', 0);
+    }
+    if (settings.sensorKind === 'azure_kinect'
+      && (settings.rgbResolution === '2160p' || settings.rgbResolution === '3072p')
+      && settings.sensorFps === 0
+      && value) {
+      updateSetting('rgbResolution', 'auto');
+    }
+    updateSetting('depthBinned', value);
+  }
+
+  function updateSensorFps(value: number): void {
+    const settings = project?.settings;
+    if (!settings) return;
+    if (settings.sensorKind === 'azure_kinect'
+      && (settings.rgbResolution === '2160p' || settings.rgbResolution === '3072p')
+      && (value === 30 || (value === 0 && !(settings.depthFieldOfView === 'wide' && !settings.depthBinned)))) {
+      updateSetting('rgbResolution', 'auto');
+    }
+    updateSetting('sensorFps', value);
+  }
+
   async function persistSettings(revision = settingsRevision, refreshRuntime = false): Promise<boolean> {
     if (!project || capturing || processing) return false;
     const snapshot = project;
@@ -724,6 +770,7 @@
     const changingFamily = project.settings.sensorKind !== candidate.kind;
     return {
       ...project.settings,
+      ...(changingFamily ? cameraDefaults(candidate.kind) : {}),
       sensorKind: candidate.kind,
       sensorId: candidate.id,
       sensorConnection: candidate.connection,
@@ -737,12 +784,56 @@
     if (project.settings.sensorKind === kind) return project.settings;
     return {
       ...project.settings,
+      ...cameraDefaults(kind),
       sensorKind: kind,
       sensorId: '',
       sensorConnection: 'usb',
       sensorAddress: '',
       useImu: kind !== 'kinect_v2'
     };
+  }
+
+  function cameraDefaults(kind: SensorKind): Partial<CaptureSettings> {
+    if (kind === 'femto_mega') {
+      return {
+        rgbResolution: 'auto',
+        sensorFps: 0,
+        rgbGain: 30,
+        rgbBrightness: 0,
+        rgbContrast: 32,
+        rgbSaturation: 54,
+        rgbSharpness: 6,
+        rgbBacklightCompensation: false,
+        imuAccelRateHz: 0,
+        imuAccelRangeG: 0,
+        imuGyroRateHz: 0,
+        imuGyroRangeDps: 0
+      };
+    }
+    return {
+      rgbResolution: 'auto',
+      sensorFps: 0,
+      rgbGain: 0,
+      rgbBrightness: 128,
+      rgbContrast: 5,
+      rgbSaturation: 32,
+      rgbSharpness: 2,
+      rgbBacklightCompensation: false,
+      imuAccelRateHz: 0,
+      imuAccelRangeG: 0,
+      imuGyroRateHz: 0,
+      imuGyroRangeDps: 0
+    };
+  }
+
+  function effectiveSensorFps(settings: CaptureSettings): number {
+    if (settings.sensorFps > 0) return settings.sensorFps;
+    return settings.depthFieldOfView === 'wide' && !settings.depthBinned ? 15 : 30;
+  }
+
+  function rgbExposureLimitUs(settings: CaptureSettings): number {
+    const sensorFps = effectiveSensorFps(settings);
+    return sensorFps <= 5 ? 190_000 : sensorFps <= 15 ? 60_000 : 30_000;
   }
 
   async function commitSensorSettings(settings: CaptureSettings): Promise<boolean> {
@@ -1767,6 +1858,13 @@
                 <option value={5}>5 fps</option><option value={10}>10 fps</option><option value={15}>15 fps</option><option value={30}>30 fps</option>
               </select>
             </label>
+            {#if project.settings.sensorKind !== 'kinect_v2'}
+              <label>Sensor rate
+                <select value={project.settings.sensorFps} on:change={(event) => updateSensorFps(Number(inputValue(event)))} disabled={capturing || processing}>
+                  <option value={0}>Auto · fastest</option><option value={5}>5 fps</option><option value={15}>15 fps</option>{#if project.settings.sensorKind === 'femto_mega'}<option value={25} disabled={project.settings.depthFieldOfView === 'wide' && !project.settings.depthBinned}>25 fps</option>{/if}<option value={30} disabled={project.settings.depthFieldOfView === 'wide' && !project.settings.depthBinned}>30 fps</option>
+                </select>
+              </label>
+            {/if}
             <label>Depth limit
               <div class="unit-input"><input type="number" min="0.8" max="8" step="0.1" value={project.settings.maxDepthM} on:change={(event) => updateSetting('maxDepthM', Number(inputValue(event)))} disabled={capturing || processing}/><span>m</span></div>
             </label>
@@ -1775,12 +1873,12 @@
             </label>
             {#if project.settings.sensorKind !== 'kinect_v2'}
               <label>Depth FOV
-                <select value={project.settings.depthFieldOfView} on:change={(event) => updateSetting('depthFieldOfView', inputValue(event) as DepthFieldOfView)} disabled={capturing || processing}>
+                <select value={project.settings.depthFieldOfView} on:change={(event) => updateDepthFieldOfView(inputValue(event) as DepthFieldOfView)} disabled={capturing || processing}>
                   <option value="narrow">Narrow</option><option value="wide">Wide</option>
                 </select>
               </label>
               <label>Depth sampling
-                <select value={project.settings.depthBinned ? 'binned' : 'full'} on:change={(event) => updateSetting('depthBinned', inputValue(event) === 'binned')} disabled={capturing || processing}>
+                <select value={project.settings.depthBinned ? 'binned' : 'full'} on:change={(event) => updateDepthBinning(inputValue(event) === 'binned')} disabled={capturing || processing}>
                   <option value="full">Full resolution</option><option value="binned">2×2 binned · faster</option>
                 </select>
               </label>
@@ -1796,8 +1894,113 @@
               <label>Camera address<input value={project.settings.sensorAddress} placeholder="192.168.1.10" on:change={(event) => updateSetting('sensorAddress', inputValue(event))} disabled={capturing || processing}/></label>
             {/if}
           {/if}
-          <label class="toggle"><input type="checkbox" checked={project.settings.useImu} on:change={(event) => updateSetting('useImu', inputChecked(event))} disabled={capturing || processing || project.settings.sensorKind === 'kinect_v2'}/><span></span><div><strong>IMU motion prior</strong><small>Improves fast-rotation initialization</small></div></label>
         </section>
+
+        <details class="panel advanced-settings" open>
+          <summary><span>RGB CAMERA</span><strong>{project.settings.sensorKind === 'kinect_v2' ? 'FIXED BY SDK' : 'SENSOR + ARCHIVE'}</strong></summary>
+          {#if project.settings.sensorKind === 'kinect_v2'}
+            <p>Kinect v2 has a fixed 1920×1080, 30 fps color stream. Its public SDK exposes the current exposure, gain, gamma, and frame interval as read-only values, so ScanLan cannot safely override them.</p>
+          {:else}
+            <div class="advanced-body">
+              <label>Sensor RGB resolution
+                <select value={project.settings.rgbResolution} on:change={(event) => updateSetting('rgbResolution', inputValue(event) as RgbResolution)} disabled={capturing || processing}>
+                  <option value="auto">Automatic · best compatible</option>
+                  <option value="720p">1280×720</option>
+                  <option value="1080p">1920×1080</option>
+                  <option value="1440p">2560×1440</option>
+                  {#if project.settings.sensorKind === 'azure_kinect'}<option value="1536p">2048×1536 · 4:3</option>{/if}
+                  <option value="2160p" disabled={project.settings.sensorKind === 'azure_kinect' && (project.settings.sensorFps === 30 || (project.settings.sensorFps === 0 && !(project.settings.depthFieldOfView === 'wide' && !project.settings.depthBinned)))}>3840×2160{project.settings.sensorKind === 'azure_kinect' ? ' · 5/15 fps' : ''}</option>
+                  {#if project.settings.sensorKind === 'azure_kinect'}<option value="3072p" disabled={project.settings.sensorFps === 30 || (project.settings.sensorFps === 0 && !(project.settings.depthFieldOfView === 'wide' && !project.settings.depthBinned))}>4096×3072 · 5/15 fps</option>{/if}
+                </select>
+              </label>
+
+              <label class="toggle"><input type="checkbox" checked={project.settings.rgbAutoExposure} on:change={(event) => updateSetting('rgbAutoExposure', inputChecked(event))} disabled={capturing || processing}/><span></span><div><strong>Auto exposure</strong><small>Disable to lock exposure and gain across the take</small></div></label>
+              {#if !project.settings.rgbAutoExposure}
+                <div class="setting-grid">
+                  <label class="slider-control"><span>Exposure <output>{(project.settings.rgbExposureUs / 1000).toFixed(1)} ms</output></span>
+                    <input type="range" min="100" max={rgbExposureLimitUs(project.settings)} step="100" value={project.settings.rgbExposureUs} on:input={(event) => updateSetting('rgbExposureUs', Number(inputValue(event)))} disabled={capturing || processing}/>
+                  </label>
+                  <label class="slider-control"><span>Gain <output>{project.settings.rgbGain}</output></span>
+                    <input type="range" min={project.settings.sensorKind === 'femto_mega' ? 1 : 0} max={project.settings.sensorKind === 'femto_mega' ? 240 : 255} step="1" value={project.settings.rgbGain} on:input={(event) => updateSetting('rgbGain', Number(inputValue(event)))} disabled={capturing || processing}/>
+                  </label>
+                </div>
+              {/if}
+
+              <label class="toggle"><input type="checkbox" checked={project.settings.rgbAutoWhiteBalance} on:change={(event) => updateSetting('rgbAutoWhiteBalance', inputChecked(event))} disabled={capturing || processing}/><span></span><div><strong>Auto white balance</strong><small>Disable to keep color temperature consistent between frames</small></div></label>
+              {#if !project.settings.rgbAutoWhiteBalance}
+                <label class="slider-control"><span>White balance <output>{project.settings.rgbWhiteBalanceK} K</output></span>
+                  <input type="range" min="2000" max={project.settings.sensorKind === 'femto_mega' ? 11000 : 12500} step="10" value={project.settings.rgbWhiteBalanceK} on:input={(event) => updateSetting('rgbWhiteBalanceK', Number(inputValue(event)))} disabled={capturing || processing}/>
+                </label>
+              {/if}
+
+              <label class="toggle"><input type="checkbox" checked={project.settings.rgbColorAdjustmentsEnabled} on:change={(event) => updateSetting('rgbColorAdjustmentsEnabled', inputChecked(event))} disabled={capturing || processing}/><span></span><div><strong>Manual image processing</strong><small>Apply deterministic brightness, contrast, color, and sharpening</small></div></label>
+              {#if project.settings.rgbColorAdjustmentsEnabled}
+                <div class="setting-grid compact-settings">
+                  <label class="slider-control"><span>Brightness <output>{project.settings.rgbBrightness}</output></span><input type="range" min="0" max={project.settings.sensorKind === 'femto_mega' ? 128 : 255} step="1" value={project.settings.rgbBrightness} on:input={(event) => updateSetting('rgbBrightness', Number(inputValue(event)))} disabled={capturing || processing}/></label>
+                  <label class="slider-control"><span>Contrast <output>{project.settings.rgbContrast}</output></span><input type="range" min={project.settings.sensorKind === 'femto_mega' ? 1 : 0} max={project.settings.sensorKind === 'femto_mega' ? 60 : 10} step="1" value={project.settings.rgbContrast} on:input={(event) => updateSetting('rgbContrast', Number(inputValue(event)))} disabled={capturing || processing}/></label>
+                  <label class="slider-control"><span>Saturation <output>{project.settings.rgbSaturation}</output></span><input type="range" min={project.settings.sensorKind === 'femto_mega' ? 1 : 0} max={project.settings.sensorKind === 'femto_mega' ? 80 : 63} step="1" value={project.settings.rgbSaturation} on:input={(event) => updateSetting('rgbSaturation', Number(inputValue(event)))} disabled={capturing || processing}/></label>
+                  <label class="slider-control"><span>Sharpness <output>{project.settings.rgbSharpness}</output></span><input type="range" min={project.settings.sensorKind === 'femto_mega' ? 1 : 0} max={project.settings.sensorKind === 'femto_mega' ? 15 : 4} step="1" value={project.settings.rgbSharpness} on:input={(event) => updateSetting('rgbSharpness', Number(inputValue(event)))} disabled={capturing || processing}/></label>
+                </div>
+                {#if project.settings.sensorKind === 'azure_kinect'}
+                  <label class="toggle"><input type="checkbox" checked={project.settings.rgbBacklightCompensation} on:change={(event) => updateSetting('rgbBacklightCompensation', inputChecked(event))} disabled={capturing || processing}/><span></span><div><strong>Backlight compensation</strong><small>Lift a dark subject against a bright background</small></div></label>
+                {/if}
+              {/if}
+
+              <div class="setting-grid">
+                <label>Anti-flicker
+                  <select value={project.settings.rgbPowerlineHz} on:change={(event) => updateSetting('rgbPowerlineHz', Number(inputValue(event)))} disabled={capturing || processing}>
+                    <option value={0}>Camera default</option><option value={50}>50 Hz</option><option value={60}>60 Hz</option>
+                  </select>
+                </label>
+                <label>JPEG quality
+                  <div class="unit-input"><input type="number" min="60" max="100" step="1" value={project.settings.rgbJpegQuality} on:change={(event) => updateSetting('rgbJpegQuality', Number(inputValue(event)))} disabled={capturing || processing}/><span>%</span></div>
+                </label>
+                <label>Archived RGB size
+                  <select value={project.settings.maxRgbDimension} on:change={(event) => updateSetting('maxRgbDimension', Number(inputValue(event)))} disabled={capturing || processing}>
+                    <option value={0}>Native sensor size</option><option value={3840}>Max 3840 px</option><option value={2560}>Max 2560 px</option><option value={1920}>Max 1920 px</option><option value={1280}>Max 1280 px</option>
+                  </select>
+                </label>
+              </div>
+              <p>For texture quality, use native archive size and JPEG 95–100. Lock exposure and white balance after the preview looks correct; excessive exposure causes motion blur even when depth tracking remains stable.</p>
+            </div>
+          {/if}
+        </details>
+
+        <details class="panel advanced-settings" open>
+          <summary><span>IMU</span><strong>{project.settings.sensorKind === 'femto_mega' ? 'CONFIGURABLE' : project.settings.sensorKind === 'azure_kinect' ? 'FIXED PROFILE' : 'UNAVAILABLE'}</strong></summary>
+          <div class="advanced-body">
+            <label class="toggle"><input type="checkbox" checked={project.settings.useImu} on:change={(event) => updateSetting('useImu', inputChecked(event))} disabled={capturing || processing || project.settings.sensorKind === 'kinect_v2'}/><span></span><div><strong>IMU motion prior</strong><small>Improves fast-rotation initialization</small></div></label>
+            {#if project.settings.useImu && project.settings.sensorKind === 'femto_mega'}
+              <div class="setting-grid">
+                <label>Accelerometer rate
+                  <select value={project.settings.imuAccelRateHz} on:change={(event) => updateSetting('imuAccelRateHz', Number(inputValue(event)))} disabled={capturing || processing}>
+                    <option value={0}>Device default</option><option value={50}>50 Hz</option><option value={100}>100 Hz</option><option value={200}>200 Hz</option><option value={500}>500 Hz</option><option value={1000}>1000 Hz</option><option value={2000}>2000 Hz</option>
+                  </select>
+                </label>
+                <label>Accelerometer range
+                  <select value={project.settings.imuAccelRangeG} on:change={(event) => updateSetting('imuAccelRangeG', Number(inputValue(event)))} disabled={capturing || processing}>
+                    <option value={0}>Device default</option><option value={2}>±2 g · most sensitive</option><option value={4}>±4 g</option><option value={8}>±8 g</option><option value={16}>±16 g</option>
+                  </select>
+                </label>
+                <label>Gyroscope rate
+                  <select value={project.settings.imuGyroRateHz} on:change={(event) => updateSetting('imuGyroRateHz', Number(inputValue(event)))} disabled={capturing || processing}>
+                    <option value={0}>Device default</option><option value={50}>50 Hz</option><option value={100}>100 Hz</option><option value={200}>200 Hz</option><option value={500}>500 Hz</option><option value={1000}>1000 Hz</option><option value={2000}>2000 Hz</option>
+                  </select>
+                </label>
+                <label>Gyroscope range
+                  <select value={project.settings.imuGyroRangeDps} on:change={(event) => updateSetting('imuGyroRangeDps', Number(inputValue(event)))} disabled={capturing || processing}>
+                    <option value={0}>Device default</option><option value={125}>±125 °/s · most sensitive</option><option value={250}>±250 °/s</option><option value={500}>±500 °/s</option><option value={1000}>±1000 °/s</option><option value={2000}>±2000 °/s</option>
+                  </select>
+                </label>
+              </div>
+              <p>A faster rate resolves quick motion better. A narrower range gives finer quantization; choose ±8 g only if ±2/±4 g clips during abrupt movement. For handheld scanning, ±4 g and ±500 °/s are a balanced starting point.</p>
+            {:else if project.settings.useImu && project.settings.sensorKind === 'azure_kinect'}
+              <p>Azure Kinect exposes its factory-calibrated IMU stream but no SDK controls for sample rate or full-scale range. ScanLan drains it at the device rate and reports the measured rate below.</p>
+            {:else if project.settings.sensorKind === 'kinect_v2'}
+              <p>Kinect v2 does not contain an SDK-accessible IMU.</p>
+            {/if}
+          </div>
+        </details>
 
         {#if !capturing}
           <section class="panel connection-card" class:connected={selectedSensorConnected} class:warning={!selectedSensorConnected}>
@@ -2176,6 +2379,21 @@
 
   .settings { display: grid; gap: 13px; }
   .settings label { display: grid; gap: 6px; color: #8ba2ad; font-size: 10px; font-weight: 720; letter-spacing: .03em; }
+  .advanced-settings { padding: 0; overflow: hidden; }
+  .advanced-settings summary { display: flex; align-items: center; justify-content: space-between; padding: 14px 15px; cursor: pointer; list-style: none; }
+  .advanced-settings summary::-webkit-details-marker { display: none; }
+  .advanced-settings summary::after { margin-left: 9px; color: #617985; font-size: 11px; content: '›'; transform: rotate(90deg); transition: transform .15s; }
+  .advanced-settings:not([open]) summary::after { transform: rotate(0deg); }
+  .advanced-settings summary span { color: var(--cyan); font-size: 9px; font-weight: 850; letter-spacing: .11em; }
+  .advanced-settings summary strong { margin-left: auto; color: #8199a5; font-size: 9px; }
+  .advanced-settings > p { padding: 0 15px 15px; color: #708792; font-size: 10px; line-height: 1.55; }
+  .advanced-body { display: grid; gap: 13px; padding: 0 15px 15px; border-top: 1px solid var(--line); padding-top: 14px; }
+  .advanced-body > label, .advanced-body .setting-grid label { display: grid; gap: 6px; color: #8ba2ad; font-size: 10px; font-weight: 720; letter-spacing: .03em; }
+  .advanced-body > p { color: #708792; font-size: 10px; line-height: 1.55; }
+  .compact-settings { padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: rgba(5,15,23,.32); }
+  .slider-control > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .slider-control output { color: #c9dde5; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; font-weight: 800; letter-spacing: 0; }
+  .slider-control input[type='range'] { height: 18px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; accent-color: var(--cyan); cursor: ew-resize; }
   .setting-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 10px; }
   select, input { width: 100%; min-width: 0; height: 36px; padding: 0 10px; outline: none; border: 1px solid rgba(147,193,211,.16); border-radius: 8px; background: #091722; color: #c8dce4; font-size: 11px; }
   select:focus, input:focus { border-color: rgba(99,199,231,.55); box-shadow: 0 0 0 2px rgba(99,199,231,.08); }

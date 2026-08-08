@@ -3,12 +3,15 @@ export type ProcessingStatus = 'idle' | 'processing' | 'complete' | 'failed';
 export type SensorKind = 'kinect_v2' | 'azure_kinect' | 'femto_mega';
 export type SensorConnection = 'usb' | 'network';
 export type DepthFieldOfView = 'narrow' | 'wide';
+export type RgbResolution = 'auto' | '720p' | '1080p' | '1440p' | '1536p' | '2160p' | '3072p';
 export type MeshViewMode = 'surface' | 'surface-wireframe' | 'wireframe' | 'shaded';
 export type LiveReconstructionMode = 'points' | 'mesh';
 export type MeshRepairProfile = 'faithful' | 'architectural' | 'natural';
 
 export interface CaptureSettings {
   captureFps: number;
+  /** Zero selects the depth profile's fastest supported sensor rate. */
+  sensorFps: number;
   maxDepthM: number;
   voxelSizeMm: number;
   sensorKind: SensorKind;
@@ -21,6 +24,26 @@ export interface CaptureSettings {
   rgbJpegQuality: number;
   /** Zero keeps the sensor's native RGB dimensions. */
   maxRgbDimension: number;
+  rgbResolution: RgbResolution;
+  rgbAutoExposure: boolean;
+  /** Manual RGB exposure in microseconds. */
+  rgbExposureUs: number;
+  rgbGain: number;
+  rgbAutoWhiteBalance: boolean;
+  rgbWhiteBalanceK: number;
+  rgbColorAdjustmentsEnabled: boolean;
+  rgbBrightness: number;
+  rgbContrast: number;
+  rgbSaturation: number;
+  rgbSharpness: number;
+  rgbBacklightCompensation: boolean;
+  /** Zero restores the camera's default anti-flicker setting. */
+  rgbPowerlineHz: number;
+  /** Zero selects the Femto Mega's default IMU profile. */
+  imuAccelRateHz: number;
+  imuAccelRangeG: number;
+  imuGyroRateHz: number;
+  imuGyroRangeDps: number;
   liveReconstruction: LiveReconstructionMode;
   repairMesh: boolean;
   meshRepairProfile: MeshRepairProfile;

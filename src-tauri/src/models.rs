@@ -7,6 +7,8 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub struct CaptureSettings {
     pub capture_fps: u32,
+    #[serde(default)]
+    pub sensor_fps: u32,
     pub max_depth_m: f32,
     pub voxel_size_mm: u32,
     pub sensor_kind: String,
@@ -18,6 +20,40 @@ pub struct CaptureSettings {
     pub depth_binned: bool,
     pub rgb_jpeg_quality: u8,
     pub max_rgb_dimension: u32,
+    #[serde(default = "default_rgb_resolution")]
+    pub rgb_resolution: String,
+    #[serde(default = "default_true")]
+    pub rgb_auto_exposure: bool,
+    #[serde(default = "default_rgb_exposure_us")]
+    pub rgb_exposure_us: u32,
+    #[serde(default)]
+    pub rgb_gain: i32,
+    #[serde(default = "default_true")]
+    pub rgb_auto_white_balance: bool,
+    #[serde(default = "default_rgb_white_balance_k")]
+    pub rgb_white_balance_k: u32,
+    #[serde(default)]
+    pub rgb_color_adjustments_enabled: bool,
+    #[serde(default = "default_rgb_brightness")]
+    pub rgb_brightness: i32,
+    #[serde(default = "default_rgb_contrast")]
+    pub rgb_contrast: i32,
+    #[serde(default = "default_rgb_saturation")]
+    pub rgb_saturation: i32,
+    #[serde(default = "default_rgb_sharpness")]
+    pub rgb_sharpness: i32,
+    #[serde(default)]
+    pub rgb_backlight_compensation: bool,
+    #[serde(default)]
+    pub rgb_powerline_hz: u32,
+    #[serde(default)]
+    pub imu_accel_rate_hz: u32,
+    #[serde(default)]
+    pub imu_accel_range_g: u32,
+    #[serde(default)]
+    pub imu_gyro_rate_hz: u32,
+    #[serde(default)]
+    pub imu_gyro_range_dps: u32,
     pub live_reconstruction: String,
     #[serde(default = "default_repair_mesh")]
     pub repair_mesh: bool,
@@ -49,6 +85,38 @@ fn default_rgb_jpeg_quality() -> u8 {
     92
 }
 
+fn default_rgb_resolution() -> String {
+    "auto".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_rgb_exposure_us() -> u32 {
+    8_330
+}
+
+fn default_rgb_white_balance_k() -> u32 {
+    4_500
+}
+
+fn default_rgb_brightness() -> i32 {
+    128
+}
+
+fn default_rgb_contrast() -> i32 {
+    5
+}
+
+fn default_rgb_saturation() -> i32 {
+    32
+}
+
+fn default_rgb_sharpness() -> i32 {
+    2
+}
+
 fn default_live_reconstruction() -> String {
     "points".to_string()
 }
@@ -65,6 +133,7 @@ impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
             capture_fps: 10,
+            sensor_fps: 0,
             max_depth_m: 4.2,
             voxel_size_mm: 10,
             sensor_kind: default_sensor_kind(),
@@ -76,6 +145,23 @@ impl Default for CaptureSettings {
             depth_binned: false,
             rgb_jpeg_quality: default_rgb_jpeg_quality(),
             max_rgb_dimension: 0,
+            rgb_resolution: default_rgb_resolution(),
+            rgb_auto_exposure: true,
+            rgb_exposure_us: default_rgb_exposure_us(),
+            rgb_gain: 0,
+            rgb_auto_white_balance: true,
+            rgb_white_balance_k: default_rgb_white_balance_k(),
+            rgb_color_adjustments_enabled: false,
+            rgb_brightness: default_rgb_brightness(),
+            rgb_contrast: default_rgb_contrast(),
+            rgb_saturation: default_rgb_saturation(),
+            rgb_sharpness: default_rgb_sharpness(),
+            rgb_backlight_compensation: false,
+            rgb_powerline_hz: 0,
+            imu_accel_rate_hz: 0,
+            imu_accel_range_g: 0,
+            imu_gyro_rate_hz: 0,
+            imu_gyro_range_dps: 0,
             live_reconstruction: default_live_reconstruction(),
             repair_mesh: default_repair_mesh(),
             mesh_repair_profile: default_mesh_repair_profile(),
