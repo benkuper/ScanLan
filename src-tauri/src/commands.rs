@@ -6452,6 +6452,7 @@ mod tests {
             "imuGyroRangeDps",
             "liveMapMemoryMib",
             "lingbotDepthRefinement",
+            "experimentalRgbPreview",
         ] {
             object.remove(field);
         }
@@ -6463,6 +6464,7 @@ mod tests {
         assert_eq!(settings.imu_accel_rate_hz, 0);
         assert_eq!(settings.live_map_memory_mib, 1024);
         assert!(!settings.lingbot_depth_refinement);
+        assert!(!settings.experimental_rgb_preview);
     }
 
     #[test]

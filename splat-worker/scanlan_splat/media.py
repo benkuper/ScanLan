@@ -2269,6 +2269,7 @@ def prepare_media_dataset(
     options: MediaPreparationOptions | None = None,
     *,
     geometry_worker: Path | None = None,
+    progressive_rgb_preview: bool = False,
 ) -> dict[str, Any]:
     """Create an immutable, undistorted COLMAP dataset for Gaussian training."""
     import pycolmap
@@ -2368,6 +2369,25 @@ def prepare_media_dataset(
                     metrics={**metrics, "calibratedCameraRays": True},
                 )
 
+            def publish_rgb_preview(
+                points: np.ndarray,
+                colors: np.ndarray,
+                status: dict[str, Any],
+            ) -> None:
+                _check_cancelled(project_root)
+                preview = [
+                    {
+                        "position": [float(point[0]), float(point[1]), float(point[2])],
+                        "color": [int(color[0]), int(color[1]), int(color[2])],
+                    }
+                    for point, color in zip(points, colors, strict=True)
+                ]
+                _write_json_atomic(project_root / "outputs" / "build-preview.json", preview)
+                _write_json_atomic(
+                    project_root / "outputs" / "rgb-preview-status.json",
+                    status,
+                )
+
             lingbot_geometry = infer_lingbot_geometry_isolated(
                 geometry_worker,
                 context_paths,
@@ -2376,6 +2396,7 @@ def prepare_media_dataset(
                 normalized_rays=calibrated_rays,
                 output_indices=lingbot_output_indices,
                 progress=report_lingbot,
+                preview=publish_rgb_preview if progressive_rgb_preview else None,
             )
             _check_cancelled(project_root)
         chosen_model = staging / "chosen-model"

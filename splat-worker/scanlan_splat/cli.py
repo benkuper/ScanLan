@@ -92,6 +92,7 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--maximum-video-frames", type=int, default=3_000)
     prepare.add_argument("--maximum-image-dimension", type=int, default=2560)
     prepare.add_argument("--geometry-worker", type=Path, default=None)
+    prepare.add_argument("--progressive-rgb-preview", action="store_true")
     observations = commands.add_parser("extract-media")
     observations.add_argument("--project", type=Path, required=True)
     observations.add_argument("--source", type=Path, action="append", default=[])
@@ -164,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
                     arguments.source,
                     media_options,
                     geometry_worker=arguments.geometry_worker,
+                    progressive_rgb_preview=arguments.progressive_rgb_preview,
                 )
                 if arguments.command == "prepare-media"
                 else prepare(

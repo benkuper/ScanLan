@@ -85,6 +85,12 @@ transforms, intrinsics, scales, quaternions, ownership, and confidence before us
 No Python object, CUDA tensor, or model state crosses the process boundary. See
 [geometry-worker.md](geometry-worker.md).
 
+When the experimental RGB video preview flag is enabled, the same request also publishes bounded
+eight-frame learned-depth submaps during causal inference. The splat worker converts the latest
+validated snapshot to `build-preview.json`; the desktop displays confidence, drift risk, submap
+count, rejection count, and the mandatory `MODEL_METRIC_UNVERIFIED` scale label. This preview is
+never read back into the production solve. See [rgb-video-preview.md](rgb-video-preview.md).
+
 Every active capture owns its sensor process, stdout relay, and realtime engine as one supervised unit. Dropping that unit after any startup, storage, or state error terminates all three, so a failed command cannot leave the camera or GPU worker running in the background.
 
 Project and preference manifests are serialized to uniquely named sibling files, flushed to storage, and atomically replaced. Concurrent status or settings updates therefore cannot collide on one shared temporary path, and a failed publication leaves the previous valid manifest intact.

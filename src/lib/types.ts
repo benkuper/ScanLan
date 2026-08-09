@@ -54,6 +54,8 @@ export interface CaptureSettings {
   produceWatertightMesh: boolean;
   /** Run guarded LingBot-Depth completion after metric pose recovery. */
   lingbotDepthRefinement: boolean;
+  /** Feature-flagged provisional learned-depth preview for imported video. */
+  experimentalRgbPreview: boolean;
 }
 
 export type ArtifactStatus = 'ready' | 'building' | 'stale' | 'failed';
@@ -203,6 +205,13 @@ export interface ArtifactJob {
   stageEtaSeconds: number | null;
   elapsedSeconds: number | null;
   computeBackend: string | null;
+  rgbPreviewActive: boolean;
+  rgbPreviewScaleStatus: 'MODEL_METRIC_UNVERIFIED' | 'MODEL_METRIC_VALIDATED' | 'USER_CALIBRATED' | 'RELATIVE_SCALE' | null;
+  rgbPreviewConfidence: number | null;
+  rgbPreviewDriftRisk: number | null;
+  rgbPreviewSubmapCount: number | null;
+  rgbPreviewAcceptedFrames: number | null;
+  rgbPreviewRejectedFrames: number | null;
   status: ArtifactJobStatus;
   createdAt: string;
   startedAt: string | null;

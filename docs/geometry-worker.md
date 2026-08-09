@@ -53,6 +53,11 @@ Progress is a latest-wins atomic JSON file. Cancellation is fail-closed: the par
 shared flag, the child checks it at model progress boundaries, and the supervised Windows Job
 Object terminates descendants if the owning artifact job exits unexpectedly.
 
+When request preview paths are present, the same causal inference publishes completed frame
+chunks as bounded local submaps. Preview arrays use a separate atomic NumPy contract and cannot
+replace the final arrays. The caller caps the display map, validates finiteness, and preserves the
+mandatory `MODEL_METRIC_UNVERIFIED` label. See [rgb-video-preview.md](rgb-video-preview.md).
+
 ## Equivalence and ownership
 
 The geometry worker calls the same pinned `infer_lingbot_geometry` and `refine_depth_request`

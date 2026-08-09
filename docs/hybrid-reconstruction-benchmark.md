@@ -196,3 +196,20 @@ LightGlue and gsplat without importing either LingBot model. Packaging now emits
 `splat-runtime/` and `geometry-runtime/` directories and validates each frozen executable
 against only the assets it owns. The parent additionally rejects mismatched LingBot code/model
 revisions or model digest before accepting result arrays.
+
+### 2026-08-09 P5 progressive RGB preview validation
+
+The feature-flagged progressive path ran the actual pinned LingBot-Map model through the isolated
+source worker on 12 consecutive physical Femto RGB frames. Windows FlashInfer paged attention was
+active in the frozen `scanlan-geometry.exe`. The initial eight-frame scale submap appeared after
+37.48 seconds including process,
+5.9 GB checkpoint, CUDA, and ONNX startup; it contained 4,052 bounded preview points. The next
+four frames published at 40.04 seconds with 7,023 accumulated preview points across two local
+submaps. Reported confidence rose from 71.3% to 73.7%, drift risk remained 28.7%, and scale stayed
+explicitly `MODEL_METRIC_UNVERIFIED`.
+
+The unchanged production result completed at 43.2 seconds with 12 cameras and 6,087 final
+confidence-gated seeds. Automated tests verify ordered chunk publication without lost or reordered
+model outputs, bounded archive/resident-submap compaction, rejected-frame accounting, explicit
+unverified scale, and lossless final geometry IPC. This short physical sequence validates the
+streaming and isolation mechanics; it is not a room-scale drift-quality claim.

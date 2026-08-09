@@ -67,6 +67,8 @@ pub struct CaptureSettings {
     pub produce_watertight_mesh: bool,
     #[serde(default)]
     pub lingbot_depth_refinement: bool,
+    #[serde(default)]
+    pub experimental_rgb_preview: bool,
 }
 
 fn default_sensor_kind() -> String {
@@ -177,6 +179,7 @@ impl Default for CaptureSettings {
             fill_inferred_mesh_holes: false,
             produce_watertight_mesh: false,
             lingbot_depth_refinement: false,
+            experimental_rgb_preview: false,
         }
     }
 }
@@ -646,6 +649,20 @@ pub struct ArtifactJob {
     pub elapsed_seconds: Option<u32>,
     #[serde(default)]
     pub compute_backend: Option<String>,
+    #[serde(default)]
+    pub rgb_preview_active: bool,
+    #[serde(default)]
+    pub rgb_preview_scale_status: Option<String>,
+    #[serde(default)]
+    pub rgb_preview_confidence: Option<f32>,
+    #[serde(default)]
+    pub rgb_preview_drift_risk: Option<f32>,
+    #[serde(default)]
+    pub rgb_preview_submap_count: Option<u32>,
+    #[serde(default)]
+    pub rgb_preview_accepted_frames: Option<u32>,
+    #[serde(default)]
+    pub rgb_preview_rejected_frames: Option<u32>,
     pub status: String,
     pub created_at: String,
     #[serde(default)]

@@ -7,11 +7,61 @@ from pathlib import Path
 
 import numpy as np
 
-from scanlan_splat.geometry_ipc import _load_geometry, run_lingbot_map_request
+from scanlan_splat.geometry_ipc import (
+    ProgressivePreviewAccumulator,
+    _load_geometry,
+    run_lingbot_map_request,
+)
 from scanlan_splat.lingbot import LingbotGeometry
 
 
 class GeometryIpcTests(unittest.TestCase):
+    @staticmethod
+    def _preview_chunk(first_frame: int, count: int = 4) -> LingbotGeometry:
+        poses = np.repeat(np.eye(4)[None], count, axis=0)
+        poses[:, 0, 3] = np.arange(count) * 0.1 + first_frame * 0.1
+        intrinsics = np.repeat(np.eye(3)[None], count, axis=0)
+        intrinsics[:, 0, 0] = intrinsics[:, 1, 1] = 400.0
+        point_count = 12_000
+        return LingbotGeometry(
+            world_from_cameras=poses,
+            intrinsics=intrinsics,
+            points=np.column_stack(
+                (
+                    np.linspace(0, 1, point_count),
+                    np.zeros(point_count),
+                    np.ones(point_count),
+                )
+            ).astype(np.float32),
+            colors=np.full((point_count, 3), 128, dtype=np.uint8),
+            scales=np.full((point_count, 3), 0.01, dtype=np.float32),
+            quaternions=np.tile(np.asarray([1, 0, 0, 0], dtype=np.float32), (point_count, 1)),
+            source_frame_indices=(
+                np.arange(point_count, dtype=np.int32) % count + first_frame
+            ),
+            frame_confidence=np.asarray([0.9, 0.8, 0.4, 0.9], dtype=np.float32),
+            backend="fixture",
+            model_path="fixture.pt",
+            processed_size=(4, 3),
+        )
+
+    def test_progressive_preview_is_bounded_and_labels_unverified_scale(self) -> None:
+        accumulator = ProgressivePreviewAccumulator(maximum_points=10_000, resident_submaps=2)
+        status = None
+        for first_frame in (0, 4, 8):
+            status = accumulator.update(
+                self._preview_chunk(first_frame),
+                first_frame,
+                first_frame + 4,
+            )
+        assert status is not None
+        self.assertLessEqual(len(status["points"]), 10_000)
+        self.assertEqual(status["status"]["scaleStatus"], "MODEL_METRIC_UNVERIFIED")
+        self.assertTrue(status["status"]["learnedOnly"])
+        self.assertEqual(status["status"]["residentSubmapCount"], 2)
+        self.assertEqual(status["status"]["archivedSubmapCount"], 1)
+        self.assertGreater(status["status"]["rejectedFrameCount"], 0)
+
     def test_isolated_lingbot_contract_preserves_every_output_array_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

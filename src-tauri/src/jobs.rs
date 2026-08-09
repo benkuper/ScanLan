@@ -465,6 +465,41 @@ fn merge_progress(project_root: &Path, job: &mut ArtifactJob, splat: bool) {
         .map(str::to_string)
         .or_else(|| splat.then(|| "CUDA AMP / gsplat".to_string()))
         .or_else(|| job.compute_backend.clone());
+    if let Some(preview) = value
+        .get("metrics")
+        .and_then(|metrics| metrics.get("rgbPreview"))
+    {
+        job.rgb_preview_active = preview
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        job.rgb_preview_scale_status = preview
+            .get("scaleStatus")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        job.rgb_preview_confidence = preview
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32);
+        job.rgb_preview_drift_risk = preview
+            .get("driftRisk")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32);
+        job.rgb_preview_submap_count = preview
+            .get("residentSubmapCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        job.rgb_preview_accepted_frames = preview
+            .get("acceptedFrameCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        job.rgb_preview_rejected_frames = preview
+            .get("rejectedFrameCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+    } else if job.stage != "rgb_preview_streaming" {
+        job.rgb_preview_active = false;
+    }
     update_job_elapsed(job);
     job.updated_at = Utc::now().to_rfc3339();
     let _ = write_job(project_root, job);
@@ -735,6 +770,9 @@ fn run_pipeline(
         {
             let geometry_worker = existing_geometry_runtime(resources)?;
             prepare.arg("--geometry-worker").arg(geometry_worker);
+            if project.settings.experimental_rgb_preview {
+                prepare.arg("--progressive-rgb-preview");
+            }
         }
         run_command(prepare, project_root, job, cancel, true)?;
         job.stage = "splat_training".to_string();
@@ -945,6 +983,7 @@ fn spawn_job(
     fs::remove_file(project_root.join("outputs").join("splat-progress.json")).ok();
     if !resume {
         fs::remove_file(project_root.join("outputs").join("build-preview.json")).ok();
+        fs::remove_file(project_root.join("outputs").join("rgb-preview-status.json")).ok();
     }
     if !resume && job.targets.iter().any(|target| target == "gaussianSplat") {
         fs::remove_file(project_root.join("outputs").join("splat-checkpoint.pt")).ok();
@@ -1147,6 +1186,13 @@ pub fn start_artifact_job(
         stage_eta_seconds: None,
         elapsed_seconds: None,
         compute_backend: None,
+        rgb_preview_active: false,
+        rgb_preview_scale_status: None,
+        rgb_preview_confidence: None,
+        rgb_preview_drift_risk: None,
+        rgb_preview_submap_count: None,
+        rgb_preview_accepted_frames: None,
+        rgb_preview_rejected_frames: None,
         status: "queued".to_string(),
         created_at: now.clone(),
         started_at: None,
@@ -1248,6 +1294,7 @@ fn discard_job_record(root: &Path, job_id: &str) -> Result<ArtifactJob, String> 
         "splat-progress.json",
         "progress.json",
         "build-preview.json",
+        "rgb-preview-status.json",
         "room-splat.preview.splat",
     ] {
         fs::remove_file(outputs.join(transient)).ok();
@@ -1388,6 +1435,13 @@ mod tests {
             stage_eta_seconds: None,
             elapsed_seconds: None,
             compute_backend: None,
+            rgb_preview_active: false,
+            rgb_preview_scale_status: None,
+            rgb_preview_confidence: None,
+            rgb_preview_drift_risk: None,
+            rgb_preview_submap_count: None,
+            rgb_preview_accepted_frames: None,
+            rgb_preview_rejected_frames: None,
             status: "running".to_string(),
             created_at: String::new(),
             started_at: None,
@@ -1425,6 +1479,41 @@ mod tests {
         assert!(plan.iter().any(|(key, _)| *key == "splat"));
         assert!(!plan.iter().any(|(key, _)| *key == "track"));
         assert_eq!(stage_key(&media.stage), Some("media"));
+    }
+
+    #[test]
+    fn desktop_preserves_progressive_rgb_preview_telemetry() {
+        let root = std::env::temp_dir().join(format!("scanlan-rgb-preview-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("outputs")).unwrap();
+        storage::write_json(
+            &root.join("outputs").join("splat-progress.json"),
+            &serde_json::json!({
+                "stage": "rgb_preview_streaming",
+                "progress": 0.15,
+                "metrics": {"rgbPreview": {
+                    "active": true,
+                    "scaleStatus": "MODEL_METRIC_UNVERIFIED",
+                    "confidence": 0.76,
+                    "driftRisk": 0.18,
+                    "residentSubmapCount": 3,
+                    "acceptedFrameCount": 22,
+                    "rejectedFrameCount": 2
+                }}
+            }),
+        )
+        .unwrap();
+        let mut media = job(&["gaussianSplat"], "queued");
+        media.source_kind = "media".to_string();
+        merge_progress(&root, &mut media, true);
+        assert!(media.rgb_preview_active);
+        assert_eq!(
+            media.rgb_preview_scale_status.as_deref(),
+            Some("MODEL_METRIC_UNVERIFIED")
+        );
+        assert_eq!(media.rgb_preview_submap_count, Some(3));
+        assert_eq!(media.rgb_preview_accepted_frames, Some(22));
+        assert_eq!(media.rgb_preview_rejected_frames, Some(2));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

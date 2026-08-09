@@ -159,6 +159,7 @@
   let totalFrames = 0;
   let mediaSourceCount = 0;
   let mediaOnlyProject = false;
+  let hasImportedVideo = false;
   let readyArtifacts = 0;
   let viewerRenderMode: RenderMode = 'points';
   let viewerMesh: PreviewMesh | null = null;
@@ -183,6 +184,7 @@
   $: mediaSourceCount = project?.mediaSources.length ?? 0;
   $: if (mediaSourceCount === 0) mediaRestartStage = 'reuse';
   $: mediaOnlyProject = mediaSourceCount > 0 && completedCaptures === 0;
+  $: hasImportedVideo = project?.mediaSources.some((source) => source.kind === 'video') ?? false;
   $: if (mediaOnlyProject) {
     buildPointCloud = false;
     buildTexturedMesh = false;
@@ -1930,6 +1932,17 @@
             <span>{activeJob.computeBackend ?? 'Waiting for worker'}</span>
             <span>{activeJob.elapsedSeconds != null ? `${formatDuration(activeJob.elapsedSeconds)} elapsed` : ''}</span>
           </div>
+          {#if activeJob.rgbPreviewActive}
+            <div class="job-quality rgb-preview-quality">
+              <span>Scale <strong>{activeJob.rgbPreviewScaleStatus?.replaceAll('_', ' ') ?? 'UNVERIFIED'}</strong></span>
+              <span>Confidence <strong>{Math.round((activeJob.rgbPreviewConfidence ?? 0) * 100)}%</strong></span>
+              <span>Drift risk <strong>{Math.round((activeJob.rgbPreviewDriftRisk ?? 0) * 100)}%</strong></span>
+              <span>Local submaps <strong>{activeJob.rgbPreviewSubmapCount ?? 0}</strong></span>
+              <span>Accepted <strong>{activeJob.rgbPreviewAcceptedFrames ?? 0}</strong></span>
+              <span>Rejected <strong>{activeJob.rgbPreviewRejectedFrames ?? 0}</strong></span>
+            </div>
+            <p class="warning">Provisional learned-only geometry · production camera solving may reject or replace it.</p>
+          {/if}
         </div>
       {/if}
     </section>
@@ -2198,6 +2211,16 @@
             {/if}
           </div>
         </details>
+
+        {#if mediaOnlyProject && hasImportedVideo}
+          <details class="panel collapsible-panel" open>
+            <summary><span>RGB VIDEO PREVIEW</span><strong>{project.settings.experimentalRgbPreview ? 'EXPERIMENTAL ON' : 'OFF'}</strong></summary>
+            <div class="collapsible-body settings mesh-repair-settings">
+              <label class="toggle"><input type="checkbox" checked={project.settings.experimentalRgbPreview} on:change={(event) => updateSetting('experimentalRgbPreview', inputChecked(event))} disabled={processing || !runtime?.geometryWorkerAvailable}/><span></span><div><strong>Progressive learned-depth preview</strong><small>Streams bounded LingBot local submaps while the imported video is processed</small></div></label>
+              <p>Preview colors mix source RGB with confidence. Scale is always labeled model-metric unverified; unsafe pose/depth chunks freeze integration and never alter the production result.</p>
+            </div>
+          </details>
+        {/if}
 
         {#if !mediaOnlyProject}
           <details class="panel collapsible-panel" open>

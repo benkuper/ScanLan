@@ -12,6 +12,7 @@ from scanlan_splat.lingbot import (
     LingbotGeometry,
     _restore_bundled_flashinfer_cache,
     _rotation_matrices_to_quaternions,
+    _inference_streaming_progressive,
     _streaming_configuration,
     _surface_seeds,
 )
@@ -51,6 +52,57 @@ class _Reconstruction:
 
 
 class LingbotGeometryTests(unittest.TestCase):
+    def test_progressive_streaming_preserves_all_outputs_and_chunk_order(self) -> None:
+        import torch
+
+        class _Model:
+            pred_normalization = False
+
+            def __init__(self) -> None:
+                self.parameter = torch.zeros(1)
+                self.skip_events: list[bool] = []
+
+            def parameters(self):
+                yield self.parameter
+
+            def clean_kv_cache(self) -> None:
+                pass
+
+            def _set_skip_append(self, value: bool) -> None:
+                self.skip_events.append(value)
+
+            def forward(self, images, **_kwargs):
+                ids = images[:, :, 0, 0, 0]
+                batch, frames = ids.shape
+                return {
+                    "pose_enc": ids[:, :, None].repeat(1, 1, 9),
+                    "depth": ids[:, :, None, None, None].repeat(1, 1, 2, 2, 1),
+                    "depth_conf": (ids + 10)[:, :, None, None].repeat(1, 1, 2, 2),
+                }
+
+        images = torch.stack(
+            [torch.full((3, 2, 2), float(index)) for index in range(6)]
+        )
+        chunks: list[tuple[int, list[float]]] = []
+        model = _Model()
+        predictions = _inference_streaming_progressive(
+            model,
+            images,
+            torch=torch,
+            num_scale_frames=2,
+            keyframe_interval=2,
+            output_device=torch.device("cpu"),
+            chunk_frames=2,
+            on_chunk=lambda start, values: chunks.append(
+                (start, values["pose_enc"][0, :, 0].tolist())
+            ),
+        )
+
+        self.assertEqual(chunks, [(0, [0.0, 1.0]), (2, [2.0, 3.0]), (4, [4.0, 5.0])])
+        self.assertEqual(predictions["pose_enc"][0, :, 0].tolist(), list(map(float, range(6))))
+        self.assertEqual(predictions["depth_conf"][0, :, 0, 0].tolist(), [10, 11, 12, 13, 14, 15])
+        self.assertEqual(model.skip_events, [True, False, True, False])
+
     def test_streaming_cache_is_bounded_for_16_gib_sdpa(self) -> None:
         class _Properties:
             total_memory = 16 * 1024**3
