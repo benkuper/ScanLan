@@ -86,10 +86,15 @@ if (-not (Test-Path $WorkerPython)) {
 }
 
 # Open3D's pip-package target imports wheel from the selected Python environment.
-# Keep the build prerequisite aligned with Open3D 0.19's pinned requirement so a
-# clean worker environment can complete the final packaging step.
-& $WorkerPython -m pip install --disable-pip-version-check "wheel==0.38.4"
+# Open3D 0.19 pins wheel 0.38.4, whose bdist_wheel module still imports
+# pkg_resources. Setuptools removed pkg_resources in 82.0.0, so pin the final
+# compatible release as part of the reproducible packaging toolchain.
+& $WorkerPython -m pip install --disable-pip-version-check `
+  "setuptools==81.0.0" `
+  "wheel==0.38.4"
 if ($LASTEXITCODE -ne 0) { throw "Installing Open3D's wheel build prerequisite failed." }
+& $WorkerPython -c "import pkg_resources; from wheel.bdist_wheel import bdist_wheel"
+if ($LASTEXITCODE -ne 0) { throw "Open3D's pinned Python packaging toolchain is incompatible." }
 
 New-Item -ItemType Directory -Force -Path $BuildRoot, $WheelRoot | Out-Null
 if (-not (Test-Path (Join-Path $Open3DSource ".git"))) {
