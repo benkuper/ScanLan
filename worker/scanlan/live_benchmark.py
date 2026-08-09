@@ -16,7 +16,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .realtime import ENGINE_MESH, ENGINE_POINTS, ENGINE_STATUS, read_engine_message
+from .realtime import (
+    ENGINE_COVERAGE,
+    ENGINE_COVERAGE_POINTS,
+    ENGINE_MESH,
+    ENGINE_POINTS,
+    ENGINE_STATUS,
+    ENGINE_SUBMAPS,
+    ENGINE_TRACKING_POINTS,
+    read_engine_message,
+)
 from .replay import archive_frames
 from .stream import encode_rgbd_frame
 
@@ -167,6 +176,7 @@ def summarize_live_benchmark(
     capture: Path,
     mode: str,
     voxel_size_m: float,
+    live_map_mib: int,
     device: str,
     paced: bool,
     frame_count: int,
@@ -180,12 +190,20 @@ def summarize_live_benchmark(
     mesh_snapshots: int,
     final_point_count: int,
     final_triangle_count: int,
+    coverage_snapshots: int,
+    tracking_snapshots: int,
+    coverage_message: dict[str, Any] | None,
+    submap_message: dict[str, Any] | None,
     working_set_samples: list[int],
     gpu_samples: list[int],
     journal_entries: list[dict[str, Any]],
     exit_code: int,
 ) -> dict[str, Any]:
     final_status = statuses[-1] if statuses else {}
+    peak_status_value = lambda name: max(
+        (float(status.get(name, 0) or 0) for status in statuses),
+        default=0.0,
+    )
     state_counts = Counter(str(status.get("state", "unknown")) for status in statuses)
     rejected_entries = [entry for entry in journal_entries if not entry.get("accepted", False)]
     invalid_integration = [entry for entry in rejected_entries if entry.get("integrated", False)]
@@ -202,6 +220,7 @@ def summarize_live_benchmark(
         "configuration": {
             "mode": mode,
             "voxelSizeM": voxel_size_m,
+            "liveMapMemoryMiB": live_map_mib,
             "device": device,
             "realtimePacing": paced,
         },
@@ -222,6 +241,7 @@ def summarize_live_benchmark(
             "peakGpuMemoryMiB": _rounded(
                 max(gpu_samples) / (1024 * 1024) if gpu_samples else None
             ),
+            "contractVersion": int(peak_status_value("contractVersion")),
         },
         "latency": {
             "pose": _latency_summary(pose_latencies_ms),
@@ -250,7 +270,20 @@ def summarize_live_benchmark(
             "finalTriangleCount": final_triangle_count,
             "provisionalAvailableAfterStop": point_snapshots > 0 and final_point_count > 0,
             "trackingJournalAvailableAfterStop": bool(journal_entries),
+            "coverageSnapshots": coverage_snapshots,
+            "trackingSnapshots": tracking_snapshots,
         },
+        "liveMap": {
+            "peakAllocatedMiB": _rounded(
+                peak_status_value("allocatedLiveMapBytes") / (1024 * 1024)
+            ),
+            "peakActiveVoxels": int(peak_status_value("activeVoxelCount")),
+            "peakResidentSubmaps": int(peak_status_value("residentSubmapCount")),
+            "peakHostCachedSubmaps": int(peak_status_value("hostCachedSubmapCount")),
+            "maximumDegradationLevel": int(peak_status_value("degradationLevel")),
+            "finalSubmapCount": len((submap_message or {}).get("submaps", [])),
+        },
+        "coverage": coverage_message,
     }
 
 
@@ -259,6 +292,7 @@ def benchmark_live_capture(
     *,
     mode: str = "mesh",
     voxel_size_m: float = 0.01,
+    live_map_mib: int = 1024,
     device: str = "auto",
     paced: bool = True,
     session_root: Path | None = None,
@@ -281,6 +315,8 @@ def benchmark_live_capture(
         str(voxel_size_m),
         "--device",
         device,
+        "--live-map-mib",
+        str(live_map_mib),
         "--session",
         str(session_root),
     ]
@@ -319,6 +355,10 @@ def benchmark_live_capture(
     mesh_snapshots = 0
     final_point_count = 0
     final_triangle_count = 0
+    coverage_snapshots = 0
+    tracking_snapshots = 0
+    latest_coverage: dict[str, Any] | None = None
+    latest_submaps: dict[str, Any] | None = None
     read_error: list[BaseException] = []
 
     def latency_for(sequence: int, arrived: float) -> float | None:
@@ -328,6 +368,7 @@ def benchmark_live_capture(
 
     def read_messages() -> None:
         nonlocal point_snapshots, mesh_snapshots, final_point_count, final_triangle_count
+        nonlocal coverage_snapshots, tracking_snapshots, latest_coverage, latest_submaps
         try:
             while True:
                 try:
@@ -354,6 +395,14 @@ def benchmark_live_capture(
                         final_triangle_count = index_count // 3
                     if latency is not None:
                         mesh_latencies_ms.append(latency)
+                elif kind == ENGINE_COVERAGE_POINTS:
+                    coverage_snapshots += 1
+                elif kind == ENGINE_TRACKING_POINTS:
+                    tracking_snapshots += 1
+                elif kind == ENGINE_COVERAGE:
+                    latest_coverage = json.loads(payload)
+                elif kind == ENGINE_SUBMAPS:
+                    latest_submaps = json.loads(payload)
         except BaseException as error:
             read_error.append(error)
 
@@ -425,6 +474,7 @@ def benchmark_live_capture(
         capture=capture,
         mode=mode,
         voxel_size_m=voxel_size_m,
+        live_map_mib=live_map_mib,
         device=device,
         paced=paced,
         frame_count=frame_count,
@@ -438,6 +488,10 @@ def benchmark_live_capture(
         mesh_snapshots=mesh_snapshots,
         final_point_count=final_point_count,
         final_triangle_count=final_triangle_count,
+        coverage_snapshots=coverage_snapshots,
+        tracking_snapshots=tracking_snapshots,
+        coverage_message=latest_coverage,
+        submap_message=latest_submaps,
         working_set_samples=memory_samples["workingSet"],
         gpu_samples=memory_samples["gpu"],
         journal_entries=journal_entries,
@@ -448,7 +502,8 @@ def benchmark_live_capture(
     if read_error:
         raise RuntimeError(f"Could not read realtime benchmark output: {read_error[0]}")
     if write_error is not None:
-        raise RuntimeError(f"Could not replay benchmark capture: {write_error}")
+        detail = f"; realtime engine: {stderr}" if stderr else ""
+        raise RuntimeError(f"Could not replay benchmark capture: {write_error}{detail}")
     if exit_code != 0:
         raise RuntimeError(stderr or f"Realtime benchmark exited with code {exit_code}")
     return report

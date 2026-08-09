@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import gc
 import queue
 import struct
 import threading
@@ -14,11 +15,22 @@ import numpy as np
 
 from .compute import ComputeBackend, select_compute_backend
 from .live_contract import (
+    CoverageSummary,
     LiveFailurePolicy,
+    LiveSubmapDescriptor,
     TrackingState,
     contract_status,
     pose_uncertainty,
     tracking_confidence,
+    submap_message,
+)
+from .live_mapping import (
+    AdaptiveBudgetController,
+    CoverageField,
+    SubmapLimits,
+    VOXEL_BLOCK_BYTES,
+    rotation_degrees as live_rotation_degrees,
+    tracking_colors,
 )
 from .stream import (
     LatestFrameQueue,
@@ -37,6 +49,8 @@ ENGINE_MESH = 3
 ENGINE_CAMERA_POINTS = 4
 ENGINE_COVERAGE = 5
 ENGINE_SUBMAPS = 6
+ENGINE_COVERAGE_POINTS = 7
+ENGINE_TRACKING_POINTS = 8
 ENGINE_HEADER = struct.Struct("<8sHHIQ")
 
 POINT_MAGIC = b"K2P1"
@@ -103,6 +117,14 @@ class PendingRecovery:
 class ResetLiveMap:
     sequence: int
     timestamp_us: int
+
+
+@dataclass(frozen=True)
+class TrackingStateUpdate:
+    sequence: int
+    timestamp_us: int
+    state: str
+    confidence: float
 
 
 class TrackingJournal:
@@ -1350,6 +1372,7 @@ class RealtimeVolume:
         frame: RgbdFrame,
         voxel_size_m: float,
         backend: ComputeBackend,
+        block_count: int = 24_000,
     ) -> None:
         self.o3d = o3d
         self.camera = frame.camera
@@ -1357,6 +1380,7 @@ class RealtimeVolume:
         self.voxel_size_m = voxel_size_m
         self.sdf_trunc_m = max(voxel_size_m * 4.0, 0.04)
         self.backend = backend
+        self.block_count = block_count
         self.host = o3d.core.Device("CPU:0") if backend.uses_cuda else None
         if backend.uses_cuda:
             self.intrinsic = o3d.core.Tensor(
@@ -1374,7 +1398,7 @@ class RealtimeVolume:
                 attr_channels=((1,), (1,), (3,)),
                 voxel_size=voxel_size_m,
                 block_resolution=16,
-                block_count=24_000,
+                block_count=block_count,
                 device=backend.device,
             )
         else:
@@ -1388,21 +1412,28 @@ class RealtimeVolume:
                 color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
             )
 
-    def integrate(self, tracked: TrackedFrame) -> None:
+    def integrate(
+        self,
+        tracked: TrackedFrame,
+        world_to_camera: np.ndarray | None = None,
+    ) -> None:
         if tracked.world_to_camera is None:
             return
         if tracked.frame.camera != self.camera:
             raise RuntimeError("Camera calibration changed while fusing a scan")
+        extrinsic_values = (
+            tracked.world_to_camera if world_to_camera is None else world_to_camera
+        )
         if not self.backend.uses_cuda:
             self.volume.integrate(
                 _cpu_rgbd(self.o3d, tracked.frame),
                 self.intrinsic,
-                tracked.world_to_camera,
+                extrinsic_values,
             )
             return
         rgbd = _tensor_rgbd(self.o3d, tracked.frame, self.backend.device)
         extrinsic = self.o3d.core.Tensor(
-            np.ascontiguousarray(tracked.world_to_camera),
+            np.ascontiguousarray(extrinsic_values),
             dtype=self.o3d.core.Dtype.Float64,
             device=self.host,
         )
@@ -1426,7 +1457,7 @@ class RealtimeVolume:
             truncation_multiplier,
         )
 
-    def points(self) -> tuple[np.ndarray, np.ndarray]:
+    def raw_points(self) -> tuple[np.ndarray, np.ndarray]:
         if self.backend.uses_cuda:
             self.o3d.core.cuda.synchronize(self.backend.device)
             # Live preview should become visible after the first integrated
@@ -1436,23 +1467,381 @@ class RealtimeVolume:
             cloud = self.volume.extract_point_cloud(weight_threshold=1.0).cpu().to_legacy()
         else:
             cloud = self.volume.extract_point_cloud()
-        points = _display_positions(np.asarray(cloud.points), self.mirror_x)
+        points = np.asarray(cloud.points, dtype=np.float32)
         colors = np.rint(np.asarray(cloud.colors) * 255.0).clip(0, 255).astype(np.uint8)
         if colors.shape != points.shape:
             colors = np.full(points.shape, 180, dtype=np.uint8)
         return points, colors
 
-    def mesh(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def points(self) -> tuple[np.ndarray, np.ndarray]:
+        points, colors = self.raw_points()
+        return _display_positions(points, self.mirror_x), colors
+
+    def raw_mesh(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.backend.uses_cuda:
             self.o3d.core.cuda.synchronize(self.backend.device)
             mesh = self.volume.extract_triangle_mesh(weight_threshold=3.0).cpu().to_legacy()
         else:
             mesh = self.volume.extract_triangle_mesh()
-        vertices = _display_positions(np.asarray(mesh.vertices), self.mirror_x)
+        vertices = np.asarray(mesh.vertices, dtype=np.float32)
         colors = np.rint(np.asarray(mesh.vertex_colors) * 255.0).clip(0, 255).astype(np.uint8)
         if colors.shape != vertices.shape:
             colors = np.full(vertices.shape, 180, dtype=np.uint8)
         return vertices, colors, np.asarray(mesh.triangles, dtype=np.uint32)
+
+    def mesh(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        vertices, colors, triangles = self.raw_mesh()
+        return (
+            _display_positions(vertices, self.mirror_x),
+            colors,
+            triangles[:, [0, 2, 1]] if self.mirror_x and len(triangles) else triangles,
+        )
+
+    def active_block_count(self) -> int:
+        if not self.backend.uses_cuda:
+            return 0
+        return int(self.volume.hashmap().size())
+
+
+@dataclass
+class _CompletedLiveSubmap:
+    descriptor: LiveSubmapDescriptor
+    points: np.ndarray
+    colors: np.ndarray
+    vertices: np.ndarray
+    vertex_colors: np.ndarray
+    triangles: np.ndarray
+
+
+@dataclass
+class _ActiveLiveSubmap:
+    id: str
+    volume: RealtimeVolume
+    global_from_local: np.ndarray
+    start_camera_to_world: np.ndarray
+    first_sequence: int
+    last_sequence: int
+    integrated_frames: int
+    confidence_sum: float
+    confidence_samples: int
+    last_point_count: int = 0
+    bounds_min: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    bounds_max: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+def _transform_positions(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    if not len(points):
+        return np.empty((0, 3), dtype=np.float32)
+    return (
+        (np.asarray(transform[:3, :3], dtype=np.float64) @ points.T).T
+        + np.asarray(transform[:3, 3], dtype=np.float64)
+    ).astype(np.float32)
+
+
+def _bounded_mesh(
+    vertices: np.ndarray,
+    colors: np.ndarray,
+    triangles: np.ndarray,
+    triangle_limit: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    triangles = np.asarray(triangles, dtype=np.uint32).reshape((-1, 3))
+    if len(triangles) > triangle_limit:
+        triangles = triangles[_bounded_indices(len(triangles), triangle_limit)]
+    if not len(triangles):
+        return vertices[:0], colors[:0], triangles
+    used = np.unique(triangles.reshape(-1))
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used), dtype=np.int64)
+    return vertices[used], colors[used], remap[triangles].astype(np.uint32)
+
+
+class LiveSubmapManager:
+    def __init__(
+        self,
+        o3d: Any,
+        voxel_size_m: float,
+        backend: ComputeBackend,
+        mode: str,
+        limits: SubmapLimits,
+    ) -> None:
+        self.o3d = o3d
+        self.voxel_size_m = voxel_size_m
+        self.backend = backend
+        self.mode = mode
+        self.limits = limits
+        self.active: _ActiveLiveSubmap | None = None
+        self.completed: list[_CompletedLiveSubmap] = []
+        self.coverage = CoverageField(max(0.06, voxel_size_m * 8.0))
+        self.next_submap_index = 0
+        self.rollover_count = 0
+        self.frozen_reason: str | None = None
+        self.last_tracking_state = TrackingState.READY.value
+        self.last_tracking_confidence = 0.0
+        self.mirror_x = False
+
+    def _begin(self, tracked: TrackedFrame) -> bool:
+        if len(self.completed) >= self.limits.maximum_submaps:
+            self.frozen_reason = (
+                f"Live map reached its {self.limits.maximum_submaps}-submap hard ceiling"
+            )
+            return False
+        assert tracked.world_to_camera is not None
+        camera_to_world = np.linalg.inv(tracked.world_to_camera)
+        self.mirror_x = tracked.frame.mirror_x
+        self.active = _ActiveLiveSubmap(
+            id=f"submap-{self.next_submap_index:04d}",
+            volume=RealtimeVolume(
+                self.o3d,
+                tracked.frame,
+                self.voxel_size_m,
+                self.backend,
+                block_count=self.limits.block_capacity,
+            ),
+            global_from_local=camera_to_world.copy(),
+            start_camera_to_world=camera_to_world.copy(),
+            first_sequence=tracked.frame.sequence,
+            last_sequence=tracked.frame.sequence,
+            integrated_frames=0,
+            confidence_sum=0.0,
+            confidence_samples=0,
+        )
+        self.next_submap_index += 1
+        self.frozen_reason = None
+        return True
+
+    def _rollover_reason(self, tracked: TrackedFrame) -> str | None:
+        if self.active is None or tracked.world_to_camera is None:
+            return None
+        camera_to_world = np.linalg.inv(tracked.world_to_camera)
+        relative = np.linalg.inv(self.active.start_camera_to_world) @ camera_to_world
+        if float(np.linalg.norm(relative[:3, 3])) >= self.limits.maximum_distance_m:
+            return "travel budget"
+        if live_rotation_degrees(relative) >= self.limits.maximum_rotation_degrees:
+            return "rotation budget"
+        if self.active.integrated_frames >= self.limits.maximum_integrated_frames:
+            return "keyframe budget"
+        if (
+            self.active.volume.active_block_count()
+            >= self.limits.rollover_block_count
+        ):
+            return "voxel-block budget"
+        return None
+
+    def force_rollover(self, reason: str) -> None:
+        if self.active is not None:
+            self.complete_active(reason)
+
+    def integrate(self, tracked: TrackedFrame) -> bool:
+        if tracked.world_to_camera is None:
+            return False
+        reason = self._rollover_reason(tracked)
+        if reason is not None:
+            self.complete_active(reason)
+        if self.active is None and not self._begin(tracked):
+            return False
+        assert self.active is not None
+        local_world_to_camera = (
+            tracked.world_to_camera @ self.active.global_from_local
+        )
+        self.active.volume.integrate(tracked, local_world_to_camera)
+        confidence = tracking_confidence(tracked.quality)
+        self.active.last_sequence = tracked.frame.sequence
+        self.active.integrated_frames += 1
+        self.active.confidence_sum += confidence
+        self.active.confidence_samples += 1
+        self.last_tracking_state = tracked.state
+        self.last_tracking_confidence = confidence
+        self.coverage.observe(tracked.frame, tracked.world_to_camera, confidence)
+        return True
+
+    def _compact_host_points(self) -> None:
+        total = sum(len(submap.points) for submap in self.completed)
+        if total <= self.limits.maximum_host_points:
+            return
+        ratio = self.limits.maximum_host_points / max(total, 1)
+        for submap in self.completed:
+            keep = max(1, int(len(submap.points) * ratio))
+            indices = _bounded_indices(len(submap.points), keep)
+            submap.points = submap.points[indices]
+            submap.colors = submap.colors[indices]
+
+    def _bound_host_mesh(self) -> None:
+        total = sum(len(submap.triangles) for submap in self.completed)
+        if total <= self.limits.maximum_host_triangles:
+            return
+        # Mesh is an optional low-rate diagnostic. Retain newer submaps and
+        # discard old triangle caches before point guidance or tracking memory.
+        for submap in self.completed:
+            if total <= self.limits.maximum_host_triangles:
+                break
+            total -= len(submap.triangles)
+            submap.vertices = submap.vertices[:0]
+            submap.vertex_colors = submap.vertex_colors[:0]
+            submap.triangles = submap.triangles[:0]
+
+    def complete_active(self, reason: str) -> None:
+        active = self.active
+        if active is None:
+            return
+        points, colors = active.volume.raw_points()
+        indices = _bounded_indices(len(points), min(len(points), 150_000))
+        points = points[indices]
+        colors = colors[indices]
+        if self.mode == "mesh":
+            vertices, vertex_colors, triangles = active.volume.raw_mesh()
+            vertices, vertex_colors, triangles = _bounded_mesh(
+                vertices, vertex_colors, triangles, 150_000
+            )
+        else:
+            vertices = np.empty((0, 3), dtype=np.float32)
+            vertex_colors = np.empty((0, 3), dtype=np.uint8)
+            triangles = np.empty((0, 3), dtype=np.uint32)
+        bounds_min = tuple(np.min(points, axis=0).tolist()) if len(points) else (0.0, 0.0, 0.0)
+        bounds_max = tuple(np.max(points, axis=0).tolist()) if len(points) else (0.0, 0.0, 0.0)
+        confidence = active.confidence_sum / max(active.confidence_samples, 1)
+        descriptor = LiveSubmapDescriptor(
+            id=active.id,
+            local_origin=tuple(np.eye(4, dtype=np.float64).reshape(-1).tolist()),
+            global_from_local=tuple(active.global_from_local.reshape(-1).tolist()),
+            state="complete",
+            first_sequence=active.first_sequence,
+            last_sequence=active.last_sequence,
+            voxel_size_m=self.voxel_size_m,
+            voxel_count=active.volume.active_block_count() * 16**3,
+            point_count=len(points),
+            observation_count=active.integrated_frames,
+            confidence=confidence,
+            bounds_min=bounds_min,
+            bounds_max=bounds_max,
+            resident="host",
+        )
+        self.completed.append(
+            _CompletedLiveSubmap(
+                descriptor,
+                points,
+                colors,
+                vertices,
+                vertex_colors,
+                triangles,
+            )
+        )
+        self.active = None
+        self.rollover_count += int(reason != "capture stop")
+        self._compact_host_points()
+        self._bound_host_mesh()
+        gc.collect()
+
+    def _active_descriptor(self, frame_sequence: int) -> LiveSubmapDescriptor | None:
+        active = self.active
+        if active is None:
+            return None
+        confidence = active.confidence_sum / max(active.confidence_samples, 1)
+        return LiveSubmapDescriptor(
+            id=active.id,
+            local_origin=tuple(np.eye(4, dtype=np.float64).reshape(-1).tolist()),
+            global_from_local=tuple(active.global_from_local.reshape(-1).tolist()),
+            state="active",
+            first_sequence=active.first_sequence,
+            last_sequence=max(active.last_sequence, frame_sequence),
+            voxel_size_m=self.voxel_size_m,
+            voxel_count=active.volume.active_block_count() * 16**3,
+            point_count=active.last_point_count,
+            observation_count=active.integrated_frames,
+            confidence=confidence,
+            bounds_min=active.bounds_min,
+            bounds_max=active.bounds_max,
+            resident="gpu" if self.backend.uses_cuda else "host",
+        )
+
+    def descriptors(self, frame_sequence: int) -> dict[str, Any]:
+        values = [submap.descriptor for submap in self.completed]
+        active = self._active_descriptor(frame_sequence)
+        if active is not None:
+            values.append(active)
+        return submap_message(frame_sequence, values)
+
+    def coverage_summary(self) -> CoverageSummary:
+        return self.coverage.summary(self.last_tracking_confidence)
+
+    def world_points(self) -> tuple[np.ndarray, np.ndarray]:
+        point_batches: list[np.ndarray] = []
+        color_batches: list[np.ndarray] = []
+        for submap in self.completed:
+            point_batches.append(
+                _transform_positions(
+                    submap.points,
+                    np.asarray(submap.descriptor.global_from_local).reshape(4, 4),
+                )
+            )
+            color_batches.append(submap.colors)
+        if self.active is not None:
+            points, colors = self.active.volume.raw_points()
+            self.active.last_point_count = len(points)
+            if len(points):
+                self.active.bounds_min = tuple(np.min(points, axis=0).tolist())
+                self.active.bounds_max = tuple(np.max(points, axis=0).tolist())
+            point_batches.append(_transform_positions(points, self.active.global_from_local))
+            color_batches.append(colors)
+        if not point_batches:
+            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+        return np.concatenate(point_batches, axis=0), np.concatenate(color_batches, axis=0)
+
+    def points(self) -> tuple[np.ndarray, np.ndarray]:
+        points, colors = self.world_points()
+        return _display_positions(points, self.mirror_x), colors
+
+    def mesh(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        vertex_batches: list[np.ndarray] = []
+        color_batches: list[np.ndarray] = []
+        triangle_batches: list[np.ndarray] = []
+        offset = 0
+        for submap in self.completed:
+            if not len(submap.triangles):
+                continue
+            transform = np.asarray(submap.descriptor.global_from_local).reshape(4, 4)
+            vertices = _transform_positions(submap.vertices, transform)
+            vertex_batches.append(vertices)
+            color_batches.append(submap.vertex_colors)
+            triangle_batches.append(submap.triangles + offset)
+            offset += len(vertices)
+        if self.active is not None:
+            vertices, colors, triangles = self.active.volume.raw_mesh()
+            vertices = _transform_positions(vertices, self.active.global_from_local)
+            vertex_batches.append(vertices)
+            color_batches.append(colors)
+            triangle_batches.append(triangles + offset)
+        if not vertex_batches:
+            return (
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.uint8),
+                np.empty((0, 3), dtype=np.uint32),
+            )
+        vertices = _display_positions(np.concatenate(vertex_batches), self.mirror_x)
+        triangles = np.concatenate(triangle_batches)
+        if self.mirror_x and len(triangles):
+            triangles = triangles[:, [0, 2, 1]]
+        return vertices, np.concatenate(color_batches), triangles
+
+    def telemetry(self) -> dict[str, int]:
+        active_blocks = self.active.volume.active_block_count() if self.active else 0
+        host_bytes = sum(
+            submap.points.nbytes
+            + submap.colors.nbytes
+            + submap.vertices.nbytes
+            + submap.vertex_colors.nbytes
+            + submap.triangles.nbytes
+            for submap in self.completed
+        )
+        active_bytes = (
+            self.limits.block_capacity * VOXEL_BLOCK_BYTES if self.active else 0
+        )
+        return {
+            "allocatedLiveMapBytes": active_bytes + host_bytes,
+            "activeVoxelCount": active_blocks * 16**3,
+            "activeSurfelCount": self.active.last_point_count if self.active else 0,
+            "residentSubmapCount": int(self.active is not None),
+            "hostCachedSubmapCount": len(self.completed),
+        }
 
 
 def run_realtime_engine(
@@ -1463,11 +1852,13 @@ def run_realtime_engine(
     voxel_size_m: float = 0.01,
     requested_device: str = "auto",
     session_root: Path | None = None,
+    live_map_mib: int = 1024,
 ) -> dict[str, Any]:
     if mode not in {"points", "mesh"}:
         raise ValueError("Realtime mode must be points or mesh")
     if not 0.005 <= voxel_size_m <= 0.08:
         raise ValueError("Realtime voxel size must be between 5 and 80 mm")
+    limits = SubmapLimits.from_mebibytes(live_map_mib)
     try:
         import open3d as o3d
     except ImportError as error:
@@ -1500,11 +1891,22 @@ def run_realtime_engine(
             "poseLatencyMs": None,
             "mapUpdateLatencyMs": None,
             "mapUpdateHz": 0.0,
+            "allocatedLiveMapBytes": 0,
+            "activeVoxelCount": 0,
+            "activeSurfelCount": 0,
+            "residentSubmapCount": 0,
+            "hostCachedSubmapCount": 0,
+            "droppedPreviewJobs": 0,
+            "degradationLevel": 0,
         },
     )
     journal = TrackingJournal(session_root) if session_root is not None else None
     frame_queue = LatestFrameQueue(capacity=4)
-    map_queue: queue.Queue[TrackedFrame | ResetLiveMap | None] = queue.Queue(maxsize=8)
+    map_queue: queue.Queue[
+        TrackedFrame | ResetLiveMap | TrackingStateUpdate | None
+    ] = queue.Queue(maxsize=8)
+    rollover_request: list[str] = []
+    rollover_lock = threading.Lock()
     reader_done = threading.Event()
     stop = threading.Event()
     failure: list[BaseException] = []
@@ -1519,6 +1921,16 @@ def run_realtime_engine(
         "triangleCount": 0,
         "mapUpdateLatencyMs": 0.0,
         "mapUpdateHz": 0.0,
+        "allocatedLiveMapBytes": 0,
+        "activeVoxelCount": 0,
+        "activeSurfelCount": 0,
+        "residentSubmapCount": 0,
+        "hostCachedSubmapCount": 0,
+        "droppedPreviewJobs": 0,
+        "degradationLevel": 0,
+        "coverageCellCount": 0,
+        "submapCount": 0,
+        "mapCapacityFrozen": False,
     }
     counters_lock = threading.Lock()
     started = time.perf_counter()
@@ -1553,10 +1965,12 @@ def run_realtime_engine(
         finally:
             reader_done.set()
 
-    def enqueue_map(tracked: TrackedFrame) -> None:
+    def enqueue_map(
+        item: TrackedFrame | TrackingStateUpdate,
+    ) -> None:
         while True:
             try:
-                map_queue.put_nowait(tracked)
+                map_queue.put_nowait(item)
                 return
             except queue.Full:
                 try:
@@ -1566,30 +1980,118 @@ def run_realtime_engine(
                 except queue.Empty:
                     pass
 
+    def request_submap_rollover(reason: str) -> None:
+        with rollover_lock:
+            rollover_request[:] = [reason]
+
     def map_frames() -> None:
-        volume: RealtimeVolume | None = None
+        manager = LiveSubmapManager(
+            o3d,
+            voxel_size_m,
+            backend,
+            mode,
+            limits,
+        )
+        controller = AdaptiveBudgetController()
         last_points = 0.0
         last_mesh = 0.0
+        last_coverage = 0.0
+        last_tracking_overlay = 0.0
         last_tracked: TrackedFrame | None = None
+        integration_number = 0
+
+        def publish_points(tracked: TrackedFrame, now: float) -> None:
+            nonlocal last_points
+            points, colors = manager.points()
+            map_update_hz = counters["integrated"] / max(now - started, 1e-3)
+            writer.write(
+                ENGINE_POINTS,
+                tracked.frame.sequence,
+                point_packet(
+                    tracked.frame.sequence,
+                    tracked.frame.depth_timestamp_us,
+                    map_update_hz,
+                    points,
+                    colors,
+                ),
+            )
+            writer.write(
+                ENGINE_TRACKING_POINTS,
+                tracked.frame.sequence,
+                point_packet(
+                    tracked.frame.sequence,
+                    tracked.frame.depth_timestamp_us,
+                    map_update_hz,
+                    points,
+                    tracking_colors(
+                        len(points),
+                        manager.last_tracking_state,
+                        manager.last_tracking_confidence,
+                    ),
+                ),
+            )
+            with counters_lock:
+                counters["pointCount"] = len(points)
+            last_points = now
+
+        def publish_coverage(tracked: TrackedFrame, now: float) -> None:
+            nonlocal last_coverage
+            world_points, _ = manager.world_points()
+            points = _display_positions(world_points, manager.mirror_x)
+            writer.write(
+                ENGINE_COVERAGE_POINTS,
+                tracked.frame.sequence,
+                point_packet(
+                    tracked.frame.sequence,
+                    tracked.frame.depth_timestamp_us,
+                    counters["mapUpdateHz"],
+                    points,
+                    manager.coverage.colors(world_points),
+                ),
+            )
+            summary = manager.coverage_summary()
+            writer.contract_message(
+                ENGINE_COVERAGE,
+                tracked.frame.sequence,
+                summary.to_message(tracked.frame.sequence),
+            )
+            writer.contract_message(
+                ENGINE_SUBMAPS,
+                tracked.frame.sequence,
+                manager.descriptors(tracked.frame.sequence),
+            )
+            last_coverage = now
+
         try:
             while not stop.is_set():
+                with rollover_lock:
+                    pending_rollover = rollover_request.pop() if rollover_request else None
+                if pending_rollover is not None:
+                    manager.force_rollover(pending_rollover)
                 try:
-                    tracked = map_queue.get(timeout=0.1)
+                    item = map_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                if tracked is None:
+                if item is None:
                     break
-                if isinstance(tracked, ResetLiveMap):
-                    volume = None
+                if isinstance(item, ResetLiveMap):
+                    manager = LiveSubmapManager(
+                        o3d,
+                        voxel_size_m,
+                        backend,
+                        mode,
+                        limits,
+                    )
                     last_tracked = None
                     last_points = 0.0
                     last_mesh = 0.0
+                    last_coverage = 0.0
                     writer.write(
                         ENGINE_POINTS,
-                        tracked.sequence,
+                        item.sequence,
                         point_packet(
                             0,
-                            tracked.timestamp_us,
+                            item.timestamp_us,
                             0.0,
                             np.empty((0, 3), dtype=np.float32),
                             np.empty((0, 3), dtype=np.uint8),
@@ -1598,7 +2100,7 @@ def run_realtime_engine(
                     if mode == "mesh":
                         writer.write(
                             ENGINE_MESH,
-                            tracked.sequence,
+                            item.sequence,
                             mesh_packet(
                                 0,
                                 np.empty((0, 3), dtype=np.float32),
@@ -1608,35 +2110,49 @@ def run_realtime_engine(
                             ),
                         )
                     continue
+                if isinstance(item, TrackingStateUpdate):
+                    manager.last_tracking_state = item.state
+                    manager.last_tracking_confidence = item.confidence
+                    now = time.perf_counter()
+                    if now - last_tracking_overlay >= 0.10:
+                        points, _ = manager.points()
+                        writer.write(
+                            ENGINE_TRACKING_POINTS,
+                            item.sequence,
+                            point_packet(
+                                item.sequence,
+                                item.timestamp_us,
+                                counters["mapUpdateHz"],
+                                points,
+                                tracking_colors(
+                                    len(points), item.state, item.confidence
+                                ),
+                            ),
+                        )
+                        last_tracking_overlay = now
+                    continue
+                tracked = item
                 last_tracked = tracked
                 map_started = time.perf_counter()
-                if volume is None:
-                    volume = RealtimeVolume(o3d, tracked.frame, voxel_size_m, backend)
-                volume.integrate(tracked)
-                with counters_lock:
-                    counters["integrated"] += 1
-                    integrated = counters["integrated"]
-                    accepted = counters["accepted"]
-                now = time.perf_counter()
-                update_fps = accepted / max(now - started, 1e-3)
-                if now - last_points >= 0.20:
-                    points, colors = volume.points()
+                integration_number += 1
+                if integration_number % controller.integration_stride != 0:
                     with counters_lock:
-                        counters["pointCount"] = len(points)
-                    writer.write(
-                        ENGINE_POINTS,
-                        tracked.frame.sequence,
-                        point_packet(
-                            tracked.frame.sequence,
-                            tracked.frame.depth_timestamp_us,
-                            update_fps,
-                            points,
-                            colors,
-                        ),
-                    )
-                    last_points = now
-                if mode == "mesh" and now - last_mesh >= 1.0:
-                    vertices, colors, triangles = volume.mesh()
+                        counters["mappingDrops"] += 1
+                        counters["droppedPreviewJobs"] += 1
+                    continue
+                integrated_successfully = manager.integrate(tracked)
+                with counters_lock:
+                    counters["integrated"] += int(integrated_successfully)
+                    integrated = counters["integrated"]
+                now = time.perf_counter()
+                if now - last_points >= controller.point_interval_seconds:
+                    publish_points(tracked, now)
+                if (
+                    mode == "mesh"
+                    and controller.mesh_enabled
+                    and now - last_mesh >= 1.0
+                ):
+                    vertices, colors, triangles = manager.mesh()
                     with counters_lock:
                         counters["triangleCount"] = len(triangles)
                     writer.write(
@@ -1647,31 +2163,54 @@ def run_realtime_engine(
                             vertices,
                             colors,
                             triangles,
-                            flip_winding=volume.mirror_x,
+                            flip_winding=False,
                         ),
                     )
                     last_mesh = now
+                if now - last_coverage >= controller.coverage_interval_seconds:
+                    publish_coverage(tracked, now)
+                elapsed_map_ms = (time.perf_counter() - map_started) * 1000.0
+                telemetry = manager.telemetry()
+                memory_ratio = telemetry["activeVoxelCount"] / max(
+                    limits.rollover_block_count * 16**3,
+                    1,
+                )
+                level = controller.observe(
+                    map_latency_ms=elapsed_map_ms,
+                    mapping_queue_ratio=map_queue.qsize() / map_queue.maxsize,
+                    memory_ratio=memory_ratio,
+                )
                 with counters_lock:
-                    counters["mapUpdateLatencyMs"] = (
-                        time.perf_counter() - map_started
-                    ) * 1000.0
+                    counters["mapUpdateLatencyMs"] = elapsed_map_ms
                     counters["mapUpdateHz"] = integrated / max(
                         time.perf_counter() - started, 1e-3
                     )
-            # Always publish the newest geometry once more at clean shutdown.
-            if volume is not None and last_tracked is not None and not stop.is_set():
-                points, colors = volume.points()
-                writer.write(
-                    ENGINE_POINTS,
-                    last_tracked.frame.sequence,
-                    point_packet(
+                    counters.update(telemetry)
+                    counters["degradationLevel"] = level
+                    counters["coverageCellCount"] = len(manager.coverage.cells)
+                    counters["submapCount"] = len(manager.completed) + int(
+                        manager.active is not None
+                    )
+                    counters["mapCapacityFrozen"] = manager.frozen_reason is not None
+            if last_tracked is not None and not stop.is_set():
+                manager.complete_active("capture stop")
+                publish_points(last_tracked, time.perf_counter())
+                publish_coverage(last_tracked, time.perf_counter())
+                if mode == "mesh":
+                    vertices, colors, triangles = manager.mesh()
+                    writer.write(
+                        ENGINE_MESH,
                         last_tracked.frame.sequence,
-                        last_tracked.frame.depth_timestamp_us,
-                        0.0,
-                        points,
-                        colors,
-                    ),
-                )
+                        mesh_packet(
+                            last_tracked.frame.sequence,
+                            vertices,
+                            colors,
+                            triangles,
+                            flip_winding=False,
+                        ),
+                    )
+                    with counters_lock:
+                        counters["triangleCount"] = len(triangles)
         except BaseException as error:
             failure.append(error)
             stop.set()
@@ -1794,6 +2333,13 @@ def run_realtime_engine(
                             "poseLatencyMs": None,
                             "mapUpdateLatencyMs": snapshot["mapUpdateLatencyMs"],
                             "mapUpdateHz": snapshot["mapUpdateHz"],
+                            "allocatedLiveMapBytes": 0,
+                            "activeVoxelCount": 0,
+                            "activeSurfelCount": 0,
+                            "residentSubmapCount": 0,
+                            "hostCachedSubmapCount": 0,
+                            "droppedPreviewJobs": 0,
+                            "degradationLevel": 0,
                         },
                     )
                     last_status_at = now
@@ -1816,6 +2362,20 @@ def run_realtime_engine(
                 snapshot = dict(counters)
             if tracked.integrate:
                 enqueue_map(tracked)
+            elif tracked.state == TrackingState.RELOCALIZED.value:
+                request_submap_rollover("tracking discontinuity")
+            if (
+                not tracked.integrate
+                and tracked.state != TrackingState.TRACKING.value
+            ):
+                enqueue_map(
+                    TrackingStateUpdate(
+                        tracked.frame.sequence,
+                        tracked.frame.depth_timestamp_us,
+                        tracked.state,
+                        tracking_confidence(tracked.quality),
+                    )
+                )
             now = time.perf_counter()
             if now - last_status_at >= 0.09 or tracked.world_to_camera is None:
                 writer.status(
@@ -1851,6 +2411,18 @@ def run_realtime_engine(
                         "poseLatencyMs": pose_latency_ms,
                         "mapUpdateLatencyMs": snapshot["mapUpdateLatencyMs"],
                         "mapUpdateHz": snapshot["mapUpdateHz"],
+                        "allocatedLiveMapBytes": snapshot["allocatedLiveMapBytes"],
+                        "activeVoxelCount": snapshot["activeVoxelCount"],
+                        "activeSurfelCount": snapshot["activeSurfelCount"],
+                        "residentSubmapCount": snapshot["residentSubmapCount"],
+                        "hostCachedSubmapCount": snapshot["hostCachedSubmapCount"],
+                        "droppedPreviewJobs": snapshot["droppedPreviewJobs"],
+                        "degradationLevel": snapshot["degradationLevel"],
+                        "integrationFrozen": (
+                            tracked.world_to_camera is None
+                            or tracked.state == TrackingState.FROZEN.value
+                            or snapshot["mapCapacityFrozen"]
+                        ),
                     },
                 )
                 last_status_at = now
@@ -1907,6 +2479,14 @@ def run_realtime_engine(
             "poseLatencyMs": None,
             "mapUpdateLatencyMs": result["mapUpdateLatencyMs"],
             "mapUpdateHz": result["mapUpdateHz"],
+            "allocatedLiveMapBytes": result["allocatedLiveMapBytes"],
+            "activeVoxelCount": result["activeVoxelCount"],
+            "activeSurfelCount": result["activeSurfelCount"],
+            "residentSubmapCount": result["residentSubmapCount"],
+            "hostCachedSubmapCount": result["hostCachedSubmapCount"],
+            "droppedPreviewJobs": result["droppedPreviewJobs"],
+            "degradationLevel": result["degradationLevel"],
+            "integrationFrozen": bool(result["mapCapacityFrozen"]),
         },
     )
     return result

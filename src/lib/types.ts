@@ -6,6 +6,7 @@ export type DepthFieldOfView = 'narrow' | 'wide';
 export type RgbResolution = 'auto' | '720p' | '1080p' | '1440p' | '1536p' | '2160p' | '3072p';
 export type MeshViewMode = 'surface' | 'surface-wireframe' | 'wireframe' | 'shaded';
 export type LiveReconstructionMode = 'points' | 'mesh';
+export type LiveOverlayMode = 'normal' | 'coverage' | 'tracking' | 'confidence';
 export type MeshRepairProfile = 'faithful' | 'architectural' | 'natural';
 
 export interface CaptureSettings {
@@ -45,6 +46,8 @@ export interface CaptureSettings {
   imuGyroRateHz: number;
   imuGyroRangeDps: number;
   liveReconstruction: LiveReconstructionMode;
+  /** Hard budget for the active sparse live submap. */
+  liveMapMemoryMib: number;
   repairMesh: boolean;
   meshRepairProfile: MeshRepairProfile;
   fillInferredMeshHoles: boolean;

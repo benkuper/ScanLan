@@ -213,8 +213,17 @@ def contract_status(
         contractVersion=LIVE_CONTRACT_VERSION,
         trackingState=state.value,
         scaleStatus=str(value.get("scaleStatus", ScaleStatus.SENSOR_METRIC.value)),
-        integrationFrozen=state
-        in {TrackingState.SEARCHING, TrackingState.FROZEN, TrackingState.FAILED},
+        integrationFrozen=bool(
+            value.get(
+                "integrationFrozen",
+                state
+                in {
+                    TrackingState.SEARCHING,
+                    TrackingState.FROZEN,
+                    TrackingState.FAILED,
+                },
+            )
+        ),
         **{
             "poseLatencyMs": telemetry.pose_latency_ms,
             "mapUpdateLatencyMs": telemetry.map_update_latency_ms,

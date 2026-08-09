@@ -63,6 +63,12 @@ def parser() -> argparse.ArgumentParser:
     )
     realtime.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     realtime.add_argument(
+        "--live-map-mib",
+        type=int,
+        default=1024,
+        help="Hard memory budget for the active sparse live submap",
+    )
+    realtime.add_argument(
         "--session", type=Path, required=True, help="Capture directory for the tracking journal"
     )
 
@@ -79,6 +85,7 @@ def parser() -> argparse.ArgumentParser:
     benchmark_live.add_argument("--mode", choices=["points", "mesh"], default="mesh")
     benchmark_live.add_argument("--voxel-size", type=float, default=0.01)
     benchmark_live.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    benchmark_live.add_argument("--live-map-mib", type=int, default=1024)
     benchmark_live.add_argument("--session", type=Path, default=None)
     benchmark_live.add_argument("--report", type=Path, default=None)
     benchmark_live.add_argument(
@@ -123,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
                 voxel_size_m=arguments.voxel_size,
                 requested_device=arguments.device,
                 session_root=arguments.session,
+                live_map_mib=arguments.live_map_mib,
             )
             return 0
         if arguments.command == "replay":
@@ -137,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.capture,
                 mode=arguments.mode,
                 voxel_size_m=arguments.voxel_size,
+                live_map_mib=arguments.live_map_mib,
                 device=arguments.device,
                 paced=arguments.realtime_pacing,
                 session_root=arguments.session,

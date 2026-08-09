@@ -20,6 +20,7 @@ class LiveBenchmarkTests(unittest.TestCase):
             capture=Path("capture"),
             mode="mesh",
             voxel_size_m=0.01,
+            live_map_mib=768,
             device="cuda",
             paced=True,
             frame_count=3,
@@ -45,6 +46,10 @@ class LiveBenchmarkTests(unittest.TestCase):
             mesh_snapshots=1,
             final_point_count=40,
             final_triangle_count=12,
+            coverage_snapshots=1,
+            tracking_snapshots=1,
+            coverage_message={"observedRatio": 0.5},
+            submap_message={"submaps": [{"id": "submap-0"}]},
             working_set_samples=[10 * 1024 * 1024],
             gpu_samples=[20 * 1024 * 1024],
             journal_entries=[
@@ -57,6 +62,8 @@ class LiveBenchmarkTests(unittest.TestCase):
         self.assertTrue(report["tracking"]["integrationFrozenForEveryRejectedFrame"])
         self.assertTrue(report["preview"]["provisionalAvailableAfterStop"])
         self.assertEqual(report["runtime"]["peakGpuMemoryMiB"], 20.0)
+        self.assertEqual(report["liveMap"]["finalSubmapCount"], 1)
+        self.assertEqual(report["configuration"]["liveMapMemoryMiB"], 768)
 
 
 if __name__ == "__main__":

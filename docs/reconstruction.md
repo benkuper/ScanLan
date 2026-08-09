@@ -11,8 +11,15 @@ All representations share one quality-gated RGB-D trajectory. A visually attract
 5. Reproject metric depth and reject candidates with weak overlap, too few correspondences, high RMSE, or impossible motion.
 6. On loss, test recent accepted anchors through the same gates.
 7. Select keyframes by translation, rotation, and elapsed time.
-8. Integrate selected frames into a weighted TSDF.
-9. Publish bounded point snapshots at roughly 3 Hz and optional mesh snapshots at 1 Hz.
+8. Integrate selected frames into a bounded active sparse TSDF submap.
+9. Move completed submaps to compact host geometry while retaining their rigid transforms.
+10. Publish normal, coverage, and tracking-confidence point snapshots at independent adaptive rates, plus an optional 1 Hz mesh when headroom permits.
+
+The low-resolution coverage field stores per-cell observation count, best projected pixel
+density, pose confidence, and recent sequence. Green geometry has at least three independent
+observations, yellow has two, orange is single-view, and purple is unknown. Guidance is derived
+from measured coverage and tracking confidence, so the UI can request more parallax, a revisit,
+or a return to trusted geometry without changing raw observations.
 
 Kinect Fusion poses enter at step 4 but still pass ScanLan’s finite, rigid, physical-motion, overlap, and metric depth-residual checks.
 

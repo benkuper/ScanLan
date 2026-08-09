@@ -56,6 +56,8 @@ struct RealtimeEngineSnapshot {
     status: LiveReconstructionStatus,
     camera_points: Option<LiveGeometryFrame>,
     points: Option<LiveGeometryFrame>,
+    coverage_points: Option<LiveGeometryFrame>,
+    tracking_points: Option<LiveGeometryFrame>,
     mesh: Option<LiveGeometryFrame>,
     coverage: Option<serde_json::Value>,
     submaps: Option<serde_json::Value>,
@@ -66,6 +68,8 @@ struct RealtimeEngineSnapshot {
 enum RealtimeGeometry {
     CameraPoints,
     FusedPoints,
+    CoveragePoints,
+    TrackingPoints,
     Mesh,
 }
 
@@ -496,6 +500,11 @@ fn normalize_project(project: &mut ProjectSummary) -> bool {
     let safe_voxel_size = project.settings.voxel_size_mm.clamp(1, 40);
     if safe_voxel_size != project.settings.voxel_size_mm {
         project.settings.voxel_size_mm = safe_voxel_size;
+        changed = true;
+    }
+    let safe_live_memory = project.settings.live_map_memory_mib.clamp(256, 4096);
+    if safe_live_memory != project.settings.live_map_memory_mib {
+        project.settings.live_map_memory_mib = safe_live_memory;
         changed = true;
     }
     if !matches!(
@@ -1240,6 +1249,7 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
     if !matches!(settings.live_reconstruction.as_str(), "points" | "mesh") {
         return Err("Unknown live reconstruction mode".to_string());
     }
+    settings.live_map_memory_mib = settings.live_map_memory_mib.clamp(256, 4096);
     if !matches!(
         settings.mesh_repair_profile.as_str(),
         "faithful" | "architectural" | "natural"
@@ -1290,6 +1300,8 @@ fn start_realtime_engine(
         .arg(&settings.live_reconstruction)
         .arg("--voxel-size")
         .arg(live_voxel_size_m.to_string())
+        .arg("--live-map-mib")
+        .arg(settings.live_map_memory_mib.to_string())
         .arg("--session")
         .arg(phase_root)
         .stdin(Stdio::piped())
@@ -1569,7 +1581,7 @@ fn read_realtime_engine_stream(
                         integration_frozen: message.integration_frozen,
                     };
                 }
-                2 | 4 => {
+                2 | 4 | 7 | 8 => {
                     if payload.len() < 24 || &payload[0..4] != b"K2P1" {
                         return Err("Realtime point packet has an invalid header".to_string());
                     }
@@ -1589,8 +1601,12 @@ fn read_realtime_engine_stream(
                     if kind == 2 {
                         snapshot.status.point_count = point_count as u64;
                         snapshot.points = Some(frame);
-                    } else {
+                    } else if kind == 4 {
                         snapshot.camera_points = Some(frame);
+                    } else if kind == 7 {
+                        snapshot.coverage_points = Some(frame);
+                    } else {
+                        snapshot.tracking_points = Some(frame);
                     }
                 }
                 3 => {
@@ -1665,6 +1681,8 @@ fn realtime_packet(
     let geometry = match geometry {
         RealtimeGeometry::CameraPoints => snapshot.camera_points.as_ref(),
         RealtimeGeometry::FusedPoints => snapshot.points.as_ref(),
+        RealtimeGeometry::CoveragePoints => snapshot.coverage_points.as_ref(),
+        RealtimeGeometry::TrackingPoints => snapshot.tracking_points.as_ref(),
         RealtimeGeometry::Mesh => snapshot.mesh.as_ref(),
     };
     match geometry {
@@ -1837,6 +1855,12 @@ fn save_live_reconstruction_preview(
     if let Ok(bytes) = fs::read(&journal) {
         write_export(&live_root.join("poses.jsonl"), &bytes)?;
     }
+    if let Some(coverage) = &snapshot.coverage {
+        storage::write_json(&live_root.join("coverage").join("latest.json"), coverage)?;
+    }
+    if let Some(submaps) = &snapshot.submaps {
+        storage::write_json(&live_root.join("submaps").join("descriptors.json"), submaps)?;
+    }
     let phase_manifest = File::open(phase_root.join("phase.json"))
         .ok()
         .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
@@ -1848,7 +1872,8 @@ fn save_live_reconstruction_preview(
         "phaseId": phase_root.file_name().map(|value| value.to_string_lossy()),
         "calibration": phase_manifest.as_ref().and_then(|value| value.get("camera")),
         "sensor": phase_manifest.as_ref().and_then(|value| value.get("sensor")),
-        "submaps": [],
+        "submaps": snapshot.submaps.as_ref().and_then(|value| value.get("submaps")).cloned().unwrap_or_else(|| serde_json::json!([])),
+        "coverage": snapshot.coverage.clone(),
         "provisionalScaleStatus": if snapshot.status.scale_status.is_empty() { "SENSOR_METRIC" } else { snapshot.status.scale_status.as_str() },
         "trackingStatistics": {
             "processedFrames": snapshot.status.processed_frames,
@@ -1933,6 +1958,28 @@ pub async fn live_reconstruction_mesh(
     } else {
         Vec::new()
     };
+    Ok(tauri::ipc::Response::new(body))
+}
+
+#[tauri::command]
+pub async fn live_reconstruction_overlay(
+    mode: String,
+    after_frame: u32,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let geometry = match mode.as_str() {
+        "coverage" => RealtimeGeometry::CoveragePoints,
+        "tracking" | "confidence" => RealtimeGeometry::TrackingPoints,
+        _ => return Err("Live overlay mode must be coverage, tracking, or confidence".to_string()),
+    };
+    let realtime = state
+        .active_capture
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|capture| Arc::clone(&capture.realtime)));
+    let body = realtime
+        .map(|snapshot| realtime_packet(&snapshot, geometry, after_frame))
+        .unwrap_or_default();
     Ok(tauri::ipc::Response::new(body))
 }
 
@@ -6317,6 +6364,7 @@ mod tests {
             "imuAccelRangeG",
             "imuGyroRateHz",
             "imuGyroRangeDps",
+            "liveMapMemoryMib",
             "lingbotDepthRefinement",
         ] {
             object.remove(field);
@@ -6327,6 +6375,7 @@ mod tests {
         assert!(settings.rgb_auto_white_balance);
         assert_eq!(settings.rgb_exposure_us, 8_330);
         assert_eq!(settings.imu_accel_rate_hz, 0);
+        assert_eq!(settings.live_map_memory_mib, 1024);
         assert!(!settings.lingbot_depth_refinement);
     }
 

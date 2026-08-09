@@ -20,7 +20,9 @@
     loadCaptureDraft,
     loadGaussianSplat,
     loadLivePreviewFrame,
+    loadLiveReconstructionGuidance,
     loadLiveReconstructionMesh,
+    loadLiveReconstructionOverlay,
     localizeSupplementalPhotos,
     loadPreview,
     loadPreviewMesh,
@@ -51,6 +53,8 @@
     CloudTransform,
     DepthFieldOfView,
     LiveReconstructionMode,
+    LiveOverlayMode,
+    LiveReconstructionGuidance,
     MediaRestartStage,
     MediaSourceSummary,
     MeshRepairProfile,
@@ -133,6 +137,9 @@
   let selectingSensor = false;
   let lastPreviewFrame = 0;
   let lastMeshFrame = 0;
+  let liveOverlayMode: LiveOverlayMode = 'normal';
+  let liveGuidance: LiveReconstructionGuidance | null = null;
+  let lastGuidanceAt = 0;
   let lastBuildPreviewAt = 0;
   let lastBuildSplatSignature = '';
   let lastSensorScanAt = 0;
@@ -186,9 +193,9 @@
   $: viewerRenderMode = previewing
     ? 'points'
     : capturing
-      ? project?.settings.liveReconstruction === 'mesh' ? 'mesh' : 'points'
+      ? liveOverlayMode === 'normal' && project?.settings.liveReconstruction === 'mesh' ? 'mesh' : 'points'
       : renderMode;
-  $: viewerMesh = capturing ? liveMesh : previewing ? null : previewMesh;
+  $: viewerMesh = capturing && liveOverlayMode === 'normal' ? liveMesh : previewing ? null : previewMesh;
   $: viewerPackedFrame = liveSensor
     ? packedPreviewFrame
     : workspace === 'reconstruct' && !processing && readyArtifacts === 0
@@ -959,11 +966,22 @@
     return { frameCount, pointCount, positions, colors };
   }
 
+  function setLiveOverlayMode(mode: LiveOverlayMode): void {
+    if (liveOverlayMode === mode) return;
+    liveOverlayMode = mode;
+    packedPreviewFrame = null;
+    lastPreviewFrame = 0;
+    void pollLiveGeometry();
+  }
+
   async function pollLiveGeometry(): Promise<void> {
     if (!project || !liveSensor || geometryInFlight) return;
     geometryInFlight = true;
     try {
-      const packet = parsePointPacket(await loadLivePreviewFrame(lastPreviewFrame));
+      const source = capturing && liveOverlayMode !== 'normal'
+        ? loadLiveReconstructionOverlay(liveOverlayMode, lastPreviewFrame)
+        : loadLivePreviewFrame(lastPreviewFrame);
+      const packet = parsePointPacket(await source);
       if (packet && packet.frameCount > lastPreviewFrame) {
         packedPreviewFrame = packet;
         if (capturing) captureDraftFrame = packet;
@@ -975,6 +993,11 @@
           liveMesh = result.mesh;
           lastMeshFrame = result.frameCount;
         }
+      }
+      const now = performance.now();
+      if (capturing && now - lastGuidanceAt >= 500) {
+        lastGuidanceAt = now;
+        liveGuidance = await loadLiveReconstructionGuidance();
       }
     } catch (error) {
       message = `Live geometry: ${errorText(error)}`;
@@ -1849,15 +1872,36 @@
         onClipBoundsCommitted={commitClipBounds}
       />
 
+      {#if capturing}
+        <div class="live-overlays" aria-label="Live reconstruction view">
+          <button class:active={liveOverlayMode === 'normal'} on:click={() => setLiveOverlayMode('normal')}>Normal</button>
+          <button class:active={liveOverlayMode === 'coverage'} on:click={() => setLiveOverlayMode('coverage')}>Coverage</button>
+          <button class:active={liveOverlayMode === 'tracking'} on:click={() => setLiveOverlayMode('tracking')}>Tracking</button>
+          <button class:active={liveOverlayMode === 'confidence'} on:click={() => setLiveOverlayMode('confidence')}>Confidence</button>
+        </div>
+      {/if}
+
       {#if liveSensor && sensor}
         <div class="live-metrics">
-          <div><span>{capturing ? 'Tracking' : 'Camera'}</span><strong class:good={capturing ? sensor.tracking : sensor.sensorConnected}>{capturing ? sensor.tracking ? 'LOCKED' : 'SEARCHING' : sensor.sensorConnected ? 'CONNECTED' : 'WAITING'}</strong></div>
+          <div><span>{capturing ? 'Tracking' : 'Camera'}</span><strong class:good={capturing ? sensor.trackingState === 'tracking' || sensor.trackingState === 'relocalized' : sensor.sensorConnected}>{capturing ? sensor.trackingState.toUpperCase() : sensor.sensorConnected ? 'CONNECTED' : 'WAITING'}</strong></div>
           <div><span>{capturing ? 'Tracker' : 'Stream'}</span><strong>{(capturing ? sensor.trackingFps : sensor.streamFps).toFixed(1)} fps</strong></div>
           <div><span>{capturing ? 'Keyframes' : 'Frames seen'}</span><strong>{capturing ? sensor.liveIntegratedFrameCount : sensor.liveProcessedFrameCount}</strong></div>
+          <div><span>Confidence</span><strong>{Math.round(sensor.trackingConfidence * 100)}%</strong></div>
           <div><span>Overlap</span><strong>{Math.round(sensor.trackingOverlap * 100)}%</strong></div>
           <div><span>Depth error</span><strong>{sensor.depthRmseMm ? `${sensor.depthRmseMm.toFixed(1)} mm` : '—'}</strong></div>
           <div><span>Queue drops</span><strong>{sensor.trackingQueueDropCount + sensor.mappingDropCount}</strong></div>
+          <div><span>Map update</span><strong>{sensor.mapUpdateHz.toFixed(1)} Hz</strong></div>
+          <div><span>Submaps</span><strong>{sensor.residentSubmapCount} GPU / {sensor.hostCachedSubmapCount} host</strong></div>
+          <div><span>Live memory</span><strong>{formatByteSize(sensor.allocatedLiveMapBytes)}</strong></div>
+          <div><span>Pose age</span><strong>{sensor.poseLatencyMs == null ? '—' : `${sensor.poseLatencyMs.toFixed(0)} ms`}</strong></div>
+          <div><span>Pressure</span><strong>{sensor.degradationLevel ? `LEVEL ${sensor.degradationLevel}` : 'NORMAL'}</strong></div>
         </div>
+        {#if capturing && liveGuidance?.coverage?.guidance?.length}
+          <div class="live-guidance">
+            <strong>{liveGuidance.coverage.guidance[0]}</strong>
+            <span>{Math.round(liveGuidance.coverage.observedRatio * 100)}% well observed · {Math.round(liveGuidance.coverage.singleViewRatio * 100)}% single-view</span>
+          </div>
+        {/if}
       {/if}
 
       {#if processing && activeJob}
@@ -1940,6 +1984,9 @@
             </label>
             <label>Fusion voxel
               <div class="unit-input"><input type="number" min="3" max="40" step="1" value={project.settings.voxelSizeMm} on:change={(event) => updateSetting('voxelSizeMm', Number(inputValue(event)))} disabled={capturing || processing}/><span>mm</span></div>
+            </label>
+            <label>Live map budget
+              <div class="unit-input"><input type="number" min="256" max="4096" step="128" value={project.settings.liveMapMemoryMib} on:change={(event) => updateSetting('liveMapMemoryMib', Number(inputValue(event)))} disabled={capturing || processing}/><span>MiB</span></div>
             </label>
             {#if project.settings.sensorKind !== 'kinect_v2'}
               <label>Depth FOV
@@ -2704,6 +2751,12 @@
   .live-metrics span { color: #6f8792; font-size: 8px; text-transform: uppercase; }
   .live-metrics strong { font-size: 10px; }
   .live-metrics strong.good { color: var(--mint); }
+  .live-overlays { position: absolute; top: 24px; left: 24px; z-index: 3; display: flex; padding: 3px; gap: 2px; border: 1px solid #31363e; border-radius: 5px; background: #171b20e8; }
+  .live-overlays button { min-width: 0; padding: 7px 9px; border: 0; color: #82929a; background: transparent; font-size: 9px; text-transform: uppercase; }
+  .live-overlays button.active { color: #101719; background: var(--mint); }
+  .live-guidance { position: absolute; left: 50%; bottom: 26px; z-index: 3; display: grid; gap: 4px; min-width: 320px; padding: 10px 14px; transform: translateX(-50%); border: 1px solid #31363e; border-radius: 5px; background: #171b20e8; text-align: center; }
+  .live-guidance strong { color: #e8f1f3; font-size: 11px; }
+  .live-guidance span { color: #82929a; font-size: 9px; }
   .job-overlay { position: absolute; right: 24px; bottom: 24px; width: min(420px, calc(100% - 48px)); padding: 13px; border: 1px solid #31363e; border-radius: 5px; background: #171b20; }
   .job-overlay > div:first-child { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 10px; text-transform: capitalize; }
   .job-overlay .job-quality { justify-content: flex-start; }

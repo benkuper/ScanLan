@@ -55,6 +55,8 @@ pub struct CaptureSettings {
     #[serde(default)]
     pub imu_gyro_range_dps: u32,
     pub live_reconstruction: String,
+    #[serde(default = "default_live_map_memory_mib")]
+    pub live_map_memory_mib: u32,
     #[serde(default = "default_repair_mesh")]
     pub repair_mesh: bool,
     #[serde(default = "default_mesh_repair_profile")]
@@ -123,6 +125,10 @@ fn default_live_reconstruction() -> String {
     "points".to_string()
 }
 
+fn default_live_map_memory_mib() -> u32 {
+    1024
+}
+
 fn default_repair_mesh() -> bool {
     true
 }
@@ -165,6 +171,7 @@ impl Default for CaptureSettings {
             imu_gyro_rate_hz: 0,
             imu_gyro_range_dps: 0,
             live_reconstruction: default_live_reconstruction(),
+            live_map_memory_mib: default_live_map_memory_mib(),
             repair_mesh: default_repair_mesh(),
             mesh_repair_profile: default_mesh_repair_profile(),
             fill_inferred_mesh_holes: false,

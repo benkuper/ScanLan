@@ -111,3 +111,33 @@ loss. Per-process NVIDIA memory was unavailable through `nvidia-smi` under the a
 driver, so this run does not establish the VRAM baseline. The high first-publication outliers
 also show why P1/P2 must separate warm-up, map-update cadence, and steady-state latency rather
 than relying on tracking fps alone.
+
+### 2026-08-09 P2 bounded-live-map revalidation
+
+The same physical archive and CUDA mesh configuration were replayed alone after the P2
+submap, budget-controller, coverage, and confidence-overlay work. The active sparse map used a
+configured 1,024 MiB ceiling. Its reported block-pool allocation peaked at 895.97 MiB, below
+that ceiling; the single short capture did not naturally require a rollover, while the
+automated Open3D integration test forces travel rollover and verifies that the completed host
+submap remains in the combined preview.
+
+| Metric | P0 baseline | P2 bounded live engine |
+| --- | ---: | ---: |
+| Pose latency p95 | 46.25 ms | 62.05 ms |
+| Point-map publication latency p95 | 718.70 ms | 330.80 ms |
+| Mesh publication latency p95 | 1,214.25 ms | 1,049.45 ms |
+| Accepted / integrated | 71 / 15 frames | 80 / 17 frames |
+| Final provisional geometry | 59,263 points / 105,468 triangles | 59,274 points / 105,560 triangles |
+| Tracking / mapping / journal drops | 10 / 0 / 0 | 1 / 0 / 0 |
+| Peak worker working set | 923.33 MiB | 924.22 MiB |
+| Peak allocated live map | not reported | 895.97 MiB |
+| Coverage / tracking-overlay snapshots | not available | 10 / 17 |
+
+P2 therefore preserves the provisional artifact, cuts the point-map latency tail by 54%, and
+reduces tracker queue loss from ten frames to one without increasing mapping or journal loss.
+Pose p95 regressed by 15.8 ms and remains an explicit P3 tracking/loop-correction target. The
+mesh statistic has only two low-rate samples by design and should not be read as a stable
+distribution. Coverage finished at 95.0% repeatedly observed, 1.7% weak, and 3.3% single-view.
+As in P0, Windows `nvidia-smi` did not expose per-process VRAM, so the hard ceiling is validated
+from the VoxelBlockGrid allocation contract and active-block telemetry rather than a driver
+process counter.

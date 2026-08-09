@@ -78,3 +78,29 @@ Optional LingBot-Depth inference is launched as a child of the reconstruction jo
 Every active capture owns its sensor process, stdout relay, and realtime engine as one supervised unit. Dropping that unit after any startup, storage, or state error terminates all three, so a failed command cannot leave the camera or GPU worker running in the background.
 
 Project and preference manifests are serialized to uniquely named sibling files, flushed to storage, and atomically replaced. Concurrent status or settings updates therefore cannot collide on one shared temporary path, and a failed publication leaves the previous valid manifest intact.
+
+## Bounded live submaps
+
+The Reconstruction 2.0 mapper owns exactly one active sparse voxel-block grid. Its capacity is
+derived from the configured live-map budget (1,024 MiB by default), including an explicit
+allowance for hash keys and allocator overhead. This follows Open3D's globally sparse,
+locally dense [VoxelBlockGrid design](https://www.open3d.org/docs/release/tutorial/t_reconstruction_system/voxel_block_grid.html)
+instead of allocating a room-sized dense volume.
+
+The active submap rolls over before integration when travel reaches 2.5 m, accumulated
+rotation reaches 100 degrees, 450 keyframes have been integrated, 82% of the sparse block pool
+is active, or tracking relocalizes across a discontinuity. Completed volumes are extracted once
+to compact host points and optional mesh geometry; only their rigid transforms remain mutable.
+This is the same scalable principle used by Kähler et al.'s
+[real-time submap reconstruction](https://www.robots.ox.ac.uk/~lav/Papers/kahler_etal_eccv2016/kahler_etal_eccv2016.html).
+
+Host preview memory is also bounded: at most 64 submaps, 750,000 retained points, and 600,000
+cached preview triangles. Older mesh caches are discarded before point guidance, and point
+samples are deterministically compacted. Reaching the hard submap ceiling freezes integration
+while tracking and raw archival continue.
+
+Map publication runs independently from viewport rendering. Normal and tracking overlays
+share bounded point snapshots, coverage is refreshed at a lower adaptive cadence, and mesh
+extraction runs only at degradation level zero. The hysteretic pressure controller first lowers
+publication rates, then pauses mesh/coverage work, and finally integrates fewer keyframes; it
+never reduces archive fidelity or skips pose tracking.

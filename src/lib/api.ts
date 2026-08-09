@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ArtifactJob, ArtifactTarget, AvailableSensor, BoundingBoxClip, BuildReusePolicy, CaptureSettings, CaptureStatus, CloudTransform, LiveReconstructionGuidance, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
+import type { ArtifactJob, ArtifactTarget, AvailableSensor, BoundingBoxClip, BuildReusePolicy, CaptureSettings, CaptureStatus, CloudTransform, LiveOverlayMode, LiveReconstructionGuidance, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
 
 const inTauri = () => typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
 
@@ -242,6 +242,19 @@ export async function loadLiveReconstructionMesh(afterFrame: number): Promise<{ 
 export async function loadLiveReconstructionGuidance(): Promise<LiveReconstructionGuidance> {
   requireDesktop();
   return invoke<LiveReconstructionGuidance>('live_reconstruction_guidance');
+}
+
+export async function loadLiveReconstructionOverlay(
+  mode: Exclude<LiveOverlayMode, 'normal'>,
+  afterFrame: number
+): Promise<ArrayBuffer> {
+  requireDesktop();
+  const response = await invoke<ArrayBuffer | Uint8Array | number[]>('live_reconstruction_overlay', { mode, afterFrame });
+  if (response instanceof ArrayBuffer) return response;
+  if (ArrayBuffer.isView(response)) {
+    return response.buffer.slice(response.byteOffset, response.byteOffset + response.byteLength) as ArrayBuffer;
+  }
+  return Uint8Array.from(response).buffer;
 }
 
 export async function startArtifactJob(

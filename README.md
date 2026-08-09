@@ -34,7 +34,14 @@ Realtime processing uses three independent stages:
 
 1. decode and edge-aware depth-speckle rejection;
 2. persistent RGB-D odometry with an optional calibrated gyro prior, deliberate handheld-motion limits, metric overlap/RMSE gates, and fail-closed recovery that must remain within 15 cm / 10 degrees of the last trusted pose and agree for three consecutive frames before integration;
-3. weighted TSDF integration with asynchronous point extraction and an optional 1 Hz mesh.
+3. bounded sparse-TSDF submaps with compact host caching, adaptive point/coverage publication,
+   tracking-confidence overlays, and an optional 1 Hz mesh that pauses under pressure.
+
+The live map has a hard memory ceiling. Travel, rotation, voxel pressure, keyframe count, or a
+tracking discontinuity closes the active submap; completed submaps remain visible as immutable
+host geometry and can later move through pose-graph corrections. The capture viewport can
+switch between normal color, coverage, tracking, and confidence views without changing the
+sensor, archive, tracking, or fusion rates.
 
 The compact `tracking.jsonl` journal feeds accepted live poses into the production pass. A rejected live pose does not discard its archived pixels: the final pass keeps consecutive RGB-D frames for fresh offline odometry, then refines short trajectory fragments, verifies nonlocal loop candidates, globally optimizes a pose graph, registers separate takes, and rebuilds the selected outputs from archived calibrated RGB-D data.
 
