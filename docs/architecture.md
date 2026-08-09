@@ -9,7 +9,8 @@ ScanLan separates realtime latency from archival throughput and final quality. E
 | Tauri application | lifecycle, project state, status snapshots, exports | camera SDK state or reconstruction kernels |
 | Native capture worker | camera SDK, calibration, synchronized RGB-D, IMU conversion | UI rendering or Open3D |
 | Reconstruction worker | tracking, relocalization, TSDF, pose graph, point/mesh build | camera SDK |
-| Splat worker | Photo/video decoding, COLMAP camera solving, guarded LingBot-Depth inference, CUDA 2DGS/3DGS optimization, checkpoints | RGB-D capture, tracking, pose recovery, and TSDF quality decisions |
+| Splat worker | Photo/video decoding, COLMAP camera solving, CUDA 2DGS/3DGS optimization, checkpoints | Learned-model loading, RGB-D capture, tracking, pose recovery, and TSDF quality decisions |
+| Geometry worker | Pinned LingBot-Map and LingBot-Depth CUDA inference, model lifecycle, lossless array publication | Camera solving, production validation, fusion, or Gaussian optimization |
 
 The realtime engine is started and reports `ready` before the camera is opened. Tauri pipes camera stdout directly into engine stdin and drains engine stdout on a dedicated thread. Sensor stderr goes to `sensor.log`, so a full pipe cannot stall capture.
 
@@ -74,6 +75,15 @@ Normal stop creates `stop.flag`, lets the capture worker flush its archive, drai
 Unexpected phases are recovered from their manifest and CSV at the next launch. Derived jobs have independent checkpoints and can be cancelled without deleting raw captures.
 
 Optional LingBot-Depth inference is launched as a child of the reconstruction job only after pose recovery. It reads an immutable JSON request and aligned raw frame paths, writes atomic NumPy predictions, observes the shared cancellation flag between frames, and never mutates an archive. The reconstruction worker—not the model process—owns metric, RGB-coverage, multi-view, and provenance validation before publishing an immutable fingerprinted cache.
+
+LingBot-Map and LingBot-Depth now execute only in the dedicated geometry worker. Media
+preparation writes a schema-1 request containing ordered absolute image paths, calibrated rays,
+selected output indices, a hard seed limit, and the shared cancellation path. The geometry
+worker owns the model and CUDA cache for exactly one request, then atomically publishes typed
+NumPy arrays plus small JSON metadata. The caller validates shape, finiteness, camera
+transforms, intrinsics, scales, quaternions, ownership, and confidence before using the result.
+No Python object, CUDA tensor, or model state crosses the process boundary. See
+[geometry-worker.md](geometry-worker.md).
 
 Every active capture owns its sensor process, stdout relay, and realtime engine as one supervised unit. Dropping that unit after any startup, storage, or state error terminates all three, so a failed command cannot leave the camera or GPU worker running in the background.
 

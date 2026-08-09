@@ -18,10 +18,10 @@ from PIL import Image, ImageOps
 
 from .lingbot import (
     LingbotGeometry,
-    infer_lingbot_geometry,
     lingbot_processed_size,
     lingbot_source_pixel_grid,
 )
+from .geometry_ipc import infer_lingbot_geometry_isolated
 from .runtime import pycolmap_device, pycolmap_feature_runtime
 
 
@@ -2267,6 +2267,8 @@ def prepare_media_dataset(
     project_root: Path,
     sources: Sequence[Path] = (),
     options: MediaPreparationOptions | None = None,
+    *,
+    geometry_worker: Path | None = None,
 ) -> dict[str, Any]:
     """Create an immutable, undistorted COLMAP dataset for Gaussian training."""
     import pycolmap
@@ -2328,6 +2330,10 @@ def prepare_media_dataset(
         )
         _check_cancelled(project_root)
         if single_video:
+            if geometry_worker is None:
+                raise RuntimeError(
+                    "Video reconstruction requires the isolated ScanLan geometry worker"
+                )
             calibrated_rays = _lingbot_calibrated_rays(
                 _shared_video_camera(reconstruction)[0],
                 records,
@@ -2362,8 +2368,11 @@ def prepare_media_dataset(
                     metrics={**metrics, "calibratedCameraRays": True},
                 )
 
-            lingbot_geometry = infer_lingbot_geometry(
+            lingbot_geometry = infer_lingbot_geometry_isolated(
+                geometry_worker,
                 context_paths,
+                work_root=staging / "geometry-ipc",
+                cancel_path=project_root / "outputs" / "cancel.flag",
                 normalized_rays=calibrated_rays,
                 output_indices=lingbot_output_indices,
                 progress=report_lingbot,

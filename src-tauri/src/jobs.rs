@@ -582,6 +582,15 @@ fn existing_runtime(resources: Option<&Path>, splat: bool) -> Result<PathBuf, St
         })
 }
 
+fn existing_geometry_runtime(resources: Option<&Path>) -> Result<PathBuf, String> {
+    storage::candidate_geometry_worker_paths(resources)
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "Learned geometry support is not installed. Run npm run prepare:splat.".to_string()
+        })
+}
+
 fn current_media_observation_manifest(project_root: &Path) -> Result<PathBuf, String> {
     let observations_root = project_root
         .join("outputs")
@@ -701,6 +710,7 @@ fn run_pipeline(
     if !resume {
         invalidate_pipeline_cache(project_root, job)?;
     }
+    let project = storage::read_project(project_root)?;
     if job.source_kind == "media" {
         let splat_worker = existing_runtime(resources, true)?;
         job.stage = "media_preparation".to_string();
@@ -718,6 +728,14 @@ fn run_pipeline(
             .arg("15")
             .arg("--maximum-video-frames")
             .arg("3000");
+        if project
+            .media_sources
+            .iter()
+            .any(|source| source.kind == "video")
+        {
+            let geometry_worker = existing_geometry_runtime(resources)?;
+            prepare.arg("--geometry-worker").arg(geometry_worker);
+        }
         run_command(prepare, project_root, job, cancel, true)?;
         job.stage = "splat_training".to_string();
         job.detail = "Initializing photoreal 3D Gaussian optimization".to_string();
@@ -743,9 +761,8 @@ fn run_pipeline(
         return run_command(train, project_root, job, cancel, true);
     }
     let reconstruction = existing_runtime(resources, false)?;
-    let project = storage::read_project(project_root)?;
     let depth_refiner = if project.settings.lingbot_depth_refinement {
-        Some(existing_runtime(resources, true)?)
+        Some(existing_geometry_runtime(resources)?)
     } else {
         None
     };

@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $PackageRoot = Join-Path $ProjectRoot "splat-worker"
+$GeometryPackageRoot = Join-Path $ProjectRoot "geometry-worker"
 $RuntimeRoot = Join-Path $PackageRoot ".venv"
 $Python = Join-Path $RuntimeRoot "Scripts/python.exe"
 $RuntimeScripts = Join-Path $RuntimeRoot "Scripts"
@@ -303,6 +304,8 @@ if (-not (Test-Path -LiteralPath $GsplatExtension)) {
 }
 & $Python -m pip install --upgrade --force-reinstall --no-deps $PackageRoot
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat worker could not be installed." }
+& $Python -m pip install --upgrade --force-reinstall --no-deps $GeometryPackageRoot
+if ($LASTEXITCODE -ne 0) { throw "ScanLan geometry worker could not be installed." }
 if ($FlashInferReady) {
   $PreviousErrorActionPreference = $ErrorActionPreference
   try {
@@ -347,11 +350,13 @@ if ($FlashInferReady) {
 & $Python -m scanlan_splat.cli diagnostics `
   --require-cuda `
   --require-learned-features `
-  --require-lingbot `
-  --require-lingbot-depth `
-  --require-flashinfer `
   --require-adaptive-frames
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat runtime validation failed." }
+& $Python -m scanlan_geometry.cli diagnostics `
+  --require-lingbot `
+  --require-lingbot-depth `
+  --require-flashinfer
+if ($LASTEXITCODE -ne 0) { throw "ScanLan geometry runtime validation failed." }
 
 Push-Location $PackageRoot
 try {
@@ -368,17 +373,14 @@ try {
     "--add-binary", "${PycolmapOnnxShared};pycolmap.libs",
     "--add-binary", "${PycolmapOnnxCuda};pycolmap.libs",
     "--collect-all", "gsplat", "--collect-all", "pycolmap", "--collect-all", "av",
-    "--collect-all", "lingbot_map", "--collect-all", "mdm", "--collect-all", "torchvision",
     "--collect-all", "onnxruntime", "--collect-all", "cv2",
     "--collect-all", "huggingface_hub", "--collect-all", "tvm_ffi",
     "--collect-all", "ninja",
-    "--copy-metadata", "torch", "--copy-metadata", "torchvision",
+    "--copy-metadata", "torch",
     "--copy-metadata", "gsplat", "--copy-metadata", "pycolmap",
-    "--copy-metadata", "av", "--copy-metadata", "lingbot-map", "--copy-metadata", "mdm"
+    "--copy-metadata", "av",
+    "--exclude-module", "lingbot_map", "--exclude-module", "mdm", "--exclude-module", "flashinfer"
   )
-  if ($FlashInferReady) {
-    $PyInstallerArguments += @("--collect-all", "flashinfer")
-  }
   $PyInstallerArguments += "entry.py"
   & $Python -m PyInstaller @PyInstallerArguments
   if ($LASTEXITCODE -ne 0) { throw "ScanLan splat runtime packaging failed." }
@@ -389,14 +391,38 @@ $PackagedWorker = Join-Path $PackageRoot "dist/scanlan-splat/scanlan-splat.exe"
 $PackagedModels = Join-Path $PackageRoot "dist/scanlan-splat/models"
 $null = New-Item -ItemType Directory -Path $PackagedModels -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "THIRD_PARTY_NOTICES.md") -Destination (Split-Path -Parent $PackagedModels) -Force
-Copy-Item -LiteralPath (Join-Path $LingbotModels "lingbot-map-long.pt") -Destination $PackagedModels -Force
-Copy-Item -LiteralPath (Join-Path $LingbotModels "skyseg_batch.onnx") -Destination $PackagedModels -Force
-Copy-Item -LiteralPath $LingbotDepthDestination -Destination $PackagedModels -Force
 foreach ($Asset in $ColmapModelAssets) {
   Copy-Item -LiteralPath (Join-Path $LingbotModels $Asset.Name) -Destination $PackagedModels -Force
 }
+
+Push-Location $GeometryPackageRoot
+try {
+  $GeometryArguments = @(
+    "--noconfirm", "--clean", "--onedir", "--name", "scanlan-geometry",
+    "--collect-all", "lingbot_map", "--collect-all", "mdm", "--collect-all", "torchvision",
+    "--collect-all", "onnxruntime", "--collect-all", "cv2",
+    "--collect-all", "huggingface_hub", "--collect-all", "tvm_ffi", "--collect-all", "ninja",
+    "--copy-metadata", "torch", "--copy-metadata", "torchvision",
+    "--copy-metadata", "lingbot-map", "--copy-metadata", "mdm"
+  )
+  if ($FlashInferReady) {
+    $GeometryArguments += @("--collect-all", "flashinfer")
+  }
+  $GeometryArguments += "entry.py"
+  & $Python -m PyInstaller @GeometryArguments
+  if ($LASTEXITCODE -ne 0) { throw "ScanLan geometry runtime packaging failed." }
+} finally {
+  Pop-Location
+}
+$PackagedGeometryWorker = Join-Path $GeometryPackageRoot "dist/scanlan-geometry/scanlan-geometry.exe"
+$PackagedGeometryModels = Join-Path $GeometryPackageRoot "dist/scanlan-geometry/models"
+$null = New-Item -ItemType Directory -Path $PackagedGeometryModels -Force
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "THIRD_PARTY_NOTICES.md") -Destination (Split-Path -Parent $PackagedGeometryModels) -Force
+Copy-Item -LiteralPath (Join-Path $LingbotModels "lingbot-map-long.pt") -Destination $PackagedGeometryModels -Force
+Copy-Item -LiteralPath (Join-Path $LingbotModels "skyseg_batch.onnx") -Destination $PackagedGeometryModels -Force
+Copy-Item -LiteralPath $LingbotDepthDestination -Destination $PackagedGeometryModels -Force
 if ($FlashInferReady -and (Test-Path -LiteralPath $FlashInferCacheArchive)) {
-  Copy-Item -LiteralPath $FlashInferCacheArchive -Destination $PackagedModels -Force
+  Copy-Item -LiteralPath $FlashInferCacheArchive -Destination $PackagedGeometryModels -Force
 }
 # The frozen-worker validation must resolve only the assets beside the frozen
 # executable. Do not let development paths conceal a packaging omission.
@@ -409,10 +435,13 @@ Remove-Item Env:SCANLAN_FLASHINFER_CACHE_ARCHIVE -ErrorAction SilentlyContinue
 & $PackagedWorker diagnostics `
   --require-cuda `
   --require-learned-features `
-  --require-lingbot `
-  --require-lingbot-depth `
-  --require-flashinfer `
   --require-adaptive-frames
 if ($LASTEXITCODE -ne 0) { throw "The packaged ScanLan splat runtime failed validation." }
+& $PackagedGeometryWorker diagnostics `
+  --require-lingbot `
+  --require-lingbot-depth `
+  --require-flashinfer
+if ($LASTEXITCODE -ne 0) { throw "The packaged ScanLan geometry runtime failed validation." }
 
 Write-Host "Splat runtime ready: $PackagedWorker"
+Write-Host "Geometry runtime ready: $PackagedGeometryWorker"

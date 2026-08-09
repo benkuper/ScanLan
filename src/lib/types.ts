@@ -171,6 +171,8 @@ export interface RuntimeInfo {
   reconstructionWorkerAvailable: boolean;
   splatWorkerAvailable: boolean;
   splatStatus: string;
+  geometryWorkerAvailable: boolean;
+  geometryStatus: string;
 }
 
 export type ArtifactTarget = 'pointCloud' | 'texturedMesh' | 'gaussianSplat';

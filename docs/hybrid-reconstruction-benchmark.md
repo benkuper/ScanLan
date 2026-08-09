@@ -170,3 +170,29 @@ raw observations. It produced 43,722 points from 11 fused keyframes, retained al
 tracking frames, reported 96/100 confidence, and stabilized three production local maps with a
 0.00 m maximum correction in 6.46 seconds. This confirms that live loop evidence remains
 advisory and does not replace production trajectory validation or raw-depth fusion.
+
+### 2026-08-09 P4 isolated geometry-worker validation
+
+P4 separated learned geometry inference from the COLMAP/gsplat runtime without changing the
+pinned model implementations. The schema-1 IPC equivalence test round-trips every LingBot-Map
+camera, intrinsic, point, color, scale, quaternion, source-ownership, and frame-confidence array
+bit-for-bit through the same compressed NumPy artifact used across the process boundary. The
+existing LingBot-Depth request is routed unchanged to the new executable.
+
+Runtime diagnostics executed actual kernels on the RTX 5080 Laptop GPU:
+
+- LingBot-Map loaded code revision `1f480aeb` and model revision `204754b7`; Windows FlashInfer
+  successfully ran the production 783 x 16 x 64 paged-attention shape on compute capability
+  12.0.
+- LingBot-Depth loaded code revision `f3a237e4`, the SHA-256-verified v0.5 model revision
+  `79204ed6`, and completed its real BF16 SDPA smoke inference.
+- An end-to-end request through the frozen geometry executable processed three physical Femto
+  RGB frames at 518 x 294, returned three finite cameras and 2,857 confidence-gated seeds through
+  atomic IPC, and identified the active backend as Windows FlashInfer paged attention. This is a
+  process-isolation and package validation smoke, not a reconstruction quality claim.
+
+The splat runtime's independent diagnostics continued to validate CUDA PyCOLMAP ALIKED +
+LightGlue and gsplat without importing either LingBot model. Packaging now emits separate
+`splat-runtime/` and `geometry-runtime/` directories and validates each frozen executable
+against only the assets it owns. The parent additionally rejects mismatched LingBot code/model
+revisions or model digest before accepting result arrays.

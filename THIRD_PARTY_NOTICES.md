@@ -1,5 +1,16 @@
 # Third-party notices
 
+## LingBot-Map
+
+ScanLan's optional learned-geometry runtime bundles pinned LingBot-Map source and the
+LingBot-Map long pretrained checkpoint, Copyright 2026 Robbyant Team. The upstream project is
+published under the Apache License 2.0.
+
+- Source: `Robbyant/lingbot-map`, pinned at `1f480aeb8a47a24656090d46d053115b7fe60435`
+- Model: `robbyant/lingbot-map`, pinned at `204754b72bb24f561f8d7e7e1e4e4cd9e809adf9`
+- Model SHA-256: `832bc82cbae0bc9bbe946ef5ee1f7226abd8c0e183ccf8beddbb3d133576f409`
+- License: <https://www.apache.org/licenses/LICENSE-2.0>
+
 ## LingBot-Depth
 
 ScanLan's optional depth-refinement runtime bundles LingBot-Depth source and the LingBot-Depth v0.5 pretrained checkpoint, Copyright 2026 LingBot-Depth Contributors. Both upstream artifacts are published under the Apache License 2.0.

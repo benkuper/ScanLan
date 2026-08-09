@@ -371,6 +371,8 @@ pub struct RuntimeInfo {
     pub reconstruction_worker_available: bool,
     pub splat_worker_available: bool,
     pub splat_status: String,
+    pub geometry_worker_available: bool,
+    pub geometry_status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

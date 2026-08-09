@@ -13,8 +13,6 @@ from .media import (
     prepare_media_dataset,
     prepare_media_observations,
 )
-from .lingbot import lingbot_runtime_status
-from .lingbot_depth import lingbot_depth_runtime_status, refine_depth_request
 from .runtime import pycolmap_feature_runtime
 from .train import train_dataset
 
@@ -93,6 +91,7 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--video-fps", type=float, default=15.0)
     prepare.add_argument("--maximum-video-frames", type=int, default=3_000)
     prepare.add_argument("--maximum-image-dimension", type=int, default=2560)
+    prepare.add_argument("--geometry-worker", type=Path, default=None)
     observations = commands.add_parser("extract-media")
     observations.add_argument("--project", type=Path, required=True)
     observations.add_argument("--source", type=Path, action="append", default=[])
@@ -102,22 +101,13 @@ def parser() -> argparse.ArgumentParser:
     diagnostics = commands.add_parser("diagnostics")
     diagnostics.add_argument("--require-cuda", action="store_true")
     diagnostics.add_argument("--require-learned-features", action="store_true")
-    diagnostics.add_argument("--require-lingbot", action="store_true")
-    diagnostics.add_argument("--require-lingbot-depth", action="store_true")
-    diagnostics.add_argument("--require-flashinfer", action="store_true")
     diagnostics.add_argument("--require-adaptive-frames", action="store_true")
-    refine_depth = commands.add_parser("refine-rgbd-depth")
-    refine_depth.add_argument("--request", type=Path, required=True)
-    refine_depth.add_argument("--progress", type=Path, required=True)
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
-        if arguments.command == "refine-rgbd-depth":
-            refine_depth_request(arguments.request, arguments.progress)
-            return 0
         if arguments.command == "diagnostics":
             import torch
             import gsplat
@@ -126,14 +116,6 @@ def main(argv: list[str] | None = None) -> int:
             if arguments.require_cuda and cuda_available:
                 _cuda_smoke_test()
             feature_runtime = pycolmap_feature_runtime()
-            lingbot_runtime = lingbot_runtime_status(
-                allow_download=arguments.require_lingbot,
-                validate_flashinfer=arguments.require_flashinfer,
-            )
-            lingbot_depth_runtime = lingbot_depth_runtime_status(
-                verify_model=arguments.require_lingbot_depth,
-                smoke_test=arguments.require_lingbot_depth,
-            )
             adaptive_frames = adaptive_frame_selection_status()
             print(
                 json.dumps(
@@ -150,8 +132,7 @@ def main(argv: list[str] | None = None) -> int:
                         "torch": torch.__version__,
                         "gsplat": getattr(gsplat, "__version__", "unknown"),
                         "pycolmap": feature_runtime,
-                        "lingbotMap": lingbot_runtime,
-                        "lingbotDepth": lingbot_depth_runtime,
+                        "learnedGeometryIsolation": "scanlan-geometry",
                         "adaptiveFrames": adaptive_frames,
                     }
                 )
@@ -162,12 +143,6 @@ def main(argv: list[str] | None = None) -> int:
                 and (not cuda_available or not feature_runtime["cudaValidated"])
                 or arguments.require_learned_features
                 and not feature_runtime["learnedValidated"]
-                or arguments.require_lingbot
-                and not lingbot_runtime["available"]
-                or arguments.require_lingbot_depth
-                and not lingbot_depth_runtime["available"]
-                or arguments.require_flashinfer
-                and not lingbot_runtime["flashinferValidated"]
                 or arguments.require_adaptive_frames
                 and not adaptive_frames["enabled"]
                 else 0
@@ -183,10 +158,19 @@ def main(argv: list[str] | None = None) -> int:
                 if arguments.command == "extract-media"
                 else prepare_media_dataset
             )
-            result = prepare(
-                arguments.project.resolve(),
-                arguments.source,
-                media_options,
+            result = (
+                prepare(
+                    arguments.project.resolve(),
+                    arguments.source,
+                    media_options,
+                    geometry_worker=arguments.geometry_worker,
+                )
+                if arguments.command == "prepare-media"
+                else prepare(
+                    arguments.project.resolve(),
+                    arguments.source,
+                    media_options,
+                )
             )
             print(json.dumps(result))
             return 0

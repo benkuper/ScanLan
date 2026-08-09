@@ -2202,9 +2202,6 @@ pub async fn runtime_info(
                     "diagnostics",
                     "--require-cuda",
                     "--require-learned-features",
-                    "--require-lingbot",
-                    "--require-lingbot-depth",
-                    "--require-flashinfer",
                     "--require-adaptive-frames",
                 ]);
                 match command.output() {
@@ -2253,6 +2250,46 @@ pub async fn runtime_info(
                 "Not installed; run npm run prepare:splat".to_string(),
             ),
         };
+        let geometry_worker = first_existing(storage::candidate_geometry_worker_paths(
+            resources.as_deref(),
+        ));
+        let (geometry_worker_available, geometry_status) = match geometry_worker {
+            Some(worker) => {
+                let output = worker_command(&worker)
+                    .args([
+                        "diagnostics",
+                        "--require-lingbot",
+                        "--require-lingbot-depth",
+                        "--require-flashinfer",
+                    ])
+                    .output();
+                match output {
+                    Ok(output) if output.status.success() => (
+                        true,
+                        "Isolated LingBot-Map and LingBot-Depth runtime ready".to_string(),
+                    ),
+                    Ok(output) => {
+                        let detail = output_message(&output);
+                        (
+                            false,
+                            if detail.is_empty() {
+                                "Learned geometry runtime diagnostics failed".to_string()
+                            } else {
+                                detail
+                            },
+                        )
+                    }
+                    Err(error) => (
+                        false,
+                        format!("Could not start learned geometry diagnostics: {error}"),
+                    ),
+                }
+            }
+            None => (
+                false,
+                "Not installed; run npm run prepare:splat".to_string(),
+            ),
+        };
         let sensor_status = if sensor_worker_available {
             format!(
                 "{} capture support ready; the camera opens when recording starts",
@@ -2273,6 +2310,8 @@ pub async fn runtime_info(
             reconstruction_worker_available,
             splat_worker_available,
             splat_status,
+            geometry_worker_available,
+            geometry_status,
         }
     })
     .await
@@ -2284,6 +2323,8 @@ pub async fn runtime_info(
         reconstruction_worker_available: false,
         splat_worker_available: false,
         splat_status: "Splat runtime detection failed".to_string(),
+        geometry_worker_available: false,
+        geometry_status: "Learned geometry runtime detection failed".to_string(),
     });
     Ok(runtime)
 }
