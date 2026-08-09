@@ -58,3 +58,56 @@ Two tuning probes informed the final policy. A forced single-model run selected 
 - Splat/media worker: 34 tests passed.
 - Rust library/job orchestration: 30 tests passed.
 - Svelte/TypeScript diagnostics: 0 errors and 0 warnings; production Vite build completed.
+
+## Realtime RGB-D baseline
+
+Reconstruction 2.0 protects the live path with a reproducible archive-replay benchmark. It
+replays the original ordered RGB-D observations through the production realtime executable,
+paces them from device timestamps by default, and records:
+
+- pose, point-map, and mesh publication latency (median, p95, and maximum);
+- processed, accepted, rejected, and integrated frame counts;
+- source, tracking, mapping, and journal queue drops;
+- tracking-state and relocalization counts;
+- peak worker working set and NVIDIA process memory when available;
+- final point/triangle counts and post-stop provisional/journal availability;
+- the fail-closed invariant that no rejected frame is marked integrated.
+
+Run the canonical benchmark against a representative capture with:
+
+```powershell
+.\build\worker-venv\Scripts\python.exe -m scanlan.cli benchmark-live `
+  C:\path\to\capture-phase --mode mesh --device cuda `
+  --session build\live-baseline-session `
+  --report build\live-baseline.json
+```
+
+Use `--no-realtime-pacing` as a separate overload test. It is not comparable to the
+interactive latency result because it deliberately feeds the engine faster than the sensor.
+Machine- and scene-specific results belong in dated benchmark records; acceptance decisions
+must not be inferred from synthetic fixtures alone.
+
+### 2026-08-09 physical Femto baseline
+
+The first Reconstruction 2.0 baseline replayed the existing 81-frame physical Femto Mega
+capture `femto-live-smoke-6c9808ce` at its recorded 9.99 fps through the CUDA mesh profile on
+the RTX 5080 Laptop GPU. This short, mostly static smoke capture validates the measurement
+path and freezes current behavior; it is not the room-scale release scene.
+
+| Metric | Baseline |
+| --- | ---: |
+| Pose latency | 31.0 ms median / 46.25 ms p95 |
+| Point-map publication latency | 47.0 ms median / 718.7 ms p95 |
+| Mesh publication latency | 70.5 ms median / 1,214.25 ms p95 |
+| Accepted / integrated | 71 / 15 frames |
+| Final provisional geometry | 59,263 points / 105,468 triangles |
+| Tracking / mapping / journal drops | 10 / 0 / 0 |
+| Peak worker working set | 923.33 MiB |
+| Post-stop point packet / tracking journal | available / available |
+
+The 160 reported source gaps are archive-rate sequence gaps from replaying a 10 fps archive
+that was captured from a roughly 30 fps sensor stream; they are not benchmark-induced archive
+loss. Per-process NVIDIA memory was unavailable through `nvidia-smi` under the active Windows
+driver, so this run does not establish the VRAM baseline. The high first-publication outliers
+also show why P1/P2 must separate warm-up, map-update cadence, and steady-state latency rather
+than relying on tracking fps alone.

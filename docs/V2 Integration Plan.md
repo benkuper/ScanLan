@@ -1,0 +1,926 @@
+# ScanLan Reconstruction 2.0 — Revised Master Plan
+
+## 1. Core product definition
+
+ScanLan must produce three distinct reconstruction products from every capture:
+
+### A. Live reconstruction preview
+
+Available during recording or progressive video processing:
+
+* continuously estimated camera pose;
+* accumulated scene geometry;
+* camera trajectory and frustum;
+* tracking confidence;
+* coverage and missing-area guidance;
+* visible relocalization and loop-correction behavior;
+* bounded latency and memory.
+
+This is a real reconstruction, not merely a current-frame point cloud.
+
+### B. Immediate provisional reconstruction
+
+Available as soon as recording stops:
+
+* preserves the final live map;
+* remains inspectable while production processing starts;
+* can be exported as a clearly identified provisional point cloud or mesh;
+* never blocks access to the raw capture.
+
+### C. Production reconstruction
+
+Built asynchronously after capture:
+
+* reruns or refines the trajectory;
+* performs global optimization;
+* reintegrates original observations;
+* runs learned geometry, material, PBR and Gaussian stages;
+* replaces the provisional result only after validation.
+
+The current ScanLan live path already performs quality-gated RGB-D tracking, weighted TSDF integration, point snapshots and an optional low-rate mesh. That becomes a protected first-class subsystem rather than an implementation detail.
+
+---
+
+# 2. Revised architectural principle
+
+The application must have two deliberately separate compute lanes:
+
+```text
+                    CAPTURE-TIME LANE
+                    hard latency budget
+                           │
+RGB-D / video input ───────┼──► tracking
+                           │
+                           ├──► local map integration
+                           │
+                           ├──► coverage analysis
+                           │
+                           └──► reconstruction preview
+                                      │
+                                      ▼
+                            provisional live map
+                                      │
+                                      │ raw observations remain authoritative
+                                      ▼
+                   PRODUCTION-TIME LANE
+                    quality-first processing
+                                      │
+                           global camera refinement
+                                      │
+                           learned geometry backends
+                                      │
+                           final dense fusion / SDF
+                                      │
+                           materials and PBR
+                                      │
+                           optimized Gaussian splat
+                                      │
+                                      ▼
+                           final validated outputs
+```
+
+The production lane may use LingBot, MapAnything, DA3, neural SDF, material segmentation and inverse rendering.
+
+The RGB-D capture-time lane must not depend on any of them.
+
+For RGB-only video, a learned streaming backend is necessary to obtain depth and poses, but it still operates under a separate bounded preview profile rather than the full production profile.
+
+---
+
+# 3. Updated non-negotiable requirements
+
+1. **Realtime reconstruction preview is a release-blocking feature.**
+
+2. **Capture never waits for reconstruction preview.** Sensor acquisition, archive writing, preview integration and viewport rendering remain independent bounded queues.
+
+3. **Realtime preview never modifies raw observations.**
+
+4. **Production work never runs concurrently with an active RGB-D capture on the same GPU unless an explicit resource test proves sufficient headroom.**
+
+5. **The viewport render rate is independent from map-update rate.** A 60 Hz viewport may render geometry that is updated at 10 Hz.
+
+6. **Tracking failure freezes integration rather than corrupting the live map.**
+
+7. **Loop corrections transform live submaps instead of rebuilding the entire scene during capture.**
+
+8. **The production pass always has the right to reject and rebuild the live trajectory.**
+
+9. **Live RGB-only video geometry is explicitly marked provisional and scale-qualified.**
+
+10. **Material segmentation and PBR reconstruction are not allowed to jeopardize capture latency.**
+
+11. **A low-confidence live preview must communicate uncertainty visibly rather than hide it behind smooth rendering.**
+
+12. **The final live map survives application workspace transitions and remains visible immediately after capture.**
+
+---
+
+# 4. Realtime RGB-D reconstruction architecture
+
+## 4.1 Capture stages
+
+```text
+sensor acquisition
+      │
+      ├──► bounded archive writer
+      │
+      └──► bounded realtime queue
+                    │
+                    ▼
+             depth preparation
+                    │
+                    ▼
+             camera tracking
+                    │
+             accepted pose?
+               │         │
+              yes        no
+               │         └──► freeze integration + relocalize
+               ▼
+          keyframe decision
+               │
+               ▼
+        active submap fusion
+               │
+        ┌──────┴─────────┐
+        ▼                ▼
+ preview geometry   coverage map
+        │                │
+        └──────┬─────────┘
+               ▼
+             viewport
+```
+
+## 4.2 Tracking
+
+Keep the current deterministic tracking foundation:
+
+* calibrated RGB-D odometry;
+* gyro initialization where available;
+* overlap and depth-residual gates;
+* physical-motion gates;
+* recent-anchor relocalization;
+* fail-closed integration.
+
+Upgrade it with:
+
+* explicit tracking-state confidence;
+* pose covariance or a practical uncertainty approximation;
+* tracking-quality history;
+* separate `TRACKING`, `SEARCHING`, `RELOCALIZED`, `FROZEN` and `FAILED` states;
+* keyframe descriptors retained for local relocalization and loop detection;
+* deterministic replay tests for every tracker change.
+
+Learned models may assist production relocalization later, but do not become mandatory for live RGB-D tracking.
+
+---
+
+# 5. Live map representation
+
+## 5.1 Submap-based fusion
+
+Replace the conceptual single ever-growing live volume with bounded local submaps.
+
+Each submap contains:
+
+* local origin;
+* local trajectory segment;
+* voxel-hashed TSDF or surfels;
+* color;
+* normal;
+* observation count;
+* confidence;
+* approximate coverage;
+* bounding volume.
+
+A new submap begins when one or more conditions are reached:
+
+* distance from current submap origin;
+* rotation accumulation;
+* voxel or memory budget;
+* tracking discontinuity;
+* take boundary;
+* substantial loop correction.
+
+Completed submaps become immutable during normal capture except for their global transform.
+
+## 5.2 Why submaps are required
+
+They allow ScanLan to:
+
+* bound active GPU memory;
+* avoid rebuilding an entire room after loop closure;
+* correct drift by moving submaps;
+* stream old submaps to host memory;
+* preserve responsive rendering in large scenes;
+* isolate tracking failures;
+* reuse the same representation for RGB-only video preview.
+
+## 5.3 Live representation hierarchy
+
+The live engine should support three progressively heavier display forms.
+
+### Default: surfel or fused-point preview
+
+* fastest update;
+* suitable for continuous capture;
+* preserves color and normals;
+* straightforward confidence visualization;
+* preferred when tracking headroom is limited.
+
+### Enhanced: TSDF raycast preview
+
+* visually denser and easier to interpret;
+* updated from the active sparse volume;
+* avoids constant triangle extraction;
+* recommended balanced default where the CUDA implementation supports it efficiently.
+
+### Optional: asynchronous mesh preview
+
+* extracted from completed or active submaps;
+* lower update rate;
+* never blocks tracking or fusion;
+* useful for topology inspection rather than primary responsiveness.
+
+A lightweight “Gaussianized surfel” renderer may later draw each fused surfel as an oriented disc. This can improve visual density without running Gaussian optimization during capture.
+
+Full 2DGS/3DGS training does not belong in the RGB-D capture loop.
+
+---
+
+# 6. Live submap corrections and loop closure
+
+## 6.1 During capture
+
+The live system performs bounded loop detection:
+
+* recent keyframe relocalization continuously;
+* nonlocal loop queries at a controlled rate;
+* strict geometric verification;
+* local pose-graph correction;
+* submap-transform update.
+
+It does not globally reintegrate all archived depth during recording.
+
+## 6.2 Visual correction behavior
+
+When a loop is accepted:
+
+1. calculate corrected submap transforms;
+2. interpolate viewport transforms over a short interval;
+3. update camera trajectory and coverage;
+4. preserve active tracking continuity;
+5. mark the live map as corrected;
+6. record the loop for production validation.
+
+This prevents a distracting single-frame map jump while avoiding false geometry blending.
+
+## 6.3 After capture
+
+Production reconstruction:
+
+* verifies all loops again;
+* performs the full pose-graph solve;
+* rejects unsafe corrections;
+* reintegrates original depth using final poses;
+* replaces the provisional submaps with final geometry.
+
+The live map is not treated as the final fusion source.
+
+---
+
+# 7. Realtime coverage guidance
+
+The preview must help the user improve the scan, not merely show geometry.
+
+Maintain a low-resolution coverage field containing:
+
+* observation count;
+* best viewing angle;
+* estimated pixel density;
+* depth confidence;
+* pose confidence;
+* recent visibility;
+* material-risk status where available.
+
+Viewport modes:
+
+### Normal
+
+Colored accumulated reconstruction.
+
+### Coverage
+
+* well observed;
+* weakly observed;
+* single-view only;
+* unseen or hole boundary.
+
+### Tracking
+
+* trusted map;
+* recently integrated geometry;
+* frozen geometry;
+* uncertain trajectory;
+* relocalization anchors.
+
+### Geometry confidence
+
+* measured and repeatedly observed;
+* single observation;
+* learned or repaired;
+* rejected/unknown.
+
+### Material-risk preview
+
+Later optional overlay:
+
+* likely glass;
+* mirror;
+* polished metal;
+* emissive display;
+* thin/fibrous material;
+* dynamic object.
+
+User guidance should be concrete:
+
+* move slower;
+* return to last trusted region;
+* increase parallax;
+* revisit this surface;
+* close the loop;
+* surface may be glass or reflective;
+* coverage is one-sided;
+* depth is unavailable here.
+
+---
+
+# 8. Compute and memory scheduling
+
+## 8.1 Capture has absolute priority
+
+Resource priority:
+
+```text
+1. camera acquisition
+2. archive persistence
+3. pose tracking
+4. live fusion
+5. reconstruction rendering
+6. coverage analysis
+7. optional loop queries
+8. optional material-risk inference
+```
+
+Lower-priority work is skipped or delayed before higher-priority work is allowed to miss its budget.
+
+## 8.2 Bounded queues
+
+Use latest-wins queues for:
+
+* viewport geometry snapshots;
+* coverage overlays;
+* optional mesh extraction;
+* optional material analysis.
+
+Use ordered queues for:
+
+* archived raw observations;
+* tracking frames;
+* pose journal entries.
+
+Queue pressure is visible in diagnostics.
+
+## 8.3 Adaptive degradation ladder
+
+When the live system exceeds its latency or memory budget:
+
+1. reduce viewport geometry publication frequency;
+2. pause live mesh extraction;
+3. reduce raycast resolution;
+4. reduce coverage-analysis frequency;
+5. reduce nonlocal loop-query frequency;
+6. integrate fewer keyframes while continuing to track every frame;
+7. temporarily switch from TSDF raycast to surfel rendering;
+8. freeze integration if pose quality becomes unsafe.
+
+It must not:
+
+* reduce archive fidelity silently;
+* skip tracking solely to preserve UI smoothness;
+* continue integrating stale poses;
+* allow memory to grow without a hard ceiling.
+
+## 8.4 GPU isolation
+
+On the 12 GB target GPU:
+
+* the realtime engine receives a fixed configurable VRAM budget;
+* the active submap remains on GPU;
+* completed submaps may be compacted or moved to host memory;
+* preview rendering uses bounded buffers;
+* production learned models are unloaded during capture;
+* post-capture workers release one large model before loading another.
+
+The system should explicitly report:
+
+* allocated live-map memory;
+* active voxel/surfel count;
+* resident submap count;
+* host-cached submap count;
+* dropped preview jobs;
+* pose and map-update latency.
+
+---
+
+# 9. Realtime material handling
+
+Material-aware reconstruction remains in the roadmap, but its capture-time role is deliberately limited.
+
+## Stage 1: initial release
+
+During RGB-D capture:
+
+* no full material segmentation model;
+* no inverse rendering;
+* no PBR estimation;
+* no material-aware remeshing.
+
+Use fast geometric signals only:
+
+* missing depth;
+* unstable depth;
+* multiview disagreement;
+* high RGB variation;
+* likely dynamic regions.
+
+Material analysis begins immediately after capture.
+
+## Stage 2: optional asynchronous optical-risk model
+
+Run a compact model on selected keyframes at a low rate to identify:
+
+* glass/transmission;
+* mirror;
+* polished metal;
+* emissive screens;
+* dynamic people or objects;
+* sky for outdoor captures.
+
+Rules:
+
+* runs only when tracking and fusion have headroom;
+* uses a latest-wins queue;
+* never blocks capture;
+* initially affects the overlay only;
+* does not alter live fusion until separately benchmarked.
+
+## Stage 3: conservative live policy
+
+After validation, optical risk may influence live fusion:
+
+* reflective/transmissive regions receive lower generated-depth authority;
+* unstable regions are displayed but not repaired live;
+* screen content is excluded from appearance normalization;
+* suspected glass holes remain unknown.
+
+The final material segmentation, PBR estimation and material-aware second fusion remain production stages.
+
+---
+
+# 10. RGB-only video reconstruction preview
+
+This becomes an explicit secondary workstream rather than an undefined future possibility.
+
+## 10.1 Supported scenarios
+
+### Live RGB camera
+
+Use a webcam, phone stream or supported video camera as a live reconstruction source.
+
+### Progressive imported video
+
+Play through an existing video file while progressively constructing the scene.
+
+Both use the same ordered-frame reconstruction API.
+
+## 10.2 Pipeline
+
+```text
+video decode or live frames
+        │
+        ▼
+bounded quality/motion sampling
+        │
+        ▼
+streaming learned pose + depth
+ LingBot-Map initially
+        │
+        ▼
+confidence and continuity gates
+        │
+        ▼
+local RGB-derived submap
+        │
+        ▼
+provisional reconstruction preview
+```
+
+LingBot-Map is the initial backend because ScanLan already integrates its ordered streaming model and bounded context logic.
+
+DA3-Streaming and MapAnything become alternative backends after the generic geometry-worker contract exists.
+
+## 10.3 Video preview behavior
+
+The preview must show:
+
+* reconstructed local geometry;
+* provisional camera trajectory;
+* scale status;
+* pose confidence;
+* submap boundaries;
+* drift estimate;
+* accepted and rejected frames;
+* areas supported by multiple views;
+* learned-only geometry.
+
+Scale labels:
+
+```text
+MODEL_METRIC_UNVERIFIED
+MODEL_METRIC_VALIDATED
+USER_CALIBRATED
+RELATIVE_SCALE
+```
+
+The UI must not imply calibrated metric accuracy when it has not been established.
+
+## 10.4 Drift control
+
+Use:
+
+* streaming model context;
+* local feature tracking;
+* optical-flow continuity;
+* keyframe overlap;
+* local submaps;
+* periodic loop candidates;
+* optional sparse high-resolution anchors;
+* user-visible drift state.
+
+During live video capture, do not run full COLMAP mapping on every frame.
+
+After stop:
+
+1. run learned-first camera proposal;
+2. select high-value anchors;
+3. perform high-resolution feature verification;
+4. run bundle adjustment;
+5. correct submap transforms;
+6. reintegrate dense depth;
+7. produce final point cloud, mesh and GS.
+
+## 10.5 Failure behavior
+
+When live video tracking becomes unsafe:
+
+* stop integrating geometry;
+* keep recording video;
+* continue searching for relocalization;
+* display the last valid map;
+* allow a new provisional submap if relocalization fails;
+* attempt multi-submap registration after capture.
+
+RGB-only live preview never contaminates the final result merely because it rendered successfully.
+
+---
+
+# 11. Live reconstruction artifacts
+
+Add a dedicated live-session artifact:
+
+```text
+outputs/live/
+    session.json
+    poses.jsonl
+    submaps/
+    coverage/
+    latest-preview.ply
+    latest-preview.glb
+    tracking-summary.json
+```
+
+`session.json` records:
+
+* source type;
+* live-engine revision;
+* calibration;
+* submap definitions;
+* provisional scale status;
+* tracking statistics;
+* accepted loops;
+* rejected loops;
+* queue drops;
+* peak memory;
+* final live-map fingerprint.
+
+At capture stop:
+
+* publish the live artifact atomically;
+* make it immediately visible in Reconstruct;
+* begin production reconstruction from raw observations;
+* retain the live artifact for A/B diagnosis;
+* never overwrite it with the production result.
+
+---
+
+# 12. Revised implementation order
+
+The previous roadmap should be reordered so realtime reconstruction is secured before expanding the offline model stack.
+
+## P0 — Freeze current baseline
+
+Benchmark:
+
+* current RGB-D tracking;
+* accumulated point preview;
+* live mesh;
+* latency;
+* queue behavior;
+* memory;
+* relocalization;
+* current post-stop artifact availability.
+
+Include live-preview metrics in the canonical benchmark report.
+
+## P1 — Realtime reconstruction contract
+
+Define:
+
+* tracking states;
+* live submap format;
+* preview geometry messages;
+* coverage messages;
+* latency telemetry;
+* memory telemetry;
+* capture/preview failure policy;
+* immediate provisional artifact.
+
+This phase changes interfaces, not algorithms.
+
+## P2 — Harden the RGB-D live engine
+
+Implement:
+
+* submap management;
+* sparse bounded fusion;
+* independent render/update rates;
+* adaptive degradation ladder;
+* persistent post-stop live map;
+* coverage visualization;
+* tracking-confidence visualization.
+
+Maintain the existing path as fallback during development.
+
+## P3 — Live relocalization and bounded loop correction
+
+Implement:
+
+* local anchor database;
+* verified loop candidates;
+* submap pose graph;
+* smooth viewport correction;
+* deterministic replay tests;
+* production revalidation.
+
+## P4 — Geometry-worker scaffold
+
+Create the isolated learned-model worker and migrate:
+
+* LingBot-Map;
+* LingBot-Depth.
+
+Preserve output equivalence.
+
+## P5 — RGB-only progressive preview
+
+Implement experimental:
+
+* LingBot streaming inference;
+* local learned-depth submaps;
+* drift/confidence visualization;
+* progressive imported-video processing;
+* optional live RGB camera input.
+
+This remains feature-flagged until acceptance gates pass.
+
+## P6 — ScanLan validation engine
+
+Implement generic camera, scale, depth, free-space and geometry validation shared by live-video and production backends.
+
+## P7 — MapAnything integration
+
+Add:
+
+* RGB-D completion;
+* photo camera/depth proposals;
+* short-video challenger.
+
+## P8 — DA3 integration
+
+Add:
+
+* photo and video geometry challenger;
+* pose-conditioned depth;
+* streaming evaluation;
+* optional direct-Gaussian initialization.
+
+## P9 — Learned-first production camera solving
+
+Convert video and photo production reconstruction to:
+
+* learned proposal;
+* guided pair selection;
+* geometric verification;
+* high-resolution bundle adjustment;
+* camera recovery.
+
+## P10 — Unified dense fusion
+
+Use one confidence/provenance-aware path for:
+
+* RGB-D;
+* photos;
+* video;
+* hybrid projects.
+
+Produce point clouds and meshes for every source type.
+
+## P11 — Optional neural-SDF production surface
+
+Add only for Max Quality and only after camera/depth validation.
+
+## P12 — Gaussian initialization and production optimization
+
+Generalize sparse, dense and direct learned initialization while retaining source-resolution gsplat optimization.
+
+## P13 — Material and radiometric foundation
+
+Add:
+
+* material contracts;
+* linear-light preparation;
+* model bake-off;
+* commercial/research pack separation.
+
+## P14 — Two-pass material analysis
+
+Add:
+
+* coarse optical-risk pass;
+* final multiview material analysis;
+* 3D material-region fusion.
+
+## P15 — Material-aware geometry
+
+Add:
+
+* material-dependent depth confidence;
+* reflective/transmissive protection;
+* material-aware repair;
+* second-pass surface refinement.
+
+## P16 — PBR reconstruction and export
+
+Add:
+
+* base color;
+* roughness;
+* metallic;
+* transmission;
+* normal;
+* emission;
+* observed and intrinsic atlases;
+* GLB PBR output.
+
+## P17 — Material-aware Gaussian reconstruction
+
+Separate diffuse, view-dependent, emissive and transmissive behavior in the production trainer.
+
+## P18 — Adaptive backend policy
+
+Select live and production backends from benchmarked source, hardware and quality characteristics.
+
+## P19 — Full validation and default selection
+
+Run the complete:
+
+* RGB-D;
+* video;
+* photos;
+* hybrid;
+* material;
+* reflective/transmissive;
+* 12 GB memory;
+* cancellation/resume;
+
+release matrix before changing defaults.
+
+---
+
+# 13. Realtime acceptance gates
+
+## RGB-D live preview
+
+Target acceptance criteria:
+
+* capture and archive fidelity are unchanged by preview load;
+* tracking processes the full intended sensor stream or explicitly reports degraded operation;
+* p95 visible preview latency remains within the defined interactive budget;
+* point/surfel or raycast geometry updates are frequent enough for active scan guidance;
+* viewport rendering remains responsive independently of geometry-update frequency;
+* optional mesh extraction cannot stall tracking;
+* memory remains bounded during long room-scale captures;
+* integration stops within one frame of an unsafe tracking decision;
+* relocalization does not integrate intermediate invalid poses;
+* loop correction moves submaps without generating duplicate geometry;
+* stopping capture immediately exposes the final provisional map;
+* raw capture remains usable if the live engine crashes.
+
+Recommended performance targets for the 12 GB reference machine:
+
+```text
+viewport rendering:             30 FPS minimum sustained, 60 FPS target
+pose age visible to viewport:   below 100 ms p95
+point/surfel map update:        10 Hz or better target
+TSDF raycast update:            10 Hz or better target where enabled
+mesh update:                    0.5–1 Hz target
+tracking-loss integration stop: immediate
+capture queue growth:           bounded
+live-map memory:                hard capped
+```
+
+These are engineering targets and must be adjusted only from measured reference-scene data.
+
+## RGB-only video preview
+
+Initial acceptance criteria:
+
+* first provisional geometry appears quickly after startup;
+* the preview progresses without storing an unbounded model context;
+* frame processing never blocks recording;
+* stale inference work is dropped safely;
+* local geometry remains stable over short windows;
+* drift is measured and displayed;
+* integration freezes on unsafe pose/depth;
+* post-stop BA can correct the provisional trajectory;
+* final production output is not degraded by provisional errors;
+* scale status is always explicit.
+
+RGB-only live preview may remain experimental longer than RGB-D preview, but its architecture must be established before the production learned-backend integrations are finalized.
+
+---
+
+# 14. Updated definition of done
+
+The complete program now requires all of the following:
+
+1. RGB-D recording immediately builds an accumulated reconstruction preview.
+
+2. The live preview contains fused scene geometry rather than only the current camera frame.
+
+3. Tracking, integration and rendering have independent bounded pipelines.
+
+4. The user can identify unscanned, weakly scanned and uncertain areas during capture.
+
+5. Tracking loss visibly freezes integration and supports relocalization.
+
+6. Verified loop closures can correct live submaps without full reintegration.
+
+7. The provisional live reconstruction remains available immediately after capture.
+
+8. Production reconstruction always starts from raw observations, not the provisional mesh.
+
+9. Production work never compromises an active RGB-D capture.
+
+10. Long captures remain bounded through active and completed submaps.
+
+11. Photos and video can later use LingBot, MapAnything and DA3 through the shared geometry contracts.
+
+12. RGB-only video supports progressive reconstruction preview with explicit drift and scale status.
+
+13. RGB-only video recording continues safely even when preview tracking fails.
+
+14. Full material segmentation and PBR reconstruction remain off the capture-critical path.
+
+15. Optional optical-risk detection can eventually assist live guidance without blocking tracking.
+
+16. Final material-aware geometry can reinterpret uncertain live regions after capture.
+
+17. Every live and final surface retains confidence and provenance.
+
+18. Point cloud, mesh, PBR mesh and Gaussian outputs remain independent validated products.
+
+19. The 12 GB target retains enough GPU headroom for stable realtime RGB-D reconstruction.
+
+20. Realtime reconstruction quality, latency and reliability become protected benchmark gates for every subsequent architecture change.

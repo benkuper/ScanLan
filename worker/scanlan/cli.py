@@ -71,6 +71,23 @@ def parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("capture", type=Path)
 
+    benchmark_live = commands.add_parser(
+        "benchmark-live",
+        help="Replay a capture through the realtime engine and report latency and memory",
+    )
+    benchmark_live.add_argument("capture", type=Path)
+    benchmark_live.add_argument("--mode", choices=["points", "mesh"], default="mesh")
+    benchmark_live.add_argument("--voxel-size", type=float, default=0.01)
+    benchmark_live.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    benchmark_live.add_argument("--session", type=Path, default=None)
+    benchmark_live.add_argument("--report", type=Path, default=None)
+    benchmark_live.add_argument(
+        "--realtime-pacing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Replay using capture timestamps (disable for an overload stress run)",
+    )
+
     localize = commands.add_parser(
         "localize-photos",
         help="Pose high-resolution photos against an existing RGB-D reconstruction",
@@ -112,6 +129,21 @@ def main(argv: list[str] | None = None) -> int:
             from .replay import replay_archive
 
             replay_archive(arguments.capture, sys.stdout.buffer)
+            return 0
+        if arguments.command == "benchmark-live":
+            from .live_benchmark import benchmark_live_capture
+
+            result = benchmark_live_capture(
+                arguments.capture,
+                mode=arguments.mode,
+                voxel_size_m=arguments.voxel_size,
+                device=arguments.device,
+                paced=arguments.realtime_pacing,
+                session_root=arguments.session,
+            )
+            if arguments.report is not None:
+                write_json(arguments.report, result)
+            print(json.dumps(result, indent=2))
             return 0
         if arguments.command in {"localize-photos", "localize-media"}:
             from .supplemental import localize_supplemental_photos
