@@ -169,6 +169,40 @@ class CoverageField:
                 cell.pose_confidence = max(cell.pose_confidence, pose_confidence)
                 cell.last_sequence = frame.sequence
 
+    def transform(self, global_correction: np.ndarray) -> None:
+        """Move the bounded guidance field when the live map closes a loop."""
+        if not self.cells:
+            return
+        correction = np.asarray(global_correction, dtype=np.float64)
+        transformed: dict[tuple[int, int, int], _CoverageCell] = {}
+        for key, cell in sorted(self.cells.items()):
+            center = (np.asarray(key, dtype=np.float64) + 0.5) * self.voxel_size_m
+            corrected = correction[:3, :3] @ center + correction[:3, 3]
+            corrected_key = tuple(
+                int(value)
+                for value in np.floor(corrected / self.voxel_size_m).astype(np.int32)
+            )
+            existing = transformed.get(corrected_key)
+            if existing is None:
+                transformed[corrected_key] = _CoverageCell(
+                    cell.observations,
+                    cell.best_pixel_density,
+                    cell.pose_confidence,
+                    cell.last_sequence,
+                )
+            else:
+                existing.observations = min(
+                    65_535, existing.observations + cell.observations
+                )
+                existing.best_pixel_density = max(
+                    existing.best_pixel_density, cell.best_pixel_density
+                )
+                existing.pose_confidence = max(
+                    existing.pose_confidence, cell.pose_confidence
+                )
+                existing.last_sequence = max(existing.last_sequence, cell.last_sequence)
+        self.cells = transformed
+
     def summary(self, tracking_confidence: float) -> CoverageSummary:
         total = len(self.cells)
         if total == 0:
@@ -230,4 +264,3 @@ def tracking_colors(point_count: int, state: str, confidence: float) -> np.ndarr
 def rotation_degrees(matrix: np.ndarray) -> float:
     trace = min(3.0, max(-1.0, float(np.trace(matrix[:3, :3]))))
     return math.degrees(math.acos(min(1.0, max(-1.0, (trace - 1.0) * 0.5))))
-

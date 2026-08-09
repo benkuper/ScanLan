@@ -43,6 +43,11 @@ host geometry and can later move through pose-graph corrections. The capture vie
 switch between normal color, coverage, tracking, and confidence views without changing the
 sensor, archive, tracking, or fusion rates.
 
+Nonlocal live loops are queried only at bounded submap boundaries and accepted only after
+strict metric ICP verification. Accepted pose-graph corrections move existing rigid submaps
+over 350 ms without reintegration or duplicate geometry, while `live_loops.jsonl` records every
+decision for independent production revalidation.
+
 The compact `tracking.jsonl` journal feeds accepted live poses into the production pass. A rejected live pose does not discard its archived pixels: the final pass keeps consecutive RGB-D frames for fresh offline odometry, then refines short trajectory fragments, verifies nonlocal loop candidates, globally optimizes a pose graph, registers separate takes, and rebuilds the selected outputs from archived calibrated RGB-D data.
 
 See [architecture](docs/architecture.md), [archive format](docs/scan-format.md), and [reconstruction details](docs/reconstruction.md).

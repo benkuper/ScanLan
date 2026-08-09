@@ -420,6 +420,8 @@ pub struct CaptureStatus {
     pub host_cached_submap_count: u32,
     pub dropped_preview_job_count: u64,
     pub degradation_level: u8,
+    pub loop_closure_count: u32,
+    pub loop_correction_active: bool,
     pub live_scale_status: String,
     pub integration_frozen: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,6 +545,10 @@ pub struct LiveReconstructionStatus {
     pub mapping_queue_depth: u32,
     #[serde(default)]
     pub degradation_level: u8,
+    #[serde(default)]
+    pub loop_closure_count: u32,
+    #[serde(default)]
+    pub loop_correction_active: bool,
     #[serde(default)]
     pub scale_status: String,
     #[serde(default)]

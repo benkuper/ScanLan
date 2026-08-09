@@ -104,3 +104,29 @@ share bounded point snapshots, coverage is refreshed at a lower adaptive cadence
 extraction runs only at degradation level zero. The hysteretic pressure controller first lowers
 publication rates, then pauses mesh/coverage work, and finally integrates fewer keyframes; it
 never reduces archive fidelity or skips pose tracking.
+
+## Live relocalization and loop correction
+
+The tracker owns a 48-entry local anchor database. It retains the first accepted view, a
+deterministically thinned capture-wide history, and the eight newest anchors; a rotating query
+therefore searches the whole take without turning tracking loss into an unbounded GPU search.
+Recovery still requires three temporally consistent, depth-verified observations, and neither
+the lock frame nor any intermediate rejected pose is fused.
+
+Completed submaps are nodes in a bounded rigid pose graph. Adjacent nodes are certain odometry
+edges. On submap completion, at most three non-adjacent candidates are queried when the adaptive
+controller has headroom. A candidate becomes an uncertain loop edge only after robust
+point-to-plane ICP passes overlap, correspondence, metric residual, translation, and rotation
+gates. ScanLan uses Open3D's documented
+[multiway pose-graph model](https://open3d.org/docs/latest/tutorial/Advanced/multiway_registration.html),
+then rejects an optimized graph whose node correction or verified-loop residual exceeds the
+live safety limits.
+
+An accepted solve changes rigid submap transforms only: depth is not reintegrated and point
+buffers are not duplicated. The viewport interpolates each correction for 350 ms, while a
+separate map-to-odometry transform preserves active tracking continuity and places future
+submaps in the corrected frame. The coverage field receives the same map-frame correction.
+Every accepted and rejected loop decision is written asynchronously to `live_loops.jsonl` for
+production revalidation. The final stop artifact settles the exact optimized transforms;
+production still reruns tracking, verifies loops from raw RGB-D, and may reject every live
+decision.

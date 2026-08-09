@@ -143,6 +143,10 @@ struct RealtimeEngineStatusMessage {
     #[serde(default)]
     degradation_level: u8,
     #[serde(default)]
+    loop_closure_count: u32,
+    #[serde(default)]
+    loop_correction_active: bool,
+    #[serde(default)]
     scale_status: String,
     #[serde(default)]
     integration_frozen: bool,
@@ -1577,6 +1581,8 @@ fn read_realtime_engine_stream(
                         tracking_queue_depth: message.tracking_queue_depth,
                         mapping_queue_depth: message.mapping_queue_depth,
                         degradation_level: message.degradation_level,
+                        loop_closure_count: message.loop_closure_count,
+                        loop_correction_active: message.loop_correction_active,
                         scale_status: message.scale_status,
                         integration_frozen: message.integration_frozen,
                     };
@@ -1855,6 +1861,19 @@ fn save_live_reconstruction_preview(
     if let Ok(bytes) = fs::read(&journal) {
         write_export(&live_root.join("poses.jsonl"), &bytes)?;
     }
+    let loop_journal = phase_root.join("live_loops.jsonl");
+    let loop_decisions = fs::read_to_string(&loop_journal)
+        .ok()
+        .map(|value| {
+            value
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Ok(bytes) = fs::read(&loop_journal) {
+        write_export(&live_root.join("loops.jsonl"), &bytes)?;
+    }
     if let Some(coverage) = &snapshot.coverage {
         storage::write_json(&live_root.join("coverage").join("latest.json"), coverage)?;
     }
@@ -1873,6 +1892,7 @@ fn save_live_reconstruction_preview(
         "calibration": phase_manifest.as_ref().and_then(|value| value.get("camera")),
         "sensor": phase_manifest.as_ref().and_then(|value| value.get("sensor")),
         "submaps": snapshot.submaps.as_ref().and_then(|value| value.get("submaps")).cloned().unwrap_or_else(|| serde_json::json!([])),
+        "poseGraph": snapshot.submaps.as_ref().and_then(|value| value.get("poseGraph")).cloned(),
         "coverage": snapshot.coverage.clone(),
         "provisionalScaleStatus": if snapshot.status.scale_status.is_empty() { "SENSOR_METRIC" } else { snapshot.status.scale_status.as_str() },
         "trackingStatistics": {
@@ -1882,8 +1902,8 @@ fn save_live_reconstruction_preview(
             "integratedFrames": snapshot.status.integrated_frames,
             "trackingConfidence": snapshot.status.tracking_confidence
         },
-        "acceptedLoops": [],
-        "rejectedLoops": [],
+        "acceptedLoops": loop_decisions.iter().filter(|value| value.get("accepted").and_then(|accepted| accepted.as_bool()).unwrap_or(false)).cloned().collect::<Vec<_>>(),
+        "rejectedLoops": loop_decisions.iter().filter(|value| !value.get("accepted").and_then(|accepted| accepted.as_bool()).unwrap_or(false)).cloned().collect::<Vec<_>>(),
         "queueDrops": {
             "source": snapshot.status.source_drops,
             "tracking": snapshot.status.tracking_queue_drops,
@@ -1893,6 +1913,7 @@ fn save_live_reconstruction_preview(
         "peakMemory": {
             "allocatedLiveMapBytes": snapshot.status.allocated_live_map_bytes
         },
+        "loopClosureCount": snapshot.status.loop_closure_count,
         "finalLiveMapFingerprint": live_map_fingerprint(packet.as_ref()),
         "preview": {
             "frameSequence": snapshot.points.as_ref().map(|frame| frame.frame_count),
@@ -3162,6 +3183,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             host_cached_submap_count: 0,
             dropped_preview_job_count: 0,
             degradation_level: 0,
+            loop_closure_count: 0,
+            loop_correction_active: false,
             live_scale_status: "SENSOR_METRIC".to_string(),
             integration_frozen: false,
             depth_rmse_mm: None,
@@ -3419,6 +3442,14 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
                 .as_ref()
                 .map(|status| status.degradation_level)
                 .unwrap_or(0),
+            loop_closure_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.loop_closure_count)
+                .unwrap_or(0),
+            loop_correction_active: live_reconstruction
+                .as_ref()
+                .map(|status| status.loop_correction_active)
+                .unwrap_or(false),
             live_scale_status: live_reconstruction
                 .as_ref()
                 .map(|status| status.scale_status.clone())
@@ -3496,6 +3527,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             host_cached_submap_count: 0,
             dropped_preview_job_count: 0,
             degradation_level: 0,
+            loop_closure_count: 0,
+            loop_correction_active: false,
             live_scale_status: "SENSOR_METRIC".to_string(),
             integration_frozen: false,
             depth_rmse_mm: None,
@@ -3552,6 +3585,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         host_cached_submap_count: 0,
         dropped_preview_job_count: 0,
         degradation_level: 0,
+        loop_closure_count: 0,
+        loop_correction_active: false,
         live_scale_status: "SENSOR_METRIC".to_string(),
         integration_frozen: false,
         depth_rmse_mm: None,
@@ -5722,6 +5757,11 @@ mod tests {
             std::env::temp_dir().join(format!("scanlan-live-preview-{}", uuid::Uuid::new_v4()));
         let phase_root = root.join("phases").join("phase-1");
         fs::create_dir_all(&phase_root).unwrap();
+        fs::write(
+            phase_root.join("live_loops.jsonl"),
+            b"{\"schemaVersion\":1,\"accepted\":true,\"requiresProductionRevalidation\":true}\n",
+        )
+        .unwrap();
         let mut packet = Vec::new();
         packet.extend_from_slice(b"K2P1");
         packet.extend_from_slice(&7_u32.to_le_bytes());
@@ -5749,6 +5789,11 @@ mod tests {
             packet
         );
         assert!(root.join("outputs/live/session.json").is_file());
+        assert!(root.join("outputs/live/loops.jsonl").is_file());
+        let session: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("outputs/live/session.json")).unwrap())
+                .unwrap();
+        assert_eq!(session["acceptedLoops"].as_array().unwrap().len(), 1);
         let ply = fs::read(root.join("outputs/live/latest-preview.ply")).unwrap();
         let glb = fs::read(root.join("outputs/live/latest-preview.glb")).unwrap();
         assert!(ply.starts_with(b"ply\nformat binary_little_endian 1.0\n"));

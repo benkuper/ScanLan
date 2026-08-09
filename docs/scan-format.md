@@ -155,6 +155,13 @@ index,source_sequence,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_
 
 The production loader matches the journal to archived frames by `source_sequence`. Explicitly rejected frames are excluded. A complete accepted trajectory is inverted to camera-to-world and validated before being used as the final-pass seed.
 
+`live_loops.jsonl` is schema 1, one record per bounded nonlocal submap query. Each record stores
+the source and target submap IDs, sensor sequence, accepted state, ICP fitness/RMSE and
+correspondence count, row-major target-from-source transform, 6 x 6 information matrix,
+pose-graph safety result, and `requiresProductionRevalidation: true`. An accepted live record
+is not permission for production fusion; the offline solver independently verifies the raw
+observations and may reject it.
+
 ## Provisional live-session artifact
 
 Stopping a capture atomically publishes the latest validated live map beneath `outputs/live/`:
@@ -163,6 +170,7 @@ Stopping a capture atomically publishes the latest validated live map beneath `o
 outputs/live/
 |-- session.json
 |-- poses.jsonl
+|-- loops.jsonl
 |-- tracking-summary.json
 |-- latest-preview.bin
 |-- latest-preview.ply

@@ -56,6 +56,10 @@ class LiveBenchmarkTests(unittest.TestCase):
                 {"accepted": True, "integrated": True, "state": "tracking"},
                 {"accepted": False, "integrated": False, "state": "searching"},
             ],
+            loop_entries=[
+                {"accepted": True, "requiresProductionRevalidation": True}
+            ],
+            loop_journal_available=True,
             exit_code=0,
         )
 
@@ -64,6 +68,7 @@ class LiveBenchmarkTests(unittest.TestCase):
         self.assertEqual(report["runtime"]["peakGpuMemoryMiB"], 20.0)
         self.assertEqual(report["liveMap"]["finalSubmapCount"], 1)
         self.assertEqual(report["configuration"]["liveMapMemoryMiB"], 768)
+        self.assertEqual(report["loops"]["acceptedCount"], 1)
 
 
 if __name__ == "__main__":

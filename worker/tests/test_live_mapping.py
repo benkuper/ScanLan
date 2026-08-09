@@ -54,6 +54,31 @@ class LiveMappingTests(unittest.TestCase):
 
         self.assertEqual(colors.tolist(), [[230, 68, 84], [230, 68, 84]])
 
+    def test_coverage_field_moves_with_a_loop_correction(self) -> None:
+        camera = StreamCamera(8, 8, 8.0, 8.0, 3.5, 3.5, 1000.0, 0.25, 5.0)
+        frame = RgbdFrame(
+            0,
+            0,
+            0,
+            camera,
+            np.full((8, 8), 1000, dtype=np.uint16),
+            None,
+            None,
+            None,
+        )
+        field = CoverageField(0.25)
+        field.observe(frame, np.eye(4), 0.9)
+        before = set(field.cells)
+        correction = np.eye(4)
+        correction[0, 3] = 0.5
+
+        field.transform(correction)
+
+        self.assertEqual(
+            {key[0] for key in field.cells},
+            {key[0] + 2 for key in before},
+        )
+
     def test_travel_rollover_keeps_completed_submap_on_host(self) -> None:
         import open3d as o3d
 
@@ -89,6 +114,51 @@ class LiveMappingTests(unittest.TestCase):
         self.assertIsNotNone(manager.active)
         self.assertEqual(manager.completed[0].descriptor.resident, "host")
         self.assertEqual(manager.rollover_count, 1)
+
+    def test_verified_loop_moves_submaps_without_duplicating_geometry(self) -> None:
+        import open3d as o3d
+
+        camera = StreamCamera(64, 48, 60.0, 60.0, 31.5, 23.5, 1000.0, 0.25, 5.0)
+        depth = np.full((48, 64), 1000, dtype=np.uint16)
+        color = np.full((48, 64, 3), 128, dtype=np.uint8)
+        quality = AlignmentQuality(True, 1.0, 1.0, 0.0, depth.size, "captured")
+        limits = replace(
+            SubmapLimits.from_mebibytes(256),
+            maximum_distance_m=0.10,
+        )
+        manager = LiveSubmapManager(
+            o3d,
+            0.02,
+            ComputeBackend("test", "CPU", o3d.core.Device("CPU:0"), False),
+            "points",
+            limits,
+        )
+        for sequence, camera_x in enumerate((0.0, 0.20, 0.02)):
+            world_to_camera = np.eye(4)
+            world_to_camera[0, 3] = -camera_x
+            frame = RgbdFrame(
+                sequence,
+                sequence * 100_000,
+                sequence * 100_000,
+                camera,
+                depth,
+                color,
+                None,
+                None,
+            )
+            manager.integrate(
+                TrackedFrame(
+                    frame, world_to_camera, quality, True, "tracking", "closed loop"
+                )
+            )
+        manager.complete_active("capture stop")
+
+        expected_points = sum(len(submap.points) for submap in manager.completed)
+        combined_points, _ = manager.world_points()
+        self.assertEqual(len(combined_points), expected_points)
+        self.assertEqual(manager.correction_count, 1)
+        self.assertEqual(len(manager.pose_graph.loops), 1)
+        self.assertTrue(manager.loop_events[-1]["accepted"])
 
 
 if __name__ == "__main__":

@@ -197,6 +197,8 @@ def summarize_live_benchmark(
     working_set_samples: list[int],
     gpu_samples: list[int],
     journal_entries: list[dict[str, Any]],
+    loop_entries: list[dict[str, Any]],
+    loop_journal_available: bool,
     exit_code: int,
 ) -> dict[str, Any]:
     final_status = statuses[-1] if statuses else {}
@@ -284,6 +286,15 @@ def summarize_live_benchmark(
             "finalSubmapCount": len((submap_message or {}).get("submaps", [])),
         },
         "coverage": coverage_message,
+        "loops": {
+            "candidateCount": len(loop_entries),
+            "acceptedCount": sum(bool(entry.get("accepted")) for entry in loop_entries),
+            "journalAvailableAfterStop": loop_journal_available,
+            "allRequireProductionRevalidation": all(
+                bool(entry.get("requiresProductionRevalidation")) for entry in loop_entries
+            ),
+            "finalPoseGraph": (submap_message or {}).get("poseGraph"),
+        },
     }
 
 
@@ -465,6 +476,14 @@ def benchmark_live_capture(
             for line in journal_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+    loop_path = session_root / "live_loops.jsonl"
+    loop_entries = []
+    if loop_path.is_file():
+        loop_entries = [
+            json.loads(line)
+            for line in loop_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
     source_duration_seconds = (
         max(0.0, (last_timestamp_us - first_timestamp_us) / 1_000_000.0)
         if first_timestamp_us is not None and last_timestamp_us is not None
@@ -495,6 +514,8 @@ def benchmark_live_capture(
         working_set_samples=memory_samples["workingSet"],
         gpu_samples=memory_samples["gpu"],
         journal_entries=journal_entries,
+        loop_entries=loop_entries,
+        loop_journal_available=loop_path.is_file(),
         exit_code=exit_code,
     )
     if owned_session is not None:

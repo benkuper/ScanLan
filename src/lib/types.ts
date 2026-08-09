@@ -256,6 +256,8 @@ export interface CaptureStatus {
   hostCachedSubmapCount: number;
   droppedPreviewJobCount: number;
   degradationLevel: number;
+  loopClosureCount: number;
+  loopCorrectionActive: boolean;
   liveScaleStatus: 'SENSOR_METRIC' | 'MODEL_METRIC_UNVERIFIED' | 'MODEL_METRIC_VALIDATED' | 'USER_CALIBRATED' | 'RELATIVE_SCALE';
   integrationFrozen: boolean;
   depthRmseMm?: number;
@@ -268,7 +270,7 @@ export interface LiveSubmapDescriptor {
   id: string;
   localOrigin: number[];
   globalFromLocal: number[];
-  state: 'active' | 'complete' | 'frozen';
+  state: 'active' | 'complete' | 'corrected' | 'frozen';
   firstSequence: number;
   lastSequence: number;
   voxelSizeM: number;
@@ -298,6 +300,20 @@ export interface LiveReconstructionGuidance {
     contractVersion: 2;
     frameSequence: number;
     submaps: LiveSubmapDescriptor[];
+    poseGraph?: {
+      nodeCount: number;
+      loopConstraintCount: number;
+      acceptedCorrectionCount: number;
+      mapFromTrackingWorld: number[];
+    };
+    recentLoopEvents?: Array<{
+      sequence: number;
+      sourceSubmapId: string;
+      targetSubmapId: string;
+      accepted: boolean;
+      requiresProductionRevalidation: boolean;
+    }>;
+    viewportCorrection?: { durationMs: number; active: boolean };
   } | null;
 }
 

@@ -1895,6 +1895,7 @@
           <div><span>Live memory</span><strong>{formatByteSize(sensor.allocatedLiveMapBytes)}</strong></div>
           <div><span>Pose age</span><strong>{sensor.poseLatencyMs == null ? '—' : `${sensor.poseLatencyMs.toFixed(0)} ms`}</strong></div>
           <div><span>Pressure</span><strong>{sensor.degradationLevel ? `LEVEL ${sensor.degradationLevel}` : 'NORMAL'}</strong></div>
+          <div><span>Loop closures</span><strong>{sensor.loopClosureCount}{sensor.loopCorrectionActive ? ' · SMOOTHING' : ''}</strong></div>
         </div>
         {#if capturing && liveGuidance?.coverage?.guidance?.length}
           <div class="live-guidance">

@@ -13,7 +13,9 @@ All representations share one quality-gated RGB-D trajectory. A visually attract
 7. Select keyframes by translation, rotation, and elapsed time.
 8. Integrate selected frames into a bounded active sparse TSDF submap.
 9. Move completed submaps to compact host geometry while retaining their rigid transforms.
-10. Publish normal, coverage, and tracking-confidence point snapshots at independent adaptive rates, plus an optional 1 Hz mesh when headroom permits.
+10. Query a bounded set of non-adjacent submaps and accept a loop only after strict geometric verification.
+11. Optimize the rigid submap pose graph, reject unsafe corrections, and interpolate accepted viewport transforms over 350 ms.
+12. Publish normal, coverage, and tracking-confidence point snapshots at independent adaptive rates, plus an optional 1 Hz mesh when headroom permits.
 
 The low-resolution coverage field stores per-cell observation count, best projected pixel
 density, pose confidence, and recent sequence. Green geometry has at least three independent
@@ -39,6 +41,12 @@ For each take, the final pass prefers a complete validated live trajectory. If i
 - interpolates rigid corrections smoothly over all camera poses.
 
 Separate takes are registered through global features followed by quality-gated colored ICP. An ambiguous take fails visibly instead of being fused at an arbitrary transform.
+
+Live loop decisions are diagnostics and candidate evidence, never production constraints.
+`live_loops.jsonl` preserves their transforms, information matrices, verification metrics, and
+accept/reject reasons. The production fragment solver independently rebuilds geometry from raw
+depth, repeats its stricter color/geometric verification, performs the complete pose-graph
+solve, and retains the prior validated trajectory if the correction is unsafe.
 
 ## Optional LingBot depth refinement
 

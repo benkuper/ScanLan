@@ -141,3 +141,32 @@ distribution. Coverage finished at 95.0% repeatedly observed, 1.7% weak, and 3.3
 As in P0, Windows `nvidia-smi` did not expose per-process VRAM, so the hard ceiling is validated
 from the VoxelBlockGrid allocation contract and active-block telemetry rather than a driver
 process counter.
+
+### 2026-08-09 P3 relocalization and loop-correction revalidation
+
+The P3 engine replayed the same physical Femto archive alone after introducing the local-anchor
+database and bounded pose graph. The scene remains a short, mostly static single-submap smoke,
+so it correctly emitted no nonlocal loop candidate. Its empty `live_loops.jsonl`, one-node final
+pose graph, tracking journal, and provisional geometry were all available after stop.
+
+| Metric | P2 | P3 |
+| --- | ---: | ---: |
+| Pose latency p95 | 62.05 ms | 62.60 ms |
+| Point-map publication latency p95 | 330.80 ms | 365.80 ms |
+| Tracking / mapping / journal drops | 1 / 0 / 0 | 1 / 0 / 0 |
+| Final provisional geometry | 59,274 points / 105,560 triangles | 59,282 points / 105,548 triangles |
+| Peak worker working set | 924.22 MiB | 921.67 MiB |
+| Peak allocated live map | 895.97 MiB | 895.97 MiB |
+
+The deterministic replay test solves the same three-node drifted graph twice to a 1e-12 matrix
+tolerance. A real Open3D integration test forces three submaps, returns the third camera to the
+first surface, accepts a 252-correspondence loop at 1.0 fitness and effectively zero RMSE,
+applies one smooth rigid correction, and verifies that the combined point count remains exactly
+the sum of the submap point buffers. This covers the no-duplicate-geometry invariant without
+pretending the short physical smoke is a room-scale loop scene.
+
+Finally, the 81-frame physical archive was rerun through the production CUDA Open3D path from
+raw observations. It produced 43,722 points from 11 fused keyframes, retained all 81 validated
+tracking frames, reported 96/100 confidence, and stabilized three production local maps with a
+0.00 m maximum correction in 6.46 seconds. This confirms that live loop evidence remains
+advisory and does not replace production trajectory validation or raw-depth fusion.

@@ -7,9 +7,9 @@ import queue
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 import numpy as np
 
@@ -31,6 +31,16 @@ from .live_mapping import (
     VOXEL_BLOCK_BYTES,
     rotation_degrees as live_rotation_degrees,
     tracking_colors,
+)
+from .live_loop import (
+    LocalAnchorDatabase,
+    PoseGraphLoop,
+    SubmapPoseGraph,
+    interpolate_transform,
+    loop_event,
+    submap_odometry_information,
+    transform_delta,
+    verify_loop_candidate,
 )
 from .stream import (
     LatestFrameQueue,
@@ -196,6 +206,50 @@ class TrackingJournal:
                         break
                     handle.write(
                         json.dumps(entry, separators=(",", ":"), allow_nan=False) + "\n"
+                    )
+        except BaseException as error:
+            self.error = str(error)
+
+
+class LoopJournal:
+    """Persist sparse loop decisions for production revalidation."""
+
+    def __init__(self, root: Path, capacity: int = 64) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        self.path = root / "live_loops.jsonl"
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(capacity)
+        self.dropped = 0
+        self.error: str | None = None
+        self._thread = threading.Thread(target=self._write, name="loop-journal", daemon=True)
+        self._thread.start()
+
+    def append(self, event: dict[str, Any]) -> None:
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            self.dropped += 1
+
+    def close(self) -> None:
+        try:
+            self._queue.put(None, timeout=2.0)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+                self.dropped += 1
+                self._queue.put_nowait(None)
+            except queue.Empty:
+                pass
+        self._thread.join(timeout=5.0)
+
+    def _write(self) -> None:
+        try:
+            with self.path.open("w", encoding="utf-8", newline="\n", buffering=1) as handle:
+                while True:
+                    event = self._queue.get()
+                    if event is None:
+                        break
+                    handle.write(
+                        json.dumps(event, separators=(",", ":"), allow_nan=False) + "\n"
                     )
         except BaseException as error:
             self.error = str(error)
@@ -555,15 +609,23 @@ class RealtimeTracker:
         self.previous_frame: RgbdFrame | None = None
         self.previous_rgbd: Any | None = None
         self.previous_tensor: Any | None = None
-        self.anchors: list[TrackingAnchor] = []
-        self.relocalization_cursor = 0
-        self.relocalization_features: dict[int, tuple[Any, Any]] = {}
+        self.anchor_database: LocalAnchorDatabase[TrackingAnchor] = LocalAnchorDatabase(
+            MAX_TRACKING_ANCHORS, RECENT_TRACKING_ANCHORS
+        )
         self.last_integrated_pose: np.ndarray | None = None
         self.last_integrated_timestamp_us = 0
         self.rejected_since_accept = 0
         self.gyro_since_accept = np.eye(4, dtype=np.float64)
         self.gyro_samples_since_accept = 0
         self.pending_recovery: PendingRecovery | None = None
+
+    @property
+    def anchors(self) -> list[TrackingAnchor]:
+        return self.anchor_database.entries
+
+    @property
+    def relocalization_features(self) -> dict[int, tuple[Any, Any]]:
+        return self.anchor_database.features
 
     def _initialize_camera(self, camera: StreamCamera) -> None:
         if self.camera is None:
@@ -671,84 +733,24 @@ class RealtimeTracker:
                 and _rotation_degrees(relative) < TRACKING_ANCHOR_ROTATION_DEGREES
             ):
                 return
-        self.anchors.append(
+        self.anchor_database.add(
             TrackingAnchor(frame, representation, np.asarray(world_to_camera).copy())
         )
-        if len(self.anchors) > MAX_TRACKING_ANCHORS:
-            # Keep the first view, a spatially broad history, and the newest
-            # views.  Periodic compaction bounds GPU memory without turning the
-            # bank into a recent-only ring buffer; a user can therefore return
-            # to any earlier part of a long take after tracking is lost.
-            history_end = max(1, len(self.anchors) - RECENT_TRACKING_ANCHORS)
-            history = self.anchors[:history_end]
-            recent = self.anchors[history_end:]
-            self.anchors = history[::2] + recent
-            self.relocalization_cursor %= max(len(self.anchors), 1)
-            retained_sequences = {anchor.frame.sequence for anchor in self.anchors}
-            self.relocalization_features = {
-                sequence: value
-                for sequence, value in self.relocalization_features.items()
-                if sequence in retained_sequences
-            }
 
     def _relocalization_anchors(self) -> list[TrackingAnchor]:
-        if not self.anchors:
-            return []
         previous_sequence = (
             self.previous_frame.sequence if self.previous_frame is not None else None
         )
-        available = [
-            anchor
-            for anchor in self.anchors
-            if anchor.frame.sequence != previous_sequence
-        ]
-        if not available:
-            return []
-
-        # Once a candidate begins temporal confirmation, test its exact anchor
-        # on every frame. Without this priority a rotating bank may not revisit
-        # that anchor for several seconds, making a valid recovery impossible.
-        selected: list[TrackingAnchor] = []
         pending_sequence = (
             self.pending_recovery.anchor_sequence
             if self.pending_recovery is not None
             else None
         )
-        if pending_sequence is not None:
-            pending_anchor = next(
-                (
-                    anchor
-                    for anchor in available
-                    if anchor.frame.sequence == pending_sequence
-                ),
-                None,
-            )
-            if pending_anchor is not None:
-                selected.append(pending_anchor)
-
-        # The initial view remains the natural fallback. The remaining budget
-        # walks the complete saved bank, so every accepted view is eventually
-        # searchable without sacrificing a pending confirmation.
-        if all(
-            anchor.frame.sequence != available[0].frame.sequence
-            for anchor in selected
-        ):
-            selected.append(available[0])
-        selected_sequences = {anchor.frame.sequence for anchor in selected}
-        rotating = [
-            anchor
-            for anchor in available[1:]
-            if anchor.frame.sequence not in selected_sequences
-        ]
-        budget = RELOCALIZATION_CANDIDATES_PER_FRAME - len(selected)
-        if rotating and budget > 0:
-            start = self.relocalization_cursor % len(rotating)
-            count = min(budget, len(rotating))
-            selected.extend(
-                rotating[(start + offset) % len(rotating)] for offset in range(count)
-            )
-            self.relocalization_cursor = (start + count) % len(rotating)
-        return selected
+        return self.anchor_database.candidates(
+            previous_sequence=previous_sequence,
+            pending_sequence=pending_sequence,
+            limit=RELOCALIZATION_CANDIDATES_PER_FRAME,
+        )
 
     def _feature_geometry(self, frame: RgbdFrame) -> tuple[Any, Any]:
         voxel_size = max(0.06, self.voxel_size_m * 6.0)
@@ -1511,6 +1513,10 @@ class _CompletedLiveSubmap:
     vertices: np.ndarray
     vertex_colors: np.ndarray
     triangles: np.ndarray
+    tracking_global_from_local: np.ndarray
+    display_global_from_local: np.ndarray
+    target_global_from_local: np.ndarray
+    correction_started_at: float
 
 
 @dataclass
@@ -1563,6 +1569,7 @@ class LiveSubmapManager:
         backend: ComputeBackend,
         mode: str,
         limits: SubmapLimits,
+        loop_event_sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.o3d = o3d
         self.voxel_size_m = voxel_size_m
@@ -1578,6 +1585,14 @@ class LiveSubmapManager:
         self.last_tracking_state = TrackingState.READY.value
         self.last_tracking_confidence = 0.0
         self.mirror_x = False
+        self.pose_graph = SubmapPoseGraph(o3d, voxel_size_m)
+        self.map_from_tracking_world = np.eye(4, dtype=np.float64)
+        self.loop_events: list[dict[str, Any]] = []
+        self.queried_loop_pairs: set[tuple[str, str]] = set()
+        self.loop_queries_enabled = True
+        self.correction_count = 0
+        self.correction_duration_seconds = 0.35
+        self.loop_event_sink = loop_event_sink
 
     def _begin(self, tracked: TrackedFrame) -> bool:
         if len(self.completed) >= self.limits.maximum_submaps:
@@ -1587,6 +1602,7 @@ class LiveSubmapManager:
             return False
         assert tracked.world_to_camera is not None
         camera_to_world = np.linalg.inv(tracked.world_to_camera)
+        global_from_local = self.map_from_tracking_world @ camera_to_world
         self.mirror_x = tracked.frame.mirror_x
         self.active = _ActiveLiveSubmap(
             id=f"submap-{self.next_submap_index:04d}",
@@ -1597,7 +1613,7 @@ class LiveSubmapManager:
                 self.backend,
                 block_count=self.limits.block_capacity,
             ),
-            global_from_local=camera_to_world.copy(),
+            global_from_local=global_from_local,
             start_camera_to_world=camera_to_world.copy(),
             first_sequence=tracked.frame.sequence,
             last_sequence=tracked.frame.sequence,
@@ -1641,7 +1657,9 @@ class LiveSubmapManager:
             return False
         assert self.active is not None
         local_world_to_camera = (
-            tracked.world_to_camera @ self.active.global_from_local
+            tracked.world_to_camera
+            @ np.linalg.inv(self.map_from_tracking_world)
+            @ self.active.global_from_local
         )
         self.active.volume.integrate(tracked, local_world_to_camera)
         confidence = tracking_confidence(tracked.quality)
@@ -1651,8 +1669,137 @@ class LiveSubmapManager:
         self.active.confidence_samples += 1
         self.last_tracking_state = tracked.state
         self.last_tracking_confidence = confidence
-        self.coverage.observe(tracked.frame, tracked.world_to_camera, confidence)
+        corrected_world_to_camera = (
+            tracked.world_to_camera @ np.linalg.inv(self.map_from_tracking_world)
+        )
+        self.coverage.observe(tracked.frame, corrected_world_to_camera, confidence)
         return True
+
+    def _display_transform(
+        self, submap: _CompletedLiveSubmap, now: float | None = None
+    ) -> np.ndarray:
+        now = time.perf_counter() if now is None else now
+        elapsed = now - submap.correction_started_at
+        if elapsed >= self.correction_duration_seconds:
+            submap.display_global_from_local = submap.target_global_from_local.copy()
+            return submap.display_global_from_local
+        return interpolate_transform(
+            submap.display_global_from_local,
+            submap.target_global_from_local,
+            elapsed / self.correction_duration_seconds,
+        )
+
+    def _record_loop_event(self, event: dict[str, Any]) -> None:
+        self.loop_events.append(event)
+        if len(self.loop_events) > 64:
+            self.loop_events = self.loop_events[-64:]
+        if self.loop_event_sink is not None:
+            self.loop_event_sink(event)
+
+    def _apply_pose_graph_solution(self, transforms: dict[str, np.ndarray]) -> None:
+        now = time.perf_counter()
+        previous_map_correction = self.map_from_tracking_world.copy()
+        for submap in self.completed:
+            corrected = transforms.get(submap.descriptor.id)
+            if corrected is None:
+                continue
+            current = self._display_transform(submap, now).copy()
+            submap.display_global_from_local = current
+            submap.target_global_from_local = corrected.copy()
+            submap.correction_started_at = now
+            submap.descriptor = replace(
+                submap.descriptor,
+                global_from_local=tuple(corrected.reshape(-1).tolist()),
+                state="corrected",
+            )
+        newest = self.completed[-1]
+        self.map_from_tracking_world = (
+            newest.target_global_from_local
+            @ np.linalg.inv(newest.tracking_global_from_local)
+        )
+        coverage_correction = (
+            self.map_from_tracking_world @ np.linalg.inv(previous_map_correction)
+        )
+        self.coverage.transform(coverage_correction)
+        self.correction_count += 1
+
+    def settle_viewport_corrections(self) -> None:
+        """Publish exact optimized transforms in the persistent stop artifact."""
+        for submap in self.completed:
+            submap.display_global_from_local = submap.target_global_from_local.copy()
+            submap.correction_started_at = 0.0
+
+    def _query_nonlocal_loops(self, sequence: int) -> None:
+        if not self.loop_queries_enabled or len(self.completed) < 3:
+            return
+        source = self.completed[-1]
+        source_center = np.mean(source.points, axis=0) if len(source.points) else np.zeros(3)
+        source_world_center = (
+            source.target_global_from_local[:3, :3] @ source_center
+            + source.target_global_from_local[:3, 3]
+        )
+        candidates: list[tuple[float, _CompletedLiveSubmap]] = []
+        for target in self.completed[:-2]:
+            pair = (source.descriptor.id, target.descriptor.id)
+            if pair in self.queried_loop_pairs:
+                continue
+            target_center = np.mean(target.points, axis=0) if len(target.points) else np.zeros(3)
+            target_world_center = (
+                target.target_global_from_local[:3, :3] @ target_center
+                + target.target_global_from_local[:3, 3]
+            )
+            candidates.append(
+                (float(np.linalg.norm(source_world_center - target_world_center)), target)
+            )
+        for _, target in sorted(candidates, key=lambda item: item[0])[:3]:
+            pair = (source.descriptor.id, target.descriptor.id)
+            self.queried_loop_pairs.add(pair)
+            initial = (
+                np.linalg.inv(target.target_global_from_local)
+                @ source.target_global_from_local
+            )
+            verification = verify_loop_candidate(
+                self.o3d,
+                source_points=source.points,
+                target_points=target.points,
+                initial_target_from_source=initial,
+                voxel_size_m=self.voxel_size_m,
+            )
+            if not verification.accepted:
+                self._record_loop_event(
+                    loop_event(
+                        sequence=sequence,
+                        source_id=source.descriptor.id,
+                        target_id=target.descriptor.id,
+                        verification=verification,
+                        solution=None,
+                    )
+                )
+                continue
+            constraint = PoseGraphLoop(
+                source.descriptor.id,
+                target.descriptor.id,
+                verification.target_from_source,
+                verification.information,
+                verification.fitness,
+                verification.rmse_m,
+                sequence,
+            )
+            self.pose_graph.add_loop(constraint)
+            solution = self.pose_graph.optimize()
+            if not solution.accepted:
+                self.pose_graph.loops.pop()
+            event = loop_event(
+                sequence=sequence,
+                source_id=source.descriptor.id,
+                target_id=target.descriptor.id,
+                verification=verification,
+                solution=solution,
+            )
+            self._record_loop_event(event)
+            if solution.accepted:
+                self._apply_pose_graph_solution(solution.transforms)
+                break
 
     def _compact_host_points(self) -> None:
         total = sum(len(submap.points) for submap in self.completed)
@@ -1723,12 +1870,35 @@ class LiveSubmapManager:
                 vertices,
                 vertex_colors,
                 triangles,
+                active.start_camera_to_world.copy(),
+                active.global_from_local.copy(),
+                active.global_from_local.copy(),
+                0.0,
             )
+        )
+        odometry_information = None
+        if len(self.completed) >= 2:
+            previous = self.completed[-2]
+            current = self.completed[-1]
+            current_from_previous = (
+                np.linalg.inv(current.target_global_from_local)
+                @ previous.target_global_from_local
+            )
+            odometry_information = submap_odometry_information(
+                self.o3d,
+                source_points=previous.points,
+                target_points=current.points,
+                target_from_source=current_from_previous,
+                voxel_size_m=self.voxel_size_m,
+            )
+        self.pose_graph.add_submap(
+            active.id, active.global_from_local, odometry_information
         )
         self.active = None
         self.rollover_count += int(reason != "capture stop")
         self._compact_host_points()
         self._bound_host_mesh()
+        self._query_nonlocal_loops(active.last_sequence)
         gc.collect()
 
     def _active_descriptor(self, frame_sequence: int) -> LiveSubmapDescriptor | None:
@@ -1754,11 +1924,37 @@ class LiveSubmapManager:
         )
 
     def descriptors(self, frame_sequence: int) -> dict[str, Any]:
-        values = [submap.descriptor for submap in self.completed]
+        now = time.perf_counter()
+        values = [
+            replace(
+                submap.descriptor,
+                global_from_local=tuple(
+                    self._display_transform(submap, now).reshape(-1).tolist()
+                ),
+            )
+            for submap in self.completed
+        ]
         active = self._active_descriptor(frame_sequence)
         if active is not None:
             values.append(active)
-        return submap_message(frame_sequence, values)
+        message = submap_message(frame_sequence, values)
+        message["poseGraph"] = {
+            "nodeCount": len(self.pose_graph.ids),
+            "loopConstraintCount": len(self.pose_graph.loops),
+            "acceptedCorrectionCount": self.correction_count,
+            "mapFromTrackingWorld": self.map_from_tracking_world.reshape(-1).tolist(),
+        }
+        message["recentLoopEvents"] = self.loop_events[-16:]
+        message["viewportCorrection"] = {
+            "durationMs": int(self.correction_duration_seconds * 1000),
+            "active": any(
+                time.perf_counter() - submap.correction_started_at
+                < self.correction_duration_seconds
+                for submap in self.completed
+                if submap.correction_started_at > 0
+            ),
+        }
+        return message
 
     def coverage_summary(self) -> CoverageSummary:
         return self.coverage.summary(self.last_tracking_confidence)
@@ -1770,7 +1966,7 @@ class LiveSubmapManager:
             point_batches.append(
                 _transform_positions(
                     submap.points,
-                    np.asarray(submap.descriptor.global_from_local).reshape(4, 4),
+                    self._display_transform(submap),
                 )
             )
             color_batches.append(submap.colors)
@@ -1798,7 +1994,7 @@ class LiveSubmapManager:
         for submap in self.completed:
             if not len(submap.triangles):
                 continue
-            transform = np.asarray(submap.descriptor.global_from_local).reshape(4, 4)
+            transform = self._display_transform(submap)
             vertices = _transform_positions(submap.vertices, transform)
             vertex_batches.append(vertices)
             color_batches.append(submap.vertex_colors)
@@ -1841,6 +2037,15 @@ class LiveSubmapManager:
             "activeSurfelCount": self.active.last_point_count if self.active else 0,
             "residentSubmapCount": int(self.active is not None),
             "hostCachedSubmapCount": len(self.completed),
+            "loopClosureCount": self.correction_count,
+            "loopCorrectionActive": int(
+                any(
+                    time.perf_counter() - submap.correction_started_at
+                    < self.correction_duration_seconds
+                    for submap in self.completed
+                    if submap.correction_started_at > 0
+                )
+            ),
         }
 
 
@@ -1898,9 +2103,12 @@ def run_realtime_engine(
             "hostCachedSubmapCount": 0,
             "droppedPreviewJobs": 0,
             "degradationLevel": 0,
+            "loopClosureCount": 0,
+            "loopCorrectionActive": False,
         },
     )
     journal = TrackingJournal(session_root) if session_root is not None else None
+    loop_journal = LoopJournal(session_root) if session_root is not None else None
     frame_queue = LatestFrameQueue(capacity=4)
     map_queue: queue.Queue[
         TrackedFrame | ResetLiveMap | TrackingStateUpdate | None
@@ -1931,6 +2139,8 @@ def run_realtime_engine(
         "coverageCellCount": 0,
         "submapCount": 0,
         "mapCapacityFrozen": False,
+        "loopClosureCount": 0,
+        "loopCorrectionActive": False,
     }
     counters_lock = threading.Lock()
     started = time.perf_counter()
@@ -1991,6 +2201,7 @@ def run_realtime_engine(
             backend,
             mode,
             limits,
+            loop_journal.append if loop_journal is not None else None,
         )
         controller = AdaptiveBudgetController()
         last_points = 0.0
@@ -2081,6 +2292,7 @@ def run_realtime_engine(
                         backend,
                         mode,
                         limits,
+                        loop_journal.append if loop_journal is not None else None,
                     )
                     last_tracked = None
                     last_points = 0.0
@@ -2135,6 +2347,7 @@ def run_realtime_engine(
                 last_tracked = tracked
                 map_started = time.perf_counter()
                 integration_number += 1
+                manager.loop_queries_enabled = controller.level < 5
                 if integration_number % controller.integration_stride != 0:
                     with counters_lock:
                         counters["mappingDrops"] += 1
@@ -2194,6 +2407,11 @@ def run_realtime_engine(
                     counters["mapCapacityFrozen"] = manager.frozen_reason is not None
             if last_tracked is not None and not stop.is_set():
                 manager.complete_active("capture stop")
+                manager.settle_viewport_corrections()
+                with counters_lock:
+                    counters.update(manager.telemetry())
+                    counters["coverageCellCount"] = len(manager.coverage.cells)
+                    counters["submapCount"] = len(manager.completed)
                 publish_points(last_tracked, time.perf_counter())
                 publish_coverage(last_tracked, time.perf_counter())
                 if mode == "mesh":
@@ -2340,6 +2558,8 @@ def run_realtime_engine(
                             "hostCachedSubmapCount": 0,
                             "droppedPreviewJobs": 0,
                             "degradationLevel": 0,
+                            "loopClosureCount": 0,
+                            "loopCorrectionActive": False,
                         },
                     )
                     last_status_at = now
@@ -2418,6 +2638,8 @@ def run_realtime_engine(
                         "hostCachedSubmapCount": snapshot["hostCachedSubmapCount"],
                         "droppedPreviewJobs": snapshot["droppedPreviewJobs"],
                         "degradationLevel": snapshot["degradationLevel"],
+                        "loopClosureCount": snapshot["loopClosureCount"],
+                        "loopCorrectionActive": bool(snapshot["loopCorrectionActive"]),
                         "integrationFrozen": (
                             tracked.world_to_camera is None
                             or tracked.state == TrackingState.FROZEN.value
@@ -2447,6 +2669,8 @@ def run_realtime_engine(
         stop.set()
         if journal is not None:
             journal.close()
+        if loop_journal is not None:
+            loop_journal.close()
 
     if failure:
         raise RuntimeError(str(failure[0])) from failure[0]
@@ -2455,6 +2679,9 @@ def run_realtime_engine(
     result["journalDrops"] = journal.dropped if journal is not None else 0
     if journal is not None and journal.error is not None:
         result["journalError"] = journal.error
+    result["loopJournalDrops"] = loop_journal.dropped if loop_journal is not None else 0
+    if loop_journal is not None and loop_journal.error is not None:
+        result["loopJournalError"] = loop_journal.error
     result.update(backend=backend.label, elapsedSeconds=time.perf_counter() - started)
     writer.status(
         last_sequence or 0,
@@ -2486,6 +2713,8 @@ def run_realtime_engine(
             "hostCachedSubmapCount": result["hostCachedSubmapCount"],
             "droppedPreviewJobs": result["droppedPreviewJobs"],
             "degradationLevel": result["degradationLevel"],
+            "loopClosureCount": result["loopClosureCount"],
+            "loopCorrectionActive": bool(result["loopCorrectionActive"]),
             "integrationFrozen": bool(result["mapCapacityFrozen"]),
         },
     )
