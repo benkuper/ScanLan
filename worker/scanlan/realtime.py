@@ -13,6 +13,13 @@ from typing import Any, BinaryIO
 import numpy as np
 
 from .compute import ComputeBackend, select_compute_backend
+from .live_contract import (
+    LiveFailurePolicy,
+    TrackingState,
+    contract_status,
+    pose_uncertainty,
+    tracking_confidence,
+)
 from .stream import (
     LatestFrameQueue,
     RgbdFrame,
@@ -28,6 +35,8 @@ ENGINE_STATUS = 1
 ENGINE_POINTS = 2
 ENGINE_MESH = 3
 ENGINE_CAMERA_POINTS = 4
+ENGINE_COVERAGE = 5
+ENGINE_SUBMAPS = 6
 ENGINE_HEADER = struct.Struct("<8sHHIQ")
 
 POINT_MAGIC = b"K2P1"
@@ -435,6 +444,26 @@ class EngineMessageWriter:
         self.write(
             ENGINE_STATUS,
             sequence,
+            json.dumps(
+                contract_status(
+                    value,
+                    failure_policy=(
+                        LiveFailurePolicy()
+                        if value.get("state") == TrackingState.READY.value
+                        else None
+                    ),
+                ),
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8"),
+        )
+
+    def contract_message(self, kind: int, sequence: int, value: dict[str, Any]) -> None:
+        if kind not in {ENGINE_COVERAGE, ENGINE_SUBMAPS}:
+            raise ValueError("Contract JSON messages are coverage or submaps")
+        self.write(
+            kind,
+            sequence,
             json.dumps(value, separators=(",", ":"), allow_nan=False).encode("utf-8"),
         )
 
@@ -798,7 +827,7 @@ class RealtimeTracker:
                 or abs(float(np.linalg.det(rotation)) - 1.0) > 0.04
                 or float(np.linalg.norm(rotation.T @ rotation - np.eye(3))) > 0.07
             ):
-                return TrackedFrame(frame, None, AlignmentQuality(False, 0, 0, math.inf, 0, "invalid captured pose"), False, "lost", "Captured pose was invalid")
+                return TrackedFrame(frame, None, AlignmentQuality(False, 0, 0, math.inf, 0, "invalid captured pose"), False, TrackingState.SEARCHING.value, "Captured pose was invalid")
             if self.first_captured_pose is None:
                 self.first_captured_pose = captured
             camera_to_world = np.linalg.inv(self.first_captured_pose) @ captured
@@ -816,7 +845,7 @@ class RealtimeTracker:
                     or _rotation_degrees(relative) / elapsed
                     > MAX_TRACKING_ANGULAR_SPEED_DEG_S
                 ):
-                    return TrackedFrame(frame, None, AlignmentQuality(False, 0, 0, math.inf, 0, "captured motion jump"), False, "lost", "Captured pose jumped beyond physical limits")
+                    return TrackedFrame(frame, None, AlignmentQuality(False, 0, 0, math.inf, 0, "captured motion jump"), False, TrackingState.SEARCHING.value, "Captured pose jumped beyond physical limits")
                 quality = evaluate_depth_alignment(
                     self.previous_frame.depth,
                     frame.depth,
@@ -830,7 +859,7 @@ class RealtimeTracker:
                         None,
                         quality,
                         False,
-                        "lost",
+                        TrackingState.SEARCHING.value,
                         f"Kinect Fusion pose rejected: {quality.reason}; return to recently scanned geometry",
                     )
             self.world_to_camera = proposed
@@ -852,7 +881,7 @@ class RealtimeTracker:
                 proposed.copy(),
                 quality,
                 integrate,
-                "tracking",
+                TrackingState.TRACKING.value,
                 detail,
             )
 
@@ -882,7 +911,7 @@ class RealtimeTracker:
                         f"only {valid_samples} valid depth samples",
                     ),
                     False,
-                    "lost",
+                    TrackingState.SEARCHING.value,
                     f"Waiting for usable depth ({valid_samples} samples); aim beyond the camera's minimum range",
                 )
             representation = self._representation(frame)
@@ -896,7 +925,7 @@ class RealtimeTracker:
             self.gyro_since_accept = np.eye(4, dtype=np.float64)
             self.gyro_samples_since_accept = 0
             self.pending_recovery = None
-            return TrackedFrame(frame, self.world_to_camera.copy(), perfect, integrate, "tracking", "RGB-D odometry initialized")
+            return TrackedFrame(frame, self.world_to_camera.copy(), perfect, integrate, TrackingState.TRACKING.value, "RGB-D odometry initialized")
 
         current = self._representation(frame)
         previous_representation = (
@@ -1208,7 +1237,7 @@ class RealtimeTracker:
                 None,
                 quality,
                 False,
-                "lost",
+                TrackingState.SEARCHING.value,
                 f"Tracking rejected: {quality.reason}; searching all saved capture keyframes",
             )
 
@@ -1236,7 +1265,7 @@ class RealtimeTracker:
                     None,
                     rejected_quality,
                     False,
-                    "lost",
+                    TrackingState.SEARCHING.value,
                     "Tracking recovery rejected; return to the last correctly aligned view",
                 )
 
@@ -1275,18 +1304,17 @@ class RealtimeTracker:
                     None,
                     pending_quality,
                     False,
-                    "recovering",
+                    TrackingState.SEARCHING.value,
                     f"Verifying tracking recovery {confirmations}/{RECOVERY_CONFIRMATION_FRAMES}; hold the camera steady",
                 )
 
         self.world_to_camera = proposed_world_to_camera
         self._remember(frame, current)
+        fusion_safe = self._quality_is_safe_to_integrate(quality)
         integrate = (
             not recovery_required
-            and self._quality_is_safe_to_integrate(quality)
-            and self._should_integrate(
-                self.world_to_camera, frame.depth_timestamp_us
-            )
+            and fusion_safe
+            and self._should_integrate(self.world_to_camera, frame.depth_timestamp_us)
         )
         if integrate:
             self._remember_anchor(frame, current, self.world_to_camera)
@@ -1298,12 +1326,19 @@ class RealtimeTracker:
             detail += " - relocalization locked; map resumes after the next validated frame"
         elif not integrate:
             detail += " - map held for fusion quality"
+        state = (
+            TrackingState.RELOCALIZED.value
+            if recovery_required
+            else TrackingState.FROZEN.value
+            if not fusion_safe
+            else TrackingState.TRACKING.value
+        )
         return TrackedFrame(
             frame,
             self.world_to_camera.copy(),
             quality,
             integrate,
-            "tracking",
+            state,
             f"{detail} · {quality.overlap:.0%} overlap · {quality.rmse_m * 1000:.0f} mm",
         )
 
@@ -1444,7 +1479,7 @@ def run_realtime_engine(
         0,
         {
             "active": True,
-            "state": "ready",
+            "state": TrackingState.READY.value,
             "detail": "Realtime RGB-D engine ready",
             "backend": backend.label,
             "processedFrames": 0,
@@ -1459,6 +1494,12 @@ def run_realtime_engine(
             "trackingFps": 0.0,
             "trackingQueueDepth": 0,
             "mappingQueueDepth": 0,
+            "trackingConfidence": 0.0,
+            "poseUncertaintyMm": None,
+            "poseUncertaintyDegrees": None,
+            "poseLatencyMs": None,
+            "mapUpdateLatencyMs": None,
+            "mapUpdateHz": 0.0,
         },
     )
     journal = TrackingJournal(session_root) if session_root is not None else None
@@ -1476,6 +1517,8 @@ def run_realtime_engine(
         "mappingDrops": 0,
         "pointCount": 0,
         "triangleCount": 0,
+        "mapUpdateLatencyMs": 0.0,
+        "mapUpdateHz": 0.0,
     }
     counters_lock = threading.Lock()
     started = time.perf_counter()
@@ -1566,6 +1609,7 @@ def run_realtime_engine(
                         )
                     continue
                 last_tracked = tracked
+                map_started = time.perf_counter()
                 if volume is None:
                     volume = RealtimeVolume(o3d, tracked.frame, voxel_size_m, backend)
                 volume.integrate(tracked)
@@ -1607,6 +1651,13 @@ def run_realtime_engine(
                         ),
                     )
                     last_mesh = now
+                with counters_lock:
+                    counters["mapUpdateLatencyMs"] = (
+                        time.perf_counter() - map_started
+                    ) * 1000.0
+                    counters["mapUpdateHz"] = integrated / max(
+                        time.perf_counter() - started, 1e-3
+                    )
             # Always publish the newest geometry once more at clean shutdown.
             if volume is not None and last_tracked is not None and not stop.is_set():
                 points, colors = volume.points()
@@ -1718,7 +1769,7 @@ def run_realtime_engine(
                         frame.sequence,
                         {
                             "active": True,
-                            "state": "preview",
+                            "state": TrackingState.PREVIEW.value,
                             "detail": "Raw camera preview; tracking starts from the first recorded frame",
                             "backend": backend.label,
                             "processedFrames": snapshot["processed"],
@@ -1737,12 +1788,23 @@ def run_realtime_engine(
                             "trackingFps": 0.0,
                             "trackingQueueDepth": frame_queue.qsize(),
                             "mappingQueueDepth": 0,
+                            "trackingConfidence": 0.0,
+                            "poseUncertaintyMm": None,
+                            "poseUncertaintyDegrees": None,
+                            "poseLatencyMs": None,
+                            "mapUpdateLatencyMs": snapshot["mapUpdateLatencyMs"],
+                            "mapUpdateHz": snapshot["mapUpdateHz"],
                         },
                     )
                     last_status_at = now
                 continue
 
+            pose_started = time.perf_counter()
             tracked = tracker.track(frame)
+            pose_latency_ms = (time.perf_counter() - pose_started) * 1000.0
+            position_uncertainty_mm, rotation_uncertainty_degrees = pose_uncertainty(
+                tracked.quality
+            )
             if journal is not None:
                 journal.append(tracked)
             with counters_lock:
@@ -1783,6 +1845,12 @@ def run_realtime_engine(
                         "trackingFps": snapshot["processed"] / max(now - started, 1e-3),
                         "trackingQueueDepth": frame_queue.qsize(),
                         "mappingQueueDepth": map_queue.qsize(),
+                        "trackingConfidence": tracking_confidence(tracked.quality),
+                        "poseUncertaintyMm": position_uncertainty_mm,
+                        "poseUncertaintyDegrees": rotation_uncertainty_degrees,
+                        "poseLatencyMs": pose_latency_ms,
+                        "mapUpdateLatencyMs": snapshot["mapUpdateLatencyMs"],
+                        "mapUpdateHz": snapshot["mapUpdateHz"],
                     },
                 )
                 last_status_at = now
@@ -1820,7 +1888,7 @@ def run_realtime_engine(
         last_sequence or 0,
         {
             "active": False,
-            "state": "complete",
+            "state": TrackingState.COMPLETE.value,
             "detail": "Realtime RGB-D engine stopped cleanly",
             "backend": backend.label,
             "processedFrames": result["processed"],
@@ -1833,6 +1901,12 @@ def run_realtime_engine(
             "journalDrops": result["journalDrops"],
             "pointCount": result["pointCount"],
             "triangleCount": result["triangleCount"],
+            "trackingConfidence": 0.0,
+            "poseUncertaintyMm": None,
+            "poseUncertaintyDegrees": None,
+            "poseLatencyMs": None,
+            "mapUpdateLatencyMs": result["mapUpdateLatencyMs"],
+            "mapUpdateHz": result["mapUpdateHz"],
         },
     )
     return result

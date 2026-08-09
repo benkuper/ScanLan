@@ -37,6 +37,13 @@ The capture-side stream queue has capacity 3 and discards its oldest unpublished
 - packed point snapshots (`K2P1`, maximum 150,000 preview points);
 - packed indexed meshes (`K2M2`, maximum 150,000 preview triangles).
 
+Reconstruction 2.0 contract messages extend that same framed transport without breaking the
+binary geometry readers: kind 4 is the raw-camera point preview, kind 5 is a versioned coverage
+summary, and kind 6 is the ordered live-submap descriptor set. Status messages carry explicit
+tracking state/confidence, pose uncertainty, pose/map latency, map-update rate, bounded-memory
+counters, submap residency, queue pressure, degradation level, scale status, and whether
+integration is frozen. A `ready` status also declares the capture/preview failure policy.
+
 Tauri validates message sizes and stores only the newest point and mesh packets in memory. UI polling returns a packet only when its frame sequence is newer than the caller’s. Reconstruction geometry is never polled from a growing file.
 
 ## Archive path

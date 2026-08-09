@@ -540,6 +540,7 @@ class RealtimeQualityTests(unittest.TestCase):
         assert tracked.world_to_camera is not None
         self.assertAlmostEqual(float(tracked.world_to_camera[0, 3]), 0.020)
         self.assertIn("Keyframe", tracked.detail)
+        self.assertEqual(tracked.state, "tracking")
 
     def test_tracker_waits_for_usable_depth_before_initializing(self) -> None:
         class CapturedRepresentationTracker(RealtimeTracker):

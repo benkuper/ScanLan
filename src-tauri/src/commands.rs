@@ -57,6 +57,8 @@ struct RealtimeEngineSnapshot {
     camera_points: Option<LiveGeometryFrame>,
     points: Option<LiveGeometryFrame>,
     mesh: Option<LiveGeometryFrame>,
+    coverage: Option<serde_json::Value>,
+    submaps: Option<serde_json::Value>,
     error: Option<String>,
 }
 
@@ -71,6 +73,8 @@ enum RealtimeGeometry {
 #[serde(rename_all = "camelCase")]
 struct RealtimeEngineStatusMessage {
     #[serde(default)]
+    contract_version: u16,
+    #[serde(default)]
     active: bool,
     #[serde(default)]
     state: String,
@@ -80,6 +84,8 @@ struct RealtimeEngineStatusMessage {
     backend: String,
     #[serde(default)]
     processed_frames: u32,
+    #[serde(default)]
+    accepted_frames: u32,
     #[serde(default)]
     rejected_frames: u32,
     #[serde(default)]
@@ -100,6 +106,42 @@ struct RealtimeEngineStatusMessage {
     overlap: f32,
     #[serde(default)]
     depth_rmse_mm: Option<f32>,
+    #[serde(default)]
+    tracking_state: String,
+    #[serde(default)]
+    tracking_confidence: f32,
+    #[serde(default)]
+    pose_uncertainty_mm: Option<f32>,
+    #[serde(default)]
+    pose_uncertainty_degrees: Option<f32>,
+    #[serde(default)]
+    pose_latency_ms: Option<f32>,
+    #[serde(default)]
+    map_update_latency_ms: Option<f32>,
+    #[serde(default)]
+    map_update_hz: f32,
+    #[serde(default)]
+    allocated_live_map_bytes: u64,
+    #[serde(default)]
+    active_voxel_count: u64,
+    #[serde(default)]
+    active_surfel_count: u64,
+    #[serde(default)]
+    resident_submap_count: u32,
+    #[serde(default)]
+    host_cached_submap_count: u32,
+    #[serde(default)]
+    dropped_preview_jobs: u64,
+    #[serde(default)]
+    tracking_queue_depth: u32,
+    #[serde(default)]
+    mapping_queue_depth: u32,
+    #[serde(default)]
+    degradation_level: u8,
+    #[serde(default)]
+    scale_status: String,
+    #[serde(default)]
+    integration_frozen: bool,
 }
 
 #[derive(Clone)]
@@ -1476,16 +1518,28 @@ fn read_realtime_engine_stream(
                 1 => {
                     let message: RealtimeEngineStatusMessage = serde_json::from_slice(&payload)
                         .map_err(|error| format!("Realtime engine status is invalid: {error}"))?;
+                    let tracking_state = if message.tracking_state.is_empty() {
+                        message.state.clone()
+                    } else {
+                        message.tracking_state.clone()
+                    };
                     snapshot.status = LiveReconstructionStatus {
+                        contract_version: message.contract_version,
                         active: message.active,
                         mode: mode.clone(),
-                        tracking: message.state == "tracking",
+                        tracking: matches!(
+                            tracking_state.as_str(),
+                            "tracking" | "relocalized" | "frozen"
+                        ),
                         tracking_status: if message.detail.is_empty() {
-                            message.state
+                            tracking_state.clone()
                         } else {
                             message.detail
                         },
+                        tracking_state,
+                        tracking_confidence: message.tracking_confidence,
                         processed_frames: message.processed_frames,
+                        accepted_frames: message.accepted_frames,
                         integrated_frames: message.integrated_frames,
                         rejected_frames: message.rejected_frames,
                         point_count: message.point_count,
@@ -1497,6 +1551,22 @@ fn read_realtime_engine_stream(
                         mapping_drops: message.mapping_drops,
                         overlap: message.overlap,
                         depth_rmse_mm: message.depth_rmse_mm,
+                        pose_uncertainty_mm: message.pose_uncertainty_mm,
+                        pose_uncertainty_degrees: message.pose_uncertainty_degrees,
+                        pose_latency_ms: message.pose_latency_ms,
+                        map_update_latency_ms: message.map_update_latency_ms,
+                        map_update_hz: message.map_update_hz,
+                        allocated_live_map_bytes: message.allocated_live_map_bytes,
+                        active_voxel_count: message.active_voxel_count,
+                        active_surfel_count: message.active_surfel_count,
+                        resident_submap_count: message.resident_submap_count,
+                        host_cached_submap_count: message.host_cached_submap_count,
+                        dropped_preview_jobs: message.dropped_preview_jobs,
+                        tracking_queue_depth: message.tracking_queue_depth,
+                        mapping_queue_depth: message.mapping_queue_depth,
+                        degradation_level: message.degradation_level,
+                        scale_status: message.scale_status,
+                        integration_frozen: message.integration_frozen,
                     };
                 }
                 2 | 4 => {
@@ -1549,6 +1619,26 @@ fn read_realtime_engine_stream(
                         packet: Arc::new(payload),
                     });
                 }
+                5 | 6 => {
+                    let message: serde_json::Value =
+                        serde_json::from_slice(&payload).map_err(|error| {
+                            format!("Realtime contract message is invalid: {error}")
+                        })?;
+                    if message
+                        .get("contractVersion")
+                        .and_then(|value| value.as_u64())
+                        != Some(2)
+                    {
+                        return Err(
+                            "Realtime contract message has an unsupported version".to_string()
+                        );
+                    }
+                    if kind == 5 {
+                        snapshot.coverage = Some(message);
+                    } else {
+                        snapshot.submaps = Some(message);
+                    }
+                }
                 _ => return Err("Realtime engine emitted an unknown message kind".to_string()),
             }
         }
@@ -1584,6 +1674,7 @@ fn realtime_packet(
 }
 
 const LIVE_CAPTURE_PREVIEW_FILE: &str = "live-reconstruction.preview.bin";
+const LIVE_ARTIFACT_DIRECTORY: &str = "live";
 
 fn valid_packed_point_preview(packet: &[u8]) -> bool {
     if packet.len() < 24 || &packet[0..4] != b"K2P1" {
@@ -1596,13 +1687,129 @@ fn valid_packed_point_preview(packet: &[u8]) -> bool {
     point_count <= 150_000 && packet.len() == 24 + point_count * 15
 }
 
+fn packed_point_preview_to_ply(packet: &[u8]) -> Result<Vec<u8>, String> {
+    if !valid_packed_point_preview(packet) {
+        return Err("Realtime point preview is incomplete".to_string());
+    }
+    let point_count = u32::from_le_bytes(packet[20..24].try_into().unwrap());
+    let header = format!(
+        concat!(
+            "ply\n",
+            "format binary_little_endian 1.0\n",
+            "comment ScanLan provisional live reconstruction\n",
+            "element vertex {}\n",
+            "property float x\nproperty float y\nproperty float z\n",
+            "property uchar red\nproperty uchar green\nproperty uchar blue\n",
+            "end_header\n"
+        ),
+        point_count
+    );
+    let mut output = Vec::with_capacity(header.len() + packet.len() - 24);
+    output.extend_from_slice(header.as_bytes());
+    output.extend_from_slice(&packet[24..]);
+    Ok(output)
+}
+
+fn packed_point_preview_to_glb(packet: &[u8]) -> Result<Vec<u8>, String> {
+    if !valid_packed_point_preview(packet) {
+        return Err("Realtime point preview is incomplete".to_string());
+    }
+    let point_count = u32::from_le_bytes(packet[20..24].try_into().unwrap()) as usize;
+    let mut positions = Vec::with_capacity(point_count * 12);
+    let mut colors = Vec::with_capacity(point_count * 3 + 3);
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for record in packet[24..].chunks_exact(15) {
+        positions.extend_from_slice(&record[..12]);
+        colors.extend_from_slice(&record[12..15]);
+        for axis in 0..3 {
+            let start = axis * 4;
+            let value = f32::from_le_bytes(record[start..start + 4].try_into().unwrap());
+            minimum[axis] = minimum[axis].min(value);
+            maximum[axis] = maximum[axis].max(value);
+        }
+    }
+    while colors.len() % 4 != 0 {
+        colors.push(0);
+    }
+    if point_count == 0 {
+        minimum = [0.0; 3];
+        maximum = [0.0; 3];
+    }
+    let position_bytes = positions.len();
+    let binary_bytes = position_bytes + colors.len();
+    let document = serde_json::json!({
+        "asset": {"version": "2.0", "generator": "ScanLan Reconstruction 2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"name": "Provisional live map", "primitives": [{
+            "attributes": {"POSITION": 0, "COLOR_0": 1},
+            "mode": 0
+        }]}],
+        "buffers": [{"byteLength": binary_bytes}],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": position_bytes, "target": 34962},
+            {"buffer": 0, "byteOffset": position_bytes, "byteLength": point_count * 3, "target": 34962}
+        ],
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": point_count,
+                "type": "VEC3",
+                "min": minimum,
+                "max": maximum
+            },
+            {
+                "bufferView": 1,
+                "componentType": 5121,
+                "normalized": true,
+                "count": point_count,
+                "type": "VEC3"
+            }
+        ]
+    });
+    let mut json = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+    while json.len() % 4 != 0 {
+        json.push(b' ');
+    }
+    let mut binary = positions;
+    binary.extend_from_slice(&colors);
+    while binary.len() % 4 != 0 {
+        binary.push(0);
+    }
+    let total_length = 12 + 8 + json.len() + 8 + binary.len();
+    let mut output = Vec::with_capacity(total_length);
+    output.extend_from_slice(b"glTF");
+    output.extend_from_slice(&2_u32.to_le_bytes());
+    output.extend_from_slice(&(total_length as u32).to_le_bytes());
+    output.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    output.extend_from_slice(&0x4E4F534A_u32.to_le_bytes());
+    output.extend_from_slice(&json);
+    output.extend_from_slice(&(binary.len() as u32).to_le_bytes());
+    output.extend_from_slice(&0x004E4942_u32.to_le_bytes());
+    output.extend_from_slice(&binary);
+    Ok(output)
+}
+
+fn live_map_fingerprint(packet: &[u8]) -> String {
+    let hash = packet.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("fnv1a64:{hash:016x}")
+}
+
 fn save_live_reconstruction_preview(
+    project_root: &Path,
     phase_root: &Path,
     realtime: &Arc<Mutex<RealtimeEngineSnapshot>>,
 ) -> Result<bool, String> {
-    let packet = realtime
+    let snapshot = realtime
         .lock()
         .map_err(|_| "Realtime preview state is unavailable".to_string())?
+        .clone();
+    let packet = snapshot
         .points
         .as_ref()
         .map(|frame| Arc::clone(&frame.packet));
@@ -1614,6 +1821,76 @@ fn save_live_reconstruction_preview(
     }
     fs::write(phase_root.join(LIVE_CAPTURE_PREVIEW_FILE), packet.as_ref())
         .map_err(|error| format!("Could not preserve the live reconstruction: {error}"))?;
+    let live_root = project_root.join("outputs").join(LIVE_ARTIFACT_DIRECTORY);
+    fs::create_dir_all(live_root.join("submaps")).map_err(|error| error.to_string())?;
+    fs::create_dir_all(live_root.join("coverage")).map_err(|error| error.to_string())?;
+    write_export(&live_root.join("latest-preview.bin"), packet.as_ref())?;
+    write_export(
+        &live_root.join("latest-preview.ply"),
+        &packed_point_preview_to_ply(packet.as_ref())?,
+    )?;
+    write_export(
+        &live_root.join("latest-preview.glb"),
+        &packed_point_preview_to_glb(packet.as_ref())?,
+    )?;
+    let journal = phase_root.join("tracking.jsonl");
+    if let Ok(bytes) = fs::read(&journal) {
+        write_export(&live_root.join("poses.jsonl"), &bytes)?;
+    }
+    let phase_manifest = File::open(phase_root.join("phase.json"))
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
+    let session = serde_json::json!({
+        "schemaVersion": 1,
+        "contractVersion": 2,
+        "sourceType": "rgbd",
+        "liveEngineRevision": env!("CARGO_PKG_VERSION"),
+        "phaseId": phase_root.file_name().map(|value| value.to_string_lossy()),
+        "calibration": phase_manifest.as_ref().and_then(|value| value.get("camera")),
+        "sensor": phase_manifest.as_ref().and_then(|value| value.get("sensor")),
+        "submaps": [],
+        "provisionalScaleStatus": if snapshot.status.scale_status.is_empty() { "SENSOR_METRIC" } else { snapshot.status.scale_status.as_str() },
+        "trackingStatistics": {
+            "processedFrames": snapshot.status.processed_frames,
+            "acceptedFrames": snapshot.status.accepted_frames,
+            "rejectedFrames": snapshot.status.rejected_frames,
+            "integratedFrames": snapshot.status.integrated_frames,
+            "trackingConfidence": snapshot.status.tracking_confidence
+        },
+        "acceptedLoops": [],
+        "rejectedLoops": [],
+        "queueDrops": {
+            "source": snapshot.status.source_drops,
+            "tracking": snapshot.status.tracking_queue_drops,
+            "mapping": snapshot.status.mapping_drops,
+            "preview": snapshot.status.dropped_preview_jobs
+        },
+        "peakMemory": {
+            "allocatedLiveMapBytes": snapshot.status.allocated_live_map_bytes
+        },
+        "finalLiveMapFingerprint": live_map_fingerprint(packet.as_ref()),
+        "preview": {
+            "frameSequence": snapshot.points.as_ref().map(|frame| frame.frame_count),
+            "pointCount": snapshot.status.point_count,
+            "ply": "latest-preview.ply",
+            "glb": "latest-preview.glb"
+        },
+        "publishedAt": Utc::now().to_rfc3339()
+    });
+    storage::write_json(&live_root.join("session.json"), &session)?;
+    storage::write_json(
+        &live_root.join("tracking-summary.json"),
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "state": snapshot.status.tracking_state,
+            "confidence": snapshot.status.tracking_confidence,
+            "processedFrames": snapshot.status.processed_frames,
+            "acceptedFrames": snapshot.status.accepted_frames,
+            "rejectedFrames": snapshot.status.rejected_frames,
+            "integratedFrames": snapshot.status.integrated_frames,
+            "integrationFrozen": snapshot.status.integration_frozen
+        }),
+    )?;
     Ok(true)
 }
 
@@ -1660,25 +1937,60 @@ pub async fn live_reconstruction_mesh(
 }
 
 #[tauri::command]
+pub fn live_reconstruction_guidance(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let realtime = state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .as_ref()
+        .map(|capture| Arc::clone(&capture.realtime));
+    let Some(realtime) = realtime else {
+        return Ok(serde_json::json!({
+            "contractVersion": 2,
+            "coverage": null,
+            "submaps": null
+        }));
+    };
+    let snapshot = realtime
+        .lock()
+        .map_err(|_| "Realtime reconstruction state is unavailable".to_string())?;
+    Ok(serde_json::json!({
+        "contractVersion": 2,
+        "coverage": snapshot.coverage,
+        "submaps": snapshot.submaps
+    }))
+}
+
+#[tauri::command]
 pub async fn load_capture_draft(project_path: String) -> Result<tauri::ipc::Response, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = PathBuf::from(project_path);
         let project = storage::read_project(&root)?;
-        let packet = project
-            .phases
-            .iter()
-            .rev()
-            .filter(|phase| phase.status == "complete")
-            .find_map(|phase| {
-                fs::read(
-                    root.join("phases")
-                        .join(&phase.id)
-                        .join(LIVE_CAPTURE_PREVIEW_FILE),
-                )
-                .ok()
-            })
-            .filter(|packet| valid_packed_point_preview(packet))
-            .unwrap_or_default();
+        let packet = fs::read(
+            root.join("outputs")
+                .join(LIVE_ARTIFACT_DIRECTORY)
+                .join("latest-preview.bin"),
+        )
+        .ok()
+        .or_else(|| {
+            project
+                .phases
+                .iter()
+                .rev()
+                .filter(|phase| phase.status == "complete")
+                .find_map(|phase| {
+                    fs::read(
+                        root.join("phases")
+                            .join(&phase.id)
+                            .join(LIVE_CAPTURE_PREVIEW_FILE),
+                    )
+                    .ok()
+                })
+        })
+        .filter(|packet| valid_packed_point_preview(packet))
+        .unwrap_or_default();
         Ok(tauri::ipc::Response::new(packet))
     })
     .await
@@ -2718,7 +3030,12 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
         drain_live_reconstruction(&mut capture, Duration::from_secs(1));
         stop_live_reconstruction(&mut capture, Duration::from_secs(2));
-        save_live_reconstruction_preview(&capture.phase_root, &capture.realtime).ok();
+        save_live_reconstruction_preview(
+            &capture.project_root,
+            &capture.phase_root,
+            &capture.realtime,
+        )
+        .ok();
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
         let detail = read_sensor_log(&capture.phase_root);
         let frame_count = indexed_frame_count(&capture.phase_root);
@@ -2751,6 +3068,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         let selected_sensor_name = sensor_name(&project.settings).to_string();
         return Ok(CaptureStatus {
             project: project.clone(),
+            live_contract_version: 2,
             preview: Vec::new(),
             capturing: false,
             previewing: false,
@@ -2768,6 +3086,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             stream_fps: 0.0,
             tracking: false,
             tracking_status: "Tracking stopped".to_string(),
+            tracking_state: "complete".to_string(),
+            tracking_confidence: 0.0,
             imu_active: false,
             imu_rate_hz: 0.0,
             live_reconstruction_active: false,
@@ -2780,7 +3100,23 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             source_drop_count: 0,
             tracking_queue_drop_count: 0,
             mapping_drop_count: 0,
+            tracking_queue_depth: 0,
+            mapping_queue_depth: 0,
             tracking_overlap: 0.0,
+            pose_uncertainty_mm: None,
+            pose_uncertainty_degrees: None,
+            pose_latency_ms: None,
+            map_update_latency_ms: None,
+            map_update_hz: 0.0,
+            allocated_live_map_bytes: 0,
+            active_voxel_count: 0,
+            active_surfel_count: 0,
+            resident_submap_count: 0,
+            host_cached_submap_count: 0,
+            dropped_preview_job_count: 0,
+            degradation_level: 0,
+            live_scale_status: "SENSOR_METRIC".to_string(),
+            integration_frozen: false,
             depth_rmse_mm: None,
             live_reconstruction_backend: None,
             reconstruction,
@@ -2884,6 +3220,11 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             .unwrap_or_else(|| sensor_name(&project.settings).to_string());
         return Ok(CaptureStatus {
             project: project.clone(),
+            live_contract_version: live_reconstruction
+                .as_ref()
+                .map(|status| status.contract_version)
+                .filter(|version| *version > 0)
+                .unwrap_or(1),
             preview_point_count: live_reconstruction
                 .as_ref()
                 .map(|status| status.point_count)
@@ -2918,6 +3259,15 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
                 .map(|status| status.tracking_status.clone())
                 .or_else(|| live.as_ref().map(|status| status.tracking_status.clone()))
                 .unwrap_or_else(|| "Initializing camera tracking".to_string()),
+            tracking_state: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking_state.clone())
+                .filter(|state| !state.is_empty())
+                .unwrap_or_else(|| if recording { "searching" } else { "preview" }.to_string()),
+            tracking_confidence: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking_confidence)
+                .unwrap_or(0.0),
             imu_active: live
                 .as_ref()
                 .map(|status| status.imu_active)
@@ -2966,10 +3316,71 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
                 .as_ref()
                 .map(|status| status.mapping_drops)
                 .unwrap_or(0),
+            tracking_queue_depth: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking_queue_depth)
+                .unwrap_or(0),
+            mapping_queue_depth: live_reconstruction
+                .as_ref()
+                .map(|status| status.mapping_queue_depth)
+                .unwrap_or(0),
             tracking_overlap: live_reconstruction
                 .as_ref()
                 .map(|status| status.overlap)
                 .unwrap_or(0.0),
+            pose_uncertainty_mm: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.pose_uncertainty_mm),
+            pose_uncertainty_degrees: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.pose_uncertainty_degrees),
+            pose_latency_ms: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.pose_latency_ms),
+            map_update_latency_ms: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.map_update_latency_ms),
+            map_update_hz: live_reconstruction
+                .as_ref()
+                .map(|status| status.map_update_hz)
+                .unwrap_or(0.0),
+            allocated_live_map_bytes: live_reconstruction
+                .as_ref()
+                .map(|status| status.allocated_live_map_bytes)
+                .unwrap_or(0),
+            active_voxel_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.active_voxel_count)
+                .unwrap_or(0),
+            active_surfel_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.active_surfel_count)
+                .unwrap_or(0),
+            resident_submap_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.resident_submap_count)
+                .unwrap_or(0),
+            host_cached_submap_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.host_cached_submap_count)
+                .unwrap_or(0),
+            dropped_preview_job_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.dropped_preview_jobs)
+                .unwrap_or(0),
+            degradation_level: live_reconstruction
+                .as_ref()
+                .map(|status| status.degradation_level)
+                .unwrap_or(0),
+            live_scale_status: live_reconstruction
+                .as_ref()
+                .map(|status| status.scale_status.clone())
+                .filter(|status| !status.is_empty())
+                .unwrap_or_else(|| "SENSOR_METRIC".to_string()),
+            integration_frozen: live_reconstruction
+                .as_ref()
+                .map(|status| status.integration_frozen)
+                .unwrap_or(false),
             depth_rmse_mm: live_reconstruction
                 .as_ref()
                 .and_then(|status| status.depth_rmse_mm),
@@ -2995,6 +3406,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         let selected_sensor_name = sensor_name(&project.settings).to_string();
         return Ok(CaptureStatus {
             project: project.clone(),
+            live_contract_version: 2,
             preview_point_count: preview.len() as u64,
             preview,
             capturing: false,
@@ -3008,6 +3420,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             stream_fps: 0.0,
             tracking: false,
             tracking_status: "Reconstruction preview".to_string(),
+            tracking_state: "complete".to_string(),
+            tracking_confidence: 0.0,
             imu_active: false,
             imu_rate_hz: 0.0,
             live_reconstruction_active: false,
@@ -3020,7 +3434,23 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             source_drop_count: 0,
             tracking_queue_drop_count: 0,
             mapping_drop_count: 0,
+            tracking_queue_depth: 0,
+            mapping_queue_depth: 0,
             tracking_overlap: 0.0,
+            pose_uncertainty_mm: None,
+            pose_uncertainty_degrees: None,
+            pose_latency_ms: None,
+            map_update_latency_ms: None,
+            map_update_hz: 0.0,
+            allocated_live_map_bytes: 0,
+            active_voxel_count: 0,
+            active_surfel_count: 0,
+            resident_submap_count: 0,
+            host_cached_submap_count: 0,
+            dropped_preview_job_count: 0,
+            degradation_level: 0,
+            live_scale_status: "SENSOR_METRIC".to_string(),
+            integration_frozen: false,
             depth_rmse_mm: None,
             live_reconstruction_backend: None,
             reconstruction: reconstruction_progress(&project_root),
@@ -3032,6 +3462,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
     let selected_sensor_name = sensor_name(&project.settings).to_string();
     Ok(CaptureStatus {
         project: project.clone(),
+        live_contract_version: 2,
         preview_point_count: preview.len() as u64,
         preview,
         capturing: false,
@@ -3045,6 +3476,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         stream_fps: 0.0,
         tracking: false,
         tracking_status: "Ready to capture".to_string(),
+        tracking_state: "ready".to_string(),
+        tracking_confidence: 0.0,
         imu_active: false,
         imu_rate_hz: 0.0,
         live_reconstruction_active: false,
@@ -3057,7 +3490,23 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         source_drop_count: 0,
         tracking_queue_drop_count: 0,
         mapping_drop_count: 0,
+        tracking_queue_depth: 0,
+        mapping_queue_depth: 0,
         tracking_overlap: 0.0,
+        pose_uncertainty_mm: None,
+        pose_uncertainty_degrees: None,
+        pose_latency_ms: None,
+        map_update_latency_ms: None,
+        map_update_hz: 0.0,
+        allocated_live_map_bytes: 0,
+        active_voxel_count: 0,
+        active_surfel_count: 0,
+        resident_submap_count: 0,
+        host_cached_submap_count: 0,
+        dropped_preview_job_count: 0,
+        degradation_level: 0,
+        live_scale_status: "SENSOR_METRIC".to_string(),
+        integration_frozen: false,
         depth_rmse_mm: None,
         live_reconstruction_backend: None,
         reconstruction: reconstruction_progress(&project_root),
@@ -3179,8 +3628,12 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
         drain_sensor_relay(&mut capture, Duration::from_secs(3));
         drain_live_reconstruction(&mut capture, Duration::from_secs(3));
         stop_live_reconstruction(&mut capture, Duration::from_secs(5));
-        let live_preview_error =
-            save_live_reconstruction_preview(&capture.phase_root, &capture.realtime).err();
+        let live_preview_error = save_live_reconstruction_preview(
+            &capture.project_root,
+            &capture.phase_root,
+            &capture.realtime,
+        )
+        .err();
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
 
         let manifest_path = capture.phase_root.join("phase.json");
@@ -5220,7 +5673,8 @@ mod tests {
     fn final_live_point_packet_is_preserved_with_the_capture() {
         let root =
             std::env::temp_dir().join(format!("scanlan-live-preview-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
+        let phase_root = root.join("phases").join("phase-1");
+        fs::create_dir_all(&phase_root).unwrap();
         let mut packet = Vec::new();
         packet.extend_from_slice(b"K2P1");
         packet.extend_from_slice(&7_u32.to_le_bytes());
@@ -5237,10 +5691,25 @@ mod tests {
             packet: Arc::new(packet.clone()),
         });
 
-        assert!(save_live_reconstruction_preview(&root, &Arc::new(Mutex::new(snapshot)),).unwrap());
+        assert!(save_live_reconstruction_preview(
+            &root,
+            &phase_root,
+            &Arc::new(Mutex::new(snapshot)),
+        )
+        .unwrap());
         assert_eq!(
-            fs::read(root.join("live-reconstruction.preview.bin")).unwrap(),
+            fs::read(phase_root.join("live-reconstruction.preview.bin")).unwrap(),
             packet
+        );
+        assert!(root.join("outputs/live/session.json").is_file());
+        let ply = fs::read(root.join("outputs/live/latest-preview.ply")).unwrap();
+        let glb = fs::read(root.join("outputs/live/latest-preview.glb")).unwrap();
+        assert!(ply.starts_with(b"ply\nformat binary_little_endian 1.0\n"));
+        assert_eq!(&glb[..4], b"glTF");
+        assert_eq!(u32::from_le_bytes(glb[4..8].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(glb[8..12].try_into().unwrap()) as usize,
+            glb.len()
         );
         fs::remove_dir_all(root).ok();
     }

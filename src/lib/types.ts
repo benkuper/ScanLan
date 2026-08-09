@@ -210,6 +210,7 @@ export interface ArtifactJob {
 
 export interface CaptureStatus {
   project: ProjectSummary;
+  liveContractVersion: number;
   preview: PreviewPoint[];
   capturing: boolean;
   previewing: boolean;
@@ -223,6 +224,8 @@ export interface CaptureStatus {
   streamFps: number;
   tracking: boolean;
   trackingStatus: string;
+  trackingState: 'ready' | 'preview' | 'tracking' | 'searching' | 'relocalized' | 'frozen' | 'failed' | 'complete';
+  trackingConfidence: number;
   imuActive: boolean;
   imuRateHz: number;
   liveReconstructionActive: boolean;
@@ -235,11 +238,64 @@ export interface CaptureStatus {
   sourceDropCount: number;
   trackingQueueDropCount: number;
   mappingDropCount: number;
+  trackingQueueDepth: number;
+  mappingQueueDepth: number;
   trackingOverlap: number;
+  poseUncertaintyMm?: number;
+  poseUncertaintyDegrees?: number;
+  poseLatencyMs?: number;
+  mapUpdateLatencyMs?: number;
+  mapUpdateHz: number;
+  allocatedLiveMapBytes: number;
+  activeVoxelCount: number;
+  activeSurfelCount: number;
+  residentSubmapCount: number;
+  hostCachedSubmapCount: number;
+  droppedPreviewJobCount: number;
+  degradationLevel: number;
+  liveScaleStatus: 'SENSOR_METRIC' | 'MODEL_METRIC_UNVERIFIED' | 'MODEL_METRIC_VALIDATED' | 'USER_CALIBRATED' | 'RELATIVE_SCALE';
+  integrationFrozen: boolean;
   depthRmseMm?: number;
   liveReconstructionBackend?: string;
   reconstruction?: ReconstructionProgress;
   error?: string;
+}
+
+export interface LiveSubmapDescriptor {
+  id: string;
+  localOrigin: number[];
+  globalFromLocal: number[];
+  state: 'active' | 'complete' | 'frozen';
+  firstSequence: number;
+  lastSequence: number;
+  voxelSizeM: number;
+  voxelCount: number;
+  pointCount: number;
+  observationCount: number;
+  confidence: number;
+  boundsMin: [number, number, number];
+  boundsMax: [number, number, number];
+  resident: 'gpu' | 'host';
+}
+
+export interface LiveCoverageSummary {
+  contractVersion: 2;
+  frameSequence: number;
+  observedRatio: number;
+  weakRatio: number;
+  singleViewRatio: number;
+  holeBoundaryRatio: number;
+  guidance: string[];
+}
+
+export interface LiveReconstructionGuidance {
+  contractVersion: 2;
+  coverage: LiveCoverageSummary | null;
+  submaps: {
+    contractVersion: 2;
+    frameSequence: number;
+    submaps: LiveSubmapDescriptor[];
+  } | null;
 }
 
 export interface ReconstructionProgress {

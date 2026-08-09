@@ -370,6 +370,7 @@ pub struct RuntimeInfo {
 #[serde(rename_all = "camelCase")]
 pub struct CaptureStatus {
     pub project: ProjectSummary,
+    pub live_contract_version: u16,
     pub preview: Vec<PreviewPoint>,
     pub capturing: bool,
     pub previewing: bool,
@@ -383,6 +384,8 @@ pub struct CaptureStatus {
     pub stream_fps: f32,
     pub tracking: bool,
     pub tracking_status: String,
+    pub tracking_state: String,
+    pub tracking_confidence: f32,
     pub imu_active: bool,
     pub imu_rate_hz: f32,
     pub live_reconstruction_active: bool,
@@ -395,7 +398,23 @@ pub struct CaptureStatus {
     pub source_drop_count: u64,
     pub tracking_queue_drop_count: u64,
     pub mapping_drop_count: u64,
+    pub tracking_queue_depth: u32,
+    pub mapping_queue_depth: u32,
     pub tracking_overlap: f32,
+    pub pose_uncertainty_mm: Option<f32>,
+    pub pose_uncertainty_degrees: Option<f32>,
+    pub pose_latency_ms: Option<f32>,
+    pub map_update_latency_ms: Option<f32>,
+    pub map_update_hz: f32,
+    pub allocated_live_map_bytes: u64,
+    pub active_voxel_count: u64,
+    pub active_surfel_count: u64,
+    pub resident_submap_count: u32,
+    pub host_cached_submap_count: u32,
+    pub dropped_preview_job_count: u64,
+    pub degradation_level: u8,
+    pub live_scale_status: String,
+    pub integration_frozen: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depth_rmse_mm: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -450,6 +469,8 @@ pub struct LiveWorkerStatus {
 #[serde(rename_all = "camelCase")]
 pub struct LiveReconstructionStatus {
     #[serde(default)]
+    pub contract_version: u16,
+    #[serde(default)]
     pub active: bool,
     #[serde(default)]
     pub mode: String,
@@ -458,7 +479,13 @@ pub struct LiveReconstructionStatus {
     #[serde(default)]
     pub tracking_status: String,
     #[serde(default)]
+    pub tracking_state: String,
+    #[serde(default)]
+    pub tracking_confidence: f32,
+    #[serde(default)]
     pub processed_frames: u32,
+    #[serde(default)]
+    pub accepted_frames: u32,
     #[serde(default)]
     pub integrated_frames: u32,
     #[serde(default)]
@@ -481,6 +508,38 @@ pub struct LiveReconstructionStatus {
     pub overlap: f32,
     #[serde(default)]
     pub depth_rmse_mm: Option<f32>,
+    #[serde(default)]
+    pub pose_uncertainty_mm: Option<f32>,
+    #[serde(default)]
+    pub pose_uncertainty_degrees: Option<f32>,
+    #[serde(default)]
+    pub pose_latency_ms: Option<f32>,
+    #[serde(default)]
+    pub map_update_latency_ms: Option<f32>,
+    #[serde(default)]
+    pub map_update_hz: f32,
+    #[serde(default)]
+    pub allocated_live_map_bytes: u64,
+    #[serde(default)]
+    pub active_voxel_count: u64,
+    #[serde(default)]
+    pub active_surfel_count: u64,
+    #[serde(default)]
+    pub resident_submap_count: u32,
+    #[serde(default)]
+    pub host_cached_submap_count: u32,
+    #[serde(default)]
+    pub dropped_preview_jobs: u64,
+    #[serde(default)]
+    pub tracking_queue_depth: u32,
+    #[serde(default)]
+    pub mapping_queue_depth: u32,
+    #[serde(default)]
+    pub degradation_level: u8,
+    #[serde(default)]
+    pub scale_status: String,
+    #[serde(default)]
+    pub integration_frozen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

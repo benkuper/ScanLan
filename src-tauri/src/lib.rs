@@ -27,6 +27,7 @@ pub fn run() {
             commands::capture_status,
             commands::live_preview_frame,
             commands::live_reconstruction_mesh,
+            commands::live_reconstruction_guidance,
             commands::load_capture_draft,
             commands::stop_sensor_phase,
             commands::remove_capture,

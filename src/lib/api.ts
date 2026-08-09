@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ArtifactJob, ArtifactTarget, AvailableSensor, BoundingBoxClip, BuildReusePolicy, CaptureSettings, CaptureStatus, CloudTransform, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
+import type { ArtifactJob, ArtifactTarget, AvailableSensor, BoundingBoxClip, BuildReusePolicy, CaptureSettings, CaptureStatus, CloudTransform, LiveReconstructionGuidance, PreviewMesh, PreviewPoint, ProjectCatalogEntry, ProjectSummary, RuntimeInfo } from './types';
 
 const inTauri = () => typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
 
@@ -237,6 +237,11 @@ export async function loadLiveReconstructionMesh(afterFrame: number): Promise<{ 
       indices: new Uint32Array(bytes.buffer.slice(bytes.byteOffset + indexStart, bytes.byteOffset + bytes.byteLength))
     }
   };
+}
+
+export async function loadLiveReconstructionGuidance(): Promise<LiveReconstructionGuidance> {
+  requireDesktop();
+  return invoke<LiveReconstructionGuidance>('live_reconstruction_guidance');
 }
 
 export async function startArtifactJob(

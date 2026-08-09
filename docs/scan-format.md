@@ -155,6 +155,34 @@ index,source_sequence,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_
 
 The production loader matches the journal to archived frames by `source_sequence`. Explicitly rejected frames are excluded. A complete accepted trajectory is inverted to camera-to-world and validated before being used as the final-pass seed.
 
+## Provisional live-session artifact
+
+Stopping a capture atomically publishes the latest validated live map beneath `outputs/live/`:
+
+```text
+outputs/live/
+|-- session.json
+|-- poses.jsonl
+|-- tracking-summary.json
+|-- latest-preview.bin
+|-- latest-preview.ply
+|-- latest-preview.glb
+|-- submaps/
+`-- coverage/
+```
+
+`session.json` schema 1 uses live contract 2. It identifies the source phase, calibration,
+sensor, scale status, tracking counts, queue losses, memory telemetry, loop decisions, preview
+paths, and deterministic final-map fingerprint. The PLY and GLB are explicitly provisional
+point representations; production outputs never overwrite them. `latest-preview.bin` retains
+the bounded internal `K2P1` packet so the desktop can reopen the exact final live view without
+converting the raw capture. `poses.jsonl` is a snapshot of the fail-closed tracking journal.
+
+Live contract 2 defines these tracking states: `ready`, `preview`, `tracking`, `searching`,
+`relocalized`, `frozen`, `failed`, and `complete`. It also reserves engine message kind 5 for
+coverage summaries and kind 6 for submap descriptors. Both are UTF-8 JSON with
+`contractVersion: 2`; geometry messages remain the bounded binary point/mesh packets.
+
 ## IMU
 
 `imu.csv` fields are:
