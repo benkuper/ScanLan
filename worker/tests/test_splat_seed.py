@@ -31,25 +31,28 @@ class SplatSeedTests(unittest.TestCase):
         self.assertGreater(len(cells), 1)
         self.assertTrue(all(x0 < 16 for x0, _y0, _x1, _y1 in cells))
 
-    def test_compaction_keeps_the_finest_seed_per_spatial_voxel(self) -> None:
+    def test_compaction_prefers_measured_confidence_per_spatial_voxel(self) -> None:
         identity = np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
         coarse = GaussianSeeds(
             points=np.asarray([[0.001, 0.001, 0.001]], dtype=np.float32),
             colors=np.asarray([[255, 0, 0]], dtype=np.uint8),
             scales=np.asarray([[0.05, 0.05, 0.001]], dtype=np.float32),
             quaternions=identity,
+            confidence=np.asarray([1.0], dtype=np.float32),
         )
         fine = GaussianSeeds(
             points=np.asarray([[0.002, 0.002, 0.002]], dtype=np.float32),
             colors=np.asarray([[0, 255, 0]], dtype=np.uint8),
             scales=np.asarray([[0.01, 0.01, 0.001]], dtype=np.float32),
             quaternions=identity,
+            confidence=np.asarray([0.35], dtype=np.float32),
         )
 
         compact = compact_seed_batches([coarse, fine], voxel_size_m=0.01)
 
         self.assertEqual(len(compact.points), 1)
-        self.assertEqual(compact.colors[0].tolist(), [0, 255, 0])
+        self.assertEqual(compact.colors[0].tolist(), [255, 0, 0])
+        self.assertEqual(float(compact.confidence[0]), 1.0)
 
 
 if __name__ == "__main__":

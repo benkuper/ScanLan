@@ -11,9 +11,18 @@ dependencies = [
   "numpy==1.26.4",
   "Pillow==11.1.0",
   "torch==2.12.1",
+  "torchvision==0.27.1",
   "gsplat==1.5.3",
   "pycolmap==4.1.1",
   "av==18.0.0",
+  "lingbot-map @ git+https://github.com/Robbyant/lingbot-map.git@1f480aeb8a47a24656090d46d053115b7fe60435",
+  "huggingface-hub>=0.34,<2",
+  "einops>=0.8,<1",
+  "safetensors>=0.5,<1",
+  "opencv-python==4.11.0.86",
+  "scipy>=1.15,<2",
+  "tqdm>=4.67,<5",
+  "onnxruntime-gpu==1.28.0",
 ]
 
 [project.optional-dependencies]

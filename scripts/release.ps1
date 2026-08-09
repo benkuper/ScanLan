@@ -7,11 +7,17 @@ $RunningReleaseApp = Get-Process -Name "scanlan" -ErrorAction SilentlyContinue |
   Select-Object -First 1
 
 if ($RunningReleaseApp) {
-  Write-Host "ScanLan release mode is already running (PID $($RunningReleaseApp.Id))."
-  exit 0
+  Write-Host "Stopping the previous ScanLan release build (PID $($RunningReleaseApp.Id))."
+  $RunningReleaseApp | Stop-Process
+  $RunningReleaseApp | Wait-Process -ErrorAction SilentlyContinue
 }
 
-& npm.cmd run tauri -- build --no-bundle
+& npm.cmd run prepare:splat
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
+
+& npm.cmd run tauri -- build --no-bundle --config src-tauri/tauri.splat.conf.json
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }

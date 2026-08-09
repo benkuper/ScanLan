@@ -16,6 +16,12 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 from PIL import Image, ImageOps
 
+from .lingbot import (
+    LingbotGeometry,
+    infer_lingbot_geometry,
+    lingbot_processed_size,
+    lingbot_source_pixel_grid,
+)
 from .runtime import pycolmap_device, pycolmap_feature_runtime
 
 
@@ -42,11 +48,45 @@ VIDEO_EXTENSIONS = {
 
 @dataclass(frozen=True)
 class MediaPreparationOptions:
-    video_fps: float = 1.0
-    maximum_video_frames: int = 240
+    # This is the rate at which video frames are inspected, not the rate at
+    # which they are retained. Optical-flow keyframing below keeps views based
+    # on camera motion and tracked overlap, so still/slow passages contribute
+    # fewer images while fast turns contribute more.
+    video_fps: float = 15.0
+    # A crash-safety ceiling only; adaptive selection does not aim for it.
+    maximum_video_frames: int = 3_000
     maximum_image_dimension: int = 2560
     minimum_image_dimension: int = 480
     maximum_features: int = 8_192
+
+
+LINGBOT_CONTEXT_FPS = 10.0
+LINGBOT_MAX_CONTEXT_FRAMES = 3_000
+ADAPTIVE_MINIMUM_GAP_SECONDS = 0.125
+ADAPTIVE_MAXIMUM_GAP_SECONDS = 2.0
+ADAPTIVE_TARGET_TRACKED_RATIO = 0.72
+ADAPTIVE_HARD_TRACKED_RATIO = 0.50
+ADAPTIVE_TARGET_MEDIAN_MOTION = 0.055
+ADAPTIVE_TARGET_P90_MOTION = 0.12
+
+
+def adaptive_frame_selection_status() -> dict[str, Any]:
+    """Describe the non-optional video keyframing policy in this worker."""
+    defaults = MediaPreparationOptions()
+    return {
+        "enabled": True,
+        "mode": "adaptive_optical_flow",
+        "analysisFps": defaults.video_fps,
+        "maximumFrames": defaults.maximum_video_frames,
+        "maximumFramesIsSafetyCeiling": True,
+        "signals": [
+            "tracked_overlap",
+            "spatial_coverage",
+            "camera_motion",
+            "parallax",
+            "blur_guard",
+        ],
+    }
 
 
 class _CameraSolveTelemetry:
@@ -236,7 +276,7 @@ def _media_sources(project_root: Path, explicit: Sequence[Path]) -> list[Path]:
 def _source_fingerprint(sources: Sequence[Path], options: MediaPreparationOptions) -> str:
     """Fingerprint only work needed to decode and select canonical media views."""
     digest = hashlib.sha256()
-    digest.update(b"scanlan-media-observations-v1-streaming-jpeg95\0")
+    digest.update(b"scanlan-media-observations-v2-adaptive-flow-jpeg95\0")
     digest.update(
         json.dumps(
             {
@@ -270,10 +310,11 @@ def _media_dataset_fingerprint(
 ) -> str:
     """Fingerprint camera analysis independently from expensive media decoding."""
     digest = hashlib.sha256()
-    # v8 also fingerprints the bounded multi-model and bundle-adjustment
-    # schedule so an older rejected camera analysis is never silently reused.
-    digest.update(b"scanlan-media-dataset-v8-bounded-shared-video-camera\0")
+    # v11 adds conservative confidence/thickness filtering on top of calibrated
+    # video rays. Older dense priors must not be reused.
+    digest.update(b"scanlan-media-dataset-v15-lingbot-quality-gated\0")
     digest.update(observation_fingerprint.encode("ascii"))
+    digest.update(f"{LINGBOT_CONTEXT_FPS}:{LINGBOT_MAX_CONTEXT_FRAMES}".encode("ascii"))
     digest.update(str(options.maximum_features).encode("ascii"))
     return digest.hexdigest()
 
@@ -334,6 +375,163 @@ def _descriptor_distance(left: np.ndarray, right: np.ndarray) -> float:
     return float(1.0 - np.clip(np.dot(left, right), -1.0, 1.0))
 
 
+def _tracked_visual_motion(
+    reference: np.ndarray,
+    current: np.ndarray,
+) -> dict[str, float | int | bool]:
+    """Measure retained visual overlap and image motion with forward/backward LK.
+
+    The small grayscale inputs make this cheap enough to evaluate throughout a
+    long video. Forward/backward validation rejects unstable tracks from blur,
+    occlusion, and independently moving objects instead of mistaking them for
+    useful camera overlap.
+    """
+    import cv2
+
+    if reference.ndim != 2 or current.ndim != 2:
+        raise ValueError("Adaptive video tracking requires grayscale images")
+    if current.shape != reference.shape:
+        current = cv2.resize(
+            current,
+            (reference.shape[1], reference.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+    corners = cv2.goodFeaturesToTrack(
+        reference,
+        maxCorners=600,
+        qualityLevel=0.01,
+        minDistance=5,
+        blockSize=5,
+    )
+    feature_count = 0 if corners is None else len(corners)
+    if feature_count < 24:
+        return {
+            "reliable": False,
+            "featureCount": feature_count,
+            "trackedCount": 0,
+            "trackedRatio": 0.0,
+            "coverageRatio": 0.0,
+            "overlapScore": 0.0,
+            "medianMotion": 0.0,
+            "p90Motion": 0.0,
+        }
+    flow_options = {
+        "winSize": (21, 21),
+        "maxLevel": 3,
+        "criteria": (
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            30,
+            0.01,
+        ),
+    }
+    forward, forward_status, _ = cv2.calcOpticalFlowPyrLK(
+        reference,
+        current,
+        corners,
+        None,
+        **flow_options,
+    )
+    if forward is None or forward_status is None:
+        return {
+            "reliable": False,
+            "featureCount": feature_count,
+            "trackedCount": 0,
+            "trackedRatio": 0.0,
+            "coverageRatio": 0.0,
+            "overlapScore": 0.0,
+            "medianMotion": 0.0,
+            "p90Motion": 0.0,
+        }
+    backward, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+        current,
+        reference,
+        forward,
+        None,
+        **flow_options,
+    )
+    if backward is None or backward_status is None:
+        return {
+            "reliable": False,
+            "featureCount": feature_count,
+            "trackedCount": 0,
+            "trackedRatio": 0.0,
+            "coverageRatio": 0.0,
+            "overlapScore": 0.0,
+            "medianMotion": 0.0,
+            "p90Motion": 0.0,
+        }
+    source_points = corners.reshape(-1, 2)
+    target_points = forward.reshape(-1, 2)
+    recovered_points = backward.reshape(-1, 2)
+    height, width = reference.shape
+    forward_backward_error = np.linalg.norm(recovered_points - source_points, axis=1)
+    valid = (
+        forward_status.reshape(-1).astype(bool)
+        & backward_status.reshape(-1).astype(bool)
+        & np.isfinite(target_points).all(axis=1)
+        & (forward_backward_error <= 1.5)
+        & (target_points[:, 0] >= 0.0)
+        & (target_points[:, 0] < width)
+        & (target_points[:, 1] >= 0.0)
+        & (target_points[:, 1] < height)
+    )
+    tracked_count = int(np.count_nonzero(valid))
+    tracked_ratio = tracked_count / feature_count
+    grid_columns = 8
+    grid_rows = 6
+    source_cells = (
+        np.clip((source_points[:, 1] * grid_rows / max(height, 1)).astype(np.int32), 0, grid_rows - 1)
+        * grid_columns
+        + np.clip((source_points[:, 0] * grid_columns / max(width, 1)).astype(np.int32), 0, grid_columns - 1)
+    )
+    occupied_cells = np.unique(source_cells)
+    tracked_cells = np.unique(source_cells[valid])
+    coverage_ratio = len(tracked_cells) / max(len(occupied_cells), 1)
+    if not tracked_count:
+        median_motion = 0.0
+        p90_motion = 0.0
+    else:
+        diagonal = max(float(math.hypot(width, height)), 1.0)
+        motion = np.linalg.norm(target_points[valid] - source_points[valid], axis=1) / diagonal
+        median_motion = float(np.median(motion))
+        p90_motion = float(np.percentile(motion, 90))
+    return {
+        "reliable": True,
+        "featureCount": feature_count,
+        "trackedCount": tracked_count,
+        "trackedRatio": tracked_ratio,
+        "coverageRatio": coverage_ratio,
+        "overlapScore": min(tracked_ratio, coverage_ratio),
+        "medianMotion": median_motion,
+        "p90Motion": p90_motion,
+    }
+
+
+def _adaptive_keyframe_reason(
+    elapsed_seconds: float,
+    motion: dict[str, float | int | bool],
+    descriptor_distance: float,
+    *,
+    minimum_gap_seconds: float = ADAPTIVE_MINIMUM_GAP_SECONDS,
+) -> str | None:
+    """Return why the candidate should become a keyframe, if it should."""
+    if elapsed_seconds < minimum_gap_seconds:
+        return None
+    if elapsed_seconds >= ADAPTIVE_MAXIMUM_GAP_SECONDS:
+        return "maximum_gap"
+    if bool(motion["reliable"]):
+        if float(motion["overlapScore"]) <= ADAPTIVE_TARGET_TRACKED_RATIO:
+            return "tracked_overlap"
+        if float(motion["medianMotion"]) >= ADAPTIVE_TARGET_MEDIAN_MOTION:
+            return "camera_motion"
+        if float(motion["p90Motion"]) >= ADAPTIVE_TARGET_P90_MOTION:
+            return "parallax"
+        return None
+    # Very low-texture frames cannot support a trustworthy LK estimate. The
+    # coarse exposure-invariant descriptor still prevents a long blind gap.
+    return "visual_change" if descriptor_distance >= 0.12 else None
+
+
 def _extract_photo(
     source: Path,
     destination: Path,
@@ -363,78 +561,6 @@ def _extract_photo(
     }
 
 
-def _video_candidates(
-    source: Path,
-    target_fps: float,
-) -> tuple[list[tuple[float, Image.Image, float, np.ndarray]], dict[str, Any]]:
-    try:
-        import av
-    except ModuleNotFoundError as error:
-        raise RuntimeError("Video import requires the bundled PyAV runtime") from error
-
-    container = av.open(str(source))
-    try:
-        stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
-        duration = (
-            float(stream.duration * stream.time_base)
-            if stream.duration is not None and stream.time_base is not None
-            else None
-        )
-        source_rate = float(stream.average_rate) if stream.average_rate else None
-        evaluation_interval = 1.0 / max(target_fps * 3.0, 1.0)
-        next_evaluation = 0.0
-        candidates: list[tuple[float, Image.Image, float, np.ndarray]] = []
-        decoded = 0
-        for frame in container.decode(stream):
-            decoded += 1
-            timestamp = float(frame.time) if frame.time is not None else (
-                decoded / source_rate if source_rate else float(decoded)
-            )
-            if timestamp + 1e-6 < next_evaluation:
-                continue
-            next_evaluation = timestamp + evaluation_interval
-            image = frame.to_image().convert("RGB")
-            sharpness, descriptor = _sharpness_and_descriptor(image)
-            candidates.append((timestamp, image, sharpness, descriptor))
-        return candidates, {
-            "path": str(source),
-            "durationSeconds": duration,
-            "sourceFps": source_rate,
-            "decodedFrameCount": decoded,
-            "candidateFrameCount": len(candidates),
-        }
-    finally:
-        container.close()
-
-
-def _select_video_candidates(
-    candidates: Sequence[tuple[float, Image.Image, float, np.ndarray]],
-    target_fps: float,
-    maximum_frames: int,
-) -> list[tuple[float, Image.Image, float, np.ndarray]]:
-    if not candidates:
-        return []
-    bucket_width = 1.0 / max(target_fps, 0.1)
-    best_by_bucket: dict[int, tuple[float, Image.Image, float, np.ndarray]] = {}
-    for candidate in candidates:
-        bucket = int(candidate[0] / bucket_width)
-        previous = best_by_bucket.get(bucket)
-        if previous is None or candidate[2] > previous[2]:
-            best_by_bucket[bucket] = candidate
-    selected: list[tuple[float, Image.Image, float, np.ndarray]] = []
-    for candidate in sorted(best_by_bucket.values(), key=lambda value: value[0]):
-        if selected and _descriptor_distance(selected[-1][3], candidate[3]) < 0.012:
-            if candidate[2] > selected[-1][2] * 1.15:
-                selected[-1] = candidate
-            continue
-        selected.append(candidate)
-    if len(selected) > maximum_frames:
-        indices = np.linspace(0, len(selected) - 1, maximum_frames, dtype=np.int64)
-        selected = [selected[int(index)] for index in indices]
-    return selected
-
-
 def _extract_video_streaming(
     source: Path,
     images_root: Path,
@@ -444,13 +570,14 @@ def _extract_video_streaming(
     project_root: Path,
     progress: Callable[[float, str, int | None, dict[str, Any]], None],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Select and write sharp video views with constant full-frame memory.
+    """Select motion-adaptive video views with constant full-frame memory.
 
     The previous implementation retained every evaluated RGB frame until the
     entire video had decoded. A few minutes of 4K video could therefore retain
-    many gigabytes and turn normal decoding into paging. This version holds one
-    best decoded frame for the active time bucket plus one pending selected RGB
-    image used for duplicate suppression.
+    many gigabytes and turn normal decoding into paging. This version holds a
+    small grayscale reference plus at most one pending decoded frame. Keyframes
+    are driven by tracked visual overlap and normalized motion instead of video
+    duration or a fixed output FPS.
     """
     try:
         import av
@@ -467,29 +594,44 @@ def _extract_video_streaming(
             else None
         )
         source_rate = float(stream.average_rate) if stream.average_rate else None
-        effective_fps = max(options.video_fps, 1e-4)
+        analysis_fps = max(options.video_fps, 1e-4)
+        if source_rate:
+            analysis_fps = min(analysis_fps, source_rate)
+        evaluation_interval = 1.0 / max(analysis_fps, 1e-6)
+        minimum_gap = ADAPTIVE_MINIMUM_GAP_SECONDS
         if duration and duration > 0.0 and maximum_frames > 1:
-            effective_fps = min(
-                effective_fps,
-                (maximum_frames - 1) / duration,
-            )
-        bucket_width = 1.0 / max(effective_fps, 1e-6)
-        evaluation_interval = 1.0 / max(effective_fps * 3.0, 0.03)
+            # Only the crash-safety ceiling may relax the fastest permitted
+            # selection rate. Below that ceiling, selection is purely visual.
+            minimum_gap = max(minimum_gap, duration / (maximum_frames - 1))
         next_evaluation = 0.0
-        active_bucket: int | None = None
-        best: tuple[float, Any, float, np.ndarray] | None = None
-        pending: tuple[float, Image.Image, float, np.ndarray] | None = None
+        reference_gray: np.ndarray | None = None
+        reference_descriptor: np.ndarray | None = None
+        reference_timestamp: float | None = None
+        pending: tuple[float, Any, float, np.ndarray, np.ndarray] | None = None
+        pending_motion: dict[str, float | int | bool] | None = None
         records: list[dict[str, Any]] = []
         decoded = 0
         evaluated = 0
-        duplicate_count = 0
+        selection_reasons: dict[str, int] = {}
+        tracked_overlaps: list[float] = []
         started = time.perf_counter()
         last_progress_at = 0.0
 
-        def write_selected(candidate: tuple[float, Image.Image, float, np.ndarray]) -> None:
+        def write_selected(
+            candidate: tuple[float, Any, float, np.ndarray, np.ndarray],
+            reason: str,
+            motion: dict[str, float | int | bool] | None,
+        ) -> bool:
+            nonlocal reference_gray, reference_descriptor, reference_timestamp
             if len(records) >= maximum_frames:
-                return
-            timestamp, image, sharpness, descriptor = candidate
+                return False
+            timestamp, frame, sharpness, descriptor, gray = candidate
+            output_size = _limited_size(
+                int(frame.width),
+                int(frame.height),
+                options.maximum_image_dimension,
+            )
+            image = frame.to_image(width=output_size[0], height=output_size[1]).convert("RGB")
             destination = images_root / f"video-{first_frame_index + len(records):06d}.jpg"
             width, height = _save_canonical_image(
                 image,
@@ -498,7 +640,12 @@ def _extract_video_streaming(
             )
             if min(width, height) < options.minimum_image_dimension:
                 destination.unlink(missing_ok=True)
-                return
+                return False
+            tracked_ratio = (
+                float(motion["overlapScore"])
+                if motion is not None and bool(motion["reliable"])
+                else None
+            )
             records.append(
                 {
                     "source": str(source),
@@ -509,31 +656,17 @@ def _extract_video_streaming(
                     "sharpness": sharpness,
                     "descriptor": descriptor,
                     "timestampSeconds": timestamp,
+                    "selectionReason": reason,
+                    "trackedOverlap": tracked_ratio,
                 }
             )
-
-        def accept_bucket(candidate: tuple[float, Any, float, np.ndarray] | None) -> None:
-            nonlocal pending, duplicate_count
-            if candidate is None:
-                return
-            timestamp, frame, sharpness, descriptor = candidate
-            output_size = _limited_size(
-                int(frame.width),
-                int(frame.height),
-                options.maximum_image_dimension,
-            )
-            image = frame.to_image(width=output_size[0], height=output_size[1]).convert("RGB")
-            current = (timestamp, image, sharpness, descriptor)
-            if pending is None:
-                pending = current
-                return
-            if _descriptor_distance(pending[3], descriptor) < 0.012:
-                duplicate_count += 1
-                if sharpness > pending[2] * 1.15:
-                    pending = current
-                return
-            write_selected(pending)
-            pending = current
+            selection_reasons[reason] = selection_reasons.get(reason, 0) + 1
+            if tracked_ratio is not None:
+                tracked_overlaps.append(tracked_ratio)
+            reference_gray = gray.copy()
+            reference_descriptor = descriptor.copy()
+            reference_timestamp = timestamp
+            return True
 
         for frame in container.decode(stream):
             decoded += 1
@@ -567,52 +700,282 @@ def _extract_video_streaming(
                     {
                         "decodedFrames": decoded,
                         "evaluatedFrames": evaluated,
-                        "selectedFrames": len(records) + (1 if pending is not None else 0),
+                        "selectedFrames": len(records),
                         "sourceTimestampSeconds": round(timestamp, 3),
                         "sourceDurationSeconds": duration,
+                        "selectionMode": "adaptive optical flow",
                     },
                 )
                 last_progress_at = now
             if timestamp + 1e-6 < next_evaluation:
                 continue
             next_evaluation = timestamp + evaluation_interval
-            bucket = int(timestamp / bucket_width)
-            if active_bucket is not None and bucket != active_bucket:
-                accept_bucket(best)
-                best = None
-            active_bucket = bucket
             sample_size = _limited_size(int(frame.width), int(frame.height), 320)
             sample = frame.to_image(width=sample_size[0], height=sample_size[1]).convert("RGB")
             sharpness, descriptor = _sharpness_and_descriptor(sample)
+            gray = np.asarray(ImageOps.grayscale(sample), dtype=np.uint8)
             evaluated += 1
-            candidate = (timestamp, frame, sharpness, descriptor)
-            if best is None or sharpness > best[2]:
-                best = candidate
+            candidate = (timestamp, frame, sharpness, descriptor, gray)
+            if reference_gray is None:
+                write_selected(candidate, "first_frame", None)
+                pending = None
+                pending_motion = None
+                continue
+            assert reference_timestamp is not None
+            assert reference_descriptor is not None
+            motion = _tracked_visual_motion(reference_gray, gray)
+            elapsed = timestamp - reference_timestamp
 
-        accept_bucket(best)
-        if pending is not None:
-            write_selected(pending)
+            # If the current candidate has already crossed the hard continuity
+            # floor, retain the preceding evaluated frame—the last known view
+            # with safer overlap—then assess the current one against that new
+            # reference. Fast motion therefore creates closer-spaced views.
+            if (
+                bool(motion["reliable"])
+                and float(motion["overlapScore"]) < ADAPTIVE_HARD_TRACKED_RATIO
+                and pending is not None
+                and pending_motion is not None
+                and pending[0] - reference_timestamp >= minimum_gap
+            ):
+                write_selected(pending, "overlap_guard", pending_motion)
+                assert reference_gray is not None
+                assert reference_descriptor is not None
+                assert reference_timestamp is not None
+                motion = _tracked_visual_motion(reference_gray, gray)
+                elapsed = timestamp - reference_timestamp
+                pending = None
+                pending_motion = None
+
+            reason = _adaptive_keyframe_reason(
+                elapsed,
+                motion,
+                _descriptor_distance(reference_descriptor, descriptor),
+                minimum_gap_seconds=minimum_gap,
+            )
+            if (
+                reason is not None
+                and pending is not None
+                and pending_motion is not None
+                and pending[0] - reference_timestamp >= minimum_gap
+                and bool(pending_motion["reliable"])
+                and float(pending_motion["overlapScore"]) >= ADAPTIVE_HARD_TRACKED_RATIO
+                and sharpness < pending[2] * 0.70
+            ):
+                # A blurred frame often appears to have moved because its
+                # tracks disappear. Prefer the immediately preceding sharp,
+                # well-overlapped view, then re-evaluate the current frame from
+                # that safer reference instead of training on motion blur.
+                write_selected(pending, "sharpness_guard", pending_motion)
+                assert reference_gray is not None
+                assert reference_descriptor is not None
+                assert reference_timestamp is not None
+                motion = _tracked_visual_motion(reference_gray, gray)
+                elapsed = timestamp - reference_timestamp
+                reason = _adaptive_keyframe_reason(
+                    elapsed,
+                    motion,
+                    _descriptor_distance(reference_descriptor, descriptor),
+                    minimum_gap_seconds=minimum_gap,
+                )
+                pending = None
+                pending_motion = None
+            if reason is not None:
+                write_selected(candidate, reason, motion)
+                pending = None
+                pending_motion = None
+            else:
+                pending = candidate
+                pending_motion = motion
+
+        if (
+            pending is not None
+            and reference_timestamp is not None
+            and pending[0] - reference_timestamp >= minimum_gap
+        ):
+            write_selected(pending, "last_frame", pending_motion)
+        effective_selection_fps = (
+            len(records) / duration
+            if duration and duration > 0.0
+            else None
+        )
         progress(
             1.0,
-            f"Selected {len(records):,} sharp keyframes from {source.name}",
+            f"Selected {len(records):,} motion-adaptive keyframes from {source.name}",
             0,
             {
                 "decodedFrames": decoded,
                 "evaluatedFrames": evaluated,
                 "selectedFrames": len(records),
-                "duplicateFrames": duplicate_count,
+                "redundantFrames": max(0, evaluated - len(records)),
                 "sourceDurationSeconds": duration,
+                "selectionMode": "adaptive optical flow",
+                "selectionReasons": selection_reasons,
             },
         )
         return records, {
             "path": str(source),
             "durationSeconds": duration,
             "sourceFps": source_rate,
-            "effectiveSelectionFps": effective_fps,
+            "analysisFps": analysis_fps,
+            "effectiveSelectionFps": effective_selection_fps,
             "decodedFrameCount": decoded,
             "candidateFrameCount": evaluated,
             "selectedFrameCount": len(records),
-            "duplicateFrameCount": duplicate_count,
+            "redundantFrameCount": max(0, evaluated - len(records)),
+            "selectionMode": "adaptive_optical_flow",
+            "selectionReasons": selection_reasons,
+            "medianTrackedOverlap": (
+                float(np.median(tracked_overlaps)) if tracked_overlaps else None
+            ),
+            "minimumTrackedOverlap": min(tracked_overlaps, default=None),
+            "frameLimitReached": len(records) >= maximum_frames,
+        }
+    finally:
+        container.close()
+
+
+def _extract_lingbot_context(
+    source: Path,
+    records: Sequence[dict[str, Any]],
+    input_images: Path,
+    context_root: Path,
+    project_root: Path,
+) -> tuple[list[Path], list[int], dict[str, Any]]:
+    """Decode a smooth video stream while preserving exact training views.
+
+    COLMAP benefits from a sparse set of sharp, high-resolution frames. A
+    streaming trajectory model has the opposite requirement: small temporal
+    steps. Build a 10 FPS low-resolution context stream, replace the nearest
+    slots with ScanLan's exact selected frames, and remember which predictions
+    belong to the Gaussian training set.
+    """
+    try:
+        import av
+    except ModuleNotFoundError as error:
+        raise RuntimeError("LingBot video context requires the bundled PyAV runtime") from error
+    if not records:
+        raise ValueError("LingBot video context requires selected training views")
+    container = av.open(str(source))
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        source_rate = float(stream.average_rate) if stream.average_rate else 30.0
+        duration = (
+            float(stream.duration * stream.time_base)
+            if stream.duration is not None and stream.time_base is not None
+            else max(float(record.get("timestampSeconds") or 0.0) for record in records)
+        )
+        effective_fps = LINGBOT_CONTEXT_FPS
+        if duration > 0.0:
+            effective_fps = min(
+                effective_fps,
+                max(1.0, (LINGBOT_MAX_CONTEXT_FRAMES - 1) / duration),
+            )
+        regular_count = max(3, min(
+            LINGBOT_MAX_CONTEXT_FRAMES,
+            int(math.floor(max(duration, 0.0) * effective_fps)) + 1,
+        ))
+        schedule: list[dict[str, Any]] = [
+            {
+                "timestamp": index / effective_fps,
+                "trainingIndex": None,
+                "path": None,
+            }
+            for index in range(regular_count)
+        ]
+        # Replace the closest regular slot with the exact sharp frame used by
+        # COLMAP/training. This makes returned depth and color pixel-identical
+        # to the selected observation while surrounding it with smooth motion.
+        for training_index, record in enumerate(records):
+            timestamp = float(record.get("timestampSeconds") or 0.0)
+            nearest = min(
+                range(len(schedule)),
+                key=lambda index: abs(float(schedule[index]["timestamp"]) - timestamp),
+            )
+            if schedule[nearest]["trainingIndex"] is not None:
+                schedule.append(
+                    {"timestamp": timestamp, "trainingIndex": training_index, "path": None}
+                )
+                target = schedule[-1]
+            else:
+                target = schedule[nearest]
+            target["timestamp"] = timestamp
+            target["trainingIndex"] = training_index
+            target["path"] = input_images / str(record["image"])
+        schedule.sort(key=lambda item: (float(item["timestamp"]), item["trainingIndex"] is None))
+        context_root.mkdir(parents=True, exist_ok=False)
+        pending = [item for item in schedule if item["path"] is None]
+        pending_index = 0
+        decoded = 0
+        saved = 0
+        last_report = 0.0
+        processed_width, processed_height = lingbot_processed_size(
+            int(stream.codec_context.width),
+            int(stream.codec_context.height),
+        )
+        last_image: Image.Image | None = None
+        for frame in container.decode(stream):
+            decoded += 1
+            if decoded % 60 == 0:
+                _check_cancelled(project_root)
+            timestamp = float(frame.time) if frame.time is not None else decoded / source_rate
+            while pending_index < len(pending) and timestamp + 1e-6 >= float(
+                pending[pending_index]["timestamp"]
+            ):
+                image = frame.to_image(
+                    width=processed_width,
+                    height=processed_height,
+                ).convert("RGB")
+                destination = context_root / f"context-{saved:06d}.jpg"
+                image.save(destination, format="JPEG", quality=95, subsampling=0)
+                pending[pending_index]["path"] = destination
+                last_image = image
+                pending_index += 1
+                saved += 1
+            now = time.perf_counter()
+            if now - last_report >= 0.75:
+                fraction = min(1.0, timestamp / max(duration, 1e-6))
+                _progress(
+                    project_root,
+                    "lingbot_context",
+                    f"Decoding continuous LingBot context · {timestamp:.1f}s of {duration:.1f}s",
+                    0.685 + 0.005 * fraction,
+                    compute_backend="PyAV 10 FPS LingBot context",
+                    metrics={
+                        "decodedFrames": decoded,
+                        "contextFrames": saved + len(records),
+                        "effectiveContextFps": effective_fps,
+                    },
+                )
+                last_report = now
+            if pending_index >= len(pending):
+                break
+        if pending_index < len(pending):
+            if last_image is None:
+                raise RuntimeError("Video decoder produced no LingBot context frames")
+            while pending_index < len(pending):
+                destination = context_root / f"context-{saved:06d}.jpg"
+                last_image.save(destination, format="JPEG", quality=95, subsampling=0)
+                pending[pending_index]["path"] = destination
+                pending_index += 1
+                saved += 1
+        paths = [Path(item["path"]) for item in schedule]
+        output_indices = [
+            index
+            for index, item in enumerate(schedule)
+            if item["trainingIndex"] is not None
+        ]
+        training_order = [
+            int(schedule[index]["trainingIndex"])
+            for index in output_indices
+        ]
+        if training_order != list(range(len(records))):
+            raise RuntimeError("LingBot context did not preserve selected video frame order")
+        return paths, output_indices, {
+            "contextFrameCount": len(paths),
+            "contextFps": effective_fps,
+            "decodedFrameCount": decoded,
+            "trainingViewCount": len(records),
         }
     finally:
         container.close()
@@ -711,6 +1074,7 @@ def _configure_sfm(
     use_cuda: bool,
     sequential: bool,
     maximum_image_dimension: int = 2560,
+    feature_runtime: dict[str, Any] | None = None,
 ) -> tuple[Any, ...]:
     import pycolmap
 
@@ -728,24 +1092,35 @@ def _configure_sfm(
     extraction.max_image_size = maximum_image_dimension
     extraction.num_threads = worker_threads
     extraction.use_gpu = use_cuda
-    extraction.sift.max_num_features = maximum_features
-    extraction.sift.peak_threshold = 0.004
-    extraction.sift.edge_threshold = 12.0
-    extraction.sift.max_num_orientations = 1
-    # Covariant affine/DSP SIFT is prohibitively slow in the CPU-only Windows
-    # PyCOLMAP wheel (roughly a minute per 4K view). Dense standard SIFT plus
-    # guided geometric matching has materially better end-to-end throughput
-    # and retains the source-resolution camera solve.
-    extraction.sift.estimate_affine_shape = False
-    extraction.sift.domain_size_pooling = False
+    learned_features = bool(feature_runtime and feature_runtime.get("learnedValidated"))
+    if learned_features:
+        extraction.type = pycolmap.FeatureExtractorType.ALIKED_N16ROT
+        extraction.aliked.max_num_features = maximum_features
+        extraction.aliked.n16rot_model_path = str(feature_runtime["alikedModel"])
+    else:
+        extraction.sift.max_num_features = maximum_features
+        extraction.sift.peak_threshold = 0.004
+        extraction.sift.edge_threshold = 12.0
+        extraction.sift.max_num_orientations = 1
+        # Covariant affine/DSP SIFT is prohibitively slow in the CPU-only
+        # Windows build. Dense standard SIFT plus guided geometric matching is
+        # the validated fallback when learned ONNX matching is unavailable.
+        extraction.sift.estimate_affine_shape = False
+        extraction.sift.domain_size_pooling = False
 
     matching = pycolmap.FeatureMatchingOptions()
     matching.num_threads = worker_threads
     matching.use_gpu = use_cuda
     matching.max_num_matches = 32_768
-    matching.guided_matching = True
-    matching.sift.max_ratio = 0.85
-    matching.sift.cross_check = True
+    if learned_features:
+        matching.type = pycolmap.FeatureMatcherType.ALIKED_LIGHTGLUE
+        matching.aliked.lightglue.model_path = str(feature_runtime["lightglueModel"])
+        # COLMAP does not support its SIFT-only guided rematch for ALIKED.
+        matching.guided_matching = False
+    else:
+        matching.guided_matching = True
+        matching.sift.max_ratio = 0.85
+        matching.sift.cross_check = True
 
     verification = pycolmap.TwoViewGeometryOptions()
     verification.min_num_inliers = 20
@@ -912,6 +1287,7 @@ def _run_sfm(
         bool(feature_runtime["cudaValidated"]),
         sequential,
         options.maximum_image_dimension,
+        feature_runtime,
     )
     runtime_error = feature_runtime.get("error")
     backend_detail = (
@@ -1180,6 +1556,42 @@ def _camera_intrinsics(camera: Any) -> dict[str, Any]:
     }
 
 
+def _shared_video_camera(reconstruction: Any) -> tuple[Any, dict[str, Any]]:
+    registered_by_name = {
+        image.name: image
+        for image in reconstruction.images.values()
+        if image.has_pose
+    }
+    if not registered_by_name:
+        raise RuntimeError("COLMAP supplied no registered camera for the video")
+    camera_ids = {int(image.camera_id) for image in registered_by_name.values()}
+    if len(camera_ids) != 1:
+        raise RuntimeError("A locked-settings video unexpectedly uses multiple COLMAP cameras")
+    return reconstruction.cameras[next(iter(camera_ids))], registered_by_name
+
+
+def _lingbot_calibrated_rays(camera: Any, records: Sequence[dict[str, Any]]) -> np.ndarray:
+    sizes = {
+        (int(record["width"]), int(record["height"]))
+        for record in records
+    }
+    if len(sizes) != 1:
+        raise RuntimeError("A locked-settings video unexpectedly contains mixed frame sizes")
+    width, height = next(iter(sizes))
+    if int(camera.width) != width or int(camera.height) != height:
+        raise RuntimeError(
+            "COLMAP's calibrated video dimensions do not match the selected frames"
+        )
+    source_pixels = lingbot_source_pixel_grid(width, height)
+    normalized = camera.cam_from_img(source_pixels.reshape(-1, 2))
+    if normalized is None:
+        raise RuntimeError("COLMAP could not unproject the calibrated video pixels")
+    rays = np.asarray(normalized, dtype=np.float64).reshape(*source_pixels.shape)
+    if not np.isfinite(rays).all():
+        raise RuntimeError("COLMAP produced non-finite calibrated camera rays")
+    return rays
+
+
 def _world_from_camera(image: Any) -> list[float]:
     camera_from_world = np.eye(4, dtype=np.float64)
     camera_from_world[:3, :] = np.asarray(image.cam_from_world().matrix(), dtype=np.float64)
@@ -1243,6 +1655,481 @@ def _write_initialization(path: Path, points: np.ndarray, colors: np.ndarray) ->
     with path.open("wb") as handle:
         handle.write(header)
         vertices.tofile(handle)
+
+
+def _write_initialization_parameters(
+    path: Path,
+    points: np.ndarray,
+    colors: np.ndarray,
+    scales: np.ndarray,
+    quaternions: np.ndarray,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        points=np.asarray(points, dtype=np.float32),
+        colors=np.asarray(colors, dtype=np.uint8),
+        scales=np.asarray(scales, dtype=np.float32),
+        quaternions=np.asarray(quaternions, dtype=np.float32),
+    )
+
+
+def _average_rotation(rotations: np.ndarray) -> np.ndarray:
+    total = np.sum(np.asarray(rotations, dtype=np.float64), axis=0)
+    left, _values, right = np.linalg.svd(total)
+    rotation = left @ right
+    if np.linalg.det(rotation) < 0.0:
+        left[:, -1] *= -1.0
+        rotation = left @ right
+    return rotation
+
+
+def _rotation_quaternion_wxyz(rotation: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(rotation, dtype=np.float64)
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        value = np.asarray(
+            [
+                0.25 * scale,
+                (matrix[2, 1] - matrix[1, 2]) / scale,
+                (matrix[0, 2] - matrix[2, 0]) / scale,
+                (matrix[1, 0] - matrix[0, 1]) / scale,
+            ]
+        )
+    else:
+        axis = int(np.argmax(np.diag(matrix)))
+        if axis == 0:
+            scale = math.sqrt(max(1e-12, 1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2])) * 2.0
+            value = np.asarray(
+                [
+                    (matrix[2, 1] - matrix[1, 2]) / scale,
+                    0.25 * scale,
+                    (matrix[0, 1] + matrix[1, 0]) / scale,
+                    (matrix[0, 2] + matrix[2, 0]) / scale,
+                ]
+            )
+        elif axis == 1:
+            scale = math.sqrt(max(1e-12, 1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2])) * 2.0
+            value = np.asarray(
+                [
+                    (matrix[0, 2] - matrix[2, 0]) / scale,
+                    (matrix[0, 1] + matrix[1, 0]) / scale,
+                    0.25 * scale,
+                    (matrix[1, 2] + matrix[2, 1]) / scale,
+                ]
+            )
+        else:
+            scale = math.sqrt(max(1e-12, 1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1])) * 2.0
+            value = np.asarray(
+                [
+                    (matrix[1, 0] - matrix[0, 1]) / scale,
+                    (matrix[0, 2] + matrix[2, 0]) / scale,
+                    (matrix[1, 2] + matrix[2, 1]) / scale,
+                    0.25 * scale,
+                ]
+            )
+    return value / max(float(np.linalg.norm(value)), 1e-12)
+
+
+def _multiply_quaternions_wxyz(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    lw, lx, ly, lz = np.asarray(left, dtype=np.float64)
+    values = np.asarray(right, dtype=np.float64)
+    rw, rx, ry, rz = values.T
+    result = np.column_stack(
+        (
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        )
+    )
+    result /= np.maximum(np.linalg.norm(result, axis=1, keepdims=True), 1e-12)
+    return result.astype(np.float32)
+
+
+def _align_lingbot_geometry(
+    geometry: LingbotGeometry,
+    reconstruction: Any,
+    image_names: Sequence[str],
+) -> tuple[LingbotGeometry, dict[str, Any]]:
+    """Estimate a positive-scale LingBot-to-COLMAP similarity from camera centers."""
+    references: list[tuple[int, np.ndarray]] = []
+    for frame_index, image_name in enumerate(image_names):
+        image = reconstruction.find_image_with_name(image_name)
+        if image is None or not image.has_pose:
+            continue
+        references.append(
+            (
+                frame_index,
+                np.asarray(_world_from_camera(image), dtype=np.float64).reshape(4, 4),
+            )
+        )
+    if len(references) < 3:
+        raise RuntimeError(
+            "LingBot-Map geometry could not be aligned because COLMAP validated fewer than three shared cameras"
+        )
+    indices = np.asarray([index for index, _pose in references], dtype=np.int64)
+    source_poses = geometry.world_from_cameras[indices]
+    target_poses = np.asarray([pose for _index, pose in references], dtype=np.float64)
+    inliers = np.ones(len(indices), dtype=bool)
+    rotation = np.eye(3, dtype=np.float64)
+    scale = 1.0
+    translation = np.zeros(3, dtype=np.float64)
+    residuals = np.zeros(len(indices), dtype=np.float64)
+    for _iteration in range(5):
+        source_centers = source_poses[inliers, :3, 3]
+        target_centers = target_poses[inliers, :3, 3]
+        source_mean = np.mean(source_centers, axis=0)
+        target_mean = np.mean(target_centers, axis=0)
+        source_centered = source_centers - source_mean
+        target_centered = target_centers - target_mean
+        left, _values, right = np.linalg.svd(source_centered.T @ target_centered)
+        rotation = right.T @ left.T
+        if np.linalg.det(rotation) < 0.0:
+            right[-1] *= -1.0
+            rotation = right.T @ left.T
+        rotated = source_centered @ rotation.T
+        denominator = float(np.sum(source_centered * source_centered))
+        scale = float(np.sum(rotated * target_centered) / max(denominator, 1e-12))
+        if not math.isfinite(scale) or scale <= 1e-8:
+            raise RuntimeError("LingBot-Map and COLMAP camera scales could not be reconciled")
+        translation = target_mean - scale * (rotation @ source_mean)
+        predicted = scale * (source_poses[:, :3, 3] @ rotation.T) + translation
+        residuals = np.linalg.norm(predicted - target_poses[:, :3, 3], axis=1)
+        median = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - median)))
+        next_inliers = residuals <= median + max(3.5 * mad, median * 0.35, 1e-5)
+        if int(np.sum(next_inliers)) < max(3, len(indices) // 2):
+            break
+        if np.array_equal(next_inliers, inliers):
+            break
+        inliers = next_inliers
+
+    poses = np.asarray(geometry.world_from_cameras, dtype=np.float64).copy()
+    poses[:, :3, :3] = rotation[None] @ poses[:, :3, :3]
+    poses[:, :3, 3] = scale * (poses[:, :3, 3] @ rotation.T) + translation
+    points = scale * (geometry.points.astype(np.float64) @ rotation.T) + translation
+    rotation_quaternion = _rotation_quaternion_wxyz(rotation)
+    quaternions = _multiply_quaternions_wxyz(
+        rotation_quaternion,
+        geometry.quaternions,
+    )
+    aligned = LingbotGeometry(
+        world_from_cameras=poses,
+        intrinsics=geometry.intrinsics,
+        points=points.astype(np.float32),
+        colors=geometry.colors,
+        scales=(geometry.scales * scale).astype(np.float32),
+        quaternions=quaternions,
+        source_frame_indices=geometry.source_frame_indices,
+        frame_confidence=geometry.frame_confidence,
+        backend=geometry.backend,
+        model_path=geometry.model_path,
+        processed_size=geometry.processed_size,
+    )
+    rotation_residuals = []
+    for source, target in zip(poses[indices, :3, :3], target_poses[:, :3, :3], strict=True):
+        delta = target @ source.T
+        angle = math.degrees(math.acos(float(np.clip((np.trace(delta) - 1.0) * 0.5, -1.0, 1.0))))
+        rotation_residuals.append(angle)
+    target_centers = target_poses[:, :3, 3]
+    target_scale = max(
+        float(
+            np.percentile(
+                np.linalg.norm(
+                    target_centers - np.median(target_centers, axis=0, keepdims=True),
+                    axis=1,
+                ),
+                90.0,
+            )
+        ),
+        1e-6,
+    )
+    return aligned, {
+        "alignmentCameraCount": len(indices),
+        "alignmentInlierCount": int(np.sum(inliers)),
+        "alignmentScale": scale,
+        "medianCameraCenterResidual": float(np.median(residuals[inliers])),
+        "maximumCameraCenterResidual": float(np.max(residuals[inliers])),
+        "medianAllCameraCenterResidual": float(np.median(residuals)),
+        "normalizedMedianCameraCenterResidual": float(np.median(residuals) / target_scale),
+        "medianCameraRotationResidualDegrees": float(np.median(rotation_residuals)),
+    }
+
+
+def _accept_lingbot_alignment(quality: dict[str, Any]) -> bool:
+    camera_count = int(quality.get("alignmentCameraCount", 0))
+    inlier_count = int(quality.get("alignmentInlierCount", 0))
+    return bool(
+        camera_count >= 6
+        and inlier_count >= max(6, math.ceil(camera_count * 0.6))
+        and float(quality.get("normalizedMedianCameraCenterResidual", math.inf)) <= 0.08
+        and float(quality.get("medianCameraRotationResidualDegrees", math.inf)) <= 12.0
+    )
+
+
+def _anchor_lingbot_geometry(
+    geometry: LingbotGeometry,
+    reconstruction: Any,
+    image_names: Sequence[str],
+) -> tuple[LingbotGeometry, dict[str, Any]]:
+    """Warp LingBot locally so every validated COLMAP camera remains exact."""
+    from scipy.spatial.transform import Rotation, Slerp
+
+    references: list[tuple[int, np.ndarray]] = []
+    for frame_index, image_name in enumerate(image_names):
+        image = reconstruction.find_image_with_name(image_name)
+        if image is not None and image.has_pose:
+            references.append(
+                (
+                    frame_index,
+                    np.asarray(_world_from_camera(image), dtype=np.float64).reshape(4, 4),
+                )
+            )
+    if len(references) < 2:
+        raise RuntimeError("Hybrid LingBot anchoring requires at least two COLMAP cameras")
+    anchor_indices = np.asarray([index for index, _pose in references], dtype=np.int64)
+    source_poses = np.asarray(geometry.world_from_cameras, dtype=np.float64)
+    target_poses = np.asarray([pose for _index, pose in references], dtype=np.float64)
+    source_centers = source_poses[anchor_indices, :3, 3]
+    target_centers = target_poses[:, :3, 3]
+    correction_rotations = (
+        target_poses[:, :3, :3]
+        @ np.transpose(source_poses[anchor_indices, :3, :3], (0, 2, 1))
+    )
+    pair_source = np.linalg.norm(np.diff(source_centers, axis=0), axis=1)
+    pair_target = np.linalg.norm(np.diff(target_centers, axis=0), axis=1)
+    valid_pairs = (pair_source > 1e-6) & (pair_target > 1e-6)
+    pair_scales = pair_target[valid_pairs] / pair_source[valid_pairs]
+    global_scale = float(np.median(pair_scales)) if len(pair_scales) else 1.0
+    # One global scale keeps dense depths from different anchors in the same
+    # world metric. Per-anchor ratios become unstable when two selected frames
+    # have almost no translation and previously produced giant splats.
+    anchor_scales = np.full(len(anchor_indices), global_scale, dtype=np.float64)
+    anchor_translations = target_centers - anchor_scales[:, None] * np.einsum(
+        "nij,nj->ni",
+        correction_rotations,
+        source_centers,
+    )
+
+    frame_count = len(source_poses)
+    frame_rotations = np.empty((frame_count, 3, 3), dtype=np.float64)
+    frame_scales = np.empty(frame_count, dtype=np.float64)
+    frame_translations = np.empty((frame_count, 3), dtype=np.float64)
+    for frame_index in range(frame_count):
+        upper = int(np.searchsorted(anchor_indices, frame_index, side="left"))
+        if upper <= 0:
+            lower = upper = 0
+            alpha = 0.0
+        elif upper >= len(anchor_indices):
+            lower = upper = len(anchor_indices) - 1
+            alpha = 0.0
+        else:
+            lower = upper - 1
+            span = max(1, int(anchor_indices[upper] - anchor_indices[lower]))
+            alpha = float((frame_index - anchor_indices[lower]) / span)
+        if lower == upper:
+            frame_rotations[frame_index] = correction_rotations[lower]
+            frame_scales[frame_index] = anchor_scales[lower]
+            frame_translations[frame_index] = anchor_translations[lower]
+        else:
+            interpolator = Slerp(
+                [0.0, 1.0],
+                Rotation.from_matrix(correction_rotations[[lower, upper]]),
+            )
+            frame_rotations[frame_index] = interpolator([alpha]).as_matrix()[0]
+            frame_scales[frame_index] = math.exp(
+                (1.0 - alpha) * math.log(anchor_scales[lower])
+                + alpha * math.log(anchor_scales[upper])
+            )
+            frame_translations[frame_index] = (
+                (1.0 - alpha) * anchor_translations[lower]
+                + alpha * anchor_translations[upper]
+            )
+
+    poses = source_poses.copy()
+    poses[:, :3, :3] = frame_rotations @ poses[:, :3, :3]
+    poses[:, :3, 3] = frame_scales[:, None] * np.einsum(
+        "nij,nj->ni",
+        frame_rotations,
+        poses[:, :3, 3],
+    ) + frame_translations
+    # Remove interpolation round-off at validated anchors.
+    poses[anchor_indices] = target_poses
+    source_indices = np.asarray(geometry.source_frame_indices, dtype=np.int64)
+    if (
+        source_indices.shape != (len(geometry.points),)
+        or np.any(source_indices < 0)
+        or np.any(source_indices >= frame_count)
+    ):
+        raise RuntimeError("LingBot dense seeds lost their source-frame ownership")
+    point_rotations = frame_rotations[source_indices]
+    point_scales = frame_scales[source_indices]
+    points = point_scales[:, None] * np.einsum(
+        "nij,nj->ni",
+        point_rotations,
+        np.asarray(geometry.points, dtype=np.float64),
+    ) + frame_translations[source_indices]
+    correction_quaternions = np.asarray(
+        [_rotation_quaternion_wxyz(rotation) for rotation in frame_rotations],
+        dtype=np.float64,
+    )
+    quaternions = np.empty_like(geometry.quaternions, dtype=np.float32)
+    for frame_index in np.unique(source_indices):
+        mask = source_indices == frame_index
+        quaternions[mask] = _multiply_quaternions_wxyz(
+            correction_quaternions[frame_index],
+            geometry.quaternions[mask],
+        )
+    anchored = LingbotGeometry(
+        world_from_cameras=poses,
+        intrinsics=geometry.intrinsics,
+        points=points.astype(np.float32),
+        colors=geometry.colors,
+        scales=(geometry.scales * point_scales[:, None]).astype(np.float32),
+        quaternions=quaternions,
+        source_frame_indices=geometry.source_frame_indices,
+        frame_confidence=geometry.frame_confidence,
+        backend=geometry.backend,
+        model_path=geometry.model_path,
+        processed_size=geometry.processed_size,
+    )
+    center_residuals = np.linalg.norm(
+        poses[anchor_indices, :3, 3] - target_centers,
+        axis=1,
+    )
+    rotation_residuals = []
+    for source, target in zip(
+        poses[anchor_indices, :3, :3],
+        target_poses[:, :3, :3],
+        strict=True,
+    ):
+        delta = target @ source.T
+        rotation_residuals.append(
+            math.degrees(
+                math.acos(float(np.clip((np.trace(delta) - 1.0) * 0.5, -1.0, 1.0)))
+            )
+        )
+    return anchored, {
+        "anchorCameraCount": len(anchor_indices),
+        "recoveredCameraCount": frame_count - len(anchor_indices),
+        "medianLocalScale": float(np.median(frame_scales)),
+        "minimumLocalScale": float(np.min(frame_scales)),
+        "maximumLocalScale": float(np.max(frame_scales)),
+        "maximumAnchorCenterResidual": float(np.max(center_residuals)),
+        "maximumAnchorRotationResidualDegrees": float(np.max(rotation_residuals)),
+    }
+
+
+def _restrict_lingbot_seeds_to_frames(
+    geometry: LingbotGeometry,
+    frame_indices: Sequence[int],
+) -> LingbotGeometry:
+    allowed = np.asarray(sorted(set(int(index) for index in frame_indices)), dtype=np.int64)
+    if not len(allowed):
+        raise RuntimeError("No validated cameras are available for LingBot depth seeding")
+    keep = np.isin(geometry.source_frame_indices, allowed)
+    if not np.any(keep):
+        raise RuntimeError("LingBot produced no dense seeds owned by validated cameras")
+    return LingbotGeometry(
+        world_from_cameras=geometry.world_from_cameras,
+        intrinsics=geometry.intrinsics,
+        points=geometry.points[keep],
+        colors=geometry.colors[keep],
+        scales=geometry.scales[keep],
+        quaternions=geometry.quaternions[keep],
+        source_frame_indices=geometry.source_frame_indices[keep],
+        frame_confidence=geometry.frame_confidence,
+        backend=geometry.backend,
+        model_path=geometry.model_path,
+        processed_size=geometry.processed_size,
+    )
+
+
+def _undistort_complete_video(
+    pycolmap: Any,
+    input_images: Path,
+    output_images: Path,
+    records: Sequence[dict[str, Any]],
+    reconstruction: Any,
+    geometry: LingbotGeometry,
+    *,
+    use_colmap_poses: bool,
+) -> tuple[list[dict[str, Any]], int]:
+    """Undistort every selected video frame and keep validated COLMAP poses."""
+    distorted_camera, registered_by_name = _shared_video_camera(reconstruction)
+    options = pycolmap.UndistortCameraOptions()
+    options.max_image_size = -1
+    output_images.mkdir(parents=True, exist_ok=True)
+    source_by_name = {str(record["image"]): record for record in records}
+    frames: list[dict[str, Any]] = []
+    recovered = 0
+    canonical_intrinsics: dict[str, Any] | None = None
+    for frame_index, record in enumerate(records):
+        image_name = str(record["image"])
+        # Resample in linear light, then let Bitmap.write convert back to sRGB.
+        # This avoids both gamma-darkened interpolation and accidental double
+        # delinearization in PyCOLMAP's default write path.
+        bitmap = pycolmap.Bitmap.read(input_images / image_name, True, True)
+        if bitmap is None or bitmap.is_empty:
+            raise RuntimeError(f"Could not read video frame for undistortion: {image_name}")
+        undistorted_bitmap, output_camera = pycolmap.undistort_image(
+            options,
+            bitmap,
+            distorted_camera,
+        )
+        undistorted_bitmap.set_jpeg_quality(100)
+        if not undistorted_bitmap.write(output_images / image_name):
+            raise RuntimeError(f"Could not write undistorted video frame: {image_name}")
+        intrinsics = _camera_intrinsics(output_camera)
+        if canonical_intrinsics is None:
+            canonical_intrinsics = intrinsics
+        else:
+            normalized_delta = max(
+                abs(float(intrinsics[key]) - float(canonical_intrinsics[key]))
+                / max(abs(float(canonical_intrinsics[key])), 1e-9)
+                for key in ("fx", "fy", "cx", "cy")
+            )
+            if normalized_delta > 1e-6:
+                raise RuntimeError("Video undistortion produced inconsistent shared intrinsics")
+        validated = registered_by_name.get(image_name)
+        if validated is not None and use_colmap_poses:
+            world_from_camera = np.asarray(_world_from_camera(validated), dtype=np.float64)
+            pose_confidence = 1.0
+            pose_source = "colmap_bundle_adjusted"
+        else:
+            world_from_camera = geometry.world_from_cameras[frame_index].reshape(-1)
+            pose_confidence = float(geometry.frame_confidence[frame_index])
+            pose_source = (
+                "lingbot_map_aligned" if use_colmap_poses else "lingbot_map"
+            )
+            if validated is None:
+                recovered += 1
+        source = source_by_name[image_name]
+        frames.append(
+            {
+                "phaseId": "media",
+                "frameIndex": frame_index,
+                "timestampUs": (
+                    round(float(source["timestampSeconds"]) * 1_000_000)
+                    if source.get("timestampSeconds") is not None
+                    else None
+                ),
+                "intrinsics": intrinsics,
+                "worldFromRgbCamera": world_from_camera.tolist(),
+                "image": f"images/{image_name}",
+                "sourcePath": source.get("source"),
+                "sharpness": source.get("sharpness"),
+                "poseConfidence": pose_confidence,
+                "poseSource": pose_source,
+                "poseAnchor": (
+                    (validated is not None if use_colmap_poses else frame_index == 0)
+                    and not any(frame.get("poseAnchor", False) for frame in frames)
+                ),
+            }
+        )
+    return frames, recovered
 
 
 def _publish_pointer(project_root: Path, dataset_root: Path) -> Path:
@@ -1425,6 +2312,12 @@ def prepare_media_dataset(
             observations,
             input_images,
         )
+        single_video = (
+            len(video_statistics) == 1
+            and not any(path.suffix.lower() in PHOTO_EXTENSIONS for path in sources)
+        )
+        lingbot_geometry: LingbotGeometry | None = None
+        lingbot_context: dict[str, Any] | None = None
         reconstruction, solve = _run_sfm(
             input_images,
             sfm_workspace,
@@ -1434,63 +2327,179 @@ def prepare_media_dataset(
             sequential=bool(video_statistics),
         )
         _check_cancelled(project_root)
+        if single_video:
+            calibrated_rays = _lingbot_calibrated_rays(
+                _shared_video_camera(reconstruction)[0],
+                records,
+            )
+            context_paths, lingbot_output_indices, lingbot_context = _extract_lingbot_context(
+                sources[0],
+                records,
+                input_images,
+                staging / "lingbot-context",
+                project_root,
+            )
+
+            def report_lingbot(
+                stage: str,
+                detail: str,
+                progress_value: float,
+                backend: str,
+                metrics: dict[str, Any],
+            ) -> None:
+                # LingBot's standalone callback uses 0.09-0.20. Camera solving
+                # already occupies the first 68% of this combined pipeline.
+                mapped_progress = 0.69 + 0.05 * min(
+                    1.0,
+                    max(0.0, (progress_value - 0.09) / 0.11),
+                )
+                _progress(
+                    project_root,
+                    stage,
+                    detail,
+                    mapped_progress,
+                    compute_backend=backend,
+                    metrics={**metrics, "calibratedCameraRays": True},
+                )
+
+            lingbot_geometry = infer_lingbot_geometry(
+                context_paths,
+                normalized_rays=calibrated_rays,
+                output_indices=lingbot_output_indices,
+                progress=report_lingbot,
+            )
+            _check_cancelled(project_root)
         chosen_model = staging / "chosen-model"
         chosen_model.mkdir(parents=True, exist_ok=True)
         reconstruction.write(chosen_model)
-        _progress(project_root, "image_undistortion", "Undistorting registered views at source resolution", 0.70)
-        pycolmap.undistort_images(
-            undistorted,
-            chosen_model,
-            input_images,
-            output_type="COLMAP",
-            copy_policy=pycolmap.FileCopyType.copy,
-            jpeg_quality=100,
-            num_threads=-1,
-        )
-        _check_cancelled(project_root)
-        undistorted_model_root = undistorted / "sparse"
-        if (undistorted_model_root / "cameras.bin").is_file():
-            undistorted_reconstruction = pycolmap.Reconstruction(undistorted_model_root)
-        elif (undistorted_model_root / "0" / "cameras.bin").is_file():
-            undistorted_reconstruction = pycolmap.Reconstruction(undistorted_model_root / "0")
+        alignment_quality: dict[str, Any] = {}
+        alignment_accepted = False
+        alignment_mode: str | None = None
+        recovered_camera_count = 0
+        dense_seed_count = 0
+        if lingbot_geometry is not None:
+            _progress(
+                project_root,
+                "camera_refinement",
+                "Aligning LingBot dense geometry to the bundle-adjusted COLMAP cameras",
+                0.75,
+                compute_backend="LingBot-Map + COLMAP similarity alignment",
+                metrics={
+                    "lingbotCameraCount": len(lingbot_geometry.world_from_cameras),
+                    "colmapCameraCount": reconstruction.num_reg_images(),
+                },
+            )
+            aligned_geometry, alignment_quality = _align_lingbot_geometry(
+                lingbot_geometry,
+                reconstruction,
+                [str(record["image"]) for record in records],
+            )
+            alignment_accepted = _accept_lingbot_alignment(alignment_quality)
+            if alignment_accepted:
+                lingbot_geometry = aligned_geometry
+                alignment_mode = "global_similarity"
+            else:
+                alignment_mode = "rejected_to_colmap"
+                _progress(
+                    project_root,
+                    "camera_refinement",
+                    "LingBot geometry failed the COLMAP agreement gate; using validated SfM only",
+                    0.76,
+                    compute_backend="COLMAP quality fallback",
+                    metrics=alignment_quality,
+                )
+                lingbot_geometry = None
+        if lingbot_geometry is not None:
+            _progress(
+                project_root,
+                "image_undistortion",
+                "Undistorting every selected video view with shared calibrated intrinsics",
+                0.77,
+                compute_backend="COLMAP calibrated image resampling",
+                metrics={"imageCount": len(records)},
+            )
+            frames, recovered_camera_count = _undistort_complete_video(
+                pycolmap,
+                input_images,
+                undistorted / "images",
+                records,
+                reconstruction,
+                lingbot_geometry,
+                use_colmap_poses=alignment_accepted,
+            )
+            points = lingbot_geometry.points
+            colors = lingbot_geometry.colors
+            dense_seed_count = len(points)
+            _write_initialization(undistorted / "initialization.ply", points, colors)
+            _write_initialization_parameters(
+                undistorted / "initialization-parameters.npz",
+                points,
+                colors,
+                lingbot_geometry.scales,
+                lingbot_geometry.quaternions,
+            )
+            _sparse_points, _sparse_colors, point_quality = _point_records(reconstruction)
         else:
-            raise RuntimeError("COLMAP did not publish an undistorted sparse model")
-        points, colors, point_quality = _point_records(undistorted_reconstruction)
-        _write_initialization(undistorted / "initialization.ply", points, colors)
+            _progress(project_root, "image_undistortion", "Undistorting registered views at source resolution", 0.70)
+            pycolmap.undistort_images(
+                undistorted,
+                chosen_model,
+                input_images,
+                output_type="COLMAP",
+                copy_policy=pycolmap.FileCopyType.copy,
+                jpeg_quality=100,
+                num_threads=-1,
+            )
+            _check_cancelled(project_root)
+            undistorted_model_root = undistorted / "sparse"
+            if (undistorted_model_root / "cameras.bin").is_file():
+                undistorted_reconstruction = pycolmap.Reconstruction(undistorted_model_root)
+            elif (undistorted_model_root / "0" / "cameras.bin").is_file():
+                undistorted_reconstruction = pycolmap.Reconstruction(undistorted_model_root / "0")
+            else:
+                raise RuntimeError("COLMAP did not publish an undistorted sparse model")
+            points, colors, point_quality = _point_records(undistorted_reconstruction)
+            _write_initialization(undistorted / "initialization.ply", points, colors)
 
-        source_by_name = {record["image"]: record for record in records}
-        frames: list[dict[str, Any]] = []
+            source_by_name = {record["image"]: record for record in records}
+            frames = []
+            for frame_index, image in enumerate(
+                sorted(undistorted_reconstruction.images.values(), key=lambda value: value.name)
+            ):
+                camera = undistorted_reconstruction.cameras[image.camera_id]
+                image_path = undistorted / "images" / image.name
+                if not image_path.is_file():
+                    continue
+                source = source_by_name.get(image.name, {})
+                frames.append(
+                    {
+                        "phaseId": "media",
+                        "frameIndex": frame_index,
+                        "timestampUs": (
+                            round(float(source["timestampSeconds"]) * 1_000_000)
+                            if source.get("timestampSeconds") is not None
+                            else None
+                        ),
+                        "intrinsics": _camera_intrinsics(camera),
+                        "worldFromRgbCamera": _world_from_camera(image),
+                        "image": f"images/{image.name}",
+                        "sourcePath": source.get("source"),
+                        "sharpness": source.get("sharpness"),
+                        "poseConfidence": 1.0,
+                        "poseSource": "colmap_bundle_adjusted",
+                        "poseAnchor": frame_index == 0,
+                    }
+                )
+            if len(frames) != undistorted_reconstruction.num_reg_images():
+                raise RuntimeError("One or more registered images were missing after undistortion")
+        _check_cancelled(project_root)
         luminances: list[float] = []
-        for frame_index, image in enumerate(
-            sorted(undistorted_reconstruction.images.values(), key=lambda value: value.name)
-        ):
-            camera = undistorted_reconstruction.cameras[image.camera_id]
-            image_path = undistorted / "images" / image.name
-            if not image_path.is_file():
-                continue
+        for frame in frames:
+            image_path = undistorted / str(frame["image"])
             with Image.open(image_path) as opened:
                 sample = ImageOps.grayscale(opened)
                 sample.thumbnail((128, 128), Image.Resampling.BILINEAR)
                 luminances.append(float(np.asarray(sample, dtype=np.float32).mean() / 255.0))
-            source = source_by_name.get(image.name, {})
-            frames.append(
-                {
-                    "phaseId": "media",
-                    "frameIndex": frame_index,
-                    "timestampUs": (
-                        round(float(source["timestampSeconds"]) * 1_000_000)
-                        if source.get("timestampSeconds") is not None
-                        else None
-                    ),
-                    "intrinsics": _camera_intrinsics(camera),
-                    "worldFromRgbCamera": _world_from_camera(image),
-                    "image": f"images/{image.name}",
-                    "sourcePath": source.get("source"),
-                    "sharpness": source.get("sharpness"),
-                }
-            )
-        if len(frames) != undistorted_reconstruction.num_reg_images():
-            raise RuntimeError("One or more registered images were missing after undistortion")
         video_intrinsic_spread = _video_intrinsic_spread(frames)
         if video_intrinsic_spread > 0.005:
             raise RuntimeError(
@@ -1503,9 +2512,25 @@ def prepare_media_dataset(
             else 0
         )
         warnings: list[str] = []
-        if solve["registrationRatio"] < 0.85:
+        if alignment_mode == "rejected_to_colmap":
+            warnings.append(
+                "LingBot geometry failed the COLMAP camera-agreement gate and was excluded; "
+                f"ScanLan retained {len(frames)} validated cameras rather than publishing "
+                "an incoherent reconstruction."
+            )
+        elif solve["registrationRatio"] < 0.85 and lingbot_geometry is None:
             warnings.append(
                 f"Only {solve['registeredImageCount']} of {solve['inputImageCount']} views formed one consistent model."
+            )
+        elif lingbot_geometry is not None and not alignment_accepted:
+            warnings.append(
+                "COLMAP's trajectory disagreed with the complete LingBot-Map path; "
+                "ScanLan retained LingBot poses and used COLMAP only for calibrated camera rays and lens correction."
+            )
+        elif recovered_camera_count:
+            warnings.append(
+                f"COLMAP validated {solve['registeredImageCount']} views; LingBot-Map recovered "
+                f"the remaining {recovered_camera_count} trajectory poses for joint optimization."
             )
         if point_quality["medianReprojectionErrorPx"] > 1.5:
             warnings.append("Camera reprojection error is higher than the preferred 1.5 px quality gate.")
@@ -1515,6 +2540,12 @@ def prepare_media_dataset(
             "metric": False,
             "sourceType": "video" if video_statistics and not any(path.suffix.lower() in PHOTO_EXTENSIONS for path in sources) else "photos",
             "initialization": "initialization.ply",
+            "initializationParameters": (
+                "initialization-parameters.npz"
+                if lingbot_geometry is not None
+                else None
+            ),
+            "denseGeometryPrior": lingbot_geometry is not None,
             "poseRefinement": True,
             # A single video is captured with locked focal length, exposure,
             # white balance, shutter, and ISO. Per-frame color transforms would
@@ -1533,6 +2564,25 @@ def prepare_media_dataset(
             "quality": {
                 **solve,
                 **point_quality,
+                "geometryBackend": (
+                    lingbot_geometry.backend
+                    if lingbot_geometry is not None
+                    else "COLMAP sparse structure-from-motion"
+                ),
+                "trainingViewCount": len(frames),
+                "lingbotRecoveredCameraCount": recovered_camera_count,
+                "lingbotExcludedCameraCount": (
+                    solve["inputImageCount"] - len(frames)
+                    if alignment_mode == "rejected_to_colmap"
+                    else 0
+                ),
+                "denseSeedCount": dense_seed_count,
+                "lingbotAlignment": alignment_quality or None,
+                "lingbotAlignmentAccepted": alignment_accepted,
+                "lingbotAlignmentMode": alignment_mode,
+                "lingbotCalibratedCameraRays": lingbot_geometry is not None,
+                "lingbotEvaluated": lingbot_context is not None,
+                "lingbotContext": lingbot_context,
                 "maximumVideoIntrinsicSpread": video_intrinsic_spread,
                 "videoSources": video_statistics,
                 "warnings": warnings,
@@ -1552,8 +2602,26 @@ def prepare_media_dataset(
         _progress(
             project_root,
             "media_ready",
-            f"Solved {len(frames):,} cameras and {len(points):,} sparse seed points",
+            (
+                f"Prepared {len(frames):,} cameras and {len(points):,} confidence-gated dense LingBot seeds"
+                if lingbot_geometry is not None
+                else f"Solved {len(frames):,} cameras and {len(points):,} sparse seed points"
+            ),
             1.0,
+            compute_backend=(
+                (
+                    f"{lingbot_geometry.backend} + COLMAP bundle-adjusted poses/intrinsics"
+                    if alignment_accepted
+                    else f"{lingbot_geometry.backend} + COLMAP calibrated intrinsics"
+                )
+                if lingbot_geometry is not None
+                else "COLMAP structure-from-motion"
+            ),
+            metrics={
+                "trainingViewCount": len(frames),
+                "seedCount": len(points),
+                "recoveredCameraCount": recovered_camera_count,
+            },
         )
         return dataset
     finally:

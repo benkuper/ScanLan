@@ -32,6 +32,7 @@ htmlcov/
 /splat-worker/build/
 /splat-worker/dist/
 /splat-worker/*.spec
+/splat-worker/models/
 /media-tools/
 *.spec.bak
 

@@ -15,9 +15,11 @@ from scanlan_splat.cli import _publish_failure
 from scanlan_splat.media import (
     _CameraSolveTelemetry,
     MediaPreparationOptions,
+    _adaptive_keyframe_reason,
     _configure_sfm,
     _cpu_match_pairs,
     _descriptor_distance,
+    _extract_lingbot_context,
     _extract_video_streaming,
     _feature_extraction_groups,
     _feature_extraction_batch_size,
@@ -26,16 +28,57 @@ from scanlan_splat.media import (
     _materialize_observation_inputs,
     _media_dataset_fingerprint,
     _progress_heartbeat,
-    _select_video_candidates,
     _source_fingerprint,
-    _video_candidates,
+    _tracked_visual_motion,
     _video_intrinsic_spread,
     _write_json_atomic,
+    adaptive_frame_selection_status,
     prepare_media_observations,
 )
 
 
 class MediaPreparationTests(unittest.TestCase):
+    def test_default_video_sampling_preserves_handheld_overlap(self) -> None:
+        options = MediaPreparationOptions()
+
+        self.assertEqual(options.video_fps, 15.0)
+        self.assertEqual(options.maximum_video_frames, 3_000)
+
+    def test_adaptive_frame_policy_is_exposed_to_release_diagnostics(self) -> None:
+        status = adaptive_frame_selection_status()
+
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["mode"], "adaptive_optical_flow")
+        self.assertTrue(status["maximumFramesIsSafetyCeiling"])
+        self.assertIn("tracked_overlap", status["signals"])
+        self.assertIn("camera_motion", status["signals"])
+
+    def test_adaptive_keyframes_follow_motion_instead_of_elapsed_video_length(self) -> None:
+        import cv2
+
+        random = np.random.default_rng(42)
+        reference = random.integers(0, 256, (240, 320), dtype=np.uint8)
+        reference = cv2.GaussianBlur(reference, (3, 3), 0.0)
+        translated = cv2.warpAffine(
+            reference,
+            np.asarray([[1.0, 0.0, 28.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+            (reference.shape[1], reference.shape[0]),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+
+        stationary = _tracked_visual_motion(reference, reference)
+        moving = _tracked_visual_motion(reference, translated)
+
+        self.assertTrue(stationary["reliable"])
+        self.assertGreater(float(stationary["trackedRatio"]), 0.95)
+        self.assertIsNone(_adaptive_keyframe_reason(0.5, stationary, 0.0))
+        self.assertIn(
+            _adaptive_keyframe_reason(0.5, moving, 0.0),
+            {"camera_motion", "tracked_overlap"},
+        )
+        self.assertEqual(_adaptive_keyframe_reason(2.1, stationary, 0.0), "maximum_gap")
+
     def test_cli_failure_publication_preserves_progress_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -204,48 +247,6 @@ class MediaPreparationTests(unittest.TestCase):
         self.assertAlmostEqual(_video_intrinsic_spread([frame(2200), frame(2200)]), 0.0)
         self.assertGreater(_video_intrinsic_spread([frame(1400), frame(2500)]), 0.25)
 
-    def test_video_selection_keeps_sharpest_frame_per_time_bucket(self) -> None:
-        image = Image.new("RGB", (16, 16))
-        a = np.zeros(256, dtype=np.float32)
-        a[0] = 1.0
-        b = np.zeros(256, dtype=np.float32)
-        b[1] = 1.0
-        candidates = [
-            (0.00, image, 0.1, a),
-            (0.20, image, 0.9, a),
-            (0.55, image, 0.8, b),
-            (1.05, image, 0.7, a),
-        ]
-
-        selected = _select_video_candidates(candidates, target_fps=2.0, maximum_frames=10)
-
-        self.assertEqual([round(value[0], 2) for value in selected], [0.2, 0.55, 1.05])
-
-    def test_bundled_video_runtime_decodes_frames(self) -> None:
-        import av
-
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "fixture.mp4"
-            container = av.open(str(path), mode="w")
-            stream = container.add_stream("mpeg4", rate=6)
-            stream.width = 64
-            stream.height = 48
-            stream.pix_fmt = "yuv420p"
-            for index in range(6):
-                pixels = np.full((48, 64, 3), index * 35, dtype=np.uint8)
-                pixels[:, index * 8 : index * 8 + 8, :] = 255
-                frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
-                for packet in stream.encode(frame):
-                    container.mux(packet)
-            for packet in stream.encode():
-                container.mux(packet)
-            container.close()
-
-            candidates, statistics = _video_candidates(path, target_fps=2.0)
-
-            self.assertEqual(statistics["decodedFrameCount"], 6)
-            self.assertGreaterEqual(len(candidates), 2)
-
     def test_streaming_video_selection_is_bounded_and_reports_progress(self) -> None:
         import av
 
@@ -293,6 +294,119 @@ class MediaPreparationTests(unittest.TestCase):
             self.assertEqual(statistics["decodedFrameCount"], 24)
             self.assertEqual(updates[-1][0], 1.0)
             self.assertEqual(updates[-1][1]["selectedFrames"], len(records))
+
+    def test_adaptive_video_selection_keeps_more_views_during_fast_motion(self) -> None:
+        import av
+        import cv2
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            random = np.random.default_rng(7)
+            texture = random.integers(0, 256, (120, 160, 3), dtype=np.uint8)
+
+            def write_video(path: Path, moving: bool) -> None:
+                container = av.open(str(path), mode="w")
+                stream = container.add_stream("mpeg4", rate=15)
+                stream.width = 160
+                stream.height = 120
+                stream.pix_fmt = "yuv420p"
+                for index in range(60):
+                    pixels = (
+                        cv2.warpAffine(
+                            texture,
+                            np.asarray(
+                                [[1.0, 0.0, float(index * 3)], [0.0, 1.0, 0.0]],
+                                dtype=np.float32,
+                            ),
+                            (160, 120),
+                            borderMode=cv2.BORDER_REFLECT,
+                        )
+                        if moving
+                        else texture
+                    )
+                    frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+                for packet in stream.encode():
+                    container.mux(packet)
+                container.close()
+
+            options = MediaPreparationOptions(
+                video_fps=15.0,
+                maximum_video_frames=100,
+                maximum_image_dimension=160,
+                minimum_image_dimension=64,
+            )
+            counts = {}
+            for label, moving in (("static", False), ("moving", True)):
+                video = root / f"{label}.mp4"
+                images = root / label
+                images.mkdir()
+                write_video(video, moving)
+                records, statistics = _extract_video_streaming(
+                    video,
+                    images,
+                    0,
+                    options,
+                    100,
+                    root,
+                    lambda *_args: None,
+                )
+                counts[label] = len(records)
+                self.assertEqual(statistics["selectionMode"], "adaptive_optical_flow")
+
+            self.assertGreater(counts["moving"], counts["static"] * 2)
+
+    def test_lingbot_context_keeps_exact_training_views_in_a_smooth_stream(self) -> None:
+        import av
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "fixture.mp4"
+            input_images = root / "selected"
+            input_images.mkdir()
+            container = av.open(str(video), mode="w")
+            stream = container.add_stream("mpeg4", rate=12)
+            stream.width = 96
+            stream.height = 72
+            stream.pix_fmt = "yuv420p"
+            for index in range(24):
+                pixels = np.full((72, 96, 3), index * 7, dtype=np.uint8)
+                frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+            container.close()
+            records = []
+            for index, timestamp in enumerate((0.25, 1.25)):
+                name = f"selected-{index}.jpg"
+                Image.new("RGB", (96, 72), (index * 80, 20, 10)).save(
+                    input_images / name
+                )
+                records.append(
+                    {
+                        "image": name,
+                        "timestampSeconds": timestamp,
+                    }
+                )
+
+            with patch("scanlan_splat.media._progress"):
+                paths, output_indices, statistics = _extract_lingbot_context(
+                    video,
+                    records,
+                    input_images,
+                    root / "context",
+                    root,
+                )
+
+            self.assertGreater(len(paths), len(records))
+            self.assertEqual(statistics["trainingViewCount"], 2)
+            self.assertEqual(
+                [paths[index] for index in output_indices],
+                [input_images / "selected-0.jpg", input_images / "selected-1.jpg"],
+            )
+            self.assertTrue(all(path.is_file() for path in paths))
 
     def test_hybrid_media_observations_are_immutable_and_reused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

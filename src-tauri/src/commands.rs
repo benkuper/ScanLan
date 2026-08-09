@@ -1818,7 +1818,15 @@ pub async fn runtime_info(
         let (splat_worker_available, splat_status) = match splat_worker {
             Some(worker) => {
                 let mut command = worker_command(&worker);
-                command.arg("diagnostics");
+                command.args([
+                    "diagnostics",
+                    "--require-cuda",
+                    "--require-learned-features",
+                    "--require-lingbot",
+                    "--require-lingbot-depth",
+                    "--require-flashinfer",
+                    "--require-adaptive-frames",
+                ]);
                 match command.output() {
                     Ok(output) => {
                         let diagnostics =
@@ -2092,7 +2100,23 @@ pub fn update_project_settings(
         || project.settings.mesh_repair_profile != settings.mesh_repair_profile
         || project.settings.fill_inferred_mesh_holes != settings.fill_inferred_mesh_holes
         || project.settings.produce_watertight_mesh != settings.produce_watertight_mesh;
+    let depth_refinement_changed =
+        project.settings.lingbot_depth_refinement != settings.lingbot_depth_refinement;
     project.settings = settings;
+    if depth_refinement_changed {
+        for artifact in [
+            project.artifacts.point_cloud.as_mut(),
+            project.artifacts.textured_mesh.as_mut(),
+            project.artifacts.gaussian_splat.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            artifact.status = "stale".to_string();
+            artifact.stale = true;
+        }
+        project.depth_refinement = None;
+    }
     if mesh_repair_changed {
         if let Some(artifact) = project.artifacts.textured_mesh.as_mut() {
             artifact.status = "stale".to_string();
@@ -5824,6 +5848,7 @@ mod tests {
             "imuAccelRangeG",
             "imuGyroRateHz",
             "imuGyroRangeDps",
+            "lingbotDepthRefinement",
         ] {
             object.remove(field);
         }
@@ -5833,6 +5858,7 @@ mod tests {
         assert!(settings.rgb_auto_white_balance);
         assert_eq!(settings.rgb_exposure_us, 8_330);
         assert_eq!(settings.imu_accel_rate_hz, 0);
+        assert!(!settings.lingbot_depth_refinement);
     }
 
     #[test]

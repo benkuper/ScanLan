@@ -178,7 +178,10 @@ Acceleration is `m/s²`; angular velocity is `rad/s`. Native workers rotate both
 The production pass writes a fingerprinted schema-3 dataset beneath
 `outputs/cache/datasets`. Each selected keyframe contains RGB and metric depth
 projected directly onto the same bounded-resolution pinhole grid, a robust
-depth mask, and `worldFromRgbCamera`. Native RGB is undistorted while it is
+depth mask, `depthConfidence`, `generatedDepthMask`, `depthProvenance`, and
+`worldFromRgbCamera`. Confidence is 255 for valid measured depth and lower for
+quality-gated generated depth; the provenance mask is 255 only where LingBot
+filled an original sensor hole. Native RGB is undistorted while it is
 resampled, rather than producing an intermediate 2K/4K depth map. 2DGS rejects
 distorted inputs because its rasterizer traces pinhole rays. There is no COLMAP
 or arbitrary-scale media path.

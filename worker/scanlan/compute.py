@@ -62,10 +62,18 @@ def tensor_intrinsic(o3d: Any, phase: PhaseData, device: Any) -> Any:
     )
 
 
-def tensor_rgbd(o3d: Any, phase: PhaseData, frame_index: int, device: Any) -> Any:
+def tensor_rgbd(
+    o3d: Any,
+    phase: PhaseData,
+    frame_index: int,
+    device: Any,
+    depth_path: str | os.PathLike[str] | None = None,
+) -> Any:
     frame = phase.frames[frame_index]
     color = np.ascontiguousarray(load_color(frame, phase.camera))
-    depth = np.ascontiguousarray(load_depth(frame, phase.camera))
+    depth = np.ascontiguousarray(
+        _load_depth_path(phase, frame_index, depth_path)
+    )
     color_image = o3d.t.geometry.Image(o3d.core.Tensor(color, device=device))
     depth_image = o3d.t.geometry.Image(o3d.core.Tensor(depth, device=device))
     return o3d.t.geometry.RGBDImage(color_image, depth_image, True)
@@ -105,9 +113,41 @@ def tensor_odometry(
     return transformation
 
 
-TsdfEntry = tuple[PhaseData, int, np.ndarray]
+@dataclass(frozen=True)
+class FusionEntry:
+    phase: PhaseData
+    frame_index: int
+    extrinsic: np.ndarray
+    depth_path: str | os.PathLike[str] | None = None
+
+
+TsdfEntry = FusionEntry
 IntegrationCallback = Callable[[int, bool], None]
 FallbackCallback = Callable[[str], None]
+
+
+def _coerce_fusion_entry(entry: Any) -> FusionEntry:
+    if isinstance(entry, FusionEntry):
+        return entry
+    if isinstance(entry, tuple) and len(entry) in (3, 4):
+        return FusionEntry(*entry)
+    raise TypeError("Fusion entries must be FusionEntry or a compatible 3/4-tuple")
+
+
+def _load_depth_path(
+    phase: PhaseData,
+    frame_index: int,
+    depth_path: str | os.PathLike[str] | None,
+) -> np.ndarray:
+    if depth_path is None:
+        return load_depth(phase.frames[frame_index], phase.camera)
+    values = np.fromfile(depth_path, dtype="<u2")
+    expected = phase.camera.width * phase.camera.height
+    if values.size != expected:
+        raise ValueError(
+            f"Fusion depth override {depth_path} has {values.size} samples; expected {expected}"
+        )
+    return values.reshape(phase.camera.height, phase.camera.width)
 
 
 def _cpu_tsdf(
@@ -125,7 +165,9 @@ def _cpu_tsdf(
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
     )
     intrinsic_cache: dict[str, Any] = {}
-    for entry_index, (phase, frame_index, extrinsic) in enumerate(entries):
+    for entry_index, raw_entry in enumerate(entries):
+        entry = _coerce_fusion_entry(raw_entry)
+        phase, frame_index, extrinsic = entry.phase, entry.frame_index, entry.extrinsic
         phase_key = str(phase.root)
         intrinsic = intrinsic_cache.get(phase_key)
         if intrinsic is None:
@@ -141,7 +183,9 @@ def _cpu_tsdf(
             intrinsic_cache[phase_key] = intrinsic
         frame = phase.frames[frame_index]
         color = np.ascontiguousarray(load_color(frame, phase.camera))
-        depth = np.ascontiguousarray(load_depth(frame, phase.camera))
+        depth = np.ascontiguousarray(
+            _load_depth_path(phase, frame_index, entry.depth_path)
+        )
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(color),
             o3d.geometry.Image(depth),
@@ -184,7 +228,13 @@ def _tensor_tsdf(
     )
     intrinsic_cache: dict[str, Any] = {}
     truncation_multiplier = sdf_trunc_m / voxel_size_m
-    for entry_index, (phase, frame_index, extrinsic_matrix) in enumerate(entries):
+    for entry_index, raw_entry in enumerate(entries):
+        entry = _coerce_fusion_entry(raw_entry)
+        phase, frame_index, extrinsic_matrix = (
+            entry.phase,
+            entry.frame_index,
+            entry.extrinsic,
+        )
         phase_key = str(phase.root)
         intrinsic = intrinsic_cache.get(phase_key)
         if intrinsic is None:
@@ -192,7 +242,9 @@ def _tensor_tsdf(
             # blocks, hashing, and integration kernels live on CUDA.
             intrinsic = tensor_intrinsic(o3d, phase, host)
             intrinsic_cache[phase_key] = intrinsic
-        rgbd = tensor_rgbd(o3d, phase, frame_index, backend.device)
+        rgbd = tensor_rgbd(
+            o3d, phase, frame_index, backend.device, entry.depth_path
+        )
         extrinsic = o3d.core.Tensor(
             np.ascontiguousarray(extrinsic_matrix),
             dtype=o3d.core.Dtype.Float64,
@@ -288,7 +340,9 @@ def _cpu_surfel_merge(
     """CPU fallback for fine-spacing point-cloud fusion."""
     cloud = o3d.geometry.PointCloud()
     intrinsic_cache: dict[str, Any] = {}
-    for entry_index, (phase, frame_index, extrinsic) in enumerate(entries):
+    for entry_index, raw_entry in enumerate(entries):
+        entry = _coerce_fusion_entry(raw_entry)
+        phase, frame_index, extrinsic = entry.phase, entry.frame_index, entry.extrinsic
         phase_key = str(phase.root)
         intrinsic = intrinsic_cache.get(phase_key)
         if intrinsic is None:
@@ -304,7 +358,9 @@ def _cpu_surfel_merge(
             intrinsic_cache[phase_key] = intrinsic
         frame = phase.frames[frame_index]
         color = np.ascontiguousarray(load_color(frame, phase.camera))
-        depth = np.ascontiguousarray(load_depth(frame, phase.camera))
+        depth = np.ascontiguousarray(
+            _load_depth_path(phase, frame_index, entry.depth_path)
+        )
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(color),
             o3d.geometry.Image(depth),
@@ -339,7 +395,11 @@ def _tensor_surfel_merge(
     device = backend.device
     host = o3d.core.Device("CPU:0")
     largest_frame = max(
-        (phase.camera.width * phase.camera.height for phase, _, _ in entries),
+        (
+            _coerce_fusion_entry(entry).phase.camera.width
+            * _coerce_fusion_entry(entry).phase.camera.height
+            for entry in entries
+        ),
         default=1,
     )
     initial_capacity = min(max(1_000_000, largest_frame * 4), 8_000_000)
@@ -353,7 +413,13 @@ def _tensor_surfel_merge(
     )
     intrinsic_cache: dict[str, Any] = {}
 
-    for entry_index, (phase, frame_index, extrinsic_matrix) in enumerate(entries):
+    for entry_index, raw_entry in enumerate(entries):
+        entry = _coerce_fusion_entry(raw_entry)
+        phase, frame_index, extrinsic_matrix = (
+            entry.phase,
+            entry.frame_index,
+            entry.extrinsic,
+        )
         phase_key = str(phase.root)
         intrinsic = intrinsic_cache.get(phase_key)
         if intrinsic is None:
@@ -365,7 +431,7 @@ def _tensor_surfel_merge(
             device=host,
         )
         frame_cloud = o3d.t.geometry.PointCloud.create_from_rgbd_image(
-            tensor_rgbd(o3d, phase, frame_index, device),
+            tensor_rgbd(o3d, phase, frame_index, device, entry.depth_path),
             intrinsic,
             extrinsic,
             phase.camera.depth_scale,

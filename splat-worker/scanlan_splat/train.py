@@ -26,9 +26,10 @@ from .pose import (
 FRAME_REUSE_PER_LOAD = 4
 LOSS_EMA_ALPHA = 0.005
 RGBD_GAUSSIAN_MULTIPLIER = 3
-TRAINER_VERSION = "photo-video-shared-camera-3dgs-rgbd-hybrid-2dgs-v6"
+TRAINER_VERSION = "lingbot-dense-video-prior-3dgs-rgbd-hybrid-2dgs-v9-depth-confidence"
 RGBD_SURFACE_SCALE_MULTIPLIER = 1.3
 RGBD_SURFACE_OPACITY = 0.45
+DENSE_PRIOR_INITIAL_OPACITY = 0.01
 MAX_METRIC_ITERATIONS = 2_000
 
 
@@ -113,21 +114,32 @@ def _read_initialization(path: Path) -> tuple[np.ndarray, np.ndarray]:
 def _read_seed_parameters(
     root: Path,
     dataset: dict[str, Any],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
     points, colors = _read_initialization(
         root / dataset.get("initialization", "initialization.ply")
     )
     parameters_path = dataset.get("initializationParameters")
     if not parameters_path:
-        return points, colors, None, None
+        return points, colors, None, None, None
     path = root / parameters_path
     if not path.is_file():
-        return points, colors, None, None
+        return points, colors, None, None, None
     with np.load(path, allow_pickle=False) as values:
         seeded_points = np.asarray(values["points"], dtype=np.float32)
         seeded_colors = np.asarray(values["colors"], dtype=np.float32)
         seeded_scales = np.asarray(values["scales"], dtype=np.float32)
         seeded_quaternions = np.asarray(values["quaternions"], dtype=np.float32)
+        seeded_confidence = (
+            np.asarray(values["confidence"], dtype=np.float32)
+            if "confidence" in values
+            else np.ones(len(seeded_points), dtype=np.float32)
+        )
     if seeded_colors.size and seeded_colors.max() > 1.0:
         seeded_colors /= 255.0
     count = len(seeded_points)
@@ -136,14 +148,28 @@ def _read_seed_parameters(
         or seeded_colors.shape != (count, 3)
         or seeded_scales.shape != (count, 3)
         or seeded_quaternions.shape != (count, 4)
+        or seeded_confidence.shape != (count,)
         or not all(
             np.isfinite(value).all()
-            for value in (seeded_points, seeded_colors, seeded_scales, seeded_quaternions)
+            for value in (
+                seeded_points,
+                seeded_colors,
+                seeded_scales,
+                seeded_quaternions,
+                seeded_confidence,
+            )
         )
         or np.any(seeded_scales <= 0.0)
+        or np.any((seeded_confidence < 0.0) | (seeded_confidence > 1.0))
     ):
         raise ValueError("RGB-D Gaussian initialization parameters are invalid")
-    return seeded_points, seeded_colors, seeded_scales, seeded_quaternions
+    return (
+        seeded_points,
+        seeded_colors,
+        seeded_scales,
+        seeded_quaternions,
+        seeded_confidence,
+    )
 
 
 def _sh_preview_colors(sh0: Any) -> Any:
@@ -246,8 +272,26 @@ def _metric_surface_scale_limit(
     """Bound learned RGB-D discs while leaving room to cover sparse surfaces."""
     if seeded_scales is None or not seeded_scales.size:
         return None
-    maximum_seed_radius = float(np.max(seeded_scales[:, :2]))
-    return max(maximum_seed_radius * 2.0, scene_scale * 0.02)
+    # A single monocular-depth outlier must not authorize enormous learned
+    # Gaussians. The robust upper footprint preserves real large surfaces while
+    # preventing the floating shards produced by an unconstrained maximum.
+    maximum_seed_radius = float(
+        np.percentile(seeded_scales[:, :2], 99.5)
+        if len(seeded_scales) >= 100
+        else np.max(seeded_scales[:, :2])
+    )
+    return max(maximum_seed_radius * 2.0, scene_scale * 0.015)
+
+
+def _dense_prior_scale_limit(
+    scene_scale: float,
+    seeded_scales: np.ndarray | None,
+) -> float | None:
+    """Keep a dense monocular prior from saturating views with large splats."""
+    if seeded_scales is None or not seeded_scales.size:
+        return None
+    footprint = np.max(np.asarray(seeded_scales)[:, :2], axis=1)
+    return max(float(np.percentile(footprint, 95.0)) * 1.25, scene_scale * 0.003)
 
 
 def _exponential_lr_gamma(total_steps: int) -> float:
@@ -438,6 +482,15 @@ def _frame_tensors(root: Path, frame: dict[str, Any], max_dimension: int) -> dic
             mask_image = source.resize((image.width, image.height), Image.Resampling.NEAREST)
             mask = torch.from_numpy(np.asarray(mask_image, dtype=np.uint8).copy())
         value.update(depth=depth, mask=mask)
+        if frame.get("depthConfidence"):
+            with Image.open(root / frame["depthConfidence"]) as source:
+                confidence_image = source.resize(
+                    (image.width, image.height), Image.Resampling.NEAREST
+                )
+                confidence = torch.from_numpy(
+                    np.asarray(confidence_image, dtype=np.uint8).copy()
+                )
+            value["depthConfidence"] = confidence
     for key, tensor in tuple(value.items()):
         if isinstance(tensor, torch.Tensor):
             value[key] = tensor.pin_memory()
@@ -459,6 +512,8 @@ def _frame_to_device(frame: dict[str, Any], device: Any) -> dict[str, Any]:
             transferred = transferred.float().div_(1000.0)
         elif key == "mask":
             transferred = transferred > 0
+        elif key == "depthConfidence":
+            transferred = transferred.float().div_(255.0)
         result[key] = transferred
     return result
 
@@ -506,7 +561,9 @@ def train_dataset(
     output_root = project_root / "outputs"
     checkpoint_path = output_root / "splat-checkpoint.pt"
     progress_path = output_root / "splat-progress.json"
-    points, colors, seeded_scales, seeded_quaternions = _read_seed_parameters(root, dataset)
+    points, colors, seeded_scales, seeded_quaternions, seeded_confidence = (
+        _read_seed_parameters(root, dataset)
+    )
     if len(points) == 0:
         raise ValueError("Sparse or RGB-D initialization contains no points")
     metric_seeded = bool(
@@ -514,6 +571,7 @@ def train_dataset(
         and seeded_scales is not None
         and seeded_quaternions is not None
     )
+    dense_geometry_prior = bool(dataset.get("denseGeometryPrior", False))
     uses_2dgs = bool(dataset.get("metric"))
     requested_iterations = iterations
     if metric_seeded and not hybrid:
@@ -527,11 +585,34 @@ def train_dataset(
     maximum_gaussians = (
         len(points)
         if metric_seeded
+        else min(
+            hardware_maximum_gaussians,
+            max(1_000_000, len(points) * 2),
+        )
+        if dense_geometry_prior
         else _rgbd_gaussian_limit(len(points), hardware_maximum_gaussians)
         if seeded_scales is not None
         else hardware_maximum_gaussians
     )
-    surface_scale_limit = _metric_surface_scale_limit(scene_scale, seeded_scales)
+    surface_scale_limit = (
+        _dense_prior_scale_limit(scene_scale, seeded_scales)
+        if dense_geometry_prior
+        else _metric_surface_scale_limit(scene_scale, seeded_scales)
+    )
+    training_seeded_scales = seeded_scales
+    if dense_geometry_prior and seeded_scales is not None:
+        training_seeded_scales = np.asarray(seeded_scales, dtype=np.float32).copy()
+        if surface_scale_limit is not None:
+            np.minimum(
+                training_seeded_scales,
+                surface_scale_limit,
+                out=training_seeded_scales,
+            )
+        training_seeded_scales[:, 2] = np.minimum(
+            training_seeded_scales[:, 2],
+            np.minimum(training_seeded_scales[:, 0], training_seeded_scales[:, 1])
+            * 0.08,
+        )
     metric_opacity_bounds = (
         (float(_logit(0.01)), float(_logit(0.8)))
         if metric_seeded
@@ -541,7 +622,7 @@ def train_dataset(
     scales = (
         np.log(
             np.maximum(
-                seeded_scales
+                training_seeded_scales
                 * (RGBD_SURFACE_SCALE_MULTIPLIER if metric_seeded else 1.0),
                 1e-5,
             )
@@ -562,14 +643,25 @@ def train_dataset(
         )
     )
     sh0 = ((colors - 0.5) / SH_C0).astype(np.float32)[:, None, :]
+    initial_opacity = (
+        np.clip(seeded_confidence, 0.05, 1.0) * RGBD_SURFACE_OPACITY
+        if metric_seeded and seeded_confidence is not None
+        else np.full(
+            len(points),
+            RGBD_SURFACE_OPACITY
+            if metric_seeded
+            else DENSE_PRIOR_INITIAL_OPACITY
+            if dense_geometry_prior
+            else 0.1,
+            dtype=np.float32,
+        )
+    )
     parameter_values = {
         "means": torch.from_numpy(points),
         "scales": torch.from_numpy(np.asarray(scales, dtype=np.float32)),
         "quats": torch.from_numpy(np.asarray(quaternions, dtype=np.float32)),
-        "opacities": torch.full(
-            (len(points),),
-            float(_logit(RGBD_SURFACE_OPACITY if metric_seeded else 0.1)),
-            dtype=torch.float32,
+        "opacities": _logit(
+            torch.from_numpy(np.asarray(initial_opacity, dtype=np.float32))
         ),
         "sh0": torch.from_numpy(sh0),
         "shN": torch.zeros((len(points), 15, 3), dtype=torch.float32),
@@ -627,7 +719,10 @@ def train_dataset(
         requires_grad=pose_refinement_enabled,
     )
     pose_anchor_mask = torch.tensor(
-        [bool(frame.get("metricAnchor", False)) for frame in frames],
+        [
+            bool(frame.get("poseAnchor", frame.get("metricAnchor", False)))
+            for frame in frames
+        ],
         dtype=torch.bool,
         device=device,
     )
@@ -645,8 +740,8 @@ def train_dataset(
         requires_grad=appearance_optimization_enabled,
     )
     learning_rates = {
-        "means": 0.0 if metric_seeded else 1.6e-4 * scene_scale,
-        "scales": 0.0 if metric_seeded else 5e-3,
+        "means": 0.0 if metric_seeded else (8e-5 if dense_geometry_prior else 1.6e-4) * scene_scale,
+        "scales": 0.0 if metric_seeded else 2.5e-3 if dense_geometry_prior else 5e-3,
         "quats": 0.0 if metric_seeded else 1e-3,
         "opacities": 1e-2 if hybrid and metric_seeded else 0.0 if metric_seeded else 5e-2,
         "sh0": 2.5e-3 if hybrid and metric_seeded else 0.0 if metric_seeded else 2.5e-3,
@@ -697,11 +792,15 @@ def train_dataset(
         else:
             strategy = DefaultStrategy(
                 absgrad=False,
-                grow_grad2d=0.0002,
-                grow_scale3d=0.01,
-                prune_scale3d=0.12,
-                refine_start_iter=500,
-                refine_stop_iter=min(20_000, max(2_000, (iterations * 2) // 3)),
+                grow_grad2d=0.00035 if dense_geometry_prior else 0.0002,
+                grow_scale3d=0.02 if dense_geometry_prior else 0.01,
+                prune_scale3d=0.10 if dense_geometry_prior else 0.12,
+                refine_start_iter=1_000 if dense_geometry_prior else 500,
+                refine_stop_iter=(
+                    min(12_000, max(3_000, iterations // 2))
+                    if dense_geometry_prior
+                    else min(20_000, max(2_000, (iterations * 2) // 3))
+                ),
                 pause_refine_after_reset=len(frames),
                 key_for_gradient="means2d",
             )
@@ -903,7 +1002,12 @@ def train_dataset(
             normal_value = torch.zeros((), device=device)
             distortion_value = torch.zeros((), device=device)
             if "depth" in frame and rendering.shape[-1] > 3:
-                depth_value = masked_robust_depth_loss(rendering[0, ..., 3], frame["depth"], frame["mask"])
+                depth_value = masked_robust_depth_loss(
+                    rendering[0, ..., 3],
+                    frame["depth"],
+                    frame["mask"],
+                    frame.get("depthConfidence"),
+                )
                 loss = loss + depth_weight(step, iterations) * depth_value
             if uses_2dgs and not metric_seeded and step >= max(1_000, iterations // 4):
                 alpha = render_alpha[0, ..., 0]
@@ -937,7 +1041,7 @@ def train_dataset(
         if (
             strategy is not None
             and densification_stopped_at is None
-            and len(parameters["means"]) >= maximum_gaussians // 2
+            and len(parameters["means"]) > maximum_gaussians // 2
         ):
             # DefaultStrategy treats refine_stop_iter as inclusive. Put the
             # boundary behind the current step so a checkpoint resumed exactly
@@ -1012,6 +1116,8 @@ def train_dataset(
             progress_action = (
                 "Validated calibrated RGB-D splats"
                 if metric_seeded
+                else "Refined dense LingBot 3DGS"
+                if dense_geometry_prior
                 else "Optimized 2DGS" if uses_2dgs else "Optimized photoreal 3DGS"
             )
             _write_json_atomic(progress_path, {"stage": "splat_training", "detail": f"{progress_action} iteration {step + 1:,} of {iterations:,} · loss {last_loss:.4f} · rolling {smoothed_loss:.4f} · {training_dimension}px · {len(parameters['means']):,} Gaussians", "progress": progress_start + (1.0 - progress_start) * stage_progress, "stageProgress": stage_progress, "iteration": step + 1, "totalIterations": iterations, "loss": last_loss, "smoothedLoss": smoothed_loss, "rgbLoss": float(rgb_l1.detach()), "depthLoss": float(depth_value.detach()), "normalLoss": float(normal_value.detach()), "distortionLoss": float(distortion_value.detach()), "poseRegularizationLoss": float(pose_regularization_value.detach()), "appearanceRegularizationLoss": float(appearance_regularization_value.detach()), "maximumPoseTranslationMm": maximum_pose_translation_mm, "gaussianCount": len(parameters["means"]), "maximumGaussians": maximum_gaussians, "etaSeconds": eta, "stageEtaSeconds": eta, "elapsedSeconds": round(elapsed), "computeBackend": f"{torch.cuda.get_device_name(device)} · CUDA AMP / gsplat {'2DGS' if uses_2dgs else '3DGS'}"})
@@ -1094,7 +1200,15 @@ def train_dataset(
         },
     )
     versions = {}
-    for package in ("torch", "gsplat", "pycolmap", "av"):
+    for package in (
+        "torch",
+        "gsplat",
+        "pycolmap",
+        "av",
+        "lingbot-map",
+        "mdm",
+        "flashinfer-python",
+    ):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
@@ -1127,9 +1241,18 @@ def train_dataset(
         "adaptiveStrategy": (
             "disabled; calibrated dense RGB-D surface is preserved"
             if metric_seeded
+            else "bounded refinement around a dense LingBot geometry prior"
+            if dense_geometry_prior
             else "bounded gsplat DefaultStrategy densification and pruning"
         ),
-        "geometryOptimization": "fixed metric RGB-D surface" if metric_seeded else "learned",
+        "geometryOptimization": (
+            "fixed metric RGB-D surface"
+            if metric_seeded
+            else "learned around confidence-gated LingBot depth"
+            if dense_geometry_prior
+            else "learned"
+        ),
+        "denseGeometryPrior": dense_geometry_prior,
         "surfaceScaleMultiplier": (
             RGBD_SURFACE_SCALE_MULTIPLIER if metric_seeded else None
         ),

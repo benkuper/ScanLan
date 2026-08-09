@@ -4,6 +4,7 @@ def masked_robust_depth_loss(
     predicted: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    confidence: torch.Tensor | None = None,
     delta: float = 0.05,
 ) -> torch.Tensor:
     import torch
@@ -18,7 +19,10 @@ def masked_robust_depth_loss(
         0.5 * residual.square() / delta_tensor,
         residual - 0.5 * delta_tensor,
     )
-    return huber.mean()
+    if confidence is None:
+        return huber.mean()
+    weights = confidence[valid].to(dtype=huber.dtype).clamp(0.0, 1.0)
+    return (huber * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
 def depth_weight(step: int, total_steps: int, start: float = 0.2, end: float = 0.02) -> float:

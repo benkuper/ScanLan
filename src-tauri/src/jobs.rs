@@ -304,6 +304,8 @@ fn stage_key(stage: &str) -> Option<&'static str> {
     if stage.contains("complete") || stage.contains("export") || stage.contains("publish") {
         Some("publish")
     } else if stage.contains("media")
+        || stage.contains("lingbot")
+        || stage.contains("camera refinement")
         || stage.contains("feature")
         || stage.contains("camera solving")
         || stage.contains("undistort")
@@ -680,7 +682,7 @@ fn invalidate_pipeline_cache(project_root: &Path, job: &ArtifactJob) -> Result<(
         remove_cache_directory(&cache_root.join("media-observations"))?;
     }
     if job.rebuild_rgbd {
-        for directory in ["local-phases", "meshes", "mesh-repair"] {
+        for directory in ["local-phases", "meshes", "mesh-repair", "lingbot-depth"] {
             remove_cache_directory(&cache_root.join(directory))?;
         }
     }
@@ -709,7 +711,13 @@ fn run_pipeline(
         prepare
             .arg("prepare-media")
             .arg("--project")
-            .arg(project_root);
+            .arg(project_root)
+            // Inspect video densely, then let optical-flow keyframing retain
+            // views according to camera motion and tracked visual overlap.
+            .arg("--video-fps")
+            .arg("15")
+            .arg("--maximum-video-frames")
+            .arg("3000");
         run_command(prepare, project_root, job, cancel, true)?;
         job.stage = "splat_training".to_string();
         job.detail = "Initializing photoreal 3D Gaussian optimization".to_string();
@@ -736,6 +744,11 @@ fn run_pipeline(
     }
     let reconstruction = existing_runtime(resources, false)?;
     let project = storage::read_project(project_root)?;
+    let depth_refiner = if project.settings.lingbot_depth_refinement {
+        Some(existing_runtime(resources, true)?)
+    } else {
+        None
+    };
     let targets = job
         .targets
         .iter()
@@ -775,6 +788,13 @@ fn run_pipeline(
                 "--no-produce-watertight-copy"
             })
             .arg("--mesh-repair-fallback");
+        if let Some(refiner) = depth_refiner.as_ref() {
+            command
+                .arg("--depth-refinement")
+                .arg("lingbot")
+                .arg("--depth-refiner")
+                .arg(refiner);
+        }
         command
     };
     if job.source_kind == "hybrid" {
@@ -789,7 +809,11 @@ fn run_pipeline(
         extract
             .arg("extract-media")
             .arg("--project")
-            .arg(project_root);
+            .arg(project_root)
+            .arg("--video-fps")
+            .arg("15")
+            .arg("--maximum-video-frames")
+            .arg("3000");
         run_command(extract, project_root, job, cancel, true)?;
 
         let observation_manifest = current_media_observation_manifest(project_root)?;

@@ -46,7 +46,7 @@ PROJECTION_SEAM_FEATHER_PIXELS = 6.0
 PROJECTION_SEAM_MIN_NORMAL_DOT = 0.86
 PROJECTION_SEAM_MAX_LINEAR_OFFSET = 0.35
 POSE_REFINEMENT_ITERATIONS = 3
-MESH_CACHE_VERSION = "all-keyframe-shared-tsdf-v2"
+MESH_CACHE_VERSION = "all-keyframe-shared-tsdf-v3-depth-provenance"
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,52 @@ class PosedFrame:
     depthless: bool = False
     localization_inliers: int = 0
     localization_rmse_px: float = 0.0
+    measured_depth_path: Path | None = None
+    refined_depth_path: Path | None = None
+    generated_depth_mask_path: Path | None = None
+    depth_confidence_path: Path | None = None
+    depth_refinement_metrics: dict[str, Any] | None = None
+
+
+def load_posed_depth(frame: PosedFrame, *, measured_only: bool = False) -> np.ndarray:
+    """Load a posed frame's immutable raw or quality-gated refined depth."""
+    camera = frame.source.camera
+    override = frame.measured_depth_path if measured_only else frame.refined_depth_path
+    if override is None:
+        return load_depth(frame.source.frames[frame.frame_index], camera)
+    values = np.fromfile(override, dtype="<u2")
+    expected = camera.width * camera.height
+    if values.size != expected:
+        raise ValueError(
+            f"Refined depth frame {override} has {values.size} samples; expected {expected}"
+        )
+    return values.reshape(camera.height, camera.width)
+
+
+def load_posed_depth_confidence(frame: PosedFrame) -> np.ndarray | None:
+    if frame.depth_confidence_path is None:
+        return None
+    camera = frame.source.camera
+    values = np.fromfile(frame.depth_confidence_path, dtype=np.uint8)
+    expected = camera.width * camera.height
+    if values.size != expected:
+        raise ValueError(
+            f"Depth confidence frame {frame.depth_confidence_path} has an unexpected size"
+        )
+    return values.reshape(camera.height, camera.width)
+
+
+def load_generated_depth_mask(frame: PosedFrame) -> np.ndarray | None:
+    if frame.generated_depth_mask_path is None:
+        return None
+    camera = frame.source.camera
+    values = np.fromfile(frame.generated_depth_mask_path, dtype=np.uint8)
+    expected = camera.width * camera.height
+    if values.size != expected:
+        raise ValueError(
+            f"Generated-depth mask {frame.generated_depth_mask_path} has an unexpected size"
+        )
+    return values.reshape(camera.height, camera.width) > 0
 
 
 @dataclass(frozen=True)
@@ -346,7 +392,7 @@ def _vertex_normals(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
 
 def _frame_depth_mesh(frame: PosedFrame) -> tuple[np.ndarray, np.ndarray]:
     camera = frame.source.camera
-    depth = load_depth(frame.source.frames[frame.frame_index], camera).astype(np.float64)
+    depth = load_posed_depth(frame).astype(np.float64)
     stride = max(1, math.ceil(max(camera.width, camera.height) / TARGET_MESH_SAMPLES))
     y_pixels = np.arange(0, camera.height, stride, dtype=np.int64)
     x_pixels = np.arange(0, camera.width, stride, dtype=np.int64)
@@ -569,18 +615,25 @@ def _open3d_fused_mesh(
             )
             intrinsic_cache[phase_key] = intrinsic
         camera = phase.camera
-        depth = np.ascontiguousarray(load_depth(phase.frames[frame.frame_index], camera))
+        depth_inputs = [load_posed_depth(frame, measured_only=True)]
+        if frame.refined_depth_path is not None and frame.depth_refinement_metrics and int(
+            frame.depth_refinement_metrics.get("generatedPixels", 0)
+        ) > 0:
+            # Measured surfaces are integrated twice (measured + refined), while
+            # generated pixels enter only through the refined pass.
+            depth_inputs.append(load_posed_depth(frame))
         # Open3D requires an RGBD image even for a geometry-only TSDF.
         color = np.ascontiguousarray(load_color(phase.frames[frame.frame_index], camera))
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            o3d.geometry.Image(color),
-            o3d.geometry.Image(depth),
-            depth_scale=camera.depth_scale,
-            depth_trunc=camera.max_depth_m,
-            convert_rgb_to_intensity=False,
-        )
         world_from_camera = world_from_depth_opencv(frame.camera_to_global, frame.image_y_up)
-        volume.integrate(rgbd, intrinsic, np.linalg.inv(world_from_camera))
+        for depth in depth_inputs:
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                o3d.geometry.Image(color),
+                o3d.geometry.Image(np.ascontiguousarray(depth)),
+                depth_scale=camera.depth_scale,
+                depth_trunc=camera.max_depth_m,
+                convert_rgb_to_intensity=False,
+            )
+            volume.integrate(rgbd, intrinsic, np.linalg.inv(world_from_camera))
         if progress:
             progress(
                 "Meshing",
@@ -1093,7 +1146,7 @@ def _refine_texture_poses(
             refined_frames.append(frame)
             continue
         camera = frame.source.camera
-        depth = load_depth(frame.source.frames[frame.frame_index], camera).astype(np.float64)
+        depth = load_posed_depth(frame, measured_only=True).astype(np.float64)
         depth /= camera.depth_scale
         stride = max(1, int(round(max(camera.width, camera.height) / 320.0)))
         y, x = np.indices(depth.shape)
@@ -1188,7 +1241,7 @@ def _photometric_refine_texture_poses(
             camera = frame.source.camera
             source_frame = frame.source.frames[frame.frame_index]
             color = load_color(source_frame, camera)
-            depth = load_depth(source_frame, camera)
+            depth = load_posed_depth(frame, measured_only=True)
             rgbd_images.append(
                 o3d.geometry.RGBDImage.create_from_color_and_depth(
                     o3d.geometry.Image(np.ascontiguousarray(color)),
@@ -2275,6 +2328,20 @@ def _mesh_cache_path(
         digest.update(np.asarray([frame.frame_index, stat.st_size, stat.st_mtime_ns], dtype="<i8").tobytes())
         digest.update(np.asarray(frame.camera_to_global, dtype="<f8").tobytes())
         digest.update(bytes((int(frame.image_y_up),)))
+        for override_path in (
+            frame.measured_depth_path,
+            frame.refined_depth_path,
+            frame.generated_depth_mask_path,
+            frame.depth_confidence_path,
+        ):
+            if override_path is not None:
+                override_stat = override_path.stat()
+                digest.update(override_path.name.encode("utf-8"))
+                digest.update(
+                    np.asarray(
+                        [override_stat.st_size, override_stat.st_mtime_ns], dtype="<i8"
+                    ).tobytes()
+                )
     key = digest.hexdigest()[:24]
     return output_dir / "cache" / "meshes" / f"{key}.npz"
 

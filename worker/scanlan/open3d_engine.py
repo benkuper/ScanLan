@@ -4,7 +4,7 @@ import hashlib
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
@@ -13,6 +13,7 @@ import numpy as np
 
 from .compute import (
     ComputeBackend,
+    FusionEntry,
     integrate_tsdf,
     merge_surfel_cloud,
     select_compute_backend,
@@ -1232,7 +1233,7 @@ def estimate_local_phase(
     local_voxel = max(voxel_size_m, 0.01)
     selected_poses = [poses[frame_index] for frame_index in frame_indices]
     entries = [
-        (phase, frame_index, np.linalg.inv(camera_to_phase))
+        FusionEntry(phase, frame_index, np.linalg.inv(camera_to_phase))
         for frame_index, camera_to_phase in zip(frame_indices, selected_poses, strict=True)
     ]
 
@@ -1820,7 +1821,7 @@ def reconstruct_open3d(
         from .mesh import PosedFrame
 
         display_axes = (-1.0, -1.0, -1.0) if flip_x else (1.0, -1.0, -1.0)
-        artifact_context["posed_frames"] = [
+        posed_frames = [
             PosedFrame(
                 phase_name=str(local.source.manifest.get("name", f"Phase {phase_index + 1}")),
                 phase_id=str(local.source.manifest.get("id", local.source.root.name)),
@@ -1837,6 +1838,35 @@ def reconstruct_open3d(
                 local.frame_indices, local.camera_to_phase, strict=True
             )
         ]
+        refinement_callback = artifact_context.get("prepare_depth_refinement")
+        if callable(refinement_callback):
+            refinement = refinement_callback(posed_frames)
+            updated_frames: list[PosedFrame] = []
+            for frame in posed_frames:
+                from .depth_refinement import frame_depth_key
+
+                override = refinement.overrides.get(frame_depth_key(frame))
+                updated_frames.append(
+                    frame
+                    if override is None
+                    else replace(
+                        frame,
+                        measured_depth_path=override.measured_depth_path,
+                        refined_depth_path=override.refined_depth_path,
+                        generated_depth_mask_path=override.generated_mask_path,
+                        depth_confidence_path=override.confidence_path,
+                        depth_refinement_metrics=override.metrics,
+                    )
+                )
+            posed_frames = updated_frames
+            artifact_context["depth_refinement_report"] = refinement.report
+            artifact_context["depth_overrides"] = {
+                (str(frame.source.root), frame.frame_index): refinement.overrides.get(
+                    frame_depth_key(frame)
+                )
+                for frame in posed_frames
+            }
+        artifact_context["posed_frames"] = posed_frames
 
     aligned_preview = o3d.geometry.PointCloud()
     for index, (local, transform) in enumerate(zip(local_phases, phase_to_global, strict=True)):
@@ -1854,7 +1884,47 @@ def reconstruct_open3d(
                 (index + 1) / len(local_phases),
             )
 
-    total_final_frames = sum(len(local.frame_indices) for local in local_phases)
+    depth_overrides = (
+        artifact_context.get("depth_overrides", {}) if artifact_context is not None else {}
+    )
+
+    def append_fusion_entries(
+        entries: list[FusionEntry],
+        details: list[tuple[int, int, str]],
+        phase: PhaseData,
+        frame_index: int,
+        extrinsic: np.ndarray,
+        detail: tuple[int, int, str],
+    ) -> None:
+        override = depth_overrides.get((str(phase.root), frame_index))
+        if override is None:
+            entries.append(FusionEntry(phase, frame_index, extrinsic))
+            details.append(detail)
+            return
+        entries.append(
+            FusionEntry(phase, frame_index, extrinsic, override.measured_depth_path)
+        )
+        details.append(detail)
+        if override.generated_pixels > 0:
+            # The measured surface appears in both passes, while generated
+            # pixels appear only once and therefore carry half TSDF/surfel weight.
+            entries.append(
+                FusionEntry(phase, frame_index, extrinsic, override.refined_depth_path)
+            )
+            details.append(detail)
+
+    total_final_frames = sum(
+        1
+        + int(
+            (
+                override := depth_overrides.get((str(local.source.root), frame_index))
+            )
+            is not None
+            and override.generated_pixels > 0
+        )
+        for local in local_phases
+        for frame_index in local.frame_indices
+    )
     needs_mesh = bool(artifact_context and artifact_context.get("needs_mesh"))
     final_fusion_method = "shared_tsdf_cuda" if backend.uses_cuda else "shared_tsdf_cpu"
     if voxel_size_m < 0.01:
@@ -1871,15 +1941,17 @@ def reconstruct_open3d(
                 zip(local.frame_indices, local.camera_to_phase, strict=True), start=1
             ):
                 camera_to_global = transform @ camera_to_phase
-                entries.append(
-                    (local.source, frame_index, np.linalg.inv(camera_to_global))
-                )
-                entry_details.append(
+                append_fusion_entries(
+                    entries,
+                    entry_details,
+                    local.source,
+                    frame_index,
+                    np.linalg.inv(camera_to_global),
                     (
                         selected_number,
                         len(local.frame_indices),
                         local.source.manifest["name"],
-                    )
+                    ),
                 )
 
         def merged(entry_index: int, repeated: bool) -> None:
@@ -1965,11 +2037,13 @@ def reconstruct_open3d(
                 zip(local.frame_indices, local.camera_to_phase, strict=True), start=1
             ):
                 camera_to_global = transform @ camera_to_phase
-                entries.append(
-                    (local.source, frame_index, np.linalg.inv(camera_to_global))
-                )
-                entry_details.append(
-                    (selected_number, len(local.frame_indices), local.source.manifest["name"])
+                append_fusion_entries(
+                    entries,
+                    entry_details,
+                    local.source,
+                    frame_index,
+                    np.linalg.inv(camera_to_global),
+                    (selected_number, len(local.frame_indices), local.source.manifest["name"]),
                 )
 
         def integrated(entry_index: int, repeated: bool) -> None:

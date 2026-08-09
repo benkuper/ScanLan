@@ -24,6 +24,7 @@
   export let renderMode: RenderMode = 'points';
   export let mesh: PreviewMesh | null = null;
   export let splatBytes: Uint8Array | null = null;
+  export let splatRepresentation: '2d' | '3d' = '2d';
   export let assetLoading: 'points' | 'mesh' | 'splat' | null = null;
   export let floorPickMode = false;
   export let cloudTransform: CloudTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
@@ -1297,7 +1298,7 @@
   <canvas class="scene-canvas" bind:this={canvas} aria-label="Interactive 3D reconstruction"></canvas>
   <div class:live class="viewer-hud top-left">
     <span class="pulse"></span>
-    {processing ? renderMode === 'splat' ? 'Training 2D Gaussian splats' : 'Reconstructing geometry' : live ? liveLabel : renderMode === 'splat' ? splatError ? 'Splat preview failed' : splatReady ? '2D Gaussian splat' : 'Loading splat' : renderMode === 'mesh' && mesh ? meshViewMode === 'wireframe' ? 'Wireframe' : meshViewMode === 'shaded' ? 'Shaded mesh' : meshViewMode === 'surface-wireframe' ? 'Mesh + wireframe' : 'Textured mesh' : points.length || packedFrame?.pointCount ? 'Point cloud' : 'Awaiting RGB-D frames'}
+    {processing ? renderMode === 'splat' ? `Training ${splatRepresentation === '3d' ? 'photoreal 3D' : 'surface 2D'} Gaussian splats` : 'Reconstructing geometry' : live ? liveLabel : renderMode === 'splat' ? splatError ? 'Splat preview failed' : splatReady ? `${splatRepresentation === '3d' ? '3D' : '2D'} Gaussian splat` : 'Loading splat' : renderMode === 'mesh' && mesh ? meshViewMode === 'wireframe' ? 'Wireframe' : meshViewMode === 'shaded' ? 'Shaded mesh' : meshViewMode === 'surface-wireframe' ? 'Mesh + wireframe' : 'Textured mesh' : points.length || packedFrame?.pointCount ? 'Point cloud' : 'Awaiting RGB-D frames'}
   </div>
 
   <div class:live-offset={live} class="view-cube-shell">

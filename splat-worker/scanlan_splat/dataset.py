@@ -75,6 +75,17 @@ def load_dataset(path: Path) -> tuple[Path, dict[str, Any]]:
             raise ValueError(f"Canonical frame {index} is a metric anchor without depth")
         if has_depth:
             depth_frame_count += 1
+            for optional_field in ("depthConfidence", "generatedDepthMask"):
+                if frame.get(optional_field):
+                    relative = Path(str(frame[optional_field]))
+                    if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError(
+                            f"Canonical frame {index} has an unsafe {optional_field} path"
+                        )
+                    if not (root / relative).is_file():
+                        raise FileNotFoundError(
+                            f"Canonical frame {index} is missing {optional_field}: {relative}"
+                        )
         if schema == 4:
             confidence = float(frame.get("poseConfidence", 0.0))
             if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:

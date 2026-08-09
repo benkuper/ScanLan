@@ -33,6 +33,20 @@ For each take, the final pass prefers a complete validated live trajectory. If i
 
 Separate takes are registered through global features followed by quality-gated colored ICP. An ambiguous take fails visibly instead of being fused at an arbitrary transform.
 
+## Optional LingBot depth refinement
+
+Depth refinement is an offline production stage after the complete metric trajectory is accepted. Tracking, loop closure, take registration, and pose refinement always use original calibrated sensor depth. The isolated CUDA worker runs the pinned Apache-2.0 LingBot-Depth v0.5 code/model on `color/*.rgb` and `depth/*.u16`; both inputs are already on the depth-camera pixel grid, and the model output is required to have exactly that same width and height.
+
+ScanLan never replaces any nonzero sensor measurement, including one outside the configured fusion range. A prediction may fill only an original zero-valued sensor hole and must pass all of these gates:
+
+- the model validity mask and finite metric depth range;
+- local depth-discontinuity rejection;
+- agreement with reliable measured pixels in median, 90th-percentile, scale-bias, and inlier metrics;
+- projection through the calibrated depth-to-native-RGB transform into the true RGB field of view;
+- reprojection agreement from independent camera centers in up to four nearby posed keyframes, with two confirmations when available.
+
+Validated caches are fingerprinted by source depth/color files, calibration, poses, implementation version, code revision, model revision, and model SHA-256. Measured and refined rasters are stored separately with generated-pixel masks and 8-bit confidence. Final TSDF/surfel fusion integrates measured depth twice and the measured-plus-generated raster once, giving generated geometry half weight. Canonical 2DGS datasets retain both confidence and provenance masks; generated depth has lower robust-loss weight and lower seed opacity, while measured seeds win voxel conflicts.
+
 ## Point cloud
 
 Normal room-scale settings use weighted TSDF fusion. Fine spacing uses a memory-bounded voxel/surfel path so the GPU does not allocate a room-sized dense volume. The result is filtered, downsampled at the requested metric spacing, colored, and saved as binary PLY.
@@ -71,7 +85,7 @@ Localization requires the OpenCV feature runtime included in packaged workers. F
 
 ## 2D Gaussian surface
 
-The splat target uses tangent-aligned 2D Gaussian discs rather than unconstrained volumetric blobs. Initial seeds come from the same metric keyframes and include local normals, anisotropic pixel footprints, and depth masks. Native Azure/Femto lens distortion is removed from RGB, reprojected depth, and masks before optimization so every training ray matches the pinhole 2DGS rasterizer. Training combines photometric, SSIM, robust expected-depth, normal, and Gaussian-distortion terms with bounded camera-pose refinement.
+The splat target uses tangent-aligned 2D Gaussian discs rather than unconstrained volumetric blobs. Initial seeds come from the same metric keyframes and include local normals, anisotropic pixel footprints, depth masks, and measured/generated confidence. Native Azure/Femto lens distortion is removed from RGB, reprojected depth, masks, and provenance before optimization so every training ray matches the pinhole 2DGS rasterizer. Training combines photometric, SSIM, confidence-weighted robust expected-depth, normal, and Gaussian-distortion terms with bounded camera-pose refinement.
 
 For a 12 GB GPU, the canonical builder retains up to 600 views using camera-position, direction, roll, time, and take-boundary coverage, then projects metric depth and undistorts RGB directly onto a 960 px pinhole grid. Compact integer images remain in pinned host memory behind a four-frame LRU; shuffled views are scheduled in cache-local blocks and only the active view is transferred to CUDA. The trainer enforces a two-million-Gaussian hard ceiling at this VRAM tier. Densification stops before a single growth cycle could cross that ceiling, and checkpoints are exported atomically.
 

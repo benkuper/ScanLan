@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Callable
+from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 
@@ -12,6 +13,7 @@ def depth_to_world_points(
     phase: PhaseData,
     frame_index: int,
     pixel_stride: int = 2,
+    depth_path: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     frame = phase.frames[frame_index]
     if frame.pose is None:
@@ -19,7 +21,15 @@ def depth_to_world_points(
             "The NumPy engine requires known poses. Install Open3D to estimate poses from real captures."
         )
     camera = phase.camera
-    depth = load_depth(frame, camera)[::pixel_stride, ::pixel_stride].astype(np.float64)
+    if depth_path is None:
+        depth_values = load_depth(frame, camera)
+    else:
+        depth_values = np.fromfile(depth_path, dtype="<u2")
+        expected = camera.width * camera.height
+        if depth_values.size != expected:
+            raise ValueError(f"Depth override {depth_path} has an unexpected size")
+        depth_values = depth_values.reshape(camera.height, camera.width)
+    depth = depth_values[::pixel_stride, ::pixel_stride].astype(np.float64)
     color = load_color(frame, camera)[::pixel_stride, ::pixel_stride]
     y_pixels, x_pixels = np.mgrid[0 : camera.height : pixel_stride, 0 : camera.width : pixel_stride]
     z = depth / camera.depth_scale
@@ -59,6 +69,7 @@ def reconstruct_known_poses(
     phases: list[PhaseData],
     voxel_size_m: float,
     progress: Callable[..., None] | None = None,
+    depth_overrides: dict[tuple[str, int], Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not phases:
         raise ValueError("At least one capture phase is required")
@@ -68,9 +79,19 @@ def reconstruct_known_poses(
     completed_frames = 0
     for phase in phases:
         for frame_index in range(len(phase.frames)):
-            points, colors = depth_to_world_points(phase, frame_index)
-            point_batches.append(points)
-            color_batches.append(colors)
+            override = (depth_overrides or {}).get((str(phase.root), frame_index))
+            depth_paths = (
+                [None]
+                if override is None
+                else [override.measured_depth_path]
+                + ([override.refined_depth_path] if override.generated_pixels > 0 else [])
+            )
+            for depth_path in depth_paths:
+                points, colors = depth_to_world_points(
+                    phase, frame_index, depth_path=depth_path
+                )
+                point_batches.append(points)
+                color_batches.append(colors)
             completed_frames += 1
             if progress:
                 progress(

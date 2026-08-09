@@ -10,6 +10,8 @@ import numpy as np
 from PIL import Image
 
 from .calibration import (
+    depth_camera_points,
+    project_rgb,
     rgb_depth_zbuffer,
     robust_depth_mask,
     scaled_pinhole_camera,
@@ -38,7 +40,7 @@ if TYPE_CHECKING:
     from .mesh import PosedFrame
 
 
-DATASET_VERSION = "hybrid-rgbd-media-pinhole-720-v7"
+DATASET_VERSION = "hybrid-rgbd-media-pinhole-720-v8-lingbot-provenance"
 CANONICAL_MAX_DIMENSION = 720
 MAX_CANONICAL_FRAMES = 600
 
@@ -145,6 +147,17 @@ def dataset_fingerprint(frames: list[PosedFrame]) -> str:
                 digest.update(path.name.encode("utf-8"))
                 digest.update(str(stat.st_size).encode("ascii"))
                 digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        for path in (
+            frame.measured_depth_path,
+            frame.refined_depth_path,
+            frame.generated_depth_mask_path,
+            frame.depth_confidence_path,
+        ):
+            if path is not None and path.is_file():
+                stat = path.stat()
+                digest.update(path.name.encode("utf-8"))
+                digest.update(str(stat.st_size).encode("ascii"))
+                digest.update(str(stat.st_mtime_ns).encode("ascii"))
     return digest.hexdigest()[:24]
 
 
@@ -162,6 +175,41 @@ def resolve_dataset(path: Path) -> Path:
 def _save_depth_png(path: Path, depth_m: np.ndarray) -> None:
     millimetres = np.rint(np.clip(depth_m, 0.0, 65.535) * 1000.0).astype(np.uint16)
     Image.fromarray(millimetres).save(path, compress_level=3)
+
+
+def _reproject_depth_labels(
+    labels: np.ndarray,
+    depth: np.ndarray,
+    frame: PosedFrame,
+    output_camera: Any,
+    depth_rgb: np.ndarray,
+) -> np.ndarray:
+    source_frame = frame.source.frames[frame.frame_index]
+    points, valid, _ = depth_camera_points(depth, frame.source)
+    rgb_points = (frame_rgb_from_depth(source_frame, frame.source) @ points.T).T[:, :3]
+    u, v, z = project_rgb(rgb_points, output_camera)
+    finite = np.isfinite(u) & np.isfinite(v)
+    ui = np.rint(np.where(finite, u, 0.0)).astype(np.int64)
+    vi = np.rint(np.where(finite, v, 0.0)).astype(np.int64)
+    projected = (
+        finite
+        & (z > 0.0)
+        & (ui >= 0)
+        & (ui < output_camera.width)
+        & (vi >= 0)
+        & (vi < output_camera.height)
+    )
+    projected_indices = np.flatnonzero(projected)
+    accepted = np.zeros(len(z), dtype=bool)
+    accepted[projected_indices] = (
+        np.abs(z[projected_indices] - depth_rgb[vi[projected_indices], ui[projected_indices]])
+        <= np.maximum(0.015, z[projected_indices] * 0.006)
+    )
+    source_labels = np.asarray(labels, dtype=np.uint8).reshape(-1)[np.flatnonzero(valid)]
+    output = np.zeros(output_camera.width * output_camera.height, dtype=np.uint8)
+    flat = vi[accepted] * output_camera.width + ui[accepted]
+    np.maximum.at(output, flat, source_labels[accepted])
+    return output.reshape(output_camera.height, output_camera.width)
 
 
 def _display_world_matrix(
@@ -202,7 +250,13 @@ def build_posed_dataset(
     temporary = datasets_root / f".{fingerprint}.tmp"
     if temporary.exists():
         shutil.rmtree(temporary)
-    for name in ("images", "depths", "masks"):
+    for name in (
+        "images",
+        "depths",
+        "masks",
+        "depth-confidence",
+        "generated-depth-masks",
+    ):
         (temporary / name).mkdir(parents=True, exist_ok=True)
 
     records: list[dict[str, Any]] = []
@@ -230,6 +284,8 @@ def build_posed_dataset(
         )
         depth_rgb = None
         mask = None
+        depth_confidence_rgb = None
+        generated_depth_rgb = None
         if frame.depthless:
             world_from_rgb = _display_world_matrix(
                 world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
@@ -238,7 +294,13 @@ def build_posed_dataset(
         else:
             assert source_frame is not None
             rgb_from_depth = frame_rgb_from_depth(source_frame, frame.source)
-            depth = load_depth(source_frame, frame.source.camera)
+            from .mesh import (
+                load_generated_depth_mask,
+                load_posed_depth,
+                load_posed_depth_confidence,
+            )
+
+            depth = load_posed_depth(frame)
             depth_rgb, uv_map, visibility = rgb_depth_zbuffer(
                 depth,
                 frame.source,
@@ -246,27 +308,55 @@ def build_posed_dataset(
                 output_camera=dataset_camera,
             )
             mask = robust_depth_mask(depth_rgb)
+            confidence_depth = load_posed_depth_confidence(frame)
+            if confidence_depth is None:
+                confidence_depth = (depth > 0).astype(np.uint8) * 255
+            generated_depth = load_generated_depth_mask(frame)
+            if generated_depth is None:
+                generated_depth = np.zeros(depth.shape, dtype=bool)
+            depth_confidence_rgb = _reproject_depth_labels(
+                confidence_depth,
+                depth,
+                frame,
+                dataset_camera,
+                depth_rgb,
+            )
+            generated_depth_rgb = _reproject_depth_labels(
+                generated_depth.astype(np.uint8) * 255,
+                depth,
+                frame,
+                dataset_camera,
+                depth_rgb,
+            )
+            mask &= depth_confidence_rgb > 0
             world_from_depth = _display_world_matrix(
                 world_from_depth_opencv(frame.camera_to_global, frame.image_y_up),
                 frame.display_axes,
             )
-            seeds = seed_rgbd_gaussians(
-                depth,
-                image,
-                uv_map,
-                visibility,
-                frame.source.camera,
-                world_from_depth,
-            )
-            if len(seeds.points):
-                seed_batches.append(seeds)
-                if len(seed_batches) >= 8:
-                    seed_batches[:] = [
-                        compact_seed_batches(
-                            seed_batches,
-                            limit=MAX_INITIAL_GAUSSIANS * 2,
-                        )
-                    ]
+            # Split provenance before adaptive quadtree seeding so a flat cell
+            # cannot hide a generated center inside mostly measured geometry.
+            for provenance_visibility in (
+                visibility & ~generated_depth,
+                visibility & generated_depth,
+            ):
+                seeds = seed_rgbd_gaussians(
+                    depth,
+                    image,
+                    uv_map,
+                    provenance_visibility,
+                    frame.source.camera,
+                    world_from_depth,
+                    confidence_depth,
+                )
+                if len(seeds.points):
+                    seed_batches.append(seeds)
+                    if len(seed_batches) >= 8:
+                        seed_batches[:] = [
+                            compact_seed_batches(
+                                seed_batches,
+                                limit=MAX_INITIAL_GAUSSIANS * 2,
+                            )
+                        ]
             world_from_rgb = _display_world_matrix(
                 world_from_rgb_camera(
                     frame.camera_to_global,
@@ -316,14 +406,30 @@ def build_posed_dataset(
             "poseConfidence": _localization_pose_confidence(frame) if frame.depthless else 1.0,
         }
         if depth_rgb is not None and mask is not None:
+            assert depth_confidence_rgb is not None and generated_depth_rgb is not None
             _save_depth_png(temporary / "depths" / f"{stem}.png", depth_rgb)
             Image.fromarray(mask.astype(np.uint8) * 255).save(
                 temporary / "masks" / f"{stem}.png",
                 compress_level=3,
             )
+            Image.fromarray(depth_confidence_rgb).save(
+                temporary / "depth-confidence" / f"{stem}.png",
+                compress_level=3,
+            )
+            Image.fromarray(generated_depth_rgb).save(
+                temporary / "generated-depth-masks" / f"{stem}.png",
+                compress_level=3,
+            )
             record.update(
                 depth=f"depths/{stem}.png",
                 depthMask=f"masks/{stem}.png",
+                depthConfidence=f"depth-confidence/{stem}.png",
+                generatedDepthMask=f"generated-depth-masks/{stem}.png",
+                depthProvenance=(
+                    "measured+lingbot-v0.5"
+                    if frame.refined_depth_path is not None
+                    else "measured"
+                ),
             )
         records.append(record)
         if progress:
@@ -347,6 +453,7 @@ def build_posed_dataset(
         colors=seeds.colors,
         scales=seeds.scales,
         quaternions=seeds.quaternions,
+        confidence=seeds.confidence,
     )
     hybrid = any(frame.depthless for frame in training_frames)
     rgbd_frame_count = sum(not frame.depthless for frame in training_frames)

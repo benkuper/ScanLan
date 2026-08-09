@@ -17,7 +17,15 @@ $SitePackages = Join-Path $RuntimeRoot "Lib/site-packages"
 $BuildRoot = Join-Path $ProjectRoot "build/pycolmap-cuda"
 $SourceRoot = Join-Path $BuildRoot "colmap-$ColmapVersion"
 $VcpkgRoot = Join-Path $BuildRoot "vcpkg"
-$NativeBuildRoot = Join-Path $BuildRoot "native-$ColmapVersion-$($Mode.ToLowerInvariant())"
+$OnnxVersion = "1.28.0"
+$OnnxArchiveName = "onnxruntime-win-x64-gpu_cuda13-$OnnxVersion.zip"
+$OnnxArchive = Join-Path $BuildRoot $OnnxArchiveName
+$OnnxArchiveSha256 = "137f0822a4923b1d84d3e09496e0792ebbb221eb3a61a0657f71a12ab68ab1e2"
+$OnnxSourceRoot = Join-Path $BuildRoot "onnxruntime-win-x64-gpu_cuda13-$OnnxVersion"
+$OnnxHeaderRoot = Join-Path $BuildRoot "onnxruntime-headers-$OnnxVersion"
+$OnnxIncludeRoot = Join-Path $OnnxHeaderRoot "include"
+$OnnxLibRoot = Join-Path $OnnxSourceRoot "lib"
+$NativeBuildRoot = Join-Path $BuildRoot "native-$ColmapVersion-$($Mode.ToLowerInvariant())-onnx-$OnnxVersion"
 $InstallRoot = Join-Path $NativeBuildRoot "install"
 $VcpkgInstalledRoot = Join-Path $NativeBuildRoot "vcpkg_installed"
 $RawWheelRoot = Join-Path $NativeBuildRoot "wheels-raw"
@@ -52,8 +60,41 @@ if (-not $env:CUDA_PATH -or -not (Test-Path -LiteralPath (Join-Path $env:CUDA_PA
 Assert-ChildPath $ProjectRoot $BuildRoot
 Assert-ChildPath $BuildRoot $SourceRoot
 Assert-ChildPath $BuildRoot $VcpkgRoot
+Assert-ChildPath $BuildRoot $OnnxArchive
+Assert-ChildPath $BuildRoot $OnnxSourceRoot
+Assert-ChildPath $BuildRoot $OnnxHeaderRoot
 Assert-ChildPath $BuildRoot $NativeBuildRoot
 $null = New-Item -ItemType Directory -Force -Path $BuildRoot, $NativeBuildRoot, $RawWheelRoot, $RepairedWheelRoot, $PythonBuildRoot
+
+$ArchiveValid = Test-Path -LiteralPath $OnnxArchive
+if ($ArchiveValid) {
+  $ArchiveValid = (Get-FileHash -LiteralPath $OnnxArchive -Algorithm SHA256).Hash -eq $OnnxArchiveSha256
+}
+if (-not $ArchiveValid) {
+  if (Test-Path -LiteralPath $OnnxArchive) {
+    Remove-Item -LiteralPath $OnnxArchive -Force
+  }
+  Invoke-WebRequest `
+    -Uri "https://github.com/microsoft/onnxruntime/releases/download/v$OnnxVersion/$OnnxArchiveName" `
+    -OutFile $OnnxArchive `
+    -UseBasicParsing
+  if ((Get-FileHash -LiteralPath $OnnxArchive -Algorithm SHA256).Hash -ne $OnnxArchiveSha256) {
+    throw "The downloaded ONNX Runtime archive did not match its pinned SHA-256 digest."
+  }
+}
+if (-not (Test-Path -LiteralPath (Join-Path $OnnxSourceRoot "include/onnxruntime_cxx_api.h"))) {
+  Expand-Archive -LiteralPath $OnnxArchive -DestinationPath $BuildRoot -Force
+}
+if (-not (Test-Path -LiteralPath (Join-Path $OnnxSourceRoot "include/onnxruntime_cxx_api.h")) -or
+    -not (Test-Path -LiteralPath (Join-Path $OnnxLibRoot "onnxruntime.lib"))) {
+  throw "The pinned ONNX Runtime archive has an unexpected layout."
+}
+# COLMAP's find module expects <hint>/onnxruntime/onnxruntime_cxx_api.h,
+# whereas Microsoft's release archive stores headers directly in include/.
+if (-not (Test-Path -LiteralPath (Join-Path $OnnxIncludeRoot "onnxruntime/onnxruntime_cxx_api.h"))) {
+  $null = New-Item -ItemType Directory -Force -Path (Join-Path $OnnxIncludeRoot "onnxruntime")
+  Copy-Item -Path (Join-Path $OnnxSourceRoot "include/*") -Destination (Join-Path $OnnxIncludeRoot "onnxruntime") -Recurse -Force
+}
 
 $env:Path = "$RuntimeScripts;$env:Path"
 $env:VCPKG_DISABLE_METRICS = "1"
@@ -74,7 +115,7 @@ if (-not $CudaArchitectures) {
   }
 }
 
-$ExpectedStamp = "colmap=$ColmapVersion;mode=$Mode;cuda=$($env:CUDA_PATH);arch=$CudaArchitectures"
+$ExpectedStamp = "colmap=$ColmapVersion;mode=$Mode;cuda=$($env:CUDA_PATH);arch=$CudaArchitectures;onnx=$OnnxVersion-cuda13;wheel=onnx-providers-v1"
 $InstalledStamp = if (Test-Path -LiteralPath $StampPath) {
   (Get-Content -Raw -LiteralPath $StampPath).Trim()
 } else { "" }
@@ -94,6 +135,26 @@ if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot ".git"))) {
 $SourceTag = (& git -C $SourceRoot describe --tags --exact-match 2>$null).Trim()
 if ($LASTEXITCODE -ne 0 -or $SourceTag -ne $ColmapVersion) {
   throw "The cached COLMAP source is not the requested $ColmapVersion tag: $SourceRoot"
+}
+
+# COLMAP normally maps ONNX_ENABLED + FETCH_ONNX=OFF to vcpkg's `onnx`
+# feature. That port tries to discover a separately installed cuDNN and cannot
+# consume Microsoft's self-contained CUDA 13 release archive. Keep the upstream
+# find_package path, but suppress only that inferred vcpkg feature so the pinned
+# external runtime below is used directly.
+$ColmapCmakeLists = Join-Path $SourceRoot "CMakeLists.txt"
+$OriginalOnnxCondition = "if(ONNX_ENABLED AND NOT FETCH_ONNX)"
+$ScanLanOnnxCondition = "if(ONNX_ENABLED AND NOT FETCH_ONNX AND NOT SCANLAN_EXTERNAL_ONNX)"
+$ColmapCmakeContent = [System.IO.File]::ReadAllText($ColmapCmakeLists)
+if ($ColmapCmakeContent.Contains($OriginalOnnxCondition)) {
+  $ColmapCmakeContent = $ColmapCmakeContent.Replace($OriginalOnnxCondition, $ScanLanOnnxCondition)
+  [System.IO.File]::WriteAllText(
+    $ColmapCmakeLists,
+    $ColmapCmakeContent,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+} elseif (-not $ColmapCmakeContent.Contains($ScanLanOnnxCondition)) {
+  throw "COLMAP's ONNX vcpkg feature condition changed; update ScanLan's pinned build patch."
 }
 
 if (-not (Test-Path -LiteralPath (Join-Path $VcpkgRoot ".git"))) {
@@ -135,7 +196,11 @@ $ConfigureArguments = @(
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures",
   "-DCUDAToolkit_ROOT=$($env:CUDA_PATH.Replace('\', '/'))",
   "-DGUI_ENABLED=OFF",
-  "-DONNX_ENABLED=OFF",
+  "-DONNX_ENABLED=ON",
+  "-DFETCH_ONNX=OFF",
+  "-DSCANLAN_EXTERNAL_ONNX=ON",
+  "-Donnxruntime_INCLUDE_DIR_HINTS=$($OnnxIncludeRoot.Replace('\', '/'))",
+  "-Donnxruntime_LIBRARY_DIR_HINTS=$($OnnxLibRoot.Replace('\', '/'))",
   "-DCGAL_ENABLED=OFF",
   "-DLSD_ENABLED=OFF",
   "-DMVS_ENABLED=OFF",
@@ -172,6 +237,9 @@ $PythonBuildArguments = @(
   "--config-settings", "cmake.define.CMAKE_PREFIX_PATH=$InstallRootCmake",
   "--config-settings", "cmake.define.pybind11_DIR=$Pybind11CmakeDir",
   "--config-settings", "cmake.define.CMAKE_CUDA_ARCHITECTURES=$CudaArchitectures",
+  "--config-settings", "cmake.define.ONNX_ENABLED=ON",
+  "--config-settings", "cmake.define.onnxruntime_INCLUDE_DIR_HINTS=$($OnnxIncludeRoot.Replace('\', '/'))",
+  "--config-settings", "cmake.define.onnxruntime_LIBRARY_DIR_HINTS=$($OnnxLibRoot.Replace('\', '/'))",
   "--config-settings", "cmake.define.GENERATE_STUBS=OFF"
 )
 Invoke-Checked "CUDA PyCOLMAP wheel build" {
@@ -187,10 +255,19 @@ if (-not $RawWheel) {
 $DependencyPaths = @(
   (Join-Path $VcpkgInstalledRoot "$Triplet/bin"),
   (Join-Path $InstallRoot "bin"),
+  $OnnxLibRoot,
   (Join-Path $env:CUDA_PATH "bin")
 ) | Where-Object { Test-Path -LiteralPath $_ }
 Invoke-Checked "CUDA PyCOLMAP dependency repair" {
-  & $Python -m delvewheel repair $RawWheel.FullName --add-path ($DependencyPaths -join ";") --wheel-dir $RepairedWheelRoot
+  # ONNX loads execution-provider DLLs dynamically by their fixed basenames,
+  # so dependency scanners cannot discover them and name mangling would make
+  # them invisible at runtime. Force all three runtime DLLs into the wheel with
+  # their upstream names; the pinned versions are identical and colocated.
+  & $Python -m delvewheel repair $RawWheel.FullName `
+    --add-path ($DependencyPaths -join ";") `
+    --include "onnxruntime_providers_shared.dll;onnxruntime_providers_cuda.dll" `
+    --no-mangle "onnxruntime.dll;onnxruntime_providers_shared.dll;onnxruntime_providers_cuda.dll" `
+    --wheel-dir $RepairedWheelRoot
 }
 
 $RepairedWheel = Get-ChildItem -LiteralPath $RepairedWheelRoot -Filter "pycolmap-$ColmapVersion-*.whl" |
@@ -215,7 +292,7 @@ Invoke-Checked "CUDA wheel-tool cleanup" {
 $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $StampPath)
 Set-Content -LiteralPath $StampPath -Value $ExpectedStamp -Encoding ASCII
 Invoke-Checked "CUDA PyCOLMAP validation" {
-  & $Python -c "import pycolmap; assert pycolmap.__version__ == '$ColmapVersion'; assert pycolmap.has_cuda; print('CUDA PyCOLMAP', pycolmap.__version__, 'architectures', '$CudaArchitectures')"
+  & $Python -c "import pycolmap; e=pycolmap.FeatureExtractionOptions(); m=pycolmap.FeatureMatchingOptions(); assert pycolmap.__version__ == '$ColmapVersion'; assert pycolmap.has_cuda; assert hasattr(e, 'aliked'); assert hasattr(m.sift, 'lightglue'); print('CUDA + ONNX PyCOLMAP', pycolmap.__version__, 'architectures', '$CudaArchitectures')"
 }
 
 Write-Host "CUDA PyCOLMAP ready: $($RepairedWheel.FullName)"

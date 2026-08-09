@@ -12,8 +12,63 @@ $Python = Join-Path $RuntimeRoot "Scripts/python.exe"
 $RuntimeScripts = Join-Path $RuntimeRoot "Scripts"
 $SitePackages = Join-Path $RuntimeRoot "Lib/site-packages"
 $GsplatExtension = Join-Path $RuntimeRoot "Lib/site-packages/gsplat/csrc.pyd"
+$PycolmapLibraries = Join-Path $SitePackages "pycolmap.libs"
+$PycolmapOnnxShared = Join-Path $PycolmapLibraries "onnxruntime_providers_shared.dll"
+$PycolmapOnnxCuda = Join-Path $PycolmapLibraries "onnxruntime_providers_cuda.dll"
 $GsplatFeatureStamp = Join-Path $RuntimeRoot "Lib/site-packages/gsplat/scanlan-build.txt"
 $GsplatFeatureSchema = "2dgs-rgbd-v3"
+$LingbotRevision = "1f480aeb8a47a24656090d46d053115b7fe60435"
+$LingbotModelRevision = "204754b72bb24f561f8d7e7e1e4e4cd9e809adf9"
+$LingbotDepthRevision = "f3a237e434ae987bc38281476d6cfb5df3e4d739"
+$LingbotDepthModelRevision = "79204ed6b837f4fdd192cf563e59481fecfa0295"
+$LingbotDepthModelName = "lingbot-depth-v0.5.pt"
+$LingbotDepthModelSha256 = "b60cf27ddbd0e51e9b59b03475c0d39d02d2e48ecf8dbb5866f04d46802b3c23"
+$FlashInferRevision = "713358284345314df4f40ddc352f4e981f5bb03e"
+$FlashInferFeatureStamp = Join-Path $SitePackages "flashinfer/scanlan-build.txt"
+$LingbotModels = Join-Path $PackageRoot "models"
+$LingbotModelAssets = @(
+  @{
+    Name = "lingbot-map-long.pt"
+    Sha256 = "832bc82cbae0bc9bbe946ef5ee1f7226abd8c0e183ccf8beddbb3d133576f409"
+  },
+  @{
+    Name = "skyseg_batch.onnx"
+    Sha256 = "b09c0f6cf79e1caa2591b946b659487bd7c8208caddd3f80680cbb169617e378"
+  }
+)
+$FlashInferSource = Join-Path $PackageRoot "build/flashinfer-windows"
+$FlashInferCacheArchive = Join-Path $LingbotModels "flashinfer-cache.zip"
+$ColmapModelRelease = "3.13.0"
+$ColmapModelAssets = @(
+  @{
+    Name = "aliked-n16rot.onnx"
+    Sha256 = "39c423d0a6f03d39ec89d3d1d61853765c2fb6a8b8381376c703e5758778a547"
+  },
+  @{
+    Name = "aliked-lightglue.onnx"
+    Sha256 = "b9a5de7204648b18a8cf5dcac819f9d30de1a5961ef03756803c8b86c2dceb8d"
+  },
+  @{
+    Name = "sift-lightglue.onnx"
+    Sha256 = "e0500228472b43f92b3d36881a09b3310d3b058b56187b246cc7b9ab6429096e"
+  }
+)
+
+function Get-VerifiedDownload([string]$Uri, [string]$Destination, [string]$Sha256) {
+  $Valid = Test-Path -LiteralPath $Destination
+  if ($Valid) {
+    $Valid = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -eq $Sha256
+  }
+  if (-not $Valid) {
+    if (Test-Path -LiteralPath $Destination) {
+      Remove-Item -LiteralPath $Destination -Force
+    }
+    Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ne $Sha256) {
+      throw "Downloaded model $([System.IO.Path]::GetFileName($Destination)) did not match its pinned SHA-256 digest."
+    }
+  }
+}
 
 if (-not (Test-Path -LiteralPath $Python)) {
   if (Get-Command py -ErrorAction SilentlyContinue) {
@@ -58,8 +113,156 @@ $CudaArchitecture = (& $Python -c "import torch; print('.'.join(map(str, torch.c
 $TorchBuild = (& $Python -c "import torch; print(torch.__version__)").Trim()
 $ExpectedGsplatFeatures = "$GsplatFeatureSchema;torch=$TorchBuild;arch=$CudaArchitecture"
 $env:TORCH_CUDA_ARCH_LIST = $CudaArchitecture
-& $Python -m pip install --upgrade "numpy==1.26.4" "Pillow==11.1.0" "av==18.0.0" "ninja>=1.10" "jaxtyping" "rich>=12" "backports.tarfile" "pyinstaller==6.16.0"
+& $Python -m pip install --upgrade --no-deps "torchvision==0.27.1" --index-url "https://download.pytorch.org/whl/cu130"
+if ($LASTEXITCODE -ne 0) { throw "The LingBot-compatible torchvision runtime could not be installed." }
+& $Python -m pip install --upgrade `
+  "numpy==1.26.4" "Pillow==11.1.0" "av==18.0.0" "ninja>=1.10" `
+  "jaxtyping" "rich>=12" "backports.tarfile" "pyinstaller==6.16.0" `
+  "huggingface-hub>=0.34,<2" "einops>=0.8,<1" "safetensors>=0.5,<1" `
+  "opencv-python==4.11.0.86" "scipy>=1.15,<2" "tqdm>=4.67,<5" `
+  "click>=8.1,<9" "matplotlib>=3.10,<4" "trimesh>=4.8,<5" `
+  "onnxruntime-gpu==1.28.0"
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat support dependencies could not be installed." }
+& $Python -m pip install --upgrade --force-reinstall --no-deps `
+  "git+https://github.com/Robbyant/lingbot-map.git@$LingbotRevision"
+if ($LASTEXITCODE -ne 0) { throw "LingBot-Map could not be installed." }
+& $Python -m pip install --upgrade --force-reinstall --no-deps `
+  "git+https://github.com/Robbyant/lingbot-depth.git@$LingbotDepthRevision"
+if ($LASTEXITCODE -ne 0) { throw "LingBot-Depth could not be installed." }
+
+# FlashInfer's upstream wheels do not support native Windows. Build the pinned
+# Windows fork's JIT package for the exact Torch/CUDA/GPU combination. It keeps
+# LingBot's long-video cache bounded and is required by ScanLan's quality path.
+$ExpectedFlashInferBuild = "revision=$FlashInferRevision;torch=$TorchBuild;arch=$CudaArchitecture"
+$InstalledFlashInferBuild = if (Test-Path -LiteralPath $FlashInferFeatureStamp) {
+  (Get-Content -Raw -LiteralPath $FlashInferFeatureStamp).Trim()
+} else { "" }
+$FlashInferReady = $false
+$PreviousErrorActionPreference = $ErrorActionPreference
+try {
+  $ErrorActionPreference = "SilentlyContinue"
+  & $Python -c "import flashinfer; print(flashinfer.__version__)" 2>$null
+  $FlashInferReady = $LASTEXITCODE -eq 0 -and $InstalledFlashInferBuild -eq $ExpectedFlashInferBuild
+} finally {
+  $ErrorActionPreference = $PreviousErrorActionPreference
+}
+if (-not $FlashInferReady) {
+  $FlashInferBuildOk = $true
+  $PreviousErrorActionPreference = $ErrorActionPreference
+  try {
+    # Every command in this block is optional. Preserve its exit status without
+    # allowing native stderr to abort the required SDPA-capable runtime build.
+    $ErrorActionPreference = "Continue"
+    if (Test-Path -LiteralPath $FlashInferSource) {
+      $InstalledFlashInferRevision = (& git -C $FlashInferSource rev-parse HEAD).Trim()
+      if ($LASTEXITCODE -ne 0 -or $InstalledFlashInferRevision -ne $FlashInferRevision) {
+        Remove-Item -LiteralPath $FlashInferSource -Recurse -Force
+      }
+    }
+    if (-not (Test-Path -LiteralPath $FlashInferSource)) {
+      & git clone --no-checkout https://github.com/SystemPanic/flashinfer-windows.git $FlashInferSource
+      $FlashInferBuildOk = $LASTEXITCODE -eq 0
+      if ($FlashInferBuildOk) {
+        & git -C $FlashInferSource checkout --detach $FlashInferRevision
+        $FlashInferBuildOk = $LASTEXITCODE -eq 0
+      }
+      if ($FlashInferBuildOk) {
+        & git -C $FlashInferSource submodule update --init --recursive
+        $FlashInferBuildOk = $LASTEXITCODE -eq 0
+      }
+    }
+    if ($FlashInferBuildOk) {
+      & $Python -m pip install --upgrade `
+        "apache-tvm-ffi>=0.1.9,<0.2" click cuda-tile nvidia-cudnn-frontend `
+        nvidia-ml-py "packaging>=24.2" requests tabulate
+      $FlashInferBuildOk = $LASTEXITCODE -eq 0
+    }
+    if ($FlashInferBuildOk) {
+      $env:FLASHINFER_CUDA_ARCH_LIST = $CudaArchitecture
+      & $Python -m pip install --upgrade --force-reinstall --no-build-isolation --no-deps $FlashInferSource
+      $FlashInferBuildOk = $LASTEXITCODE -eq 0
+    }
+    if ($FlashInferBuildOk) {
+      & $Python -c "import flashinfer; print(flashinfer.__version__)"
+      $FlashInferReady = $LASTEXITCODE -eq 0
+      if ($FlashInferReady) {
+        Set-Content -LiteralPath $FlashInferFeatureStamp -Value $ExpectedFlashInferBuild -Encoding ASCII
+      }
+    }
+  } catch {
+    $FlashInferBuildOk = $false
+    Write-Warning "Windows FlashInfer build failed: $($_.Exception.Message)"
+  } finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
+  }
+  if (-not $FlashInferReady) {
+    throw "The pinned Windows FlashInfer runtime could not be built."
+  }
+}
+
+# Resolve immutable model assets once during runtime preparation. A verified
+# local copy is authoritative, avoiding a 4.6 GB cache/network lookup on every
+# release. Missing or mismatched files are downloaded from the pinned revision.
+$null = New-Item -ItemType Directory -Path $LingbotModels -Force
+foreach ($Asset in $LingbotModelAssets) {
+  $Destination = Join-Path $LingbotModels $Asset.Name
+  $Valid = Test-Path -LiteralPath $Destination
+  if ($Valid) {
+    $Valid = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -eq $Asset.Sha256
+  }
+  if (-not $Valid) {
+    if (Test-Path -LiteralPath $Destination) {
+      Remove-Item -LiteralPath $Destination -Force
+    }
+    $Downloaded = (& $Python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id='robbyant/lingbot-map', filename='$($Asset.Name)', revision='$LingbotModelRevision'))" | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Downloaded)) {
+      throw "LingBot-Map asset $($Asset.Name) could not be downloaded."
+    }
+    try {
+      $null = New-Item -ItemType HardLink -Path $Destination -Target $Downloaded
+    } catch {
+      Copy-Item -LiteralPath $Downloaded -Destination $Destination
+    }
+  }
+  if ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ne $Asset.Sha256) {
+    throw "LingBot-Map asset $($Asset.Name) did not match its pinned SHA-256 digest."
+  }
+}
+$LingbotDepthDestination = Join-Path $LingbotModels $LingbotDepthModelName
+$LingbotDepthValid = Test-Path -LiteralPath $LingbotDepthDestination
+if ($LingbotDepthValid) {
+  $LingbotDepthValid = (Get-FileHash -LiteralPath $LingbotDepthDestination -Algorithm SHA256).Hash -eq $LingbotDepthModelSha256
+}
+if (-not $LingbotDepthValid) {
+  if (Test-Path -LiteralPath $LingbotDepthDestination) {
+    Remove-Item -LiteralPath $LingbotDepthDestination -Force
+  }
+  $LingbotDepthDownloaded = (& $Python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id='robbyant/lingbot-depth-pretrain-vitl-14-v0.5', filename='model.pt', revision='$LingbotDepthModelRevision'))" | Select-Object -Last 1)
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $LingbotDepthDownloaded)) {
+    throw "LingBot-Depth v0.5 model could not be downloaded."
+  }
+  try {
+    $null = New-Item -ItemType HardLink -Path $LingbotDepthDestination -Target $LingbotDepthDownloaded
+  } catch {
+    Copy-Item -LiteralPath $LingbotDepthDownloaded -Destination $LingbotDepthDestination
+  }
+}
+if ((Get-FileHash -LiteralPath $LingbotDepthDestination -Algorithm SHA256).Hash -ne $LingbotDepthModelSha256) {
+  throw "LingBot-Depth v0.5 did not match its pinned SHA-256 digest."
+}
+foreach ($Asset in $ColmapModelAssets) {
+  $Destination = Join-Path $LingbotModels $Asset.Name
+  Get-VerifiedDownload `
+    -Uri "https://github.com/colmap/colmap/releases/download/$ColmapModelRelease/$($Asset.Name)" `
+    -Destination $Destination `
+    -Sha256 $Asset.Sha256
+}
+$env:SCANLAN_LINGBOT_MODEL = Join-Path $LingbotModels "lingbot-map-long.pt"
+$env:SCANLAN_LINGBOT_SKY_MODEL = Join-Path $LingbotModels "skyseg_batch.onnx"
+$env:SCANLAN_LINGBOT_DEPTH_MODEL = $LingbotDepthDestination
+$env:SCANLAN_COLMAP_ALIKED_MODEL = Join-Path $LingbotModels "aliked-n16rot.onnx"
+$env:SCANLAN_COLMAP_LIGHTGLUE_MODEL = Join-Path $LingbotModels "aliked-lightglue.onnx"
+$env:SCANLAN_FLASHINFER_CACHE_ARCHIVE = $FlashInferCacheArchive
 & (Join-Path $PSScriptRoot "build-pycolmap-cuda.ps1") -Mode $PycolmapMode
 if ($LASTEXITCODE -ne 0) { throw "CUDA-enabled PyCOLMAP could not be built or validated." }
 $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
@@ -81,6 +284,7 @@ foreach ($Entry in $VcEnvironment) {
 $env:PATH = $RuntimeScripts + [IO.Path]::PathSeparator + $env:PATH
 $env:CL = (($env:CL + " /Zc:preprocessor").Trim())
 $env:MAX_JOBS = [Math]::Min([Environment]::ProcessorCount, 4).ToString()
+$env:DISTUTILS_USE_SDK = "1"
 $InstalledGsplatFeatures = if (Test-Path -LiteralPath $GsplatFeatureStamp) {
   (Get-Content -Raw -LiteralPath $GsplatFeatureStamp).Trim()
 } else { "" }
@@ -99,22 +303,116 @@ if (-not (Test-Path -LiteralPath $GsplatExtension)) {
 }
 & $Python -m pip install --upgrade --force-reinstall --no-deps $PackageRoot
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat worker could not be installed." }
-& $Python -m scanlan_splat.cli diagnostics --require-cuda
+if ($FlashInferReady) {
+  $PreviousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    # The Windows fork uses C:\_fij deliberately: generated CUDA object names
+    # exceed MAX_PATH when the cache is nested under a normal project path.
+    Remove-Item Env:FLASHINFER_CACHE_DIR -ErrorAction SilentlyContinue
+    & $Python -c "import json; from scanlan_splat.lingbot import warm_lingbot_flashinfer; print(json.dumps(warm_lingbot_flashinfer()))"
+    $FlashInferReady = $LASTEXITCODE -eq 0
+    if ($FlashInferReady) {
+      $FlashInferWorkspace = (& $Python -c "from flashinfer.jit import env; print(env.FLASHINFER_WORKSPACE_DIR)" | Select-Object -Last 1).Trim()
+      $FlashInferCompiledModules = Join-Path $FlashInferWorkspace "cached_ops"
+      $FlashInferAotStaging = Join-Path $LingbotModels "flashinfer-aot"
+      $CompiledFlashInferDlls = @(
+        Get-ChildItem -LiteralPath $FlashInferCompiledModules -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue
+      )
+      if (-not $CompiledFlashInferDlls.Count) {
+        $FlashInferReady = $false
+      } else {
+        $null = New-Item -ItemType Directory -Path $FlashInferAotStaging -Force
+        foreach ($CompiledDll in $CompiledFlashInferDlls) {
+          $ModuleDestination = Join-Path $FlashInferAotStaging $CompiledDll.Directory.Name
+          $null = New-Item -ItemType Directory -Path $ModuleDestination -Force
+          Copy-Item -LiteralPath $CompiledDll.FullName -Destination $ModuleDestination -Force
+        }
+        if (Test-Path -LiteralPath $FlashInferCacheArchive) {
+          Remove-Item -LiteralPath $FlashInferCacheArchive -Force
+        }
+        Compress-Archive -LiteralPath $FlashInferAotStaging -DestinationPath $FlashInferCacheArchive -CompressionLevel Optimal
+      }
+    }
+  } catch {
+    $FlashInferReady = $false
+    Write-Warning "Windows FlashInfer kernel warmup failed: $($_.Exception.Message)"
+  } finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
+  }
+  if (-not $FlashInferReady) {
+    throw "Windows FlashInfer could not execute LingBot's paged-attention validation shape."
+  }
+}
+& $Python -m scanlan_splat.cli diagnostics `
+  --require-cuda `
+  --require-learned-features `
+  --require-lingbot `
+  --require-lingbot-depth `
+  --require-flashinfer `
+  --require-adaptive-frames
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat runtime validation failed." }
 
 Push-Location $PackageRoot
 try {
-  & $Python -m PyInstaller --noconfirm --clean --onedir --name scanlan-splat `
-    --hidden-import gsplat.csrc --hidden-import backports.tarfile `
-    --add-binary "${GsplatExtension};gsplat" `
-    --collect-all gsplat --collect-all pycolmap --collect-all av `
-    --copy-metadata torch --copy-metadata gsplat --copy-metadata pycolmap --copy-metadata av entry.py
+  if (-not (Test-Path -LiteralPath $PycolmapOnnxShared) -or
+      -not (Test-Path -LiteralPath $PycolmapOnnxCuda)) {
+    throw "PyCOLMAP's ONNX CUDA provider DLLs are missing from the validated runtime."
+  }
+  $PyInstallerArguments = @(
+    "--noconfirm", "--clean", "--onedir", "--name", "scanlan-splat",
+    "--hidden-import", "gsplat.csrc", "--hidden-import", "backports.tarfile",
+    "--add-binary", "${GsplatExtension};gsplat",
+    # PyInstaller sees the ONNX provider DLLs as delay-loaded and otherwise
+    # drops them. COLMAP resolves these fixed names beside onnxruntime.dll.
+    "--add-binary", "${PycolmapOnnxShared};pycolmap.libs",
+    "--add-binary", "${PycolmapOnnxCuda};pycolmap.libs",
+    "--collect-all", "gsplat", "--collect-all", "pycolmap", "--collect-all", "av",
+    "--collect-all", "lingbot_map", "--collect-all", "mdm", "--collect-all", "torchvision",
+    "--collect-all", "onnxruntime", "--collect-all", "cv2",
+    "--collect-all", "huggingface_hub", "--collect-all", "tvm_ffi",
+    "--collect-all", "ninja",
+    "--copy-metadata", "torch", "--copy-metadata", "torchvision",
+    "--copy-metadata", "gsplat", "--copy-metadata", "pycolmap",
+    "--copy-metadata", "av", "--copy-metadata", "lingbot-map", "--copy-metadata", "mdm"
+  )
+  if ($FlashInferReady) {
+    $PyInstallerArguments += @("--collect-all", "flashinfer")
+  }
+  $PyInstallerArguments += "entry.py"
+  & $Python -m PyInstaller @PyInstallerArguments
   if ($LASTEXITCODE -ne 0) { throw "ScanLan splat runtime packaging failed." }
 } finally {
   Pop-Location
 }
 $PackagedWorker = Join-Path $PackageRoot "dist/scanlan-splat/scanlan-splat.exe"
-& $PackagedWorker diagnostics --require-cuda
+$PackagedModels = Join-Path $PackageRoot "dist/scanlan-splat/models"
+$null = New-Item -ItemType Directory -Path $PackagedModels -Force
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "THIRD_PARTY_NOTICES.md") -Destination (Split-Path -Parent $PackagedModels) -Force
+Copy-Item -LiteralPath (Join-Path $LingbotModels "lingbot-map-long.pt") -Destination $PackagedModels -Force
+Copy-Item -LiteralPath (Join-Path $LingbotModels "skyseg_batch.onnx") -Destination $PackagedModels -Force
+Copy-Item -LiteralPath $LingbotDepthDestination -Destination $PackagedModels -Force
+foreach ($Asset in $ColmapModelAssets) {
+  Copy-Item -LiteralPath (Join-Path $LingbotModels $Asset.Name) -Destination $PackagedModels -Force
+}
+if ($FlashInferReady -and (Test-Path -LiteralPath $FlashInferCacheArchive)) {
+  Copy-Item -LiteralPath $FlashInferCacheArchive -Destination $PackagedModels -Force
+}
+# The frozen-worker validation must resolve only the assets beside the frozen
+# executable. Do not let development paths conceal a packaging omission.
+Remove-Item Env:SCANLAN_LINGBOT_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:SCANLAN_LINGBOT_SKY_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:SCANLAN_LINGBOT_DEPTH_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:SCANLAN_COLMAP_ALIKED_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:SCANLAN_COLMAP_LIGHTGLUE_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:SCANLAN_FLASHINFER_CACHE_ARCHIVE -ErrorAction SilentlyContinue
+& $PackagedWorker diagnostics `
+  --require-cuda `
+  --require-learned-features `
+  --require-lingbot `
+  --require-lingbot-depth `
+  --require-flashinfer `
+  --require-adaptive-frames
 if ($LASTEXITCODE -ne 0) { throw "The packaged ScanLan splat runtime failed validation." }
 
 Write-Host "Splat runtime ready: $PackagedWorker"

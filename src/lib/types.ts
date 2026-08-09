@@ -49,6 +49,8 @@ export interface CaptureSettings {
   meshRepairProfile: MeshRepairProfile;
   fillInferredMeshHoles: boolean;
   produceWatertightMesh: boolean;
+  /** Run guarded LingBot-Depth completion after metric pose recovery. */
+  lingbotDepthRefinement: boolean;
 }
 
 export type ArtifactStatus = 'ready' | 'building' | 'stale' | 'failed';
@@ -131,6 +133,18 @@ export interface ProjectSummary {
   meshRepairOpeningsPreserved?: number;
   meshRepairUnknownPreserved?: number;
   watertightMeshOutputPath?: string;
+  depthRefinement?: {
+    enabled: boolean;
+    method: string;
+    frameCount?: number;
+    acceptedFrameCount?: number;
+    generatedPixelCount?: number;
+    generatedToMeasuredPercent?: number;
+    generatedFusionWeight?: number;
+    generatedTrainingConfidence?: number;
+    modelRevision?: string;
+    modelSha256?: string;
+  };
 }
 
 export interface ProjectCatalogEntry {

@@ -9,7 +9,7 @@ ScanLan separates realtime latency from archival throughput and final quality. E
 | Tauri application | lifecycle, project state, status snapshots, exports | camera SDK state or reconstruction kernels |
 | Native capture worker | camera SDK, calibration, synchronized RGB-D, IMU conversion | UI rendering or Open3D |
 | Reconstruction worker | tracking, relocalization, TSDF, pose graph, point/mesh build | camera SDK |
-| Splat worker | Photo/video decoding, COLMAP camera solving, CUDA 2DGS/3DGS optimization, checkpoints | RGB-D capture and TSDF reconstruction |
+| Splat worker | Photo/video decoding, COLMAP camera solving, guarded LingBot-Depth inference, CUDA 2DGS/3DGS optimization, checkpoints | RGB-D capture, tracking, pose recovery, and TSDF quality decisions |
 
 The realtime engine is started and reports `ready` before the camera is opened. Tauri pipes camera stdout directly into engine stdin and drains engine stdout on a dedicated thread. Sensor stderr goes to `sensor.log`, so a full pipe cannot stall capture.
 
@@ -65,6 +65,8 @@ Every decision is appended asynchronously to `tracking.jsonl`; no image data is 
 Normal stop creates `stop.flag`, lets the capture worker flush its archive, drains the mapper for a final geometry snapshot, closes the engine, and then publishes the completed phase manifest. Timeouts are bounded; a stuck child is terminated rather than leaving the UI indefinitely busy.
 
 Unexpected phases are recovered from their manifest and CSV at the next launch. Derived jobs have independent checkpoints and can be cancelled without deleting raw captures.
+
+Optional LingBot-Depth inference is launched as a child of the reconstruction job only after pose recovery. It reads an immutable JSON request and aligned raw frame paths, writes atomic NumPy predictions, observes the shared cancellation flag between frames, and never mutates an archive. The reconstruction worker—not the model process—owns metric, RGB-coverage, multi-view, and provenance validation before publishing an immutable fingerprinted cache.
 
 Every active capture owns its sensor process, stdout relay, and realtime engine as one supervised unit. Dropping that unit after any startup, storage, or state error terminates all three, so a failed command cannot leave the camera or GPU worker running in the background.
 

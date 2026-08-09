@@ -8,7 +8,7 @@ import numpy as np
 from .calibration import robust_depth_mask
 
 
-SEED_VERSION = "rgbd-quadtree-discs-v3-500k"
+SEED_VERSION = "rgbd-quadtree-discs-v4-confidence-500k"
 DEFAULT_SEED_VOXEL_M = 0.01
 DEFAULT_CONTRAST_THRESHOLD = 2.0e-4
 DEFAULT_MAX_CELL_SIZE = 24
@@ -22,6 +22,7 @@ class GaussianSeeds:
     colors: np.ndarray
     scales: np.ndarray
     quaternions: np.ndarray
+    confidence: np.ndarray | None = None
 
 
 def _integral_image(values: np.ndarray) -> np.ndarray:
@@ -227,6 +228,7 @@ def seed_rgbd_gaussians(
     visibility: np.ndarray,
     camera: Any,
     world_from_depth: np.ndarray,
+    confidence: np.ndarray | None = None,
 ) -> GaussianSeeds:
     """Create surface-aligned 2D Gaussian seeds from one posed RGB-D frame."""
     depth_m = np.asarray(depth, dtype=np.float32) / float(camera.depth_scale)
@@ -243,7 +245,13 @@ def seed_rgbd_gaussians(
     centers, sizes = _cell_centers(cells, projected)
     if not len(centers):
         empty3 = np.empty((0, 3), dtype=np.float32)
-        return GaussianSeeds(empty3, np.empty((0, 3), dtype=np.uint8), empty3, np.empty((0, 4), dtype=np.float32))
+        return GaussianSeeds(
+            empty3,
+            np.empty((0, 3), dtype=np.uint8),
+            empty3,
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
 
     points, quaternions = _surface_frames(
         depth_m,
@@ -259,7 +267,18 @@ def seed_rgbd_gaussians(
     scale_y = np.maximum(z * sizes[:, 1] * 0.5 / float(camera.fy), DEFAULT_SEED_VOXEL_M * 0.35)
     scale_z = np.maximum(np.minimum(scale_x, scale_y) * 0.08, 5.0e-4)
     scales = np.column_stack((scale_x, scale_y, scale_z)).astype(np.float32)
-    return GaussianSeeds(points, aligned[v, u], scales, quaternions)
+    if confidence is None:
+        seed_confidence = np.ones(len(points), dtype=np.float32)
+    else:
+        confidence_array = np.asarray(confidence)
+        if confidence_array.shape != depth.shape:
+            raise ValueError("confidence must match the depth raster")
+        seed_confidence = np.clip(
+            confidence_array[v, u].astype(np.float32) / 255.0,
+            0.0,
+            1.0,
+        )
+    return GaussianSeeds(points, aligned[v, u], scales, quaternions, seed_confidence)
 
 
 def compact_seed_batches(
@@ -269,19 +288,41 @@ def compact_seed_batches(
 ) -> GaussianSeeds:
     if not batches:
         empty3 = np.empty((0, 3), dtype=np.float32)
-        return GaussianSeeds(empty3, np.empty((0, 3), dtype=np.uint8), empty3, np.empty((0, 4), dtype=np.float32))
+        return GaussianSeeds(
+            empty3,
+            np.empty((0, 3), dtype=np.uint8),
+            empty3,
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
     points = np.concatenate([batch.points for batch in batches])
     colors = np.concatenate([batch.colors for batch in batches])
     scales = np.concatenate([batch.scales for batch in batches])
     quaternions = np.concatenate([batch.quaternions for batch in batches])
+    confidence = np.concatenate(
+        [
+            np.ones(len(batch.points), dtype=np.float32)
+            if batch.confidence is None
+            else np.asarray(batch.confidence, dtype=np.float32)
+            for batch in batches
+        ]
+    )
     voxel_keys = np.floor(points / voxel_size_m).astype(np.int64)
     _, inverse = np.unique(voxel_keys, axis=0, return_inverse=True)
     quality = np.maximum(scales[:, 0], scales[:, 1])
-    order = np.lexsort((quality, inverse))
+    # Prefer measured/high-confidence geometry within a voxel; footprint is the
+    # deterministic tiebreaker when provenance confidence matches.
+    order = np.lexsort((quality, -confidence, inverse))
     first = np.r_[True, inverse[order][1:] != inverse[order][:-1]]
     selected = order[first]
     # The voxel sort makes deterministic uniform subsampling spatially balanced.
     selected = selected[np.lexsort((voxel_keys[selected, 2], voxel_keys[selected, 1], voxel_keys[selected, 0]))]
     if len(selected) > limit:
         selected = selected[np.linspace(0, len(selected) - 1, limit, dtype=np.int64)]
-    return GaussianSeeds(points[selected], colors[selected], scales[selected], quaternions[selected])
+    return GaussianSeeds(
+        points[selected],
+        colors[selected],
+        scales[selected],
+        quaternions[selected],
+        confidence[selected],
+    )

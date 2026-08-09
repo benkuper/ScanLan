@@ -205,7 +205,7 @@ class SeedParameterTests(unittest.TestCase):
                 quaternions=np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
             )
 
-            points, colors, scales, quaternions = _read_seed_parameters(
+            points, colors, scales, quaternions, confidence = _read_seed_parameters(
                 root,
                 {
                     "initialization": "initialization.ply",
@@ -217,6 +217,7 @@ class SeedParameterTests(unittest.TestCase):
             self.assertTrue(np.allclose(colors, [[1.0, 128.0 / 255.0, 0.0]]))
             self.assertTrue(np.allclose(scales, [[0.02, 0.03, 0.001]]))
             self.assertTrue(np.allclose(quaternions, [[1.0, 0.0, 0.0, 0.0]]))
+            self.assertTrue(np.allclose(confidence, [1.0]))
 
 
 if __name__ == "__main__":

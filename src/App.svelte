@@ -1196,6 +1196,10 @@
 
   async function startBuild(resume = false): Promise<void> {
     if (!project || busy || capturing || photoLocalizationActive) return;
+    if (project.settings.lingbotDepthRefinement && !runtime?.splatWorkerAvailable) {
+      message = 'LingBot depth refinement requires the packaged CUDA runtime.';
+      return;
+    }
     if (resume && activeJob) {
       busy = true;
       try {
@@ -1657,15 +1661,16 @@
 
   async function exportSplat(): Promise<void> {
     if (!project || exporting || !artifactReady('gaussianSplat')) return;
-    const destination = await save({ title: 'Export metric 2D Gaussian surface', defaultPath: 'scan-2dgs.ply', filters: [{ name: 'Gaussian PLY', extensions: ['ply'] }] });
+    const splatKind = mediaOnlyProject ? 'photoreal 3D Gaussian splat' : 'metric 2D Gaussian surface';
+    const destination = await save({ title: `Export ${splatKind}`, defaultPath: mediaOnlyProject ? 'scan-3dgs.ply' : 'scan-2dgs.ply', filters: [{ name: 'Gaussian PLY', extensions: ['ply'] }] });
     if (!destination) return;
     exporting = 'splat';
-    message = `Exporting${clippingEnabled ? ' clipped' : ''} 2D Gaussian surface…`;
+    message = `Exporting${clippingEnabled ? ' clipped' : ''} ${splatKind}…`;
     await tick();
     try {
       message = `Aligned${clippingEnabled ? ' and clipped' : ''} Gaussian surface and coordinate sidecars exported to ${await exportGaussianSplat(project.path, destination, cloudTransform, clippingEnabled ? clipBounds : null)}.`;
     } catch (error) {
-      message = `2D Gaussian export failed: ${errorText(error)}`;
+      message = `Gaussian export failed: ${errorText(error)}`;
     } finally {
       exporting = null;
     }
@@ -1802,7 +1807,7 @@
       <span>01</span><div><strong>Capture</strong><small>{capturing ? 'Recording now' : `${completedCaptures} take${completedCaptures === 1 ? '' : 's'}`}</small></div>
     </button>
     <button class:active={workspace === 'reconstruct'} class:done={readyArtifacts > 0} on:click={() => void showReconstructWorkspace()} disabled={capturing}>
-      <span>02</span><div><strong>Reconstruct</strong><small>{processing ? activeJob?.stage.replaceAll('_', ' ') : 'Points · mesh · 2DGS'}</small></div>
+      <span>02</span><div><strong>Reconstruct</strong><small>{processing ? activeJob?.stage.replaceAll('_', ' ') : 'Points · mesh · Gaussian splat'}</small></div>
     </button>
     <button class:active={workspace === 'inspect'} class:done={readyArtifacts > 0} on:click={() => void showInspectWorkspace()} disabled={capturing || (!processing && readyArtifacts === 0)}>
       <span>03</span><div><strong>Edit & export</strong><small>{readyArtifacts ? `${readyArtifacts} output${readyArtifacts === 1 ? '' : 's'} ready` : 'No output yet'}</small></div>
@@ -1824,6 +1829,7 @@
         renderMode={viewerRenderMode}
         mesh={viewerMesh}
         splatBytes={liveSensor ? null : previewSplat}
+        splatRepresentation={mediaOnlyProject ? '3d' : '2d'}
         {meshViewMode}
         assetLoading={assetLoading}
         floorPickMode={floorPickMode && canEditModel}
@@ -2133,12 +2139,33 @@
           <div class="collapsible-body target-list">
             <label class:active={buildPointCloud}><input type="checkbox" bind:checked={buildPointCloud} disabled={processing || mediaOnlyProject}/><span class="target-icon">P</span><div><strong>Metric point cloud</strong><small>{mediaOnlyProject ? 'Requires calibrated RGB-D capture' : 'Filtered colored PLY · quickest'}</small></div><i>{artifactReady('pointCloud') ? 'READY' : ''}</i></label>
             <label class:active={buildTexturedMesh}><input type="checkbox" bind:checked={buildTexturedMesh} disabled={processing || mediaOnlyProject}/><span class="target-icon">M</span><div><strong>Textured triangle mesh</strong><small>{mediaOnlyProject ? 'Requires calibrated RGB-D capture' : 'TSDF surface · OBJ/MTL/PNG'}</small></div><i>{artifactReady('texturedMesh') ? 'READY' : ''}</i></label>
-            <label class:active={buildGaussianSplat}><input type="checkbox" bind:checked={buildGaussianSplat} disabled={processing || !runtime?.splatWorkerAvailable}/><span class="target-icon">G</span><div><strong>{mediaOnlyProject ? 'Photoreal 3D Gaussian splat' : '2D Gaussian surface'}</strong><small>{mediaOnlyProject ? 'COLMAP cameras · anisotropic 3DGS · SH degree 3' : 'Depth-aware discs · metric PLY'}</small></div><i>{artifactReady('gaussianSplat') ? 'READY' : runtime?.splatWorkerAvailable ? '' : 'CUDA RUNTIME MISSING'}</i></label>
+            <label class:active={buildGaussianSplat}><input type="checkbox" bind:checked={buildGaussianSplat} disabled={processing || !runtime?.splatWorkerAvailable}/><span class="target-icon">G</span><div><strong>{mediaOnlyProject ? 'Photoreal 3D Gaussian splat' : '2D Gaussian surface'}</strong><small>{mediaOnlyProject ? 'LingBot dense geometry · COLMAP refinement · SH degree 3' : 'Depth-aware discs · metric PLY'}</small></div><i>{artifactReady('gaussianSplat') ? 'READY' : runtime?.splatWorkerAvailable ? '' : 'CUDA RUNTIME MISSING'}</i></label>
             {#if buildGaussianSplat}
               <label class="iterations"><span>Training iterations</span><input type="range" min="5000" max="60000" step="5000" bind:value={splatIterations} disabled={processing}/><strong>{Number(splatIterations).toLocaleString()}</strong></label>
             {/if}
           </div>
         </details>
+
+        {#if !mediaOnlyProject}
+          <details class="panel collapsible-panel" open>
+            <summary><span>DEPTH REFINEMENT</span><strong>{project.settings.lingbotDepthRefinement ? 'LINGBOT V0.5' : 'SENSOR ONLY'}</strong></summary>
+            <div class="collapsible-body settings mesh-repair-settings">
+              <label class="toggle"><input type="checkbox" checked={project.settings.lingbotDepthRefinement} on:change={(event) => updateSetting('lingbotDepthRefinement', inputChecked(event))} disabled={processing || !runtime?.splatWorkerAvailable}/><span></span><div><strong>Fill RGB-D depth gaps with LingBot-Depth</strong><small>Runs after camera tracking; preserves measured depth and accepts only metric, RGB-aligned, multi-view-consistent predictions</small></div></label>
+              <p>Generated pixels carry lower fusion weight and are exported with confidence and provenance masks. Camera poses always remain tied to the original sensor depth.</p>
+              {#if !runtime?.splatWorkerAvailable}
+                <p class="warning">The packaged CUDA runtime is required for offline LingBot-Depth inference.</p>
+              {:else if project.depthRefinement?.enabled}
+                <div class="repair-result" class:warning={(project.depthRefinement.acceptedFrameCount ?? 0) < (project.depthRefinement.frameCount ?? 0)}>
+                  <span>LAST QUALITY GATE</span>
+                  <div><strong>{project.depthRefinement.acceptedFrameCount ?? 0}</strong><small>frames accepted</small></div>
+                  <div><strong>{project.depthRefinement.generatedPixelCount ?? 0}</strong><small>pixels accepted</small></div>
+                  <div><strong>{Math.max(0, (project.depthRefinement.frameCount ?? 0) - (project.depthRefinement.acceptedFrameCount ?? 0))}</strong><small>frames rejected</small></div>
+                  <div><strong>{Math.round((project.depthRefinement.generatedFusionWeight ?? 0) * 100)}%</strong><small>fusion weight</small></div>
+                </div>
+              {/if}
+            </div>
+          </details>
+        {/if}
 
         {#if buildTexturedMesh && !mediaOnlyProject}
           <details class="panel collapsible-panel" open>
@@ -2175,7 +2202,7 @@
           <details class="panel collapsible-panel" open>
             <summary><span>MEDIA SOURCES</span><strong>{mediaSourceCount} IMPORTED</strong></summary>
             <div class="collapsible-body pipeline-note">
-              <p>{mediaOnlyProject ? 'Sharp, non-duplicate frames are registered and bundle-adjusted before Gaussian training.' : 'High-resolution frames are localized against metric RGB-D landmarks, then enhance point colors, mesh textures, and splat appearance.'}</p>
+              <p>{mediaOnlyProject ? 'LingBot-Map supplies dense depth and a continuous trajectory; COLMAP validates and refines it before high-resolution Gaussian training.' : 'High-resolution frames are localized against metric RGB-D landmarks, then enhance point colors, mesh textures, and splat appearance.'}</p>
               <div class="media-source-list">
                 {#each project.mediaSources as source (source.id)}
                   <article class="media-source">
@@ -2293,11 +2320,11 @@
       {:else}
         <header class="inspector-heading"><div><span>RESULT</span><h2>Edit & export</h2></div><strong class="take-total">{readyArtifacts} ready</strong></header>
         <details class="panel collapsible-panel" open>
-          <summary><span>REPRESENTATION</span><strong>{renderMode === 'points' ? 'POINTS' : renderMode === 'mesh' ? 'MESH' : '2DGS'}</strong></summary>
+          <summary><span>REPRESENTATION</span><strong>{renderMode === 'points' ? 'POINTS' : renderMode === 'mesh' ? 'MESH' : mediaOnlyProject ? '3DGS' : '2DGS'}</strong></summary>
           <div class="collapsible-body view-switcher">
             <button class:active={renderMode === 'points'} disabled={!artifactReady('pointCloud')} on:click={() => loadResult('points')}><span>P</span><div><strong>Points</strong><small>{formatCount(project.pointCount)}</small></div></button>
             <button class:active={renderMode === 'mesh'} disabled={!artifactReady('texturedMesh')} on:click={() => loadResult('mesh')}><span>M</span><div><strong>Mesh</strong><small>{formatCount(project.meshTriangleCount)} tris</small></div></button>
-            <button class:active={renderMode === 'splat'} disabled={!artifactReady('gaussianSplat')} on:click={() => loadResult('splat')}><span>G</span><div><strong>2DGS</strong><small>Metric surface</small></div></button>
+            <button class:active={renderMode === 'splat'} disabled={!artifactReady('gaussianSplat')} on:click={() => loadResult('splat')}><span>G</span><div><strong>{mediaOnlyProject ? '3DGS' : '2DGS'}</strong><small>{mediaOnlyProject ? 'Photoreal volume' : 'Metric surface'}</small></div></button>
           </div>
         </details>
         {#if renderMode === 'mesh'}
@@ -2380,10 +2407,10 @@
           <div class="collapsible-body export-list">
             <button class:exporting={exporting === 'points'} aria-busy={exporting === 'points'} on:click={exportPointCloud} disabled={Boolean(exporting) || !artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>Metric colored vertices</small></div><i>{exporting === 'points' ? 'Exporting…' : 'Export…'}</i></button>
             <button class:exporting={exporting === 'mesh'} aria-busy={exporting === 'mesh'} on:click={exportMesh} disabled={Boolean(exporting) || !artifactReady('texturedMesh')}><span>M</span><div><strong>Textured OBJ bundle</strong><small>OBJ + MTL + PNG</small></div><i>{exporting === 'mesh' ? 'Exporting…' : 'Export…'}</i></button>
-            <button class:exporting={exporting === 'splat'} aria-busy={exporting === 'splat'} on:click={exportSplat} disabled={Boolean(exporting) || !artifactReady('gaussianSplat')}><span>G</span><div><strong>2D Gaussian PLY</strong><small>Aligned metric splat + sidecars</small></div><i>{exporting === 'splat' ? 'Exporting…' : 'Export…'}</i></button>
+            <button class:exporting={exporting === 'splat'} aria-busy={exporting === 'splat'} on:click={exportSplat} disabled={Boolean(exporting) || !artifactReady('gaussianSplat')}><span>G</span><div><strong>{mediaOnlyProject ? '3D Gaussian PLY' : '2D Gaussian PLY'}</strong><small>{mediaOnlyProject ? 'Photoreal splat + sidecars' : 'Aligned metric splat + sidecars'}</small></div><i>{exporting === 'splat' ? 'Exporting…' : 'Export…'}</i></button>
             {#if exporting}
               <div class="export-feedback" role="status" aria-live="polite">
-                <div><strong>{exporting === 'points' ? 'Exporting point cloud' : exporting === 'mesh' ? 'Exporting textured mesh' : 'Exporting 2D Gaussian surface'}</strong><small>Applying the saved pose{clippingEnabled ? ' and clipping bounds' : ''}, then writing to disk.</small></div>
+                <div><strong>{exporting === 'points' ? 'Exporting point cloud' : exporting === 'mesh' ? 'Exporting textured mesh' : `Exporting ${mediaOnlyProject ? '3D Gaussian splat' : '2D Gaussian surface'}`}</strong><small>Applying the saved pose{clippingEnabled ? ' and clipping bounds' : ''}, then writing to disk.</small></div>
                 <span class="export-progress"><i></i></span>
               </div>
             {/if}

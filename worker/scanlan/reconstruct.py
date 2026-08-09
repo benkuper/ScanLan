@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -22,6 +23,7 @@ from .numpy_engine import reconstruct_known_poses
 
 Engine = Literal["auto", "numpy", "open3d"]
 Device = Literal["auto", "cpu", "cuda"]
+DepthRefinement = Literal["off", "lingbot"]
 
 
 class ProgressReporter:
@@ -115,6 +117,8 @@ def reconstruct_project(
     device: Device = "auto",
     targets: tuple[str, ...] = ("point_cloud", "textured_mesh"),
     mesh_repair_settings: MeshRepairSettings | None = None,
+    depth_refinement: DepthRefinement = "off",
+    depth_refiner: Path | None = None,
 ) -> dict:
     project_root = project_root.resolve()
     project = read_project(project_root)
@@ -154,6 +158,21 @@ def reconstruct_project(
             "needs_mesh": "textured_mesh" in targets,
             "mesh_voxel_size_m": max(voxel_size_m, 0.008),
         }
+        if depth_refinement == "lingbot":
+            if depth_refiner is None:
+                raise RuntimeError("LingBot depth refinement requires an isolated CUDA worker")
+            from .depth_refinement import prepare_lingbot_depth_refinement
+
+            artifact_context["prepare_depth_refinement"] = lambda frames: (
+                prepare_lingbot_depth_refinement(
+                    frames,
+                    project_root,
+                    depth_refiner,
+                    reporter.update,
+                )
+            )
+        elif depth_refinement != "off":
+            raise ValueError(f"Unknown depth refinement mode: {depth_refinement}")
         if selected_engine == "numpy":
             reporter.update(
                 "Preparing",
@@ -161,14 +180,12 @@ def reconstruct_project(
                 0,
                 compute_backend="NumPy CPU",
             )
-            points, colors = reconstruct_known_poses(phases, voxel_size_m, reporter.update)
             flip_x = all(
                 phase.manifest.get("sensor", {}).get("kind", "kinect_v2") == "kinect_v2"
                 for phase in phases
             )
-            points = points * ([-1.0, 1.0, -1.0] if flip_x else [1.0, 1.0, -1.0])
             display_axes = (-1.0, 1.0, -1.0) if flip_x else (1.0, 1.0, -1.0)
-            artifact_context["posed_frames"] = [
+            posed_frames = [
                 PosedFrame(
                     phase_name=str(phase.manifest.get("name", f"Phase {phase_index + 1}")),
                     phase_id=str(phase.manifest.get("id", phase.root.name)),
@@ -182,6 +199,41 @@ def reconstruct_project(
                 for frame_index, frame in enumerate(phase.frames)
                 if frame.pose is not None
             ]
+            depth_overrides: dict[tuple[str, int], object] = {}
+            refinement_callback = artifact_context.get("prepare_depth_refinement")
+            if callable(refinement_callback):
+                from .depth_refinement import frame_depth_key
+
+                refinement = refinement_callback(posed_frames)
+                posed_frames = [
+                    frame
+                    if (override := refinement.overrides.get(frame_depth_key(frame))) is None
+                    else replace(
+                        frame,
+                        measured_depth_path=override.measured_depth_path,
+                        refined_depth_path=override.refined_depth_path,
+                        generated_depth_mask_path=override.generated_mask_path,
+                        depth_confidence_path=override.confidence_path,
+                        depth_refinement_metrics=override.metrics,
+                    )
+                    for frame in posed_frames
+                ]
+                depth_overrides = {
+                    (str(frame.source.root), frame.frame_index): refinement.overrides.get(
+                        frame_depth_key(frame)
+                    )
+                    for frame in posed_frames
+                }
+                artifact_context["depth_refinement_report"] = refinement.report
+                artifact_context["depth_overrides"] = depth_overrides
+            artifact_context["posed_frames"] = posed_frames
+            points, colors = reconstruct_known_poses(
+                phases,
+                voxel_size_m,
+                reporter.update,
+                depth_overrides,
+            )
+            points = points * ([-1.0, 1.0, -1.0] if flip_x else [1.0, 1.0, -1.0])
             quality = {
                 "score": 96,
                 "label": "High",
@@ -300,6 +352,10 @@ def reconstruct_project(
             "targets": list(targets),
             "datasetFingerprint": source_fingerprint,
             **point_color_metrics,
+            "depthRefinement": artifact_context.get(
+                "depth_refinement_report",
+                {"enabled": False, "method": "raw calibrated sensor depth"},
+            ),
         }
 
         # Gaussian training is a separate worker launched by the desktop job
@@ -372,6 +428,7 @@ def reconstruct_project(
         project["confidenceLabel"] = result["confidenceLabel"]
         project["confidenceDetail"] = result["confidenceDetail"]
         project["framesUsed"] = result["framesUsed"]
+        project["depthRefinement"] = result["depthRefinement"]
         if "localization_map" in targets:
             reporter.update(
                 "media_localization",

@@ -21,6 +21,12 @@ def parser() -> argparse.ArgumentParser:
     reconstruct.add_argument("--engine", choices=["auto", "numpy", "open3d"], default="auto")
     reconstruct.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     reconstruct.add_argument(
+        "--depth-refinement",
+        choices=["off", "lingbot"],
+        default="off",
+    )
+    reconstruct.add_argument("--depth-refiner", type=Path, default=None)
+    reconstruct.add_argument(
         "--targets",
         default="point_cloud,textured_mesh",
         help="Comma-separated point_cloud,textured_mesh,gaussian_splat targets",
@@ -176,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.device,
                 targets,
                 repair_settings,
+                arguments.depth_refinement,
+                arguments.depth_refiner,
             )
         print(json.dumps(result))
         return 0

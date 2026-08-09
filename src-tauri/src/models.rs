@@ -63,6 +63,8 @@ pub struct CaptureSettings {
     pub fill_inferred_mesh_holes: bool,
     #[serde(default)]
     pub produce_watertight_mesh: bool,
+    #[serde(default)]
+    pub lingbot_depth_refinement: bool,
 }
 
 fn default_sensor_kind() -> String {
@@ -167,6 +169,7 @@ impl Default for CaptureSettings {
             mesh_repair_profile: default_mesh_repair_profile(),
             fill_inferred_mesh_holes: false,
             produce_watertight_mesh: false,
+            lingbot_depth_refinement: false,
         }
     }
 }
@@ -286,6 +289,8 @@ pub struct ProjectSummary {
     pub mesh_repair_unknown_preserved: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watertight_mesh_output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_refinement: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -338,6 +343,7 @@ impl ProjectSummary {
             mesh_repair_openings_preserved: None,
             mesh_repair_unknown_preserved: None,
             watertight_mesh_output_path: None,
+            depth_refinement: None,
         }
     }
 
