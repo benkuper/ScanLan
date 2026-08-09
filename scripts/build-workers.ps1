@@ -127,9 +127,12 @@ $RuntimeKey = if ($CudaWheel) {
 $WorkerSources = @(
   Get-ChildItem -Path (Join-Path $ProjectRoot "worker/scanlan") -Recurse -File |
     Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' }
+  Get-ChildItem -Path (Join-Path $ProjectRoot "validation/scanlan_validation") -Recurse -File |
+    Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' }
   Get-Item -Path (Join-Path $ProjectRoot "worker/entry.py")
   Get-Item -Path (Join-Path $ProjectRoot "worker/pyproject.toml")
   Get-Item -Path (Join-Path $ProjectRoot "worker/scanlan-worker.spec")
+  Get-Item -Path (Join-Path $ProjectRoot "validation/pyproject.toml")
   Get-Item -Path (Join-Path $ProjectRoot "scripts/build-workers.ps1")
 )
 $NewestWorkerSource = $WorkerSources | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
@@ -177,6 +180,9 @@ if ($NeedsWorkerBuild) {
       & $PythonCommand -m venv $WorkerVenv
     }
   }
+
+  & $WorkerPython -m pip install --upgrade --force-reinstall --no-deps "$ProjectRoot/validation"
+  if ($LASTEXITCODE -ne 0) { throw "Shared ScanLan validation engine could not be installed." }
 
   if ($CudaWheel) {
     Write-Host "Using CUDA-enabled Open3D wheel: $($CudaWheel.FullName)"

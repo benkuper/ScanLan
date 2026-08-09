@@ -20,6 +20,7 @@ from .mesh import (
 )
 from .mesh_repair import MeshRepairSettings, settings_from_project
 from .numpy_engine import reconstruct_known_poses
+from .validation import validate_posed_frames
 
 Engine = Literal["auto", "numpy", "open3d"]
 Device = Literal["auto", "cpu", "cuda"]
@@ -199,6 +200,9 @@ def reconstruct_project(
                 for frame_index, frame in enumerate(phase.frames)
                 if frame.pose is not None
             ]
+            posed_frames, artifact_context["validation_report"] = validate_posed_frames(
+                posed_frames
+            )
             depth_overrides: dict[tuple[str, int], object] = {}
             refinement_callback = artifact_context.get("prepare_depth_refinement")
             if callable(refinement_callback):
@@ -227,18 +231,25 @@ def reconstruct_project(
                 artifact_context["depth_refinement_report"] = refinement.report
                 artifact_context["depth_overrides"] = depth_overrides
             artifact_context["posed_frames"] = posed_frames
+            accepted_frame_keys = {
+                (str(frame.source.root), frame.frame_index) for frame in posed_frames
+            }
             points, colors = reconstruct_known_poses(
                 phases,
                 voxel_size_m,
                 reporter.update,
                 depth_overrides,
+                accepted_frame_keys,
             )
             points = points * ([-1.0, 1.0, -1.0] if flip_x else [1.0, 1.0, -1.0])
             quality = {
                 "score": 96,
                 "label": "High",
-                "detail": f"High confidence from known global poses; used all {total_frames} frames.",
-                "framesUsed": total_frames,
+                "detail": (
+                    "High confidence from known global poses; fused "
+                    f"{len(posed_frames)} of {total_frames} frames after shared validation."
+                ),
+                "framesUsed": len(posed_frames),
                 "framesCaptured": total_frames,
                 "tracking": [],
                 "phaseMatches": [],
@@ -356,6 +367,7 @@ def reconstruct_project(
                 "depth_refinement_report",
                 {"enabled": False, "method": "raw calibrated sensor depth"},
             ),
+            "validation": artifact_context.get("validation_report"),
         }
 
         # Gaussian training is a separate worker launched by the desktop job

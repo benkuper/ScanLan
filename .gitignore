@@ -36,6 +36,8 @@ htmlcov/
 /geometry-worker/build/
 /geometry-worker/dist/
 /geometry-worker/*.spec
+/validation/build/
+/validation/dist/
 /media-tools/
 *.spec.bak
 

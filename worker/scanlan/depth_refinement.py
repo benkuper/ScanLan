@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
+from scanlan_validation import validate_depth, validate_ray_depths
 
 from .calibration import project_rgb, robust_depth_mask, world_from_depth_opencv
 from .io import (
@@ -195,47 +196,18 @@ def _metric_gate(
     predicted: np.ndarray,
     model_valid: np.ndarray,
 ) -> dict[str, Any]:
-    overlap = reliable & model_valid & np.isfinite(predicted) & (predicted > 0.0)
-    sample_count = int(overlap.sum())
-    if sample_count < 256:
-        return {
-            "accepted": False,
-            "reason": f"only {sample_count} metric comparison pixels",
-            "sampleCount": sample_count,
-        }
-    raw = measured[overlap]
-    inferred = predicted[overlap]
-    if sample_count > 100_000:
-        stride = max(1, sample_count // 100_000)
-        raw = raw[::stride]
-        inferred = inferred[::stride]
-    residual = np.abs(inferred - raw)
-    relative_ratio = inferred / np.maximum(raw, 1e-6)
-    scene_depth = float(np.median(raw))
-    median_residual = float(np.median(residual))
-    p90_residual = float(np.percentile(residual, 90))
-    scale_bias = float(abs(np.median(relative_ratio) - 1.0))
-    tolerance = np.maximum(0.04, raw * 0.025)
-    inlier_ratio = float(np.mean(residual <= tolerance))
-    accepted = (
-        median_residual <= max(0.03, scene_depth * 0.015)
-        and p90_residual <= max(0.10, scene_depth * 0.05)
-        and scale_bias <= 0.04
-        and inlier_ratio >= 0.65
-    )
-    reason = (
-        "metric agreement accepted"
-        if accepted
-        else "prediction changed measured scale or geometry beyond the quality gate"
-    )
+    validation = validate_depth(measured, predicted, reliable, model_valid)
+    values = validation.metrics
+    accepted = validation.accepted
     return {
         "accepted": accepted,
-        "reason": reason,
-        "sampleCount": sample_count,
-        "medianResidualMm": round(median_residual * 1000.0, 2),
-        "p90ResidualMm": round(p90_residual * 1000.0, 2),
-        "scaleBiasPercent": round(scale_bias * 100.0, 3),
-        "inlierRatio": round(inlier_ratio, 4),
+        "reason": "metric agreement accepted" if accepted else "; ".join(validation.reasons),
+        "sampleCount": int(values.get("sampleCount", 0)),
+        "medianResidualMm": round(float(values.get("medianResidual", 0.0)) * 1000.0, 2),
+        "p90ResidualMm": round(float(values.get("p90Residual", 0.0)) * 1000.0, 2),
+        "scaleBiasPercent": round(float(values.get("scaleBias", 0.0)) * 100.0, 3),
+        "inlierRatio": round(float(values.get("inlierRatio", 0.0)), 4),
+        "validation": validation.to_dict(),
     }
 
 
@@ -309,11 +281,12 @@ def _projective_support(
     target_reliable: np.ndarray,
     target_prediction: np.ndarray,
     target_model_valid: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     rows, columns = np.nonzero(source_candidates)
     support = np.zeros(source_candidates.shape, dtype=bool)
+    free_space_violation = np.zeros(source_candidates.shape, dtype=bool)
     if not len(rows):
-        return support
+        return support, free_space_violation
     source_camera = source_frame.source.camera
     z = source_depth[rows, columns].astype(np.float64)
     camera_points = np.column_stack(
@@ -344,7 +317,7 @@ def _projective_support(
         & (v < target_camera.height)
     )
     if not np.any(inside):
-        return support
+        return support, free_space_violation
     selected = np.flatnonzero(inside)
     target_u = u[selected]
     target_v = v[selected]
@@ -355,11 +328,14 @@ def _projective_support(
         target_prediction[target_v, target_u],
     )
     reference_valid = has_measured | target_model_valid[target_v, target_u]
-    tolerance = np.maximum(0.035, projected_z[selected] * 0.02)
-    agrees = reference_valid & (np.abs(reference - projected_z[selected]) <= tolerance)
-    supported_source = selected[agrees]
+    ray_validation = validate_ray_depths(
+        projected_z[selected], reference, reference_valid
+    )
+    supported_source = selected[ray_validation.support_mask]
+    violated_source = selected[ray_validation.free_space_violation_mask]
     support[rows[supported_source], columns[supported_source]] = True
-    return support
+    free_space_violation[rows[violated_source], columns[violated_source]] = True
+    return support, free_space_violation
 
 
 def validate_predictions(
@@ -432,6 +408,7 @@ def validate_predictions(
             state_paths[index]["candidate"], dtype=np.uint8, mode="r", shape=shape
         ) > 0
         confirmation_count = np.zeros(shape, dtype=np.uint8)
+        free_space_violation_count = np.zeros(shape, dtype=np.uint8)
         for neighbor in neighbors[index]:
             target_shape = predictions[neighbor].shape
             target_measured = np.memmap(
@@ -452,7 +429,7 @@ def validate_predictions(
                 mode="r",
                 shape=target_shape,
             ) > 0
-            confirmation_count += _projective_support(
+            support, free_space_violation = _projective_support(
                 frame,
                 frames[neighbor],
                 predictions[index],
@@ -462,11 +439,13 @@ def validate_predictions(
                 predictions[neighbor],
                 target_model_valid,
             )
+            confirmation_count += support
+            free_space_violation_count += free_space_violation
             del target_measured, target_reliable, target_model_valid
         required_confirmations = min(MINIMUM_CONFIRMATIONS, len(neighbors[index]))
         accepted = source_candidate & (
             confirmation_count >= max(required_confirmations, 1)
-        )
+        ) & (free_space_violation_count == 0)
         if len(neighbors[index]) == 0:
             accepted.fill(False)
         camera = frame.source.camera
@@ -501,6 +480,9 @@ def validate_predictions(
             **metrics[index],
             "neighborCount": len(neighbors[index]),
             "requiredConfirmations": required_confirmations,
+            "freeSpaceViolationPixels": int(
+                np.count_nonzero(source_candidate & (free_space_violation_count > 0))
+            ),
             "generatedPixels": int(accepted.sum()),
             "generatedCoveragePercent": round(float(accepted.mean()) * 100.0, 3),
         }

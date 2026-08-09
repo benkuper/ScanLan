@@ -131,6 +131,12 @@ The result is `build/ScanLan-splat-portable.zip`, containing `splat-runtime/` an
 
 Video-only projects can optionally enable the disabled-by-default **Progressive learned-depth preview**. It publishes bounded local LingBot submaps during ordered inference, colors geometry by confidence, and always labels scale as model-metric unverified. The provisional map is display-only and cannot bypass production camera or alignment gates.
 
+Camera, scale, depth, free-space, and point acceptance are defined once in the shared
+[`scanlan-validation` engine](docs/validation-engine.md). The RGB-only preview and production
+RGB-D worker emit the same versioned reports, and frozen runtimes package the validator for
+offline use. Learned backends may propose geometry but cannot promote unverified scale or bypass
+measured-depth/free-space evidence.
+
 LingBot-Depth consumes the archived RGB8 image that is already aligned to the depth grid and returns the same raster dimensions, so no post-hoc RGB warp is inferred. ScanLan runs it only after metric camera poses have been recovered. Every valid sensor depth remains unchanged; predicted pixels are accepted only in sensor holes after model-mask, depth-edge, metric-scale, calibrated native-RGB field-of-view, independent-viewpoint, and multi-view reprojection gates. Accepted pixels carry explicit provenance and lower fusion/training confidence. If a frame fails the metric gate, its raw calibrated depth is used unchanged.
 
 Recommended starting profile on the specified laptop:

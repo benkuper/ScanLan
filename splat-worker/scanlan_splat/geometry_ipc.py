@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import numpy as np
+from scanlan_validation import (
+    CameraValidationConfig,
+    GeometryValidationConfig,
+    validate_camera_trajectory,
+    validate_geometry,
+)
 
 from .lingbot import (
     LINGBOT_CODE_REVISION,
@@ -81,12 +87,6 @@ class ProgressivePreviewAccumulator:
         self.archived_drift_risk = 0.0
 
     @staticmethod
-    def _rotation_step_degrees(first: np.ndarray, second: np.ndarray) -> float:
-        relative = first[:3, :3].T @ second[:3, :3]
-        cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
-        return float(np.degrees(np.arccos(cosine)))
-
-    @staticmethod
     def _bounded(values: np.ndarray, count: int) -> np.ndarray:
         if len(values) <= count:
             return values
@@ -109,22 +109,12 @@ class ProgressivePreviewAccumulator:
             self.archived_drift_risk = 0.0
         poses = np.asarray(geometry.world_from_cameras, dtype=np.float64)
         confidence = np.asarray(geometry.frame_confidence, dtype=np.float32)
-        translations = (
-            np.linalg.norm(np.diff(poses[:, :3, 3], axis=0), axis=1)
-            if len(poses) > 1
-            else np.empty(0, dtype=np.float64)
+        camera_validation = validate_camera_trajectory(
+            poses,
+            confidence,
+            CameraValidationConfig(maximum_translation_step=2.0),
         )
-        typical_step = float(np.median(translations[translations > 1e-6])) if np.any(translations > 1e-6) else 0.0
-        accepted = confidence >= 0.50
-        pose_risk = 0.0
-        for index in range(1, len(poses)):
-            distance = float(np.linalg.norm(poses[index, :3, 3] - poses[index - 1, :3, 3]))
-            angle = self._rotation_step_degrees(poses[index - 1], poses[index])
-            distance_limit = max(2.0, typical_step * 4.0)
-            frame_pose_risk = max(distance / distance_limit, angle / 75.0)
-            pose_risk = max(pose_risk, frame_pose_risk)
-            if distance > distance_limit or angle > 75.0:
-                accepted[index] = False
+        accepted = camera_validation.frame_mask
         frame_lookup = {
             first_frame + index: bool(value) for index, value in enumerate(accepted)
         }
@@ -141,6 +131,14 @@ class ProgressivePreviewAccumulator:
             ],
             dtype=np.float32,
         )
+        geometry_validation = validate_geometry(
+            points,
+            point_confidence,
+            config=GeometryValidationConfig(minimum_confidence=0.50),
+        )
+        points = points[geometry_validation.point_mask]
+        original_colors = original_colors[geometry_validation.point_mask]
+        point_confidence = point_confidence[geometry_validation.point_mask]
         confidence_palette = np.column_stack(
             (
                 255.0 * (1.0 - point_confidence),
@@ -159,8 +157,12 @@ class ProgressivePreviewAccumulator:
             "accepted": int(np.count_nonzero(accepted)),
             "rejected": int(len(accepted) - np.count_nonzero(accepted)),
             "confidence": float(np.mean(confidence)) if len(confidence) else 0.0,
-            "driftRisk": float(np.clip(max(1.0 - float(np.mean(confidence)), pose_risk - 1.0), 0.0, 1.0)),
+            "driftRisk": camera_validation.drift_risk,
             "finalFrame": final_frame,
+            "validation": {
+                "camera": camera_validation.to_dict(),
+                "geometry": geometry_validation.to_dict(),
+            },
         }
         if not replacing:
             self.total_submaps += 1
@@ -234,6 +236,7 @@ class ProgressivePreviewAccumulator:
                 )
             ),
             "integrationFrozen": not len(points),
+            "latestValidation": self.chunk_status[first_frame]["validation"],
         }
         return {"points": preview_points, "colors": preview_colors, "status": status}
 

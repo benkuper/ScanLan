@@ -302,6 +302,8 @@ if (-not (Test-Path -LiteralPath $GsplatExtension)) {
 } else {
   Write-Host "Reusing gsplat CUDA extension: $GsplatExtension"
 }
+& $Python -m pip install --upgrade --force-reinstall --no-deps (Join-Path $ProjectRoot "validation")
+if ($LASTEXITCODE -ne 0) { throw "Shared ScanLan validation engine could not be installed." }
 & $Python -m pip install --upgrade --force-reinstall --no-deps $PackageRoot
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat worker could not be installed." }
 & $Python -m pip install --upgrade --force-reinstall --no-deps $GeometryPackageRoot

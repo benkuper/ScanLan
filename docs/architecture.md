@@ -12,6 +12,12 @@ ScanLan separates realtime latency from archival throughput and final quality. E
 | Splat worker | Photo/video decoding, COLMAP camera solving, CUDA 2DGS/3DGS optimization, checkpoints | Learned-model loading, RGB-D capture, tracking, pose recovery, and TSDF quality decisions |
 | Geometry worker | Pinned LingBot-Map and LingBot-Depth CUDA inference, model lifecycle, lossless array publication | Camera solving, production validation, fusion, or Gaussian optimization |
 
+Both reconstruction runtimes import one versioned, NumPy-only validation engine. It owns generic
+SE(3) camera continuity, robust Sim(3) scale evidence, metric-depth agreement, ray free-space
+consistency, and point admissibility. Learned adapters propose geometry; they do not define their
+own acceptance policy. Reports remain serializable across process boundaries. See
+[validation-engine.md](validation-engine.md).
+
 The realtime engine is started and reports `ready` before the camera is opened. Tauri pipes camera stdout directly into engine stdin and drains engine stdout on a dedicated thread. Sensor stderr goes to `sensor.log`, so a full pipe cannot stall capture.
 
 ## Live data path
