@@ -126,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "diagnostics":
             import torch
             import gsplat
+            from .appearance import GAUSSIAN_MATERIAL_CONTRACT
             from .neural_sdf import NEURAL_SDF_VERSION
             from scanlan_material import (
                 ANALYSIS_VERSION,
@@ -171,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
                             "geometryPolicyVersion": GEOMETRY_POLICY_VERSION,
                             "geometryResultVersion": GEOMETRY_RESULT_VERSION,
                             "pbrContractVersion": PBR_CONTRACT_VERSION,
+                            "gaussianMaterialContract": GAUSSIAN_MATERIAL_CONTRACT,
                         },
                     }
                 )

@@ -5687,6 +5687,18 @@ fn export_gaussian_splat_blocking(
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("room-splat");
+    let material_source = root.join("outputs").join("room-splat-material.npz");
+    let material_destination = destination.with_file_name(format!("{stem}.material.npz"));
+    let material_exported = clip_bounds.is_none() && material_source.is_file();
+    if material_exported {
+        let material_bytes = fs::read(&material_source)
+            .map_err(|error| format!("Could not read Gaussian material sidecar: {error}"))?;
+        write_export(&material_destination, &material_bytes)?;
+    } else if material_destination.is_file() {
+        fs::remove_file(&material_destination).map_err(|error| {
+            format!("Could not remove stale Gaussian material sidecar: {error}")
+        })?;
+    }
     for (source_name, suffix) in [
         ("room-splat.transform.json", "transform.json"),
         ("splat-manifest.json", "manifest.json"),
@@ -5744,6 +5756,39 @@ fn export_gaussian_splat_blocking(
                             serde_json::Value::String("flip_z".to_string()),
                         );
                     }
+                    if let Some(material) = object.get_mut("material") {
+                        if material_exported {
+                            if let Some(material) = material.as_object_mut() {
+                                material.insert(
+                                    "path".to_string(),
+                                    serde_json::Value::String(format!("{stem}.material.npz")),
+                                );
+                                material.insert(
+                                    "alignedWith".to_string(),
+                                    serde_json::Value::String(format!(
+                                        "{} vertex order",
+                                        destination
+                                            .file_name()
+                                            .and_then(|value| value.to_str())
+                                            .unwrap_or("Gaussian PLY")
+                                    )),
+                                );
+                            }
+                        } else {
+                            object.remove("material");
+                            object.insert(
+                                "materialExport".to_string(),
+                                serde_json::json!({
+                                    "status": "omitted",
+                                    "reason": if clip_bounds.is_some() {
+                                        "bounding-box clipping changes Gaussian row alignment"
+                                    } else {
+                                        "the source material sidecar is unavailable"
+                                    }
+                                }),
+                            );
+                        }
+                    }
                 }
                 sidecar_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
                     format!("Could not serialize Gaussian manifest metadata: {error}")
@@ -5760,15 +5805,17 @@ fn export_gaussian_splat_blocking(
 mod tests {
     use super::{
         append_sensor_args, clipped_binary_ply, clipped_obj, compact_splat_preview,
-        convert_3dgs_ply_to_splat, gaussian_edit_matrix, gaussian_splat_preview_is_live,
-        managed_media_source_path, matrix_product, normalize_project, pack_preview_mesh,
-        quaternion_matrix, read_supplemental_photo_manifest, save_live_reconstruction_preview,
-        transformed_cloud_ply, transformed_gaussian_ply, transformed_normal, transformed_obj,
-        transformed_position, unity_compatible_gaussian_ply, unity_compatible_obj,
-        unity_compatible_ply, valid_packed_preview_mesh, validate_sensor_settings,
-        LiveGeometryFrame, RealtimeEngineSnapshot,
+        convert_3dgs_ply_to_splat, export_gaussian_splat_blocking, gaussian_edit_matrix,
+        gaussian_splat_preview_is_live, managed_media_source_path, matrix_product,
+        normalize_project, pack_preview_mesh, quaternion_matrix, read_supplemental_photo_manifest,
+        save_live_reconstruction_preview, transformed_cloud_ply, transformed_gaussian_ply,
+        transformed_normal, transformed_obj, transformed_position, unity_compatible_gaussian_ply,
+        unity_compatible_obj, unity_compatible_ply, valid_packed_preview_mesh,
+        validate_sensor_settings, LiveGeometryFrame, RealtimeEngineSnapshot,
     };
-    use crate::models::{BoundingBoxClip, CaptureSettings, CloudTransform, ProjectSummary};
+    use crate::models::{
+        ArtifactSummary, BoundingBoxClip, CaptureSettings, CloudTransform, ProjectSummary,
+    };
     use std::sync::{Arc, Mutex};
     use std::{fs, process::Command};
 
@@ -5788,6 +5835,111 @@ mod tests {
         ] {
             assert!(managed_media_source_path(&root, unsafe_path).is_err());
         }
+    }
+
+    #[test]
+    fn gaussian_export_preserves_material_alignment_or_omits_it_when_clipped() {
+        let root = std::env::temp_dir().join(format!(
+            "scanlan-material-splat-export-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut project = crate::storage::create_project(&root).unwrap();
+        project.artifacts.gaussian_splat = Some(ArtifactSummary {
+            path: "outputs/room-splat.ply".to_string(),
+            material_path: Some("outputs/room-splat-material.npz".to_string()),
+            refined_camera_path: None,
+            status: "ready".to_string(),
+            source_fingerprint: "fixture".to_string(),
+            updated_at: "2026-08-11T00:00:00Z".to_string(),
+            metric: true,
+            stale: false,
+        });
+        crate::storage::write_project(&project).unwrap();
+        let mut names = vec![
+            "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
+        ];
+        let rest = (0..45)
+            .map(|index| format!("f_rest_{index}"))
+            .collect::<Vec<_>>();
+        let trailing = [
+            "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let properties = names
+            .drain(..)
+            .map(str::to_string)
+            .chain(rest)
+            .chain(trailing.into_iter().map(str::to_string))
+            .collect::<Vec<_>>();
+        let header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex 1\n{}end_header\n",
+            properties
+                .iter()
+                .map(|name| format!("property float {name}\n"))
+                .collect::<String>()
+        );
+        let mut ply = header.into_bytes();
+        for index in 0..properties.len() {
+            let value = match properties[index].as_str() {
+                "scale_0" | "scale_1" | "scale_2" => -2.0_f32,
+                "rot_0" => 1.0_f32,
+                _ => 0.0_f32,
+            };
+            ply.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(root.join("outputs/room-splat.ply"), ply).unwrap();
+        fs::write(
+            root.join("outputs/room-splat-material.npz"),
+            b"material fixture",
+        )
+        .unwrap();
+        fs::write(
+            root.join("outputs/splat-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "coordinateConvention": {},
+                "material": {"path": "room-splat-material.npz"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let destination = root.join("export.ply");
+        let transform = CloudTransform {
+            position: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: [1.0; 3],
+        };
+
+        export_gaussian_splat_blocking(
+            root.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+            transform.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(root.join("export.material.npz")).unwrap(),
+            b"material fixture"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("export.manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["material"]["path"], "export.material.npz");
+
+        export_gaussian_splat_blocking(
+            root.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+            transform,
+            Some(BoundingBoxClip {
+                min: [-1.0; 3],
+                max: [1.0; 3],
+            }),
+        )
+        .unwrap();
+        assert!(!root.join("export.material.npz").exists());
+        let clipped_manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("export.manifest.json")).unwrap()).unwrap();
+        assert!(clipped_manifest.get("material").is_none());
+        assert_eq!(clipped_manifest["materialExport"]["status"], "omitted");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

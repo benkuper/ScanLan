@@ -205,6 +205,12 @@ transmission, tangent-normal, and emissive atlases while preserving the observed
 It publishes a self-contained standards-compliant GLB and falls back to a safe observed-color rough
 dielectric wherever intrinsic evidence is unsupported; see [PBR reconstruction](docs/pbr-reconstruction.md).
 
+P17 carries those intrinsic priors into Gaussian optimization. The production trainer now keeps
+diffuse, higher-order view dependence, emission, and transmission separate, including distinct
+geometric and optical opacity. Material-free datasets remain an exact neutral compatibility path;
+material-aware jobs publish a lossless aligned sidecar beside the standard PLY. See
+[material-aware Gaussian reconstruction](docs/material-aware-gaussians.md).
+
 The dense initialization sidecar is also the shared point/mesh fusion contract. It retains source
 ownership, confidence, provenance, orientation, and footprint. Media-only point and mesh artifacts
 are correctly labeled non-metric. In a hybrid project, learned media geometry is robustly aligned

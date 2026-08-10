@@ -14,7 +14,20 @@ from PIL import Image
 
 from .dataset import load_dataset
 from .depth_loss import depth_weight, masked_robust_depth_loss
-from .export import SH_C0, export_3dgs_ply, export_splat_preview, write_splat_sidecars
+from .appearance import (
+    compose_material_render_state,
+    linear_to_srgb_tensor,
+    material_regularization,
+    resolve_gaussian_material_seeds,
+    srgb_to_linear_tensor,
+)
+from .export import (
+    SH_C0,
+    export_3dgs_ply,
+    export_material_gaussians,
+    export_splat_preview,
+    write_splat_sidecars,
+)
 from .initialization import resolve_initialization_contract
 from .pose import (
     constrain_pose_offsets_,
@@ -27,7 +40,7 @@ from .pose import (
 FRAME_REUSE_PER_LOAD = 4
 LOSS_EMA_ALPHA = 0.005
 RGBD_GAUSSIAN_MULTIPLIER = 3
-TRAINER_VERSION = "unified-initialization-source-resolution-tiles-v10"
+TRAINER_VERSION = "material-aware-components-source-resolution-v11"
 RGBD_SURFACE_SCALE_MULTIPLIER = 1.3
 RGBD_SURFACE_OPACITY = 0.45
 DENSE_PRIOR_INITIAL_OPACITY = 0.01
@@ -194,6 +207,70 @@ def _sh_preview_colors(sh0: Any) -> Any:
     import torch
 
     return torch.clamp(sh0[:, 0, :] * SH_C0 + 0.5, 0.0, 1.0)
+
+
+def _inverse_sigmoid_numpy(value: np.ndarray) -> np.ndarray:
+    bounded = np.clip(np.asarray(value, dtype=np.float32), 1e-4, 1.0 - 1e-4)
+    return np.log(bounded / (1.0 - bounded)).astype(np.float32)
+
+
+def _material_parameter_initialization(
+    colors_srgb: np.ndarray,
+    material_seeds: Any | None,
+) -> dict[str, np.ndarray]:
+    from scanlan_material.radiometry import srgb_to_linear
+
+    count = len(colors_srgb)
+    observed_linear = srgb_to_linear(np.clip(colors_srgb, 0.0, 1.0)).astype(np.float32)
+    if material_seeds is None:
+        confidence = np.zeros(count, dtype=np.float32)
+        # Preserve the established display-space trainer exactly when no
+        # intrinsic prior is declared. A neutral branch must be a true no-op.
+        diffuse = np.asarray(colors_srgb, dtype=np.float32)
+        roughness = np.ones(count, dtype=np.float32)
+        metallic = np.zeros(count, dtype=np.float32)
+        transmission = np.full(count, 1e-4, dtype=np.float32)
+        emission = np.full((count, 3), math.exp(-16.0), dtype=np.float32)
+    else:
+        confidence = np.asarray(material_seeds.confidence, dtype=np.float32)
+        diffuse = (
+            confidence[:, None] * material_seeds.albedo_linear
+            + (1.0 - confidence[:, None]) * observed_linear
+        ).astype(np.float32)
+        roughness = confidence * material_seeds.roughness + (1.0 - confidence)
+        metallic = confidence * material_seeds.metallic
+        transmission = np.clip(confidence * material_seeds.transmission, 1e-4, 1.0 - 1e-4)
+        emission = np.maximum(
+            confidence[:, None] * material_seeds.emission_linear,
+            math.exp(-16.0),
+        ).astype(np.float32)
+    transmission_logits = _inverse_sigmoid_numpy(transmission)
+    emission_log = np.log(emission).astype(np.float32)
+    return {
+        "diffuse_sh0": ((diffuse - 0.5) / SH_C0).astype(np.float32)[:, None, :],
+        "view_shN": np.zeros((count, 15, 3), dtype=np.float32),
+        "emission_log": emission_log,
+        "transmission_logits": transmission_logits,
+        "roughness_logits": _inverse_sigmoid_numpy(roughness),
+        "metallic_logits": _inverse_sigmoid_numpy(metallic),
+        "material_confidence": confidence.astype(np.float32),
+        "emission_anchor_log": emission_log.copy(),
+        "transmission_anchor_logits": transmission_logits.copy(),
+    }
+
+
+def _material_preview_colors(parameters: Any, material_aware: bool) -> Any:
+    if not material_aware:
+        return _sh_preview_colors(parameters["diffuse_sh0"])
+    import torch
+
+    diffuse_linear = torch.clamp(
+        parameters["diffuse_sh0"][:, 0, :] * SH_C0 + 0.5,
+        0.0,
+        1.0,
+    )
+    emission_linear = torch.exp(parameters["emission_log"].clamp(-16.0, 4.0))
+    return linear_to_srgb_tensor(diffuse_linear + emission_linear).clamp(0.0, 1.0)
 
 
 def _preview_log_scales(log_scales: Any, flatten_2d: bool = True) -> Any:
@@ -680,7 +757,9 @@ def _frame_tensors(
     return value
 
 
-def _frame_to_device(frame: dict[str, Any], device: Any) -> dict[str, Any]:
+def _frame_to_device(
+    frame: dict[str, Any], device: Any, *, linear_rgb: bool = False
+) -> dict[str, Any]:
     import torch
 
     result: dict[str, Any] = {}
@@ -691,6 +770,8 @@ def _frame_to_device(frame: dict[str, Any], device: Any) -> dict[str, Any]:
         transferred = value.to(device, non_blocking=True)
         if key == "rgb":
             transferred = transferred.float().div_(255.0)
+            if linear_rgb:
+                transferred = srgb_to_linear_tensor(transferred)
         elif key == "depth":
             transferred = transferred.float().div_(1000.0)
         elif key == "mask":
@@ -757,6 +838,8 @@ def train_dataset(
     )
     if len(points) == 0:
         raise ValueError("Sparse or RGB-D initialization contains no points")
+    material_seeds = resolve_gaussian_material_seeds(root, dataset, len(points))
+    material_aware = material_seeds is not None
     if initialization.is_dense and (
         seeded_scales is None or seeded_quaternions is None
     ):
@@ -842,7 +925,7 @@ def train_dataset(
             (len(points), 1),
         )
     )
-    sh0 = ((colors - 0.5) / SH_C0).astype(np.float32)[:, None, :]
+    appearance_parameters = _material_parameter_initialization(colors, material_seeds)
     initial_opacity = (
         np.clip(seeded_opacity, 1e-4, 1.0 - 1e-4)
         if direct_gaussian_prior and seeded_opacity is not None
@@ -866,8 +949,10 @@ def train_dataset(
         "opacities": _logit(
             torch.from_numpy(np.asarray(initial_opacity, dtype=np.float32))
         ),
-        "sh0": torch.from_numpy(sh0),
-        "shN": torch.zeros((len(points), 15, 3), dtype=torch.float32),
+        **{
+            name: torch.from_numpy(value)
+            for name, value in appearance_parameters.items()
+        },
     }
     start_step = 0
     checkpoint = None
@@ -947,8 +1032,15 @@ def train_dataset(
         "scales": 0.0 if metric_seeded else 2.5e-3 if dense_geometry_prior else 5e-3,
         "quats": 0.0 if metric_seeded else 1e-3,
         "opacities": 1e-2 if hybrid and metric_seeded else 0.0 if metric_seeded else 5e-2,
-        "sh0": 2.5e-3 if hybrid and metric_seeded else 0.0 if metric_seeded else 2.5e-3,
-        "shN": 1.25e-4 if hybrid and metric_seeded else 0.0 if metric_seeded else 1.25e-4,
+        "diffuse_sh0": 2.5e-3 if hybrid and metric_seeded else 0.0 if metric_seeded else 2.5e-3,
+        "view_shN": 1.25e-4 if hybrid and metric_seeded else 0.0 if metric_seeded else 1.25e-4,
+        "emission_log": 1e-3 if material_aware else 0.0,
+        "transmission_logits": 5e-4 if material_aware else 0.0,
+        "roughness_logits": 0.0,
+        "metallic_logits": 0.0,
+        "material_confidence": 0.0,
+        "emission_anchor_log": 0.0,
+        "transmission_anchor_logits": 0.0,
     }
     optimizers = {
         name: torch.optim.Adam(
@@ -1100,11 +1192,22 @@ def train_dataset(
                 if len(parameters["means"]) > preview_count
                 else slice(None)
             )
+            preview_parameters = {
+                name: value[preview_indices] for name, value in parameters.items()
+            }
+            _preview_coefficients, preview_optical_opacity, _preview_material = (
+                compose_material_render_state(
+                    preview_parameters, material_aware, SH_C0
+                )
+            )
             export_splat_preview(
                 output_root / "room-splat.preview.splat",
                 parameters["means"][preview_indices].detach().cpu().numpy(),
-                _sh_preview_colors(parameters["sh0"][preview_indices]).detach().cpu().numpy(),
-                parameters["opacities"][preview_indices].detach().cpu().numpy(),
+                _material_preview_colors(
+                    preview_parameters,
+                    material_aware,
+                ).detach().cpu().numpy(),
+                _logit(preview_optical_opacity).detach().cpu().numpy(),
                 _preview_log_scales(
                     parameters["scales"][preview_indices],
                     flatten_2d=uses_2dgs,
@@ -1160,7 +1263,9 @@ def train_dataset(
                 cached_frames.popitem(last=False)
         else:
             cached_frames.move_to_end(cache_key)
-        frame = _frame_to_device(cached_frames[cache_key], device)
+        frame = _frame_to_device(
+            cached_frames[cache_key], device, linear_rgb=material_aware
+        )
         for optimizer in optimizers.values():
             optimizer.zero_grad(set_to_none=True)
         pose_active = pose_optimizer is not None and step >= pose_refine_start
@@ -1180,12 +1285,16 @@ def train_dataset(
             sh_degree = min(3, step // max(iterations // 4, 1))
             pose_regularization_value = torch.zeros((), device=device)
             appearance_regularization_value = torch.zeros((), device=device)
+            material_regularization_value = torch.zeros((), device=device)
             normalized_quaternions = torch.nn.functional.normalize(
                 parameters["quats"], dim=-1
             )
             render_normals = None
             surface_normals = None
             render_distortion = None
+            render_coefficients, optical_opacities, _material_state = (
+                compose_material_render_state(parameters, material_aware, SH_C0)
+            )
             if uses_2dgs:
                 (
                     rendering,
@@ -1199,8 +1308,8 @@ def train_dataset(
                     means=parameters["means"],
                     quats=normalized_quaternions,
                     scales=torch.exp(parameters["scales"]).clamp(1e-5, scene_scale),
-                    opacities=torch.sigmoid(parameters["opacities"]),
-                    colors=torch.cat((parameters["sh0"], parameters["shN"]), dim=1),
+                    opacities=optical_opacities,
+                    colors=render_coefficients,
                     viewmats=refined_view.unsqueeze(0),
                     Ks=frame["K"].unsqueeze(0),
                     width=frame["width"],
@@ -1217,8 +1326,8 @@ def train_dataset(
                     means=parameters["means"],
                     quats=normalized_quaternions,
                     scales=torch.exp(parameters["scales"]).clamp(1e-5, scene_scale),
-                    opacities=torch.sigmoid(parameters["opacities"]),
-                    colors=torch.cat((parameters["sh0"], parameters["shN"]), dim=1),
+                    opacities=optical_opacities,
+                    colors=render_coefficients,
                     viewmats=refined_view.unsqueeze(0),
                     Ks=frame["K"].unsqueeze(0),
                     width=frame["width"],
@@ -1255,6 +1364,10 @@ def train_dataset(
             )
             if appearance_active:
                 loss = loss + 1e-4 * appearance_regularization_value
+            material_regularization_value, _material_loss_parts = material_regularization(
+                parameters, material_aware
+            )
+            loss = loss + material_regularization_value
             depth_value = torch.zeros((), device=device)
             normal_value = torch.zeros((), device=device)
             distortion_value = torch.zeros((), device=device)
@@ -1344,6 +1457,16 @@ def train_dataset(
                     min=metric_opacity_bounds[0],
                     max=metric_opacity_bounds[1],
                 )
+        if material_aware:
+            with torch.no_grad():
+                parameters["emission_log"].clamp_(-16.0, math.log(16.0))
+                parameters["transmission_logits"].clamp_(
+                    float(_logit(1e-4)), float(_logit(1.0 - 1e-4))
+                )
+                parameters["diffuse_sh0"].clamp_(
+                    min=-0.5 / SH_C0,
+                    max=0.5 / SH_C0,
+                )
         if len(parameters["means"]) > maximum_gaussians:
             raise RuntimeError(
                 f"Adaptive densification exceeded the {maximum_gaussians:,}-Gaussian "
@@ -1382,7 +1505,35 @@ def train_dataset(
                 if frame["sourceResolution"]
                 else f"global {frame['width']}×{frame['height']}"
             )
-            _write_json_atomic(progress_path, {"stage": "splat_training", "detail": f"{progress_action} iteration {step + 1:,} of {iterations:,} · loss {last_loss:.4f} · rolling {smoothed_loss:.4f} · {raster_label} · {len(parameters['means']):,} Gaussians", "progress": progress_start + (1.0 - progress_start) * stage_progress, "stageProgress": stage_progress, "iteration": step + 1, "totalIterations": iterations, "loss": last_loss, "smoothedLoss": smoothed_loss, "rgbLoss": float(rgb_l1.detach()), "depthLoss": float(depth_value.detach()), "normalLoss": float(normal_value.detach()), "distortionLoss": float(distortion_value.detach()), "poseRegularizationLoss": float(pose_regularization_value.detach()), "appearanceRegularizationLoss": float(appearance_regularization_value.detach()), "maximumPoseTranslationMm": maximum_pose_translation_mm, "gaussianCount": len(parameters["means"]), "maximumGaussians": maximum_gaussians, "sourceResolution": frame["sourceResolution"], "sourceCrop": frame["sourceCrop"], "etaSeconds": eta, "stageEtaSeconds": eta, "elapsedSeconds": round(elapsed), "computeBackend": f"{torch.cuda.get_device_name(device)} · CUDA AMP / gsplat {'2DGS' if uses_2dgs else '3DGS'}"})
+            _write_json_atomic(
+                progress_path,
+                {
+                    "stage": "splat_training",
+                    "detail": f"{progress_action} iteration {step + 1:,} of {iterations:,} · loss {last_loss:.4f} · rolling {smoothed_loss:.4f} · {raster_label} · {len(parameters['means']):,} Gaussians",
+                    "progress": progress_start + (1.0 - progress_start) * stage_progress,
+                    "stageProgress": stage_progress,
+                    "iteration": step + 1,
+                    "totalIterations": iterations,
+                    "loss": last_loss,
+                    "smoothedLoss": smoothed_loss,
+                    "rgbLoss": float(rgb_l1.detach()),
+                    "depthLoss": float(depth_value.detach()),
+                    "normalLoss": float(normal_value.detach()),
+                    "distortionLoss": float(distortion_value.detach()),
+                    "poseRegularizationLoss": float(pose_regularization_value.detach()),
+                    "appearanceRegularizationLoss": float(appearance_regularization_value.detach()),
+                    "materialRegularizationLoss": float(material_regularization_value.detach()),
+                    "maximumPoseTranslationMm": maximum_pose_translation_mm,
+                    "gaussianCount": len(parameters["means"]),
+                    "maximumGaussians": maximum_gaussians,
+                    "sourceResolution": frame["sourceResolution"],
+                    "sourceCrop": frame["sourceCrop"],
+                    "etaSeconds": eta,
+                    "stageEtaSeconds": eta,
+                    "elapsedSeconds": round(elapsed),
+                    "computeBackend": f"{torch.cuda.get_device_name(device)} · CUDA AMP / gsplat {'2DGS' if uses_2dgs else '3DGS'}",
+                },
+            )
         preview_due = step == start_step or step + 1 == iterations or (
             step > 0
             and step % 250 == 0
@@ -1410,6 +1561,8 @@ def train_dataset(
             if metric_seeded
             else "bounded multiview training-camera photometric gate"
         ),
+        "trainingColorSpace": "linear-srgb" if material_aware else "srgb",
+        "metricColorSpace": "srgb",
         "thresholds": {
             "minimumMedianPsnrDb": MINIMUM_PRODUCTION_PSNR_DB,
             "minimumMedianSsim": MINIMUM_PRODUCTION_SSIM,
@@ -1430,6 +1583,7 @@ def train_dataset(
                 evaluation_frame = _frame_to_device(
                     _frame_tensors(root, frames[frame_index], training_dimension),
                     device,
+                    linear_rgb=material_aware,
                 )
                 evaluation_camera_to_world = evaluation_frame["cameraToWorld"]
                 if pose_refinement_enabled:
@@ -1437,12 +1591,17 @@ def train_dataset(
                         pose_offsets[frame_index] * pose_refinement_mask[frame_index]
                     )
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    evaluation_coefficients, evaluation_opacity, _evaluation_material = (
+                        compose_material_render_state(
+                            parameters, material_aware, SH_C0
+                        )
+                    )
                     evaluation_render, _evaluation_alpha, _evaluation_info = rasterization(
                         means=parameters["means"],
                         quats=torch.nn.functional.normalize(parameters["quats"], dim=-1),
                         scales=torch.exp(parameters["scales"]).clamp(1e-5, scene_scale),
-                        opacities=torch.sigmoid(parameters["opacities"]),
-                        colors=torch.cat((parameters["sh0"], parameters["shN"]), dim=1),
+                        opacities=evaluation_opacity,
+                        colors=evaluation_coefficients,
                         viewmats=torch.linalg.inv(evaluation_camera_to_world).unsqueeze(0),
                         Ks=evaluation_frame["K"].unsqueeze(0),
                         width=evaluation_frame["width"],
@@ -1453,10 +1612,20 @@ def train_dataset(
                     )
                     predicted = evaluation_render[0, ..., :3].clamp(0.0, 1.0)
                     target = evaluation_frame["rgb"]
-                    difference = predicted - target
+                    quality_predicted = (
+                        linear_to_srgb_tensor(predicted).clamp(0.0, 1.0)
+                        if material_aware
+                        else predicted
+                    )
+                    quality_target = (
+                        linear_to_srgb_tensor(target).clamp(0.0, 1.0)
+                        if material_aware
+                        else target
+                    )
+                    difference = quality_predicted - quality_target
                     mse = float(difference.square().mean())
                     l1 = float(difference.abs().mean())
-                    ssim = float(_ssim(predicted, target))
+                    ssim = float(_ssim(quality_predicted, quality_target))
                 evaluation_records.append(
                     {
                         "frameIndex": frame_index,
@@ -1492,10 +1661,46 @@ def train_dataset(
     else:
         _write_json_atomic(output_root / "splat-quality-report.json", quality_report)
 
-    colors_out = _sh_preview_colors(parameters["sh0"]).detach().cpu().numpy()
-    sh_out = torch.cat((parameters["sh0"], parameters["shN"]), dim=1).detach().cpu().numpy()
+    with torch.no_grad():
+        _material_coefficients, optical_opacity, final_material = (
+            compose_material_render_state(parameters, material_aware, SH_C0)
+        )
+        colors_out = _material_preview_colors(parameters, material_aware).cpu().numpy()
+        diffuse_linear_out = torch.clamp(
+            parameters["diffuse_sh0"][:, 0, :] * SH_C0 + 0.5,
+            0.0,
+            1.0,
+        ).cpu().numpy()
+        view_sh_out = parameters["view_shN"].cpu().numpy()
+        geometric_opacity_out = torch.sigmoid(parameters["opacities"]).cpu().numpy()
+        optical_opacity_out = optical_opacity.cpu().numpy()
+        opacities_out = _logit(optical_opacity).cpu().numpy()
+        if material_aware:
+            emission_out = final_material["emission"].cpu().numpy()
+            transmission_out = final_material["transmission"].cpu().numpy()
+            roughness_out = final_material["roughness"].cpu().numpy()
+            metallic_out = final_material["metallic"].cpu().numpy()
+            material_confidence_out = final_material["confidence"].cpu().numpy()
+            base_linear = np.maximum(diffuse_linear_out + emission_out, 0.0)
+            display_derivative = np.where(
+                base_linear <= 0.0031308,
+                12.92,
+                (1.055 / 2.4)
+                * np.power(np.maximum(base_linear, 1e-6), 1.0 / 2.4 - 1.0),
+            ).astype(np.float32)
+            display_view_sh = view_sh_out * display_derivative[:, None, :]
+        else:
+            emission_out = np.zeros_like(diffuse_linear_out)
+            transmission_out = np.zeros(len(diffuse_linear_out), dtype=np.float32)
+            roughness_out = np.ones(len(diffuse_linear_out), dtype=np.float32)
+            metallic_out = np.zeros(len(diffuse_linear_out), dtype=np.float32)
+            material_confidence_out = np.zeros(len(diffuse_linear_out), dtype=np.float32)
+            display_view_sh = view_sh_out
+        # The standard PLY is a first-order display-space compatibility
+        # projection. The adjacent NPZ retains the exact linear decomposition.
+        display_dc = ((colors_out - 0.5) / SH_C0).astype(np.float32)[:, None, :]
+        sh_out = np.concatenate((display_dc, display_view_sh), axis=1)
     means_out = parameters["means"].detach().cpu().numpy()
-    opacities_out = parameters["opacities"].detach().cpu().numpy()
     scales_out = _preview_log_scales(
         parameters["scales"],
         flatten_2d=uses_2dgs,
@@ -1519,6 +1724,21 @@ def train_dataset(
         quaternions_out,
         limit=500_000,
     )
+    if material_aware:
+        export_material_gaussians(
+            output_root / "room-splat-material.npz",
+            diffuse_linear=diffuse_linear_out,
+            view_sh_linear=view_sh_out,
+            emission_linear=emission_out,
+            transmission=transmission_out,
+            roughness=roughness_out,
+            metallic=metallic_out,
+            confidence=material_confidence_out,
+            geometric_opacity=geometric_opacity_out,
+            optical_opacity=optical_opacity_out,
+        )
+    else:
+        (output_root / "room-splat-material.npz").unlink(missing_ok=True)
     with torch.no_grad():
         pose_corrections = pose_delta_matrix(pose_offsets).detach().cpu().numpy()
         appearance_corrections = appearance_offsets.detach().cpu().numpy()
@@ -1634,7 +1854,11 @@ def train_dataset(
         "surfaceOpacity": RGBD_SURFACE_OPACITY if metric_seeded else None,
         "gaussianCount": len(parameters["means"]),
         "sphericalHarmonicsDegree": 3,
-        "rgbLoss": "L1+SSIM with bounded per-view exposure compensation",
+        "rgbLoss": (
+            "linear-sRGB L1+SSIM with bounded per-view exposure compensation"
+            if material_aware
+            else "L1+SSIM with bounded per-view exposure compensation"
+        ),
         "depthLoss": "masked robust Huber with annealed weight" if uses_depth else "disabled",
         "normalLoss": (
             "disabled for fixed metric surface"
@@ -1657,18 +1881,74 @@ def train_dataset(
             "anchorFrameIndex": appearance_anchor_index if appearance_optimization_enabled else None,
             "model": "per-view RGB log-gain and bias",
         },
+        "materialDecomposition": {
+            "contract": "scanlan-gaussian-material-v1",
+            "enabled": material_aware,
+            "priorAvailable": material_aware,
+            "trainingColorSpace": "linear-srgb" if material_aware else "srgb compatibility",
+            "components": ["diffuse", "view-dependent", "emissive", "transmissive"],
+            "opacity": "geometric occupancy separated from optical transmission",
+            "specularGradientGate": material_aware,
+            "meanTransmission": float(np.mean(transmission_out)),
+            "emissiveGaussianCount": int(
+                np.count_nonzero(np.max(emission_out, axis=1) > 1e-3)
+            ),
+            "supportedGaussianCount": int(
+                np.count_nonzero(material_confidence_out > 0.0)
+            ),
+        },
         "sourceQuality": dataset.get("quality"),
     }
-    write_splat_sidecars(output_root, dataset.get("fingerprint", ""), bool(dataset.get("metric")), versions, training)
+    material_manifest = {
+        "schemaVersion": 1,
+        "contract": "scanlan-gaussian-material-v1",
+        "path": "room-splat-material.npz",
+        "alignedWith": "room-splat.ply vertex order",
+        "colorSpace": "linear-srgb",
+        "components": {
+            "diffuse": "diffuse_linear Nx3",
+            "viewDependent": "view_sh_linear Nx15x3",
+            "emissive": "emission_linear Nx3",
+            "transmissive": "transmission N",
+        },
+        "opacity": {
+            "geometric": "geometric_opacity N",
+            "optical": "optical_opacity = geometric_opacity * (1 - transmission)",
+        },
+        "priorAvailable": material_aware,
+        "plyCompatibility": "first-order linear-to-sRGB projection; NPZ is lossless",
+    }
+    write_splat_sidecars(
+        output_root,
+        dataset.get("fingerprint", ""),
+        bool(dataset.get("metric")),
+        versions,
+        training,
+        material=material_manifest if material_aware else None,
+    )
     project_path = project_root / "project.json"
     project = json.loads(project_path.read_text(encoding="utf-8"))
-    project.setdefault("artifacts", {})["gaussianSplat"] = {"path": "outputs/room-splat.ply", "refinedCameraPath": "outputs/room-splat-cameras.json", "status": "ready", "sourceFingerprint": dataset.get("fingerprint", ""), "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "metric": bool(dataset.get("metric")), "stale": False}
+    project.setdefault("artifacts", {})["gaussianSplat"] = {
+        "path": "outputs/room-splat.ply",
+        "refinedCameraPath": "outputs/room-splat-cameras.json",
+        "status": "ready",
+        "sourceFingerprint": dataset.get("fingerprint", ""),
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "metric": bool(dataset.get("metric")),
+        "stale": False,
+    }
+    if material_aware:
+        project["artifacts"]["gaussianSplat"]["materialPath"] = (
+            "outputs/room-splat-material.npz"
+        )
     project["processingStatus"] = "complete"
     project.pop("processingError", None)
     _write_json_atomic(project_path, project)
     checkpoint_path.unlink(missing_ok=True)
     published_description = (
-        "calibrated RGB-D splats"
+        "material-aware Gaussian components"
+        if material_aware
+        else "calibrated RGB-D splats"
         if metric_seeded
         else "optimized 2D Gaussians" if uses_2dgs else "photoreal 3D Gaussians"
     )

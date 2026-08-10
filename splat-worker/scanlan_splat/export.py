@@ -4,12 +4,75 @@ import json
 import os
 import struct
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 SH_C0 = 0.28209479177387814
+
+
+def export_material_gaussians(
+    path: Path,
+    *,
+    diffuse_linear: np.ndarray,
+    view_sh_linear: np.ndarray,
+    emission_linear: np.ndarray,
+    transmission: np.ndarray,
+    roughness: np.ndarray,
+    metallic: np.ndarray,
+    confidence: np.ndarray,
+    geometric_opacity: np.ndarray,
+    optical_opacity: np.ndarray,
+) -> None:
+    """Atomically publish the lossless P17 appearance decomposition sidecar."""
+
+    count = len(diffuse_linear)
+    vectors = {
+        "diffuse_linear": (diffuse_linear, (count, 3)),
+        "emission_linear": (emission_linear, (count, 3)),
+    }
+    scalars = {
+        "transmission": transmission,
+        "roughness": roughness,
+        "metallic": metallic,
+        "confidence": confidence,
+        "geometric_opacity": geometric_opacity,
+        "optical_opacity": optical_opacity,
+    }
+    arrays: dict[str, np.ndarray] = {}
+    for name, (value, shape) in vectors.items():
+        array = np.asarray(value, dtype=np.float32)
+        if array.shape != shape or not np.isfinite(array).all() or np.any(array < 0.0):
+            raise ValueError(f"Material Gaussian {name} must be finite {shape}")
+        arrays[name] = array
+    view = np.asarray(view_sh_linear, dtype=np.float32)
+    if view.ndim != 3 or view.shape[0] != count or view.shape[2] != 3 or not np.isfinite(view).all():
+        raise ValueError("Material Gaussian view-dependent SH must be NxKx3")
+    arrays["view_sh_linear"] = view
+    for name, value in scalars.items():
+        array = np.asarray(value, dtype=np.float32).reshape(-1)
+        if array.shape != (count,) or not np.isfinite(array).all():
+            raise ValueError(f"Material Gaussian {name} must be finite N")
+        if np.any(array < 0.0) or np.any(array > 1.0):
+            raise ValueError(f"Material Gaussian {name} must remain in [0, 1]")
+        arrays[name] = array
+    arrays.update(
+        contract=np.asarray("scanlan-gaussian-material-v1"),
+        color_space=np.asarray("linear-srgb"),
+        aligned_with=np.asarray("room-splat.ply vertex order"),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def export_splat_preview(
@@ -130,6 +193,7 @@ def write_splat_sidecars(
     metric: bool,
     versions: dict[str, str],
     training: dict[str, Any],
+    material: dict[str, Any] | None = None,
 ) -> None:
     transform = {
         "schemaVersion": 1,
@@ -167,6 +231,8 @@ def write_splat_sidecars(
         },
         "training": training,
     }
+    if material is not None:
+        manifest["material"] = material
     (output_root / "room-splat.transform.json").write_text(
         json.dumps(transform, indent=2) + "\n", encoding="utf-8"
     )

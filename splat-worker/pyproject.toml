@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scanlan-splat"
-version = "0.1.0"
-description = "Photo, video, and depth-aware Gaussian-splat runtime for ScanLan"
+version = "0.2.0"
+description = "Photo, video, depth-aware, and material-aware Gaussian-splat runtime for ScanLan"
 requires-python = ">=3.11,<3.12"
 dependencies = [
   "numpy==1.26.4",

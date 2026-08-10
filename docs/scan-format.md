@@ -26,6 +26,7 @@ scan-project/
     ├── room-mesh.mtl
     ├── room-texture.png
     ├── room-splat.ply
+    ├── room-splat-material.npz       # when a declared material prior is available
     ├── room-splat.preview.splat
     ├── room-splat.transform.json
     ├── splat-manifest.json

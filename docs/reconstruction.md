@@ -127,7 +127,7 @@ The splat target uses tangent-aligned 2D Gaussian discs rather than unconstraine
 
 For a 12 GB GPU, the canonical builder retains up to 600 views using camera-position, direction, roll, time, and take-boundary coverage. Compact integer images remain in pinned host memory behind a four-frame LRU; shuffled views are scheduled in cache-local blocks and only the active view is transferred to CUDA. Global passes use a bounded 960 px raster. The final schedule instead covers every source-resolution tile, keeps the original focal length, shifts the calibrated principal point into the crop, and never allocates a full oversized raster. The trainer enforces a two-million-Gaussian hard ceiling at this VRAM tier. Densification stops before a single growth cycle could cross that ceiling, source-tile coverage gates publication, and checkpoints preserve tile progress atomically.
 
-The exported PLY is interoperable with 3DGS tooling by flattening the third scale axis. `room-splat.transform.json` records display conversion separately. This is the production surface-splat path; the conventional mesh remains the production triangle representation.
+The exported PLY is interoperable with 3DGS tooling by flattening the third scale axis. `room-splat.transform.json` records display conversion separately. When a declared intrinsic prior is available, `room-splat-material.npz` keeps diffuse, view-dependent, emissive, transmissive, and geometric/optical-opacity components aligned to PLY vertex order; see [material-aware Gaussian reconstruction](material-aware-gaussians.md). This is the production surface-splat path; the conventional mesh remains the production triangle representation.
 
 ## Photo/video 3D Gaussian splat
 

@@ -886,7 +886,20 @@ Implemented as a confidence-preserving intrinsic-material export boundary:
 
 ## P17 — Material-aware Gaussian reconstruction
 
-Separate diffuse, view-dependent, emissive and transmissive behavior in the production trainer.
+Implemented as a prior-gated decomposition in the production trainer:
+
+* a versioned, fail-closed linear-sRGB seed contract aligns P14/P16 albedo, roughness, metallic,
+  transmission, emission, and confidence with every initialization Gaussian;
+* diffuse degree-zero radiance, higher-order view dependence, non-negative emission, and
+  transmission are distinct optimizer/checkpoint tensors that follow gsplat topology changes;
+* geometric occupancy remains separate from optical opacity, which is reduced by transmission
+  without deleting the surface primitive;
+* prior anchoring, unsupported-region penalties, roughness regularization, and specular-aware
+  transmission-gradient gating limit decomposition ambiguity;
+* datasets without a declared material prior retain the established display-space trainer as an
+  exact neutral compatibility path;
+* an atomic `outputs/room-splat-material.npz` preserves the lossless linear decomposition beside
+  the interoperable display-space PLY, and manifests expose its component and opacity semantics.
 
 ## P18 — Adaptive backend policy
 

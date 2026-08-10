@@ -198,6 +198,10 @@ impl Default for CaptureSettings {
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactSummary {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refined_camera_path: Option<String>,
     pub status: String,
     pub source_fingerprint: String,
     pub updated_at: String,

@@ -65,6 +65,8 @@ export type ArtifactStatus = 'ready' | 'building' | 'stale' | 'failed';
 
 export interface ArtifactSummary {
   path: string;
+  materialPath?: string;
+  refinedCameraPath?: string;
   status: ArtifactStatus;
   sourceFingerprint: string;
   updatedAt: string;

@@ -9,7 +9,7 @@ ScanLan separates realtime latency from archival throughput and final quality. E
 | Tauri application | lifecycle, project state, status snapshots, exports | camera SDK state or reconstruction kernels |
 | Native capture worker | camera SDK, calibration, synchronized RGB-D, IMU conversion | UI rendering or Open3D |
 | Reconstruction worker | tracking, relocalization, TSDF, pose graph, point/mesh build | camera SDK |
-| Splat worker | Photo/video decoding, COLMAP camera solving, CUDA 2DGS/3DGS optimization, checkpoints | Learned-model loading, RGB-D capture, tracking, pose recovery, and TSDF quality decisions |
+| Splat worker | Photo/video decoding, COLMAP camera solving, CUDA 2DGS/3DGS optimization, material-aware appearance decomposition, checkpoints | Learned-model loading, RGB-D capture, tracking, pose recovery, and TSDF quality decisions |
 | Geometry worker | Pinned LingBot-Map, LingBot-Depth, MapAnything, and DA3 Nested Giant-Large CUDA inference, model lifecycle, lossless array publication | Camera solving, production validation, fusion, or Gaussian optimization |
 | Material package | Linear-light preparation, two-pass view planning, material/risk/PBR contracts, multiview surface fusion, 3D material regions, material-aware geometry policy/refinement gates, confidence-aware PBR atlas/GLB export, bake-off gates, and model-pack policy | Model-specific inference, capture, or unrestricted geometry completion |
 
@@ -29,6 +29,11 @@ the shared package cannot silently load an unapproved checkpoint. See
 [two-pass-material-analysis.md](two-pass-material-analysis.md), and
 [material-aware-geometry.md](material-aware-geometry.md), and
 [pbr-reconstruction.md](pbr-reconstruction.md).
+
+The splat worker consumes declared intrinsic priors through a separate fail-closed contract and
+keeps diffuse, view-dependent, emissive, transmissive, geometric-opacity, and optical-opacity state
+aligned through optimization and publication; see
+[material-aware-gaussians.md](material-aware-gaussians.md).
 
 The splat worker also owns the opt-in Max Quality neural-SDF optimizer so its PyTorch/CUDA
 allocation cannot leak into the lightweight reconstruction runtime. The reconstruction worker
