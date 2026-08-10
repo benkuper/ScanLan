@@ -882,6 +882,7 @@ def localize_supplemental_photos(
                 "name": source_path.stem,
                 "path": destination.relative_to(project_root).as_posix(),
                 "sourcePath": str(source_path),
+                "mediaSourcePath": metadata.get("sourcePath"),
                 "camera": {
                     "width": width,
                     "height": height,

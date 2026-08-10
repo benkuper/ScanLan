@@ -761,14 +761,21 @@ Implemented:
 
 ## P10 — Unified dense fusion
 
-Use one confidence/provenance-aware path for:
+Implemented with one versioned dense-surface sample contract:
 
-* RGB-D;
-* photos;
-* video;
-* hybrid projects.
-
-Produce point clouds and meshes for every source type.
+* calibrated RGB-D, validated generated depth, photo geometry, and video geometry retain explicit
+  confidence, provenance, surface orientation, footprint, and source-frame ownership;
+* confidence/provenance-weighted voxel fusion lets generated and learned surfaces fill unseen
+  space while calibrated sensor samples win every occupied metric voxel;
+* photo/video projects publish learned-scale colored PLY and OBJ/MTL/PNG artifacts directly from
+  the same camera-validated dense prior used for Gaussian initialization;
+* hybrid projects align learned media geometry to independently localized RGB-D cameras with a
+  robust Sim(3) solve and strict center/rotation gates, then add only non-overlapping learned
+  surface triangles to the calibrated TSDF mesh;
+* an incompatible learned alignment is recorded and rejected atomically rather than contaminating
+  the metric reconstruction;
+* the desktop exposes point clouds and meshes for every source mode and labels media-only scale as
+  learned rather than metric.
 
 ## P11 — Optional neural-SDF production surface
 

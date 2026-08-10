@@ -26,6 +26,7 @@ from scanlan_splat.media import (
     _feature_extraction_groups,
     _feature_extraction_batch_size,
     _guided_match_pairs,
+    _geometry_fusion_confidence,
     _limited_size,
     _minimum_useful_registration_count,
     _materialize_observation_inputs,
@@ -35,9 +36,11 @@ from scanlan_splat.media import (
     _tracked_visual_motion,
     _video_intrinsic_spread,
     _write_json_atomic,
+    _write_initialization_parameters,
     adaptive_frame_selection_status,
     prepare_media_observations,
 )
+from scanlan_splat.lingbot import LingbotGeometry
 
 
 class MediaPreparationTests(unittest.TestCase):
@@ -57,6 +60,40 @@ class MediaPreparationTests(unittest.TestCase):
 
         self.assertEqual(options.video_fps, 15.0)
         self.assertEqual(options.maximum_video_frames, 3_000)
+
+    def test_dense_fusion_sidecar_separates_geometry_confidence_from_opacity(self) -> None:
+        geometry = LingbotGeometry(
+            world_from_cameras=np.repeat(np.eye(4)[None], 2, axis=0),
+            intrinsics=np.repeat(np.eye(3)[None], 2, axis=0),
+            points=np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]], dtype=np.float32),
+            colors=np.asarray([[10, 20, 30], [40, 50, 60]], dtype=np.uint8),
+            scales=np.full((2, 3), 0.02, dtype=np.float32),
+            quaternions=np.asarray([[1.0, 0.0, 0.0, 0.0]] * 2, dtype=np.float32),
+            source_frame_indices=np.asarray([0, 1], dtype=np.int32),
+            frame_confidence=np.asarray([0.6, 0.9], dtype=np.float32),
+            backend="fixture",
+            model_path="fixture",
+            processed_size=(32, 32),
+            opacities=np.asarray([0.01, 0.8], dtype=np.float32),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "initialization-parameters.npz"
+            _write_initialization_parameters(
+                path,
+                geometry.points,
+                geometry.colors,
+                geometry.scales,
+                geometry.quaternions,
+                confidence=geometry.opacities,
+                fusion_confidence=_geometry_fusion_confidence(geometry),
+                source_frame_indices=geometry.source_frame_indices,
+                provenance=np.full(2, 2, dtype=np.uint8),
+            )
+            with np.load(path, allow_pickle=False) as values:
+                np.testing.assert_allclose(values["confidence"], geometry.opacities)
+                np.testing.assert_allclose(values["fusion_confidence"], [0.6, 0.9])
+                np.testing.assert_array_equal(values["source_frame_indices"], [0, 1])
+                np.testing.assert_array_equal(values["provenance"], [2, 2])
 
     def test_adaptive_frame_policy_is_exposed_to_release_diagnostics(self) -> None:
         status = adaptive_frame_selection_status()

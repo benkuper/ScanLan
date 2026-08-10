@@ -168,7 +168,14 @@ Choose **Import photos or video for Gaussian splatting…** in Capture. Imported
 2. asks DA3 (or bounded MapAnything fallback) for a camera proposal and uses it to select a connected, bounded pair graph;
 3. extracts source-detail ALIKED/LightGlue features (SIFT fallback), geometrically verifies every proposed pair, and recovers missing cameras through nearby verified learned views;
 4. expands to conventional matching when the guided solve misses its quality gate, then robustly bundle-adjusts the strongest model and undistorts its registered images to canonical pinhole cameras;
-5. initializes 3D Gaussians from the accepted learned dense prior or reliable COLMAP tracks and trains source-resolution L1+SSIM appearance with degree-three spherical harmonics, bounded camera refinement, and per-view RGB exposure compensation.
+5. publishes learned-scale colored points and a confidence-gated triangle surface from the accepted dense prior when selected;
+6. initializes 3D Gaussians from the same accepted learned dense prior or reliable COLMAP tracks and trains source-resolution L1+SSIM appearance with degree-three spherical harmonics, bounded camera refinement, and per-view RGB exposure compensation.
+
+The dense initialization sidecar is also the shared point/mesh fusion contract. It retains source
+ownership, confidence, provenance, orientation, and footprint. Media-only point and mesh artifacts
+are correctly labeled non-metric. In a hybrid project, learned media geometry is robustly aligned
+through independently localized cameras and can only fill space outside calibrated RGB-D support;
+failed camera agreement excludes it without degrading the metric result.
 
 The dataset manifest records proposal backend, guided/recovery/fallback pair counts, geometric
 verification evidence, recovered cameras, registration ratio, excluded views, model count,
@@ -182,6 +189,7 @@ The standalone preparation path is:
 
 ```powershell
 scanlan-splat.exe prepare-media --project C:\path\to\project --source C:\photos\view-01.jpg --source C:\capture.mp4
+scanlan-worker.exe fuse-dataset C:\path\to\project C:\path\to\project\outputs\cache\datasets\media-current.json --targets point_cloud,textured_mesh
 scanlan-splat.exe train --project C:\path\to\project --dataset C:\path\to\project\outputs\cache\datasets\current.json --iterations 30000
 ```
 

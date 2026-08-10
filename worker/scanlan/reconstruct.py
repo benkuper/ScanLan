@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,14 @@ from typing import Literal
 import numpy as np
 
 from .dataset import build_posed_dataset, dataset_fingerprint
+from .dense_fusion import (
+    align_media_samples,
+    bounded_mesh_samples,
+    dense_surface_mesh,
+    fuse_dense_samples,
+    load_dense_samples,
+    samples_from_arrays,
+)
 from .io import phase_roots, read_phase, read_project, save_binary_ply, save_preview, write_json
 from .mesh import (
     PosedFrame,
@@ -295,6 +304,66 @@ def reconstruct_project(
             if posed_frames
             else []
         )
+        media_fusion: dict[str, object] = {
+            "enabled": False,
+            "status": "not_available",
+            "fusionContract": "dense-surface-samples-v1",
+        }
+        aligned_media_samples = None
+        supplemental_mesh = None
+        media_pointer = output_dir / "cache" / "datasets" / "media-current.json"
+        if supplemental_frames and media_pointer.is_file() and any(
+            target in targets for target in ("point_cloud", "textured_mesh")
+        ):
+            try:
+                learned_samples, media_dataset, _media_root = load_dense_samples(media_pointer)
+                aligned_media_samples, alignment = align_media_samples(
+                    learned_samples,
+                    media_dataset,
+                    supplemental_frames,
+                )
+                media_fusion = {
+                    "enabled": True,
+                    "status": "accepted",
+                    "fusionContract": "dense-surface-samples-v1",
+                    "sourceSampleCount": len(aligned_media_samples.points),
+                    "sourceFingerprint": media_dataset.get("fingerprint"),
+                    "alignment": alignment,
+                }
+                if "textured_mesh" in targets:
+                    media_voxel = max(
+                        voxel_size_m,
+                        float(np.median(np.max(aligned_media_samples.scales, axis=1)))
+                        * 0.75,
+                    )
+                    mesh_media_samples, media_voxel = bounded_mesh_samples(
+                        aligned_media_samples, media_voxel
+                    )
+                    learned_vertices, learned_triangles, _learned_colors = dense_surface_mesh(
+                        mesh_media_samples,
+                        media_voxel,
+                    )
+                    supplemental_mesh = (learned_vertices, learned_triangles)
+                    media_fusion["candidateTriangleCount"] = len(learned_triangles)
+            except Exception as error:
+                # Learned geometry is optional evidence in a metric project.
+                # Reject it atomically when camera agreement or meshing fails;
+                # calibrated RGB-D geometry remains the safe production result.
+                aligned_media_samples = None
+                supplemental_mesh = None
+                media_fusion = {
+                    "enabled": True,
+                    "status": "rejected",
+                    "fusionContract": "dense-surface-samples-v1",
+                    "reason": str(error),
+                }
+                reporter.update(
+                    "Dense fusion",
+                    f"Rejected incompatible learned media geometry - {str(error).splitlines()[0]}",
+                    0,
+                    None,
+                    1.0,
+                )
         dataset_frames = (
             [*posed_frames, *supplemental_frames]
             if needs_dataset and posed_frames
@@ -310,6 +379,16 @@ def reconstruct_project(
             if dataset is not None
             else dataset_fingerprint(posed_frames)
         )
+        if media_fusion.get("status") == "accepted":
+            source_fingerprint = hashlib.sha256(
+                (
+                    source_fingerprint
+                    + ":dense-media:"
+                    + str(media_fusion.get("sourceFingerprint", "unknown"))
+                    + ":"
+                    + json.dumps(media_fusion.get("alignment", {}), sort_keys=True)
+                ).encode("utf-8")
+            ).hexdigest()[:24]
         mesh = (
             build_mesh_artifacts(
                 output_dir,
@@ -319,6 +398,7 @@ def reconstruct_project(
                 prebuilt_mesh=artifact_context.get("fused_mesh"),
                 prebuilt_mesh_method=artifact_context.get("fused_mesh_method"),
                 repair_settings=mesh_repair_settings,
+                supplemental_mesh=supplemental_mesh,
             )
             if "textured_mesh" in targets
             else {
@@ -340,6 +420,19 @@ def reconstruct_project(
             "mediaPointColorCoveragePercent": 0.0,
         }
         if "point_cloud" in targets:
+            fusion_batches = [
+                samples_from_arrays(
+                    points,
+                    colors,
+                    voxel_size_m=voxel_size_m,
+                )
+            ]
+            if aligned_media_samples is not None:
+                fusion_batches.append(aligned_media_samples)
+            fused_samples = fuse_dense_samples(fusion_batches, voxel_size_m)
+            points, colors = fused_samples.points, fused_samples.colors
+            if aligned_media_samples is not None:
+                media_fusion["fusedPointCount"] = len(points)
             colors, point_color_metrics = enhance_point_colors_from_media(
                 points,
                 colors,
@@ -371,6 +464,15 @@ def reconstruct_project(
                 {"enabled": False, "method": "raw calibrated sensor depth"},
             ),
             "validation": artifact_context.get("validation_report"),
+            "denseFusion": {
+                "fusionContract": "dense-surface-samples-v1",
+                "primarySource": "rgbd",
+                "primaryPolicy": (
+                    "calibrated measured TSDF + half-weight validated generated depth; "
+                    "measured samples win voxel conflicts"
+                ),
+                "media": media_fusion,
+            },
         }
 
         # Gaussian training is a separate worker launched by the desktop job

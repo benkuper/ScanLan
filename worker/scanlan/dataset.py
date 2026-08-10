@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from .mesh import PosedFrame
 
 
-DATASET_VERSION = "hybrid-rgbd-media-pinhole-720-v8-lingbot-provenance"
+DATASET_VERSION = "hybrid-rgbd-media-pinhole-720-v9-unified-dense-fusion"
 CANONICAL_MAX_DIMENSION = 720
 MAX_CANONICAL_FRAMES = 600
 
@@ -335,9 +335,8 @@ def build_posed_dataset(
             )
             # Split provenance before adaptive quadtree seeding so a flat cell
             # cannot hide a generated center inside mostly measured geometry.
-            for provenance_visibility in (
-                visibility & ~generated_depth,
-                visibility & generated_depth,
+            for provenance_code, provenance_visibility in enumerate(
+                (visibility & ~generated_depth, visibility & generated_depth)
             ):
                 seeds = seed_rgbd_gaussians(
                     depth,
@@ -349,6 +348,15 @@ def build_posed_dataset(
                     confidence_depth,
                 )
                 if len(seeds.points):
+                    seeds = GaussianSeeds(
+                        seeds.points,
+                        seeds.colors,
+                        seeds.scales,
+                        seeds.quaternions,
+                        seeds.confidence,
+                        np.full(len(seeds.points), provenance_code, dtype=np.uint8),
+                        np.full(len(seeds.points), output_index, dtype=np.int32),
+                    )
                     seed_batches.append(seeds)
                     if len(seed_batches) >= 8:
                         seed_batches[:] = [
@@ -405,6 +413,9 @@ def build_posed_dataset(
             "sourceType": "high_quality_media" if frame.depthless else "rgbd",
             "poseConfidence": _localization_pose_confidence(frame) if frame.depthless else 1.0,
         }
+        if frame.depthless:
+            record["sourcePath"] = frame.media_source_path
+            record["sourceTimestampSeconds"] = frame.media_timestamp_seconds
         if depth_rgb is not None and mask is not None:
             assert depth_confidence_rgb is not None and generated_depth_rgb is not None
             _save_depth_png(temporary / "depths" / f"{stem}.png", depth_rgb)
@@ -454,6 +465,8 @@ def build_posed_dataset(
         scales=seeds.scales,
         quaternions=seeds.quaternions,
         confidence=seeds.confidence,
+        provenance=seeds.provenance,
+        source_frame_indices=seeds.source_frame_indices,
     )
     hybrid = any(frame.depthless for frame in training_frames)
     rgbd_frame_count = sum(not frame.depthless for frame in training_frames)

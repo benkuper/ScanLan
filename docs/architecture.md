@@ -91,6 +91,13 @@ transforms, intrinsics, scales, quaternions, ownership, and confidence before us
 No Python object, CUDA tensor, or model state crosses the process boundary. See
 [geometry-worker.md](geometry-worker.md).
 
+All production geometry backends converge on the versioned `dense-surface-samples-v1` contract:
+points, colors, oriented surface footprints, confidence, provenance, and source-frame ownership.
+RGB-D sensor evidence is authoritative in occupied metric voxels; validated generated and learned
+evidence fills missing support. Media-only artifacts retain learned scale. Hybrid learned geometry
+must first pass a robust Sim(3) camera-agreement gate against independently localized media views,
+and is rejected without affecting the calibrated reconstruction when that gate fails.
+
 For ordinary photos and video, DA3 (or bounded MapAnything fallback) now runs before production
 SfM. The splat worker accepts only a finite full-length proposal, then converts learned centers,
 view directions, confidence, and temporal order into an explicit bounded pair list. COLMAP's

@@ -185,10 +185,6 @@
   $: if (mediaSourceCount === 0) mediaRestartStage = 'reuse';
   $: mediaOnlyProject = mediaSourceCount > 0 && completedCaptures === 0;
   $: hasImportedVideo = project?.mediaSources.some((source) => source.kind === 'video') ?? false;
-  $: if (mediaOnlyProject) {
-    buildPointCloud = false;
-    buildTexturedMesh = false;
-  }
   $: readyArtifacts = project
     ? Object.values(project.artifacts).filter((artifact) => artifact && !artifact.stale && artifact.status === 'ready').length
     : 0;
@@ -1285,7 +1281,7 @@
               ? ' Valid decoded and analyzed data will be reused.'
               : ' Valid reconstruction caches will be reused.';
       message = (mediaOnlyProject
-        ? 'Started photo/video camera solving and photoreal Gaussian reconstruction.'
+        ? 'Started photo/video camera solving and confidence-aware dense reconstruction.'
         : mediaSourceCount > 0
           ? 'Started metric RGB-D reconstruction with high-resolution media enhancement.'
           : 'Started quality-gated RGB-D reconstruction.') + restartDetail;
@@ -1316,13 +1312,13 @@
         packedPreviewFrame = null;
       }
       project = await importMediaSources(project.path, paths);
-      buildPointCloud = completedCaptures > 0;
-      buildTexturedMesh = completedCaptures > 0;
+      buildPointCloud = true;
+      buildTexturedMesh = true;
       buildGaussianSplat = true;
       workspace = 'reconstruct';
       message = completedCaptures > 0
         ? `Imported ${paths.length} high-resolution source${paths.length === 1 ? '' : 's'}. They will enhance point colors, mesh textures, and splat appearance.`
-        : `Imported ${paths.length} source${paths.length === 1 ? '' : 's'}. Ready to solve cameras and train a photoreal 3D Gaussian splat.`;
+        : `Imported ${paths.length} source${paths.length === 1 ? '' : 's'}. Ready to solve cameras and build learned-scale points, mesh, and Gaussian outputs.`;
     } catch (error) {
       message = errorText(error);
     } finally {
@@ -2203,8 +2199,8 @@
         <details class="panel collapsible-panel" open>
           <summary><span>OUTPUTS</span><strong>{readyArtifacts} READY</strong></summary>
           <div class="collapsible-body target-list">
-            <label class:active={buildPointCloud}><input type="checkbox" bind:checked={buildPointCloud} disabled={processing || mediaOnlyProject}/><span class="target-icon">P</span><div><strong>Metric point cloud</strong><small>{mediaOnlyProject ? 'Requires calibrated RGB-D capture' : 'Filtered colored PLY · quickest'}</small></div><i>{artifactReady('pointCloud') ? 'READY' : ''}</i></label>
-            <label class:active={buildTexturedMesh}><input type="checkbox" bind:checked={buildTexturedMesh} disabled={processing || mediaOnlyProject}/><span class="target-icon">M</span><div><strong>Textured triangle mesh</strong><small>{mediaOnlyProject ? 'Requires calibrated RGB-D capture' : 'TSDF surface · OBJ/MTL/PNG'}</small></div><i>{artifactReady('texturedMesh') ? 'READY' : ''}</i></label>
+            <label class:active={buildPointCloud}><input type="checkbox" bind:checked={buildPointCloud} disabled={processing || (mediaOnlyProject && (!runtime?.splatWorkerAvailable || !runtime?.geometryWorkerAvailable))}/><span class="target-icon">P</span><div><strong>{mediaOnlyProject ? 'Learned-scale point cloud' : 'Metric point cloud'}</strong><small>{mediaOnlyProject ? 'Confidence/provenance fused colored PLY' : 'Filtered colored PLY · quickest'}</small></div><i>{artifactReady('pointCloud') ? 'READY' : ''}</i></label>
+            <label class:active={buildTexturedMesh}><input type="checkbox" bind:checked={buildTexturedMesh} disabled={processing || (mediaOnlyProject && (!runtime?.splatWorkerAvailable || !runtime?.geometryWorkerAvailable))}/><span class="target-icon">M</span><div><strong>Textured triangle mesh</strong><small>{mediaOnlyProject ? 'Learned dense surface · OBJ/MTL/PNG' : 'TSDF surface · OBJ/MTL/PNG'}</small></div><i>{artifactReady('texturedMesh') ? 'READY' : ''}</i></label>
             <label class:active={buildGaussianSplat}><input type="checkbox" bind:checked={buildGaussianSplat} disabled={processing || !runtime?.splatWorkerAvailable}/><span class="target-icon">G</span><div><strong>{mediaOnlyProject ? 'Photoreal 3D Gaussian splat' : '2D Gaussian surface'}</strong><small>{mediaOnlyProject ? 'LingBot dense geometry · COLMAP refinement · SH degree 3' : 'Depth-aware discs · metric PLY'}</small></div><i>{artifactReady('gaussianSplat') ? 'READY' : runtime?.splatWorkerAvailable ? '' : 'CUDA RUNTIME MISSING'}</i></label>
             {#if buildGaussianSplat}
               <label class="iterations"><span>Training iterations</span><input type="range" min="5000" max="60000" step="5000" bind:value={splatIterations} disabled={processing}/><strong>{Number(splatIterations).toLocaleString()}</strong></label>
@@ -2286,7 +2282,7 @@
           <details class="panel collapsible-panel" open>
             <summary><span>MEDIA SOURCES</span><strong>{mediaSourceCount} IMPORTED</strong></summary>
             <div class="collapsible-body pipeline-note">
-              <p>{mediaOnlyProject ? 'LingBot-Map supplies dense depth and a continuous trajectory; COLMAP validates and refines it before high-resolution Gaussian training.' : 'High-resolution frames are localized against metric RGB-D landmarks, then enhance point colors, mesh textures, and splat appearance.'}</p>
+              <p>{mediaOnlyProject ? 'Learned geometry supplies dense surfaces and a continuous trajectory; COLMAP validates and refines the cameras before selected point, mesh, and Gaussian outputs are published.' : 'High-resolution frames are localized against metric RGB-D landmarks, then enhance point colors, mesh textures, and splat appearance.'}</p>
               <div class="media-source-list">
                 {#each project.mediaSources as source (source.id)}
                   <article class="media-source">
@@ -2399,7 +2395,7 @@
           </details>
         {/if}
 
-        <button class="primary full build-button" on:click={() => startBuild(false)} disabled={busy || processing || photoLocalizationActive || (completedCaptures === 0 && mediaSourceCount === 0) || (!buildPointCloud && !buildTexturedMesh && !buildGaussianSplat)}>{processing ? 'Reconstruction running…' : photoLocalizationActive ? 'Localizing texture photos…' : readyArtifacts ? 'Rebuild selected outputs' : mediaOnlyProject ? 'Solve cameras & build AAA splat' : mediaSourceCount > 0 ? 'Build hybrid high-quality outputs' : 'Build selected outputs'}</button>
+        <button class="primary full build-button" on:click={() => startBuild(false)} disabled={busy || processing || photoLocalizationActive || (completedCaptures === 0 && mediaSourceCount === 0) || (!buildPointCloud && !buildTexturedMesh && !buildGaussianSplat)}>{processing ? 'Reconstruction running…' : photoLocalizationActive ? 'Localizing texture photos…' : readyArtifacts ? 'Rebuild selected outputs' : mediaOnlyProject ? 'Solve cameras & build selected outputs' : mediaSourceCount > 0 ? 'Build hybrid high-quality outputs' : 'Build selected outputs'}</button>
 
       {:else}
         <header class="inspector-heading"><div><span>RESULT</span><h2>Edit & export</h2></div><strong class="take-total">{readyArtifacts} ready</strong></header>
@@ -2489,7 +2485,7 @@
         <details class="panel collapsible-panel" open>
           <summary><span>EXPORT</span><strong>{readyArtifacts} AVAILABLE</strong></summary>
           <div class="collapsible-body export-list">
-            <button class:exporting={exporting === 'points'} aria-busy={exporting === 'points'} on:click={exportPointCloud} disabled={Boolean(exporting) || !artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>Metric colored vertices</small></div><i>{exporting === 'points' ? 'Exporting…' : 'Export…'}</i></button>
+            <button class:exporting={exporting === 'points'} aria-busy={exporting === 'points'} on:click={exportPointCloud} disabled={Boolean(exporting) || !artifactReady('pointCloud')}><span>P</span><div><strong>Point cloud PLY</strong><small>{mediaOnlyProject ? 'Learned-scale colored vertices' : 'Metric colored vertices'}</small></div><i>{exporting === 'points' ? 'Exporting…' : 'Export…'}</i></button>
             <button class:exporting={exporting === 'mesh'} aria-busy={exporting === 'mesh'} on:click={exportMesh} disabled={Boolean(exporting) || !artifactReady('texturedMesh')}><span>M</span><div><strong>Textured OBJ bundle</strong><small>OBJ + MTL + PNG</small></div><i>{exporting === 'mesh' ? 'Exporting…' : 'Export…'}</i></button>
             <button class:exporting={exporting === 'splat'} aria-busy={exporting === 'splat'} on:click={exportSplat} disabled={Boolean(exporting) || !artifactReady('gaussianSplat')}><span>G</span><div><strong>{mediaOnlyProject ? '3D Gaussian PLY' : '2D Gaussian PLY'}</strong><small>{mediaOnlyProject ? 'Photoreal splat + sidecars' : 'Aligned metric splat + sidecars'}</small></div><i>{exporting === 'splat' ? 'Exporting…' : 'Export…'}</i></button>
             {#if exporting}

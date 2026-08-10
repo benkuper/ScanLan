@@ -256,12 +256,28 @@ fn progress_file(project_root: &Path, splat: bool) -> PathBuf {
 
 fn stage_plan(job: &ArtifactJob) -> Vec<(&'static str, f32)> {
     if job.source_kind == "media" {
-        return vec![
+        let wants_dense = job
+            .targets
+            .iter()
+            .any(|target| matches!(target.as_str(), "pointCloud" | "texturedMesh"));
+        let wants_mesh = job.targets.iter().any(|target| target == "texturedMesh");
+        let wants_splat = job.targets.iter().any(|target| target == "gaussianSplat");
+        let mut plan = vec![
             ("prepare", 0.05),
             ("media", 0.35),
-            ("splat", 0.55),
-            ("publish", 0.05),
         ];
+        if wants_dense {
+            plan.push(("fuse", 0.18));
+            plan.push(("cloud", 0.12));
+        }
+        if wants_mesh {
+            plan.push(("mesh", 0.20));
+        }
+        if wants_splat {
+            plan.push(("splat", 0.55));
+        }
+        plan.push(("publish", 0.05));
+        return plan;
     }
     if job.source_kind == "hybrid" {
         return vec![
@@ -327,6 +343,7 @@ fn stage_key(stage: &str) -> Option<&'static str> {
     } else if stage.contains("building") || stage.contains("cleaning cloud") {
         Some("cloud")
     } else if stage.contains("fusing")
+        || stage.contains("fusion")
         || stage.contains("previewing")
         || stage.contains("loading cache")
     {
@@ -776,15 +793,47 @@ fn run_pipeline(
             }
         }
         run_command(prepare, project_root, job, cancel, true)?;
-        job.stage = "splat_training".to_string();
-        job.detail = "Initializing photoreal 3D Gaussian optimization".to_string();
-        job.stage_progress = Some(0.0);
-        write_job(project_root, job)?;
         let dataset = project_root
             .join("outputs")
             .join("cache")
             .join("datasets")
-            .join("current.json");
+            .join("media-current.json");
+        let mut dense_targets = job
+            .targets
+            .iter()
+            .filter_map(|target| match target.as_str() {
+                "pointCloud" => Some("point_cloud"),
+                "texturedMesh" => Some("textured_mesh"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !dense_targets.is_empty()
+            && job.targets.iter().any(|target| target == "gaussianSplat")
+        {
+            dense_targets.push("gaussian_splat");
+        }
+        let dense_targets = dense_targets.join(",");
+        if !dense_targets.is_empty() {
+            job.stage = "dense_fusion".to_string();
+            job.detail = "Fusing confidence-gated learned surfaces".to_string();
+            job.stage_progress = Some(0.0);
+            write_job(project_root, job)?;
+            let reconstruction = existing_runtime(resources, false)?;
+            let mut fuse = worker_command(&reconstruction);
+            fuse.arg("fuse-dataset")
+                .arg(project_root)
+                .arg(&dataset)
+                .arg("--targets")
+                .arg(&dense_targets);
+            run_command(fuse, project_root, job, cancel, false)?;
+        }
+        if !job.targets.iter().any(|target| target == "gaussianSplat") {
+            return Ok(());
+        }
+        job.stage = "splat_training".to_string();
+        job.detail = "Initializing photoreal 3D Gaussian optimization".to_string();
+        job.stage_progress = Some(0.0);
+        write_job(project_root, job)?;
         let mut train = worker_command(&splat_worker);
         train
             .arg("train")
@@ -866,15 +915,27 @@ fn run_pipeline(
         run_command(base, project_root, job, cancel, false)?;
 
         let splat_worker = existing_runtime(resources, true)?;
+        let wants_dense_media = job
+            .targets
+            .iter()
+            .any(|target| matches!(target.as_str(), "pointCloud" | "texturedMesh"));
         let mut extract = worker_command(&splat_worker);
         extract
-            .arg("extract-media")
+            .arg(if wants_dense_media {
+                "prepare-media"
+            } else {
+                "extract-media"
+            })
             .arg("--project")
             .arg(project_root)
             .arg("--video-fps")
             .arg("15")
             .arg("--maximum-video-frames")
             .arg("3000");
+        if wants_dense_media {
+            let geometry_worker = existing_geometry_runtime(resources)?;
+            extract.arg("--geometry-worker").arg(geometry_worker);
+        }
         run_command(extract, project_root, job, cancel, true)?;
 
         let observation_manifest = current_media_observation_manifest(project_root)?;
@@ -1148,9 +1209,6 @@ pub fn start_artifact_job(
             "Capture RGB-D data or import overlapping photos/video before reconstruction"
                 .to_string(),
         );
-    }
-    if !has_rgbd && targets.iter().any(|target| target != "gaussianSplat") {
-        return Err("Photo/video projects currently produce Gaussian splats; disable point-cloud and mesh outputs".to_string());
     }
     let media_restart = media_restart.unwrap_or_else(|| "reuse".to_string());
     if !matches!(media_restart.as_str(), "reuse" | "analysis" | "decode") {
@@ -1485,6 +1543,19 @@ mod tests {
         assert!(plan.iter().any(|(key, _)| *key == "splat"));
         assert!(!plan.iter().any(|(key, _)| *key == "track"));
         assert_eq!(stage_key(&media.stage), Some("media"));
+    }
+
+    #[test]
+    fn media_dense_jobs_plan_cloud_and_mesh_without_forcing_splat_training() {
+        let mut media = job(&["pointCloud", "texturedMesh"], "dense_fusion");
+        media.source_kind = "media".to_string();
+        let plan = stage_plan(&media);
+
+        for expected in ["media", "fuse", "cloud", "mesh", "publish"] {
+            assert!(plan.iter().any(|(key, _)| *key == expected));
+        }
+        assert!(!plan.iter().any(|(key, _)| *key == "splat"));
+        assert_eq!(stage_key(&media.stage), Some("fuse"));
     }
 
     #[test]

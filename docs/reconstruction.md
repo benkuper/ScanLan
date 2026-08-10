@@ -70,7 +70,11 @@ DA3 receives the accepted camera poses and calibrated intrinsics as explicit con
 nested metric branch proposes scale-aware depth, but ScanLan still calibrates against independent
 sensor anchors and applies the same metric, multiview, RGB-coverage, and free-space rejection path.
 
-Validated caches are fingerprinted by source depth/color files, calibration, poses, implementation version, code revision, model revision, and model SHA-256. Measured and refined rasters are stored separately with generated-pixel masks and 8-bit confidence. Final TSDF/surfel fusion integrates measured depth twice and the measured-plus-generated raster once, giving generated geometry half weight. Canonical 2DGS datasets retain both confidence and provenance masks; generated depth has lower robust-loss weight and lower seed opacity, while measured seeds win voxel conflicts.
+Validated caches are fingerprinted by source depth/color files, calibration, poses, implementation version, code revision, model revision, and model SHA-256. Measured and refined rasters are stored separately with generated-pixel masks and 8-bit confidence. Final TSDF/surfel fusion integrates measured depth twice and the measured-plus-generated raster once, giving generated geometry half weight. Canonical datasets and initialization sidecars retain confidence, provenance, surface orientation, footprint, and source-frame ownership under the `dense-surface-samples-v1` contract. Generated and learned samples can fill unobserved voxels, while calibrated measurements win conflicts.
+
+Photo/video point and triangle outputs consume the same learned dense prior as Gaussian initialization. They remain explicitly non-metric, use an adaptive scene-relative voxel size, and publish colored PLY plus OBJ/MTL/PNG artifacts. Hybrid reconstruction robustly aligns that learned prior through at least three media cameras independently localized against the RGB-D map. Normalized camera-center residual and rotation gates reject an incoherent Sim(3); accepted geometry contributes only outside the support of the calibrated TSDF surface.
+The real-phone artifact check and measured output counts are recorded in
+[unified-dense-fusion-benchmark.md](unified-dense-fusion-benchmark.md).
 
 ## Point cloud
 

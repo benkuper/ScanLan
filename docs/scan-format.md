@@ -221,3 +221,19 @@ filled an original sensor hole. Native RGB is undistorted while it is
 resampled, rather than producing an intermediate 2K/4K depth map. 2DGS rejects
 distorted inputs because its rasterizer traces pinhole rays. There is no COLMAP
 or arbitrary-scale media path.
+## Dense surface initialization
+
+Canonical datasets may reference `initialization-2dgs.npz` or
+`initialization-parameters.npz`. Both implement `dense-surface-samples-v1` and contain matching
+first dimensions for:
+
+- `points` (`float32`, N×3) and `colors` (`uint8`, N×3);
+- `scales` (`float32`, N×3) and normalized `quaternions` (`float32`, N×4, wxyz), defining an
+  oriented surface footprint whose local +Z axis is the normal;
+- `fusion_confidence` (`float32`, N) for learned media, or `confidence` for canonical RGB-D;
+- `provenance` (`uint8`, N): 0 measured, 1 validated generated depth, 2 learned media geometry;
+- `source_frame_indices` (`int32`, N), or -1 where ownership is not applicable.
+
+Extra Gaussian-specific `confidence` values may represent direct-head opacity and are not silently
+reinterpreted as geometric confidence. Media datasets therefore publish `fusion_confidence`
+separately. All arrays are shape/finiteness/range validated before point or mesh fusion.

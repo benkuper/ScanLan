@@ -315,9 +315,9 @@ def _media_dataset_fingerprint(
 ) -> str:
     """Fingerprint camera analysis independently from expensive media decoding."""
     digest = hashlib.sha256()
-    # P9 changes camera-analysis order and pair selection. Older COLMAP-first
-    # solutions must not be mistaken for learned-first verified datasets.
-    digest.update(b"scanlan-media-dataset-v18-learned-first-camera-recovery\0")
+    # P10 extends the learned-first dataset with a versioned dense-fusion
+    # sidecar. Older solutions lack independent fusion confidence/ownership.
+    digest.update(b"scanlan-media-dataset-v19-unified-dense-fusion\0")
     digest.update(observation_fingerprint.encode("ascii"))
     digest.update(DA3_CODE_REVISION.encode("ascii"))
     digest.update(DA3_MODEL_REVISION.encode("ascii"))
@@ -1986,6 +1986,9 @@ def _write_initialization_parameters(
     scales: np.ndarray,
     quaternions: np.ndarray,
     confidence: np.ndarray | None = None,
+    fusion_confidence: np.ndarray | None = None,
+    source_frame_indices: np.ndarray | None = None,
+    provenance: np.ndarray | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     values = dict(
@@ -1996,7 +1999,32 @@ def _write_initialization_parameters(
     )
     if confidence is not None:
         values["confidence"] = np.asarray(confidence, dtype=np.float32)
+    if fusion_confidence is not None:
+        values["fusion_confidence"] = np.asarray(fusion_confidence, dtype=np.float32)
+    if source_frame_indices is not None:
+        values["source_frame_indices"] = np.asarray(source_frame_indices, dtype=np.int32)
+    if provenance is not None:
+        values["provenance"] = np.asarray(provenance, dtype=np.uint8)
     np.savez_compressed(path, **values)
+
+
+def _geometry_fusion_confidence(geometry: LingbotGeometry) -> np.ndarray:
+    owners = np.asarray(geometry.source_frame_indices, dtype=np.int64)
+    frame_confidence = np.asarray(geometry.frame_confidence, dtype=np.float32)
+    if owners.shape != (len(geometry.points),):
+        raise ValueError("Learned dense geometry ownership does not match its points")
+    if np.any((owners < 0) | (owners >= len(frame_confidence))):
+        raise ValueError("Learned dense geometry contains an invalid source-frame owner")
+    values = np.clip(frame_confidence[owners], 0.0, 1.0)
+    if geometry.opacities is not None:
+        # Direct Gaussian opacity is visibility, not geometric confidence.
+        # Validate its shape here, but keep it separate so a surface seed does
+        # not disappear from point/mesh fusion merely because the renderer
+        # expects optimization to raise its initial opacity.
+        opacity = np.asarray(geometry.opacities, dtype=np.float32).reshape(-1)
+        if opacity.shape != values.shape:
+            raise ValueError("Learned opacity does not match dense geometry points")
+    return values.astype(np.float32, copy=False)
 
 
 def _average_rotation(rotations: np.ndarray) -> np.ndarray:
@@ -2438,6 +2466,7 @@ def _undistort_complete_video(
             {
                 "phaseId": "media",
                 "frameIndex": frame_index,
+                "sourceFrameIndex": frame_index,
                 "timestampUs": (
                     round(float(source["timestampSeconds"]) * 1_000_000)
                     if source.get("timestampSeconds") is not None
@@ -2463,7 +2492,12 @@ def _publish_pointer(project_root: Path, dataset_root: Path) -> Path:
     datasets = project_root / "outputs" / "cache" / "datasets"
     relative = os.path.relpath(dataset_root, datasets).replace("\\", "/")
     pointer = datasets / "current.json"
-    _write_json_atomic(pointer, {"schemaVersion": 1, "path": relative})
+    payload = {"schemaVersion": 1, "path": relative}
+    _write_json_atomic(pointer, payload)
+    # Hybrid reconstruction subsequently publishes its metric canonical
+    # dataset to current.json. Keep the independently solved media geometry
+    # addressable so dense fusion can align it through localized cameras.
+    _write_json_atomic(datasets / "media-current.json", payload)
     return pointer
 
 
@@ -2969,6 +3003,9 @@ def prepare_media_dataset(
                 lingbot_geometry.scales,
                 lingbot_geometry.quaternions,
                 confidence=lingbot_geometry.opacities,
+                fusion_confidence=_geometry_fusion_confidence(lingbot_geometry),
+                source_frame_indices=lingbot_geometry.source_frame_indices,
+                provenance=np.full(len(points), 2, dtype=np.uint8),
             )
             _sparse_points, _sparse_colors, point_quality = _point_records(reconstruction)
         else:
@@ -3004,9 +3041,15 @@ def prepare_media_dataset(
                     photo_learned_prior.scales,
                     photo_learned_prior.quaternions,
                     confidence=photo_learned_prior.opacities,
+                    fusion_confidence=_geometry_fusion_confidence(photo_learned_prior),
+                    source_frame_indices=photo_learned_prior.source_frame_indices,
+                    provenance=np.full(len(points), 2, dtype=np.uint8),
                 )
 
             source_by_name = {record["image"]: record for record in records}
+            source_index_by_name = {
+                str(record["image"]): index for index, record in enumerate(records)
+            }
             frames = []
             for frame_index, image in enumerate(
                 sorted(undistorted_reconstruction.images.values(), key=lambda value: value.name)
@@ -3020,6 +3063,7 @@ def prepare_media_dataset(
                     {
                         "phaseId": "media",
                         "frameIndex": frame_index,
+                        "sourceFrameIndex": source_index_by_name[image.name],
                         "timestampUs": (
                             round(float(source["timestampSeconds"]) * 1_000_000)
                             if source.get("timestampSeconds") is not None

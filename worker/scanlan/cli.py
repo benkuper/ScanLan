@@ -107,6 +107,17 @@ def parser() -> argparse.ArgumentParser:
     )
     localize_media.add_argument("project", type=Path)
     localize_media.add_argument("manifest", type=Path)
+    fuse_dataset = commands.add_parser(
+        "fuse-dataset",
+        help="Publish point-cloud and mesh artifacts from the shared dense dataset contract",
+    )
+    fuse_dataset.add_argument("project", type=Path)
+    fuse_dataset.add_argument("dataset", type=Path)
+    fuse_dataset.add_argument(
+        "--targets",
+        default="point_cloud,textured_mesh",
+        help="Comma-separated point_cloud,textured_mesh targets",
+    )
 
     return root
 
@@ -154,7 +165,17 @@ def main(argv: list[str] | None = None) -> int:
                 write_json(arguments.report, result)
             print(json.dumps(result, indent=2))
             return 0
-        if arguments.command in {"localize-photos", "localize-media"}:
+        if arguments.command == "fuse-dataset":
+            from .dense_fusion import publish_media_dense_artifacts
+
+            targets = tuple(value.strip() for value in arguments.targets.split(",") if value.strip())
+            unknown = set(targets) - {"point_cloud", "textured_mesh", "gaussian_splat"}
+            if unknown:
+                raise ValueError(f"Unknown dense artifact targets: {', '.join(sorted(unknown))}")
+            result = publish_media_dense_artifacts(
+                arguments.project.resolve(), arguments.dataset.resolve(), targets
+            )
+        elif arguments.command in {"localize-photos", "localize-media"}:
             from .supplemental import localize_supplemental_photos
 
             if arguments.command == "localize-media":
