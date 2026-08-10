@@ -27,6 +27,11 @@ from .geometry_ipc import (
     infer_lingbot_geometry_isolated,
     infer_mapanything_geometry_isolated,
 )
+from .initialization import (
+    GaussianRepresentation,
+    InitializationKind,
+    initialization_manifest,
+)
 from .runtime import pycolmap_device, pycolmap_feature_runtime
 
 
@@ -317,7 +322,7 @@ def _media_dataset_fingerprint(
     digest = hashlib.sha256()
     # P10 extends the learned-first dataset with a versioned dense-fusion
     # sidecar. Older solutions lack independent fusion confidence/ownership.
-    digest.update(b"scanlan-media-dataset-v19-unified-dense-fusion\0")
+    digest.update(b"scanlan-media-dataset-v20-gaussian-init-contract\0")
     digest.update(observation_fingerprint.encode("ascii"))
     digest.update(DA3_CODE_REVISION.encode("ascii"))
     digest.update(DA3_MODEL_REVISION.encode("ascii"))
@@ -1986,6 +1991,7 @@ def _write_initialization_parameters(
     scales: np.ndarray,
     quaternions: np.ndarray,
     confidence: np.ndarray | None = None,
+    opacity: np.ndarray | None = None,
     fusion_confidence: np.ndarray | None = None,
     source_frame_indices: np.ndarray | None = None,
     provenance: np.ndarray | None = None,
@@ -1999,6 +2005,8 @@ def _write_initialization_parameters(
     )
     if confidence is not None:
         values["confidence"] = np.asarray(confidence, dtype=np.float32)
+    if opacity is not None:
+        values["opacity"] = np.asarray(opacity, dtype=np.float32)
     if fusion_confidence is not None:
         values["fusion_confidence"] = np.asarray(fusion_confidence, dtype=np.float32)
     if source_frame_indices is not None:
@@ -3002,7 +3010,8 @@ def prepare_media_dataset(
                 colors,
                 lingbot_geometry.scales,
                 lingbot_geometry.quaternions,
-                confidence=lingbot_geometry.opacities,
+                confidence=_geometry_fusion_confidence(lingbot_geometry),
+                opacity=lingbot_geometry.opacities,
                 fusion_confidence=_geometry_fusion_confidence(lingbot_geometry),
                 source_frame_indices=lingbot_geometry.source_frame_indices,
                 provenance=np.full(len(points), 2, dtype=np.uint8),
@@ -3040,7 +3049,8 @@ def prepare_media_dataset(
                     colors,
                     photo_learned_prior.scales,
                     photo_learned_prior.quaternions,
-                    confidence=photo_learned_prior.opacities,
+                    confidence=_geometry_fusion_confidence(photo_learned_prior),
+                    opacity=photo_learned_prior.opacities,
                     fusion_confidence=_geometry_fusion_confidence(photo_learned_prior),
                     source_frame_indices=photo_learned_prior.source_frame_indices,
                     provenance=np.full(len(points), 2, dtype=np.uint8),
@@ -3138,6 +3148,27 @@ def prepare_media_dataset(
             )
         if point_quality["medianReprojectionErrorPx"] > 1.5:
             warnings.append("Camera reprojection error is higher than the preferred 1.5 px quality gate.")
+        selected_gaussian_prior = (
+            lingbot_geometry
+            if lingbot_geometry is not None
+            else photo_learned_prior
+        )
+        direct_gaussian_initialization = bool(
+            selected_gaussian_prior is not None
+            and selected_gaussian_prior.opacities is not None
+        )
+        initialization_kind = (
+            InitializationKind.DIRECT_GAUSSIAN
+            if direct_gaussian_initialization
+            else InitializationKind.DENSE_SURFACE
+            if selected_gaussian_prior is not None
+            else InitializationKind.SPARSE_SFM
+        )
+        initialization_representation = (
+            GaussianRepresentation.PREDICTED_ANISOTROPIC_3D
+            if direct_gaussian_initialization
+            else GaussianRepresentation.VOLUMETRIC_3D
+        )
         dataset = {
             "schemaVersion": 3,
             "fingerprint": fingerprint,
@@ -3149,17 +3180,18 @@ def prepare_media_dataset(
                 if lingbot_geometry is not None or photo_learned_prior is not None
                 else None
             ),
-            "denseGeometryPrior": lingbot_geometry is not None or photo_learned_prior is not None,
-            "directGaussianPrior": bool(
-                (
-                    lingbot_geometry.opacities
-                    if lingbot_geometry is not None
-                    else photo_learned_prior.opacities
-                    if photo_learned_prior is not None
+            "gaussianInitialization": initialization_manifest(
+                initialization_kind,
+                initialization_representation,
+                parameters=(
+                    "initialization-parameters.npz"
+                    if selected_gaussian_prior is not None
                     else None
-                )
-                is not None
+                ),
+                adaptive_densification=True,
             ),
+            "denseGeometryPrior": selected_gaussian_prior is not None,
+            "directGaussianPrior": direct_gaussian_initialization,
             "poseRefinement": True,
             # A single video is captured with locked focal length, exposure,
             # white balance, shutter, and ISO. Per-frame color transforms would

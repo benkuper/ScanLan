@@ -84,13 +84,15 @@ class MediaPreparationTests(unittest.TestCase):
                 geometry.colors,
                 geometry.scales,
                 geometry.quaternions,
-                confidence=geometry.opacities,
+                confidence=_geometry_fusion_confidence(geometry),
+                opacity=geometry.opacities,
                 fusion_confidence=_geometry_fusion_confidence(geometry),
                 source_frame_indices=geometry.source_frame_indices,
                 provenance=np.full(2, 2, dtype=np.uint8),
             )
             with np.load(path, allow_pickle=False) as values:
-                np.testing.assert_allclose(values["confidence"], geometry.opacities)
+                np.testing.assert_allclose(values["confidence"], [0.6, 0.9])
+                np.testing.assert_allclose(values["opacity"], geometry.opacities)
                 np.testing.assert_allclose(values["fusion_confidence"], [0.6, 0.9])
                 np.testing.assert_array_equal(values["source_frame_indices"], [0, 1])
                 np.testing.assert_array_equal(values["provenance"], [2, 2])

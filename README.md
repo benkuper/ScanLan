@@ -148,9 +148,10 @@ every join must pass camera-center and rotation continuity gates before the comp
 compared with COLMAP and the other learned backends. The direct Gaussian head runs inside those
 same bounded windows. If its measured CUDA allocation exceeds available headroom, the isolated
 worker records that failure and retries with the model's confidence-gated camera/depth output;
-source-resolution gsplat optimization then remains the final quality stage.
-The initialization sidecar preserves the direct head's learned opacity and anisotropic scale axes;
-opacity-free point previews are not used as a quality judgment for this representation.
+source-resolution gsplat optimization then remains the final quality stage. A versioned manifest
+distinguishes sparse SfM, dense surface, and direct learned initialization. The sidecar preserves the
+direct head's learned opacity independently from geometric confidence and retains anisotropic scale
+axes; opacity-free point previews are not used as a quality judgment for this representation.
 
 Recommended starting profile on the specified laptop:
 
@@ -169,7 +170,11 @@ Choose **Import photos or video for Gaussian splatting…** in Capture. Imported
 3. extracts source-detail ALIKED/LightGlue features (SIFT fallback), geometrically verifies every proposed pair, and recovers missing cameras through nearby verified learned views;
 4. expands to conventional matching when the guided solve misses its quality gate, then robustly bundle-adjusts the strongest model and undistorts its registered images to canonical pinhole cameras;
 5. publishes learned-scale colored points and a confidence-gated triangle surface from the accepted dense prior when selected;
-6. initializes 3D Gaussians from the same accepted learned dense prior or reliable COLMAP tracks and trains source-resolution L1+SSIM appearance with degree-three spherical harmonics, bounded camera refinement, and per-view RGB exposure compensation.
+6. initializes Gaussians through the explicit sparse/dense/direct contract, trains bounded global L1+SSIM appearance with degree-three spherical harmonics, bounded camera refinement, and per-view RGB exposure compensation, then covers every calibrated source-resolution tile before publication.
+
+Media splats must also pass a deterministic five-view raw-render gate (median PSNR, SSIM, and L1).
+An undertrained or divergent candidate is not published; its final atomic checkpoint is retained so
+the job can resume with a longer optimization budget.
 
 The dense initialization sidecar is also the shared point/mesh fusion contract. It retains source
 ownership, confidence, provenance, orientation, and footprint. Media-only point and mesh artifacts

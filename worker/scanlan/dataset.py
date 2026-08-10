@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from .mesh import PosedFrame
 
 
-DATASET_VERSION = "hybrid-rgbd-media-pinhole-720-v9-unified-dense-fusion"
+DATASET_VERSION = "hybrid-rgbd-media-pinhole-720-v10-gaussian-init-contract"
 CANONICAL_MAX_DIMENSION = 720
 MAX_CANONICAL_FRAMES = 600
 
@@ -491,6 +491,13 @@ def build_posed_dataset(
         "frames": records,
         "initialization": "initialization.ply",
         "initializationParameters": "initialization-2dgs.npz",
+        "gaussianInitialization": {
+            "schemaVersion": 1,
+            "kind": "dense_surface",
+            "representation": "surface_discs_2d",
+            "parameters": "initialization-2dgs.npz",
+            "adaptiveDensification": False,
+        },
         "gaussianRepresentation": "2d_surface_discs",
         "seedVersion": SEED_VERSION,
         "initialGaussianCount": int(len(seeds.points)),

@@ -5,21 +5,31 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from scanlan_splat.train import (
     FRAME_REUSE_PER_LOAD,
     MAX_METRIC_ITERATIONS,
     RGBD_SURFACE_OPACITY,
     RGBD_SURFACE_SCALE_MULTIPLIER,
+    MAXIMUM_PRODUCTION_L1,
+    MINIMUM_PRODUCTION_PSNR_DB,
+    MINIMUM_PRODUCTION_SSIM,
     _cache_local_frame_order,
     _exponential_lr_gamma,
     _finish_training_step,
+    _frame_tensors,
     _metric_surface_scale_limit,
+    _photometric_quality_accepted,
     _prepare_dense_seed_scales,
     _read_seed_parameters,
     _reset_opacity_if_due,
     _rgbd_gaussian_limit,
     _ssim,
+    _source_resolution_crop,
+    _source_resolution_frame_order,
+    _source_resolution_start_step,
+    _uses_source_resolution,
     _training_frame_order,
     _training_limits,
     _update_smoothed_loss,
@@ -71,6 +81,22 @@ class SeedParameterTests(unittest.TestCase):
         smoothed = _update_smoothed_loss(None, 0.3)
         self.assertEqual(smoothed, 0.3)
         self.assertAlmostEqual(_update_smoothed_loss(smoothed, 0.5), 0.301)
+
+    def test_production_photometric_gate_rejects_divergent_splats(self) -> None:
+        self.assertTrue(
+            _photometric_quality_accepted(
+                {
+                    "medianPsnrDb": MINIMUM_PRODUCTION_PSNR_DB,
+                    "medianSsim": MINIMUM_PRODUCTION_SSIM,
+                    "medianL1": MAXIMUM_PRODUCTION_L1,
+                }
+            )
+        )
+        self.assertFalse(
+            _photometric_quality_accepted(
+                {"medianPsnrDb": 12.0, "medianSsim": 0.4, "medianL1": 0.25}
+            )
+        )
 
     def test_metric_rgbd_training_is_bounded_by_seed_density_and_scale(self) -> None:
         self.assertEqual(_rgbd_gaussian_limit(350_000, 3_000_000), 1_050_000)
@@ -218,7 +244,7 @@ class SeedParameterTests(unittest.TestCase):
                 quaternions=np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
             )
 
-            points, colors, scales, quaternions, confidence = _read_seed_parameters(
+            points, colors, scales, quaternions, confidence, opacity = _read_seed_parameters(
                 root,
                 {
                     "initialization": "initialization.ply",
@@ -231,6 +257,66 @@ class SeedParameterTests(unittest.TestCase):
             self.assertTrue(np.allclose(scales, [[0.02, 0.03, 0.001]]))
             self.assertTrue(np.allclose(quaternions, [[1.0, 0.0, 0.0, 0.0]]))
             self.assertTrue(np.allclose(confidence, [1.0]))
+            self.assertIsNone(opacity)
+
+    def test_source_resolution_tiles_cover_the_calibrated_image(self) -> None:
+        frame = {
+            "frameIndex": 0,
+            "intrinsics": {"width": 2560, "height": 1440},
+        }
+        crops = [_source_resolution_crop(frame, sample, 960) for sample in range(6)]
+
+        self.assertEqual(
+            crops,
+            [
+                (0, 0, 960, 960),
+                (800, 0, 960, 960),
+                (1600, 0, 960, 960),
+                (0, 480, 960, 960),
+                (800, 480, 960, 960),
+                (1600, 480, 960, 960),
+            ],
+        )
+        start = _source_resolution_start_step([frame], 30, 960)
+        self.assertEqual(start, 24)
+        self.assertFalse(_uses_source_resolution(23, start))
+        self.assertTrue(_uses_source_resolution(24, start))
+        order = _source_resolution_frame_order(
+            [
+                frame,
+                {"frameIndex": 1, "intrinsics": {"width": 800, "height": 600}},
+            ],
+            960,
+        )
+        np.testing.assert_array_equal(np.bincount(order), [6, 1])
+
+    def test_source_crop_preserves_focal_length_and_shifts_principal_point(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pixels = np.zeros((6, 8, 3), dtype=np.uint8)
+            pixels[:, :, 0] = np.arange(8, dtype=np.uint8)
+            Image.fromarray(pixels).save(root / "frame.png")
+            frame = {
+                "frameIndex": 0,
+                "image": "frame.png",
+                "intrinsics": {
+                    "width": 8,
+                    "height": 6,
+                    "fx": 7.0,
+                    "fy": 7.0,
+                    "cx": 3.5,
+                    "cy": 2.5,
+                },
+                "worldFromRgbCamera": np.eye(4).reshape(-1).tolist(),
+            }
+
+            tensors = _frame_tensors(root, frame, 4, (4, 0, 4, 4))
+
+            self.assertEqual((tensors["width"], tensors["height"]), (4, 4))
+            self.assertEqual(tensors["sourceCrop"], (4, 0, 4, 4))
+            self.assertAlmostEqual(float(tensors["K"][0, 0]), 7.0)
+            self.assertAlmostEqual(float(tensors["K"][0, 2]), -0.5)
+            self.assertEqual(int(tensors["rgb"][0, 0, 0]), 4)
 
 
 if __name__ == "__main__":

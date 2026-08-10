@@ -798,7 +798,25 @@ Implemented as an explicit Max Quality option after camera/depth validation:
 
 ## P12 — Gaussian initialization and production optimization
 
-Generalize sparse, dense and direct learned initialization while retaining source-resolution gsplat optimization.
+Implemented with one explicit initialization contract and a bounded source-detail finish:
+
+* sparse SfM, confidence-bearing dense surfaces, and direct learned Gaussians declare distinct
+  initialization kinds and representations instead of relying on trainer-side boolean inference;
+* direct-head opacity remains renderer state while geometric confidence remains independent fusion
+  and loss evidence; contradictory manifests and missing direct opacity fail closed;
+* metric 2D surface discs remain fixed, while sparse and learned 3D priors retain bounded adaptive
+  densification under the existing hardware Gaussian ceilings;
+* global bounded-resolution passes establish appearance and geometry efficiently, then an adaptive
+  final schedule covers every calibrated source-resolution tile with exact focal length and shifted
+  principal point, without allocating an unsafe full 2.5K/4K raster;
+* requested iterations are extended only when required to complete one source-tile pass, and the
+  published training sidecar records effective iterations, initialization policy, tile coverage,
+  and source-resolution start iteration;
+* checkpoint resume preserves per-camera tile position, while incomplete source-pixel coverage
+  rejects publication rather than mislabeling a downsample-only result as production quality.
+* a deterministic five-view raw-Ply-equivalent photometric gate rejects undertrained or divergent
+  media splats, preserves the final checkpoint for more optimization, and records PSNR, SSIM, and
+  L1 evidence in `outputs/splat-quality-report.json`.
 
 ## P13 — Material and radiometric foundation
 

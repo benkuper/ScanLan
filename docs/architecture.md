@@ -24,6 +24,17 @@ serializes an immutable indexed candidate surface, invokes the isolated process,
 returned displacement independently before repair or texturing. A worker crash, CUDA error,
 rejected held-out fit, or malformed output therefore cannot replace the baseline mesh.
 
+Gaussian datasets publish a schema-1 initialization contract identifying sparse SfM points, dense
+surface samples, or direct learned anisotropic Gaussians. The contract selects 2D/3D representation,
+parameter sidecar, and densification policy; it also prevents direct-model opacity from being reused
+as geometric confidence. Training first uses bounded global rasters, then schedules every calibrated
+source-image tile at native pixel density with a crop-adjusted pinhole principal point. This keeps
+CUDA raster memory bounded while making source-resolution coverage a publication gate. See
+[gaussian-production-benchmark.md](gaussian-production-benchmark.md).
+Media splats then render five deterministic calibrated views without the training-only exposure
+transform. Median PSNR/SSIM/L1 gates the interoperable PLY itself; rejection preserves a resumable
+final checkpoint and cannot publish the candidate as ready.
+
 The realtime engine is started and reports `ready` before the camera is opened. Tauri pipes camera stdout directly into engine stdin and drains engine stdout on a dedicated thread. Sensor stderr goes to `sensor.log`, so a full pipe cannot stall capture.
 
 ## Live data path
