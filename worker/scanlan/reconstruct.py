@@ -24,7 +24,7 @@ from .validation import validate_posed_frames
 
 Engine = Literal["auto", "numpy", "open3d"]
 Device = Literal["auto", "cpu", "cuda"]
-DepthRefinement = Literal["off", "lingbot"]
+DepthRefinement = Literal["off", "lingbot", "mapanything"]
 
 
 class ProgressReporter:
@@ -159,17 +159,20 @@ def reconstruct_project(
             "needs_mesh": "textured_mesh" in targets,
             "mesh_voxel_size_m": max(voxel_size_m, 0.008),
         }
-        if depth_refinement == "lingbot":
+        if depth_refinement in ("lingbot", "mapanything"):
             if depth_refiner is None:
-                raise RuntimeError("LingBot depth refinement requires an isolated CUDA worker")
-            from .depth_refinement import prepare_lingbot_depth_refinement
+                raise RuntimeError(
+                    f"{depth_refinement} depth refinement requires an isolated CUDA worker"
+                )
+            from .depth_refinement import prepare_depth_refinement
 
             artifact_context["prepare_depth_refinement"] = lambda frames: (
-                prepare_lingbot_depth_refinement(
+                prepare_depth_refinement(
                     frames,
                     project_root,
                     depth_refiner,
                     reporter.update,
+                    backend_name=depth_refinement,
                 )
             )
         elif depth_refinement != "off":

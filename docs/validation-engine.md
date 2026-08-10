@@ -44,10 +44,14 @@ Open3D's documented [integration pipeline](https://open3d.org/docs/release/tutor
   evaluated separately by registration.
 - LingBot depth completion uses the shared metric depth gate. Multi-view confirmation also tracks
   explicit free-space contradictions, and a contradicted hole pixel cannot be generated.
+- MapAnything RGB-D completion reverses model preprocessing to the sensor grid, fits local metric
+  residuals on sensor anchors, and applies the shared depth gate only to a deterministic held-out
+  anchor set. Photo and short-video camera/depth proposals pass the same camera/geometry gates and
+  must agree with COLMAP before becoming a dense prior.
 - Frozen worker builds install this package before packaging either runtime; PyInstaller discovers
   the ordinary imports, so no runtime network access is needed.
 
-Later MapAnything and DA3 adapters must return proposals through this contract. Backend-specific
+Later DA3 adapters must return proposals through this contract. Backend-specific
 confidence can tighten a gate but cannot weaken the common minimum evidence or silently relabel
 scale.
 
@@ -70,3 +74,10 @@ validated production cameras passed, with a maximum 0.141 m selected-keyframe st
 degree rotation. Twenty sampled learned-depth frames all passed metric agreement (12.38-19.48 mm
 median residual and 0.9138-0.9562 inlier ratio), while a deliberate 20% scale perturbation was
 rejected. These figures are evidence for this capture, not universal model-accuracy claims.
+
+The P7 MapAnything check used three separated frames from the same physical Femto Mega capture.
+The raw proposals were correctly rejected at 83.7-98.9 mm median residual. Held-out sensor-anchor
+calibration then passed all three frames at 2.75-3.25 mm median residual; the independent-view and
+free-space gates accepted 15,462 original-hole pixels (2.294% of reliable measured support). A
+frozen BF16 runtime repeated model inference on the RTX 5080 with offline flags and an empty Torch
+cache. These measurements validate the adapter and gates on this capture, not every scene.

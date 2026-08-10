@@ -67,6 +67,8 @@ pub struct CaptureSettings {
     pub produce_watertight_mesh: bool,
     #[serde(default)]
     pub lingbot_depth_refinement: bool,
+    #[serde(default = "default_depth_refinement_backend")]
+    pub depth_refinement_backend: String,
     #[serde(default)]
     pub experimental_rgb_preview: bool,
 }
@@ -139,6 +141,10 @@ fn default_mesh_repair_profile() -> String {
     "faithful".to_string()
 }
 
+fn default_depth_refinement_backend() -> String {
+    "off".to_string()
+}
+
 impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
@@ -179,6 +185,7 @@ impl Default for CaptureSettings {
             fill_inferred_mesh_holes: false,
             produce_watertight_mesh: false,
             lingbot_depth_refinement: false,
+            depth_refinement_backend: default_depth_refinement_backend(),
             experimental_rgb_preview: false,
         }
     }

@@ -120,14 +120,14 @@ npm run prepare:cuda
 
 The build targets compute capability 12.0 and repackages the extracted worker at `worker\dist\scanlan-worker\scanlan-worker.exe`. Keeping its Open3D/CUDA runtime extracted avoids unpacking almost 1 GB every time preview or reconstruction starts. Set `SCANLAN_DEVICE=cpu` before launching to diagnose the CPU path.
 
-Gaussian reconstruction and optional learned RGB-D refinement use two supervised CUDA runtimes. The splat runtime owns PyCOLMAP, PyAV, gsplat, and training; the separate geometry runtime owns LingBot-Map and LingBot-Depth so model memory is released with each inference process. Both require Python 3.11 and are built together:
+Gaussian reconstruction and optional learned RGB-D refinement use two supervised CUDA runtimes. The splat runtime owns PyCOLMAP, PyAV, gsplat, and training; the separate geometry runtime owns LingBot-Map, LingBot-Depth, and MapAnything so model memory is released with each inference process. Both require Python 3.11 and are built together:
 
 ```powershell
 npm run prepare:splat
 npm run package:splat
 ```
 
-The result is `build/ScanLan-splat-portable.zip`, containing `splat-runtime/` and `geometry-runtime/`. The build downloads the Apache-2.0 LingBot assets once, verifies pinned digests, and bundles them for offline use. RGB-D projects can enable **Depth refinement** in Reconstruct; ordinary media projects use anisotropic 3D Gaussians initialized from the quality-filtered camera solve. Both keep bounded memory, publish atomic checkpoints, and stream a compact preview during training.
+The result is `build/ScanLan-splat-portable.zip`, containing `splat-runtime/` and `geometry-runtime/`. The build downloads the pinned Apache-2.0 LingBot and MapAnything assets once, verifies their digests, and bundles them for offline use. RGB-D projects can select **LingBot-Depth** or **MapAnything Apache** under Depth refinement; ordinary media projects use anisotropic 3D Gaussians initialized from the quality-filtered camera solve. Both keep bounded memory, publish atomic checkpoints, and stream a compact preview during training.
 
 Video-only projects can optionally enable the disabled-by-default **Progressive learned-depth preview**. It publishes bounded local LingBot submaps during ordered inference, colors geometry by confidence, and always labels scale as model-metric unverified. The provisional map is display-only and cannot bypass production camera or alignment gates.
 
@@ -138,6 +138,8 @@ offline use. Learned backends may propose geometry but cannot promote unverified
 measured-depth/free-space evidence.
 
 LingBot-Depth consumes the archived RGB8 image that is already aligned to the depth grid and returns the same raster dimensions, so no post-hoc RGB warp is inferred. ScanLan runs it only after metric camera poses have been recovered. Every valid sensor depth remains unchanged; predicted pixels are accepted only in sensor holes after model-mask, depth-edge, metric-scale, calibrated native-RGB field-of-view, independent-viewpoint, and multi-view reprojection gates. Accepted pixels carry explicit provenance and lower fusion/training confidence. If a frame fails the metric gate, its raw calibrated depth is used unchanged.
+
+MapAnything uses the same immutable aligned RGB-D archive but predicts in its processed image grid. ScanLan reverses the cover-resize/center-crop transform, calibrates the smooth model residual from sensor anchors, and validates only on independent held-out anchors. Unsupported large holes and any proposal that fails metric, RGB-coverage, multi-view, or free-space evidence remain sensor-only. For photos and videos of at most 32 selected views, MapAnything also proposes cameras and dense depth as a challenger; COLMAP agreement selects or rejects it, and image-only scale remains `MODEL_METRIC_UNVERIFIED` until anchored.
 
 Recommended starting profile on the specified laptop:
 
@@ -211,7 +213,7 @@ Native capture workers must also be compiled on Windows against their vendor SDK
 - `native/modern-capture/` — Azure Kinect and Femto Mega capture
 - `worker/` — realtime and final Open3D/NumPy reconstruction
 - `splat-worker/` — isolated COLMAP/PyAV media solver and CUDA 2DGS/3DGS trainer
-- `geometry-worker/` — isolated LingBot-Map and LingBot-Depth model process
+- `geometry-worker/` — isolated LingBot-Map, LingBot-Depth, and MapAnything model process
 - `scripts/` — Windows build and packaging entry points
 
 Licensed under [GPL-3.0-only](LICENSE).

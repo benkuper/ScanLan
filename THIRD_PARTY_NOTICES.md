@@ -20,4 +20,24 @@ ScanLan's optional depth-refinement runtime bundles LingBot-Depth source and the
 - Model SHA-256: `b60cf27ddbd0e51e9b59b03475c0d39d02d2e48ecf8dbb5866f04d46802b3c23`
 - License: <https://www.apache.org/licenses/LICENSE-2.0>
 
+## MapAnything Apache
+
+ScanLan's optional learned-geometry runtime bundles pinned MapAnything source and
+the commercially usable MapAnything Apache checkpoint, Copyright Meta Platforms,
+Inc. Both artifacts are distributed under the Apache License 2.0.
+
+- Source: `facebookresearch/map-anything`, pinned at `3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9`
+- Model: `facebook/map-anything-apache`, pinned at `00f9c245bbcb60522d1ed7f9e9d88462c6e3f38a`
+- Model SHA-256: `fa06c0fdccefc5048e072c85935d5789b1e36b307f3859033c17f9dcb9fd5201`
+- License: <https://www.apache.org/licenses/LICENSE-2.0>
+
+## UniCeption
+
+MapAnything uses the UniCeption 0.1.7 perception components, Copyright AirLab,
+Carnegie Mellon University, distributed under the BSD 3-Clause License.
+
+- Package: `uniception==0.1.7`
+- Source: <https://github.com/castacks/UniCeption>
+- License: <https://opensource.org/license/bsd-3-clause>
+
 The packaged Python distribution metadata retains the upstream license file. ScanLan's own source remains licensed as stated in its root `LICENSE` file.

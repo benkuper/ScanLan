@@ -25,6 +25,13 @@ from .lingbot import (
     LingbotGeometry,
     infer_lingbot_geometry,
 )
+from .mapanything import (
+    MAPANYTHING_CODE_REVISION,
+    MAPANYTHING_MAX_SEEDS,
+    MAPANYTHING_MODEL_REVISION,
+    MAPANYTHING_MODEL_SHA256,
+    MapAnythingPredictor,
+)
 
 
 GEOMETRY_REQUEST_SCHEMA = 1
@@ -241,13 +248,21 @@ class ProgressivePreviewAccumulator:
         return {"points": preview_points, "colors": preview_colors, "status": status}
 
 
-def _load_geometry(path: Path, metadata: dict[str, Any]) -> LingbotGeometry:
+def _load_geometry(
+    path: Path,
+    metadata: dict[str, Any],
+    *,
+    code_revision: str = LINGBOT_CODE_REVISION,
+    model_revision: str = LINGBOT_MODEL_REVISION,
+    model_sha256: str = LINGBOT_MODEL_SHA256,
+) -> LingbotGeometry:
     if (
-        metadata.get("codeRevision") != LINGBOT_CODE_REVISION
-        or metadata.get("modelRevision") != LINGBOT_MODEL_REVISION
-        or metadata.get("modelSha256") != LINGBOT_MODEL_SHA256
+        metadata.get("codeRevision") != code_revision
+        or metadata.get("modelRevision") != model_revision
+        or metadata.get("modelSha256") != model_sha256
     ):
-        raise RuntimeError("Geometry worker used an incompatible LingBot-Map revision")
+        name = "LingBot-Map" if code_revision == LINGBOT_CODE_REVISION else "learned model"
+        raise RuntimeError(f"Geometry worker used an incompatible {name} revision")
     with np.load(path, allow_pickle=False) as archive:
         values = {name: np.asarray(archive[name]).copy() for name in archive.files}
     required = {
@@ -454,6 +469,89 @@ def run_lingbot_map_request(
     return result
 
 
+def run_mapanything_request(
+    request_path: Path,
+    progress_path: Path,
+    *,
+    predictor: MapAnythingPredictor | None = None,
+) -> dict[str, Any]:
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    if int(request.get("schemaVersion", 0)) != GEOMETRY_REQUEST_SCHEMA:
+        raise ValueError("Unsupported geometry-worker request schema")
+    image_paths = [Path(value).resolve(strict=True) for value in request.get("imagePaths", [])]
+    if len(image_paths) < 3:
+        raise ValueError("MapAnything geometry request requires at least three images")
+    cancel_value = str(request.get("cancelPath", "")).strip()
+    cancel_path = Path(cancel_value) if cancel_value else None
+    if cancel_path is not None and cancel_path.is_file():
+        raise RuntimeError("MapAnything geometry inference cancelled")
+    _write_json_atomic(
+        progress_path,
+        {
+            "schemaVersion": GEOMETRY_REQUEST_SCHEMA,
+            "stage": "mapanything_loading",
+            "detail": "Loading pinned MapAnything Apache checkpoint offline",
+            "progress": 0.05,
+            "computeBackend": "MapAnything Apache",
+            "metrics": {"imageCount": len(image_paths)},
+        },
+    )
+    predictor = predictor or MapAnythingPredictor.load()
+    _write_json_atomic(
+        progress_path,
+        {
+            "schemaVersion": GEOMETRY_REQUEST_SCHEMA,
+            "stage": "mapanything_geometry",
+            "detail": f"Proposing cameras and dense depth for {len(image_paths)} views",
+            "progress": 0.20,
+            "computeBackend": predictor.backend,
+            "metrics": {"imageCount": len(image_paths)},
+        },
+    )
+    geometry = predictor.infer_geometry(
+        image_paths,
+        maximum_seeds=int(request.get("maximumSeeds", MAPANYTHING_MAX_SEEDS)),
+    )
+    if cancel_path is not None and cancel_path.is_file():
+        raise RuntimeError("MapAnything geometry inference cancelled")
+    arrays_path = Path(request["arraysPath"])
+    _save_geometry(arrays_path, geometry)
+    result = {
+        "schemaVersion": GEOMETRY_RESULT_SCHEMA,
+        "status": "complete",
+        "backend": geometry.backend,
+        "modelPath": geometry.model_path,
+        "codeRevision": MAPANYTHING_CODE_REVISION,
+        "modelRevision": MAPANYTHING_MODEL_REVISION,
+        "modelSha256": MAPANYTHING_MODEL_SHA256,
+        "processedSize": list(geometry.processed_size),
+        "cameraCount": len(geometry.world_from_cameras),
+        "pointCount": len(geometry.points),
+        "arraysPath": str(arrays_path),
+        "proposalType": "camera-depth",
+        # Image-only metric prediction remains unverified until COLMAP or
+        # sensor evidence validates a similarity transform.
+        "scaleStatus": "MODEL_METRIC_UNVERIFIED",
+    }
+    _write_json_atomic(Path(request["resultPath"]), result)
+    _write_json_atomic(
+        progress_path,
+        {
+            "schemaVersion": GEOMETRY_REQUEST_SCHEMA,
+            "stage": "mapanything_geometry",
+            "detail": f"Published {len(geometry.points):,} validated proposal seeds",
+            "progress": 1.0,
+            "computeBackend": geometry.backend,
+            "metrics": {
+                "cameraCount": len(geometry.world_from_cameras),
+                "pointCount": len(geometry.points),
+                "scaleStatus": "MODEL_METRIC_UNVERIFIED",
+            },
+        },
+    )
+    return result
+
+
 def infer_lingbot_geometry_isolated(
     executable: Path,
     image_paths: Sequence[Path],
@@ -566,5 +664,95 @@ def infer_lingbot_geometry_isolated(
     if int(metadata.get("schemaVersion", 0)) != GEOMETRY_RESULT_SCHEMA:
         raise RuntimeError("Geometry worker returned an unsupported result schema")
     geometry = _load_geometry(arrays_path, metadata)
+    shutil.rmtree(request_root, ignore_errors=True)
+    return geometry
+
+
+def infer_mapanything_geometry_isolated(
+    executable: Path,
+    image_paths: Sequence[Path],
+    *,
+    work_root: Path,
+    cancel_path: Path,
+    maximum_seeds: int = MAPANYTHING_MAX_SEEDS,
+    progress: ProgressCallback | None = None,
+) -> LingbotGeometry:
+    executable = executable.resolve(strict=True)
+    request_root = work_root / f"mapanything-{uuid.uuid4().hex}"
+    request_root.mkdir(parents=True, exist_ok=False)
+    request_path = request_root / "request.json"
+    progress_path = request_root / "progress.json"
+    result_path = request_root / "result.json"
+    arrays_path = request_root / "geometry.npz"
+    _write_json_atomic(
+        request_path,
+        {
+            "schemaVersion": GEOMETRY_REQUEST_SCHEMA,
+            "imagePaths": [str(Path(path).resolve(strict=True)) for path in image_paths],
+            "maximumSeeds": int(maximum_seeds),
+            "cancelPath": str(cancel_path.resolve()),
+            "arraysPath": str(arrays_path.resolve()),
+            "resultPath": str(result_path.resolve()),
+        },
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    log_path = request_root / "geometry-worker.log"
+    last_progress_mtime = -1
+    with log_path.open("w", encoding="utf-8", newline="\n") as log:
+        process = subprocess.Popen(
+            [
+                str(executable),
+                "infer-mapanything",
+                "--request",
+                str(request_path),
+                "--progress",
+                str(progress_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            creationflags=flags,
+        )
+        while process.poll() is None:
+            if progress_path.is_file():
+                modified = progress_path.stat().st_mtime_ns
+                if modified != last_progress_mtime:
+                    last_progress_mtime = modified
+                    try:
+                        value = json.loads(progress_path.read_text(encoding="utf-8"))
+                        if progress:
+                            progress(
+                                str(value.get("stage", "mapanything_geometry")),
+                                str(value.get("detail", "Running MapAnything inference")),
+                                float(value.get("progress", 0.0)),
+                                str(value.get("computeBackend", "MapAnything geometry worker")),
+                                dict(value.get("metrics") or {}),
+                            )
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        pass
+            if cancel_path.is_file():
+                try:
+                    process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                break
+            time.sleep(0.10)
+        return_code = process.wait()
+    if return_code != 0:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        detail = lines[-1] if lines else "MapAnything geometry worker failed without diagnostics"
+        raise RuntimeError(detail)
+    metadata = json.loads(result_path.read_text(encoding="utf-8"))
+    if int(metadata.get("schemaVersion", 0)) != GEOMETRY_RESULT_SCHEMA:
+        raise RuntimeError("Geometry worker returned an unsupported result schema")
+    if metadata.get("scaleStatus") != "MODEL_METRIC_UNVERIFIED":
+        raise RuntimeError("Unanchored MapAnything geometry claimed validated metric scale")
+    geometry = _load_geometry(
+        arrays_path,
+        metadata,
+        code_revision=MAPANYTHING_CODE_REVISION,
+        model_revision=MAPANYTHING_MODEL_REVISION,
+        model_sha256=MAPANYTHING_MODEL_SHA256,
+    )
     shutil.rmtree(request_root, ignore_errors=True)
     return geometry

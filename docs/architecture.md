@@ -10,7 +10,7 @@ ScanLan separates realtime latency from archival throughput and final quality. E
 | Native capture worker | camera SDK, calibration, synchronized RGB-D, IMU conversion | UI rendering or Open3D |
 | Reconstruction worker | tracking, relocalization, TSDF, pose graph, point/mesh build | camera SDK |
 | Splat worker | Photo/video decoding, COLMAP camera solving, CUDA 2DGS/3DGS optimization, checkpoints | Learned-model loading, RGB-D capture, tracking, pose recovery, and TSDF quality decisions |
-| Geometry worker | Pinned LingBot-Map and LingBot-Depth CUDA inference, model lifecycle, lossless array publication | Camera solving, production validation, fusion, or Gaussian optimization |
+| Geometry worker | Pinned LingBot-Map, LingBot-Depth, and MapAnything CUDA inference, model lifecycle, lossless array publication | Camera solving, production validation, fusion, or Gaussian optimization |
 
 Both reconstruction runtimes import one versioned, NumPy-only validation engine. It owns generic
 SE(3) camera continuity, robust Sim(3) scale evidence, metric-depth agreement, ray free-space
@@ -80,9 +80,9 @@ Normal stop creates `stop.flag`, lets the capture worker flush its archive, drai
 
 Unexpected phases are recovered from their manifest and CSV at the next launch. Derived jobs have independent checkpoints and can be cancelled without deleting raw captures.
 
-Optional LingBot-Depth inference is launched as a child of the reconstruction job only after pose recovery. It reads an immutable JSON request and aligned raw frame paths, writes atomic NumPy predictions, observes the shared cancellation flag between frames, and never mutates an archive. The reconstruction worker—not the model process—owns metric, RGB-coverage, multi-view, and provenance validation before publishing an immutable fingerprinted cache.
+Optional LingBot-Depth or MapAnything inference is launched as a child of the reconstruction job only after pose recovery. It reads an immutable JSON request and aligned raw frame paths, writes atomic NumPy predictions, observes the shared cancellation flag between frames, and never mutates an archive. The reconstruction worker—not the model process—owns held-out metric, RGB-coverage, multi-view, free-space, and provenance validation before publishing an immutable fingerprinted cache.
 
-LingBot-Map and LingBot-Depth now execute only in the dedicated geometry worker. Media
+LingBot-Map, LingBot-Depth, and MapAnything execute only in the dedicated geometry worker. Media
 preparation writes a schema-1 request containing ordered absolute image paths, calibrated rays,
 selected output indices, a hard seed limit, and the shared cancellation path. The geometry
 worker owns the model and CUDA cache for exactly one request, then atomically publishes typed

@@ -21,7 +21,10 @@ from .lingbot import (
     lingbot_processed_size,
     lingbot_source_pixel_grid,
 )
-from .geometry_ipc import infer_lingbot_geometry_isolated
+from .geometry_ipc import (
+    infer_lingbot_geometry_isolated,
+    infer_mapanything_geometry_isolated,
+)
 from .runtime import pycolmap_device, pycolmap_feature_runtime
 
 
@@ -2321,6 +2324,10 @@ def prepare_media_dataset(
         )
         lingbot_geometry: LingbotGeometry | None = None
         lingbot_context: dict[str, Any] | None = None
+        mapanything_geometry: LingbotGeometry | None = None
+        mapanything_quality: dict[str, Any] = {}
+        mapanything_error: str | None = None
+        mapanything_evaluated = False
         reconstruction, solve = _run_sfm(
             input_images,
             sfm_workspace,
@@ -2399,6 +2406,48 @@ def prepare_media_dataset(
                 preview=publish_rgb_preview if progressive_rgb_preview else None,
             )
             _check_cancelled(project_root)
+        # MapAnything is bounded to the regime where it is a useful challenger
+        # on a laptop GPU. Larger ordered videos retain LingBot's streaming,
+        # bounded-context path.
+        if geometry_worker is not None and 3 <= len(records) <= 32:
+            mapanything_evaluated = True
+
+            def report_mapanything(
+                stage: str,
+                detail: str,
+                progress_value: float,
+                backend: str,
+                metrics: dict[str, Any],
+            ) -> None:
+                _progress(
+                    project_root,
+                    stage,
+                    detail,
+                    0.70 + 0.04 * min(max(progress_value, 0.0), 1.0),
+                    compute_backend=backend,
+                    metrics={**metrics, "challenger": True},
+                )
+
+            try:
+                proposal = infer_mapanything_geometry_isolated(
+                    geometry_worker,
+                    [input_images / str(record["image"]) for record in records],
+                    work_root=staging / "geometry-ipc",
+                    cancel_path=project_root / "outputs" / "cancel.flag",
+                    progress=report_mapanything,
+                )
+                mapanything_geometry, mapanything_quality = _align_lingbot_geometry(
+                    proposal,
+                    reconstruction,
+                    [str(record["image"]) for record in records],
+                )
+                if not _accept_lingbot_alignment(mapanything_quality):
+                    mapanything_geometry = None
+                    mapanything_error = "camera proposal failed the COLMAP agreement gate"
+            except Exception as error:
+                mapanything_geometry = None
+                mapanything_error = str(error)
+            _check_cancelled(project_root)
         chosen_model = staging / "chosen-model"
         chosen_model.mkdir(parents=True, exist_ok=True)
         reconstruction.write(chosen_model)
@@ -2439,6 +2488,21 @@ def prepare_media_dataset(
                     metrics=alignment_quality,
                 )
                 lingbot_geometry = None
+        if single_video and mapanything_geometry is not None:
+            map_residual = float(
+                mapanything_quality.get("normalizedMedianCameraCenterResidual", math.inf)
+            )
+            selected_residual = float(
+                alignment_quality.get("normalizedMedianCameraCenterResidual", math.inf)
+            )
+            if lingbot_geometry is None or map_residual < selected_residual:
+                lingbot_geometry = mapanything_geometry
+                alignment_quality = mapanything_quality
+                alignment_accepted = True
+                alignment_mode = "mapanything_global_similarity"
+        photo_mapanything_prior = (
+            mapanything_geometry if not single_video and mapanything_geometry is not None else None
+        )
         if lingbot_geometry is not None:
             _progress(
                 project_root,
@@ -2489,7 +2553,19 @@ def prepare_media_dataset(
             else:
                 raise RuntimeError("COLMAP did not publish an undistorted sparse model")
             points, colors, point_quality = _point_records(undistorted_reconstruction)
+            if photo_mapanything_prior is not None:
+                points = photo_mapanything_prior.points
+                colors = photo_mapanything_prior.colors
+                dense_seed_count = len(points)
             _write_initialization(undistorted / "initialization.ply", points, colors)
+            if photo_mapanything_prior is not None:
+                _write_initialization_parameters(
+                    undistorted / "initialization-parameters.npz",
+                    points,
+                    colors,
+                    photo_mapanything_prior.scales,
+                    photo_mapanything_prior.quaternions,
+                )
 
             source_by_name = {record["image"]: record for record in records}
             frames = []
@@ -2542,6 +2618,11 @@ def prepare_media_dataset(
             else 0
         )
         warnings: list[str] = []
+        if mapanything_evaluated and mapanything_geometry is None:
+            warnings.append(
+                "MapAnything camera/depth challenger was excluded; "
+                f"{mapanything_error or 'it did not pass COLMAP camera agreement'}."
+            )
         if alignment_mode == "rejected_to_colmap":
             warnings.append(
                 "LingBot geometry failed the COLMAP camera-agreement gate and was excluded; "
@@ -2572,10 +2653,10 @@ def prepare_media_dataset(
             "initialization": "initialization.ply",
             "initializationParameters": (
                 "initialization-parameters.npz"
-                if lingbot_geometry is not None
+                if lingbot_geometry is not None or photo_mapanything_prior is not None
                 else None
             ),
-            "denseGeometryPrior": lingbot_geometry is not None,
+            "denseGeometryPrior": lingbot_geometry is not None or photo_mapanything_prior is not None,
             "poseRefinement": True,
             # A single video is captured with locked focal length, exposure,
             # white balance, shutter, and ISO. Per-frame color transforms would
@@ -2597,6 +2678,8 @@ def prepare_media_dataset(
                 "geometryBackend": (
                     lingbot_geometry.backend
                     if lingbot_geometry is not None
+                    else photo_mapanything_prior.backend
+                    if photo_mapanything_prior is not None
                     else "COLMAP sparse structure-from-motion"
                 ),
                 "trainingViewCount": len(frames),
@@ -2613,6 +2696,10 @@ def prepare_media_dataset(
                 "lingbotCalibratedCameraRays": lingbot_geometry is not None,
                 "lingbotEvaluated": lingbot_context is not None,
                 "lingbotContext": lingbot_context,
+                "mapAnythingEvaluated": mapanything_evaluated,
+                "mapAnythingAlignment": mapanything_quality or None,
+                "mapAnythingAlignmentAccepted": mapanything_geometry is not None,
+                "mapAnythingError": mapanything_error,
                 "maximumVideoIntrinsicSpread": video_intrinsic_spread,
                 "videoSources": video_statistics,
                 "warnings": warnings,
@@ -2633,8 +2720,8 @@ def prepare_media_dataset(
             project_root,
             "media_ready",
             (
-                f"Prepared {len(frames):,} cameras and {len(points):,} confidence-gated dense LingBot seeds"
-                if lingbot_geometry is not None
+                f"Prepared {len(frames):,} cameras and {len(points):,} confidence-gated dense learned seeds"
+                if lingbot_geometry is not None or photo_mapanything_prior is not None
                 else f"Solved {len(frames):,} cameras and {len(points):,} sparse seed points"
             ),
             1.0,
@@ -2645,6 +2732,8 @@ def prepare_media_dataset(
                     else f"{lingbot_geometry.backend} + COLMAP calibrated intrinsics"
                 )
                 if lingbot_geometry is not None
+                else f"{photo_mapanything_prior.backend} + COLMAP bundle-adjusted poses/intrinsics"
+                if photo_mapanything_prior is not None
                 else "COLMAP structure-from-motion"
             ),
             metrics={

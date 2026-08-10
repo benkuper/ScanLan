@@ -720,11 +720,12 @@ Implement generic camera, scale, depth, free-space and geometry validation share
 
 ## P7 — MapAnything integration
 
-Add:
+Implemented:
 
-* RGB-D completion;
-* photo camera/depth proposals;
-* short-video challenger.
+* RGB-D completion with source-grid restoration, held-out sensor anchoring, and shared metric/multi-view/free-space gates;
+* photo camera/depth proposals aligned and verified against COLMAP before dense seeding;
+* a bounded short-video challenger that replaces LingBot only when both pass and MapAnything has lower normalized camera residual;
+* pinned Apache-2.0 source/model assets and empty-cache offline frozen-runtime diagnostics.
 
 ## P8 — DA3 integration
 

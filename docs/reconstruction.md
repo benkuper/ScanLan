@@ -48,9 +48,9 @@ accept/reject reasons. The production fragment solver independently rebuilds geo
 depth, repeats its stricter color/geometric verification, performs the complete pose-graph
 solve, and retains the prior validated trajectory if the correction is unsafe.
 
-## Optional LingBot depth refinement
+## Optional learned depth refinement
 
-Depth refinement is an offline production stage after the complete metric trajectory is accepted. Tracking, loop closure, take registration, and pose refinement always use original calibrated sensor depth. The isolated CUDA worker runs the pinned Apache-2.0 LingBot-Depth v0.5 code/model on `color/*.rgb` and `depth/*.u16`; both inputs are already on the depth-camera pixel grid, and the model output is required to have exactly that same width and height.
+Depth refinement is an offline production stage after the complete metric trajectory is accepted. Tracking, loop closure, take registration, and pose refinement always use original calibrated sensor depth. The isolated CUDA worker runs either pinned Apache-2.0 LingBot-Depth v0.5 or MapAnything Apache on `color/*.rgb` and `depth/*.u16`; both inputs are already on the depth-camera pixel grid, and every published proposal is restored to exactly that raster size.
 
 ScanLan never replaces any nonzero sensor measurement, including one outside the configured fusion range. A prediction may fill only an original zero-valued sensor hole and must pass all of these gates:
 
@@ -59,6 +59,12 @@ ScanLan never replaces any nonzero sensor measurement, including one outside the
 - agreement with reliable measured pixels in median, 90th-percentile, scale-bias, and inlier metrics;
 - projection through the calibrated depth-to-native-RGB transform into the true RGB field of view;
 - reprojection agreement from independent camera centers in up to four nearby posed keyframes, with two confirmations when available.
+
+MapAnything additionally estimates a smooth residual field from measured sensor anchors while
+holding out every sixteenth anchor. Only the held-out pixels determine metric acceptance, so fit
+pixels cannot validate themselves. The correction support mask prevents unbounded extrapolation
+into large holes; the ordinary independent-view and free-space gates still decide every generated
+pixel.
 
 Validated caches are fingerprinted by source depth/color files, calibration, poses, implementation version, code revision, model revision, and model SHA-256. Measured and refined rasters are stored separately with generated-pixel masks and 8-bit confidence. Final TSDF/surfel fusion integrates measured depth twice and the measured-plus-generated raster once, giving generated geometry half weight. Canonical 2DGS datasets retain both confidence and provenance masks; generated depth has lower robust-loss weight and lower seed opacity, while measured seeds win voxel conflicts.
 

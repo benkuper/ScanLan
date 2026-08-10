@@ -24,9 +24,13 @@ $LingbotDepthRevision = "f3a237e434ae987bc38281476d6cfb5df3e4d739"
 $LingbotDepthModelRevision = "79204ed6b837f4fdd192cf563e59481fecfa0295"
 $LingbotDepthModelName = "lingbot-depth-v0.5.pt"
 $LingbotDepthModelSha256 = "b60cf27ddbd0e51e9b59b03475c0d39d02d2e48ecf8dbb5866f04d46802b3c23"
+$MapAnythingRevision = "3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9"
+$MapAnythingModelRevision = "00f9c245bbcb60522d1ed7f9e9d88462c6e3f38a"
+$MapAnythingModelSha256 = "fa06c0fdccefc5048e072c85935d5789b1e36b307f3859033c17f9dcb9fd5201"
 $FlashInferRevision = "713358284345314df4f40ddc352f4e981f5bb03e"
 $FlashInferFeatureStamp = Join-Path $SitePackages "flashinfer/scanlan-build.txt"
 $LingbotModels = Join-Path $PackageRoot "models"
+$MapAnythingModels = Join-Path $LingbotModels "map-anything-apache"
 $LingbotModelAssets = @(
   @{
     Name = "lingbot-map-long.pt"
@@ -122,7 +126,9 @@ if ($LASTEXITCODE -ne 0) { throw "The LingBot-compatible torchvision runtime cou
   "huggingface-hub>=0.34,<2" "einops>=0.8,<1" "safetensors>=0.5,<1" `
   "opencv-python==4.11.0.86" "scipy>=1.15,<2" "tqdm>=4.67,<5" `
   "click>=8.1,<9" "matplotlib>=3.10,<4" "trimesh>=4.8,<5" `
-  "onnxruntime-gpu==1.28.0"
+  "onnxruntime-gpu==1.28.0" "hydra-core==1.3.5" "natsort==8.4.0" `
+  "orjson==3.11.9" "pillow-heif==1.5.0" "python-box==7.4.1" `
+  "termcolor==3.3.0" "timm==1.0.28"
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat support dependencies could not be installed." }
 & $Python -m pip install --upgrade --force-reinstall --no-deps `
   "git+https://github.com/Robbyant/lingbot-map.git@$LingbotRevision"
@@ -130,6 +136,11 @@ if ($LASTEXITCODE -ne 0) { throw "LingBot-Map could not be installed." }
 & $Python -m pip install --upgrade --force-reinstall --no-deps `
   "git+https://github.com/Robbyant/lingbot-depth.git@$LingbotDepthRevision"
 if ($LASTEXITCODE -ne 0) { throw "LingBot-Depth could not be installed." }
+& $Python -m pip install --upgrade --force-reinstall --no-deps "uniception==0.1.7"
+if ($LASTEXITCODE -ne 0) { throw "UniCeption 0.1.7 could not be installed." }
+& $Python -m pip install --upgrade --force-reinstall --no-deps `
+  "git+https://github.com/facebookresearch/map-anything.git@$MapAnythingRevision"
+if ($LASTEXITCODE -ne 0) { throw "MapAnything could not be installed." }
 
 # FlashInfer's upstream wheels do not support native Windows. Build the pinned
 # Windows fork's JIT package for the exact Torch/CUDA/GPU combination. It keeps
@@ -251,6 +262,27 @@ if (-not $LingbotDepthValid) {
 if ((Get-FileHash -LiteralPath $LingbotDepthDestination -Algorithm SHA256).Hash -ne $LingbotDepthModelSha256) {
   throw "LingBot-Depth v0.5 did not match its pinned SHA-256 digest."
 }
+$null = New-Item -ItemType Directory -Path $MapAnythingModels -Force
+foreach ($MapAnythingAsset in @("config.json", "model.safetensors")) {
+  $MapAnythingDestination = Join-Path $MapAnythingModels $MapAnythingAsset
+  $MapAnythingValid = Test-Path -LiteralPath $MapAnythingDestination
+  if ($MapAnythingValid -and $MapAnythingAsset -eq "model.safetensors") {
+    $MapAnythingValid = (Get-FileHash -LiteralPath $MapAnythingDestination -Algorithm SHA256).Hash -eq $MapAnythingModelSha256
+  }
+  if (-not $MapAnythingValid) {
+    if (Test-Path -LiteralPath $MapAnythingDestination) {
+      Remove-Item -LiteralPath $MapAnythingDestination -Force
+    }
+    $MapAnythingDownloaded = (& $Python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id='facebook/map-anything-apache', filename='$MapAnythingAsset', revision='$MapAnythingModelRevision'))" | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $MapAnythingDownloaded)) {
+      throw "MapAnything asset $MapAnythingAsset could not be downloaded."
+    }
+    Copy-Item -LiteralPath $MapAnythingDownloaded -Destination $MapAnythingDestination -Force
+  }
+}
+if ((Get-FileHash -LiteralPath (Join-Path $MapAnythingModels "model.safetensors") -Algorithm SHA256).Hash -ne $MapAnythingModelSha256) {
+  throw "MapAnything Apache did not match its pinned SHA-256 digest."
+}
 foreach ($Asset in $ColmapModelAssets) {
   $Destination = Join-Path $LingbotModels $Asset.Name
   Get-VerifiedDownload `
@@ -261,6 +293,7 @@ foreach ($Asset in $ColmapModelAssets) {
 $env:SCANLAN_LINGBOT_MODEL = Join-Path $LingbotModels "lingbot-map-long.pt"
 $env:SCANLAN_LINGBOT_SKY_MODEL = Join-Path $LingbotModels "skyseg_batch.onnx"
 $env:SCANLAN_LINGBOT_DEPTH_MODEL = $LingbotDepthDestination
+$env:SCANLAN_MAPANYTHING_MODEL = $MapAnythingModels
 $env:SCANLAN_COLMAP_ALIKED_MODEL = Join-Path $LingbotModels "aliked-n16rot.onnx"
 $env:SCANLAN_COLMAP_LIGHTGLUE_MODEL = Join-Path $LingbotModels "aliked-lightglue.onnx"
 $env:SCANLAN_FLASHINFER_CACHE_ARCHIVE = $FlashInferCacheArchive
@@ -357,6 +390,7 @@ if ($LASTEXITCODE -ne 0) { throw "ScanLan splat runtime validation failed." }
 & $Python -m scanlan_geometry.cli diagnostics `
   --require-lingbot `
   --require-lingbot-depth `
+  --require-mapanything `
   --require-flashinfer
 if ($LASTEXITCODE -ne 0) { throw "ScanLan geometry runtime validation failed." }
 
@@ -402,10 +436,14 @@ try {
   $GeometryArguments = @(
     "--noconfirm", "--clean", "--onedir", "--name", "scanlan-geometry",
     "--collect-all", "lingbot_map", "--collect-all", "mdm", "--collect-all", "torchvision",
+    "--collect-all", "mapanything", "--collect-all", "uniception",
+    "--collect-all", "safetensors",
     "--collect-all", "onnxruntime", "--collect-all", "cv2",
     "--collect-all", "huggingface_hub", "--collect-all", "tvm_ffi", "--collect-all", "ninja",
     "--copy-metadata", "torch", "--copy-metadata", "torchvision",
-    "--copy-metadata", "lingbot-map", "--copy-metadata", "mdm"
+    "--copy-metadata", "lingbot-map", "--copy-metadata", "mdm",
+    "--copy-metadata", "mapanything", "--copy-metadata", "uniception",
+    "--copy-metadata", "safetensors"
   )
   if ($FlashInferReady) {
     $GeometryArguments += @("--collect-all", "flashinfer")
@@ -423,6 +461,10 @@ Copy-Item -LiteralPath (Join-Path $ProjectRoot "THIRD_PARTY_NOTICES.md") -Destin
 Copy-Item -LiteralPath (Join-Path $LingbotModels "lingbot-map-long.pt") -Destination $PackagedGeometryModels -Force
 Copy-Item -LiteralPath (Join-Path $LingbotModels "skyseg_batch.onnx") -Destination $PackagedGeometryModels -Force
 Copy-Item -LiteralPath $LingbotDepthDestination -Destination $PackagedGeometryModels -Force
+$PackagedMapAnythingModels = Join-Path $PackagedGeometryModels "map-anything-apache"
+$null = New-Item -ItemType Directory -Path $PackagedMapAnythingModels -Force
+Copy-Item -LiteralPath (Join-Path $MapAnythingModels "config.json") -Destination $PackagedMapAnythingModels -Force
+Copy-Item -LiteralPath (Join-Path $MapAnythingModels "model.safetensors") -Destination $PackagedMapAnythingModels -Force
 if ($FlashInferReady -and (Test-Path -LiteralPath $FlashInferCacheArchive)) {
   Copy-Item -LiteralPath $FlashInferCacheArchive -Destination $PackagedGeometryModels -Force
 }
@@ -431,6 +473,7 @@ if ($FlashInferReady -and (Test-Path -LiteralPath $FlashInferCacheArchive)) {
 Remove-Item Env:SCANLAN_LINGBOT_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_LINGBOT_SKY_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_LINGBOT_DEPTH_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:SCANLAN_MAPANYTHING_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_COLMAP_ALIKED_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_COLMAP_LIGHTGLUE_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_FLASHINFER_CACHE_ARCHIVE -ErrorAction SilentlyContinue
@@ -442,6 +485,7 @@ if ($LASTEXITCODE -ne 0) { throw "The packaged ScanLan splat runtime failed vali
 & $PackagedGeometryWorker diagnostics `
   --require-lingbot `
   --require-lingbot-depth `
+  --require-mapanything `
   --require-flashinfer
 if ($LASTEXITCODE -ne 0) { throw "The packaged ScanLan geometry runtime failed validation." }
 

@@ -54,6 +54,8 @@ export interface CaptureSettings {
   produceWatertightMesh: boolean;
   /** Run guarded LingBot-Depth completion after metric pose recovery. */
   lingbotDepthRefinement: boolean;
+  /** Guarded learned RGB-D completion backend. */
+  depthRefinementBackend: 'off' | 'lingbot' | 'mapanything';
   /** Feature-flagged provisional learned-depth preview for imported video. */
   experimentalRgbPreview: boolean;
 }

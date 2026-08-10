@@ -501,6 +501,20 @@ fn restore_sensor_preference(app: &AppHandle, project: &mut ProjectSummary) -> b
 
 fn normalize_project(project: &mut ProjectSummary) -> bool {
     let mut changed = false;
+    if project.settings.depth_refinement_backend == "off"
+        && project.settings.lingbot_depth_refinement
+    {
+        project.settings.depth_refinement_backend = "lingbot".to_string();
+        project.settings.lingbot_depth_refinement = false;
+        changed = true;
+    }
+    if !matches!(
+        project.settings.depth_refinement_backend.as_str(),
+        "off" | "lingbot" | "mapanything"
+    ) {
+        project.settings.depth_refinement_backend = "off".to_string();
+        changed = true;
+    }
     let safe_voxel_size = project.settings.voxel_size_mm.clamp(1, 40);
     if safe_voxel_size != project.settings.voxel_size_mm {
         project.settings.voxel_size_mm = safe_voxel_size;
@@ -1259,6 +1273,12 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
         "faithful" | "architectural" | "natural"
     ) {
         return Err("Unknown mesh repair profile".to_string());
+    }
+    if !matches!(
+        settings.depth_refinement_backend.as_str(),
+        "off" | "lingbot" | "mapanything"
+    ) {
+        return Err("Unknown depth refinement backend".to_string());
     }
     Ok(())
 }
@@ -2522,7 +2542,8 @@ pub fn update_project_settings(
         || project.settings.fill_inferred_mesh_holes != settings.fill_inferred_mesh_holes
         || project.settings.produce_watertight_mesh != settings.produce_watertight_mesh;
     let depth_refinement_changed =
-        project.settings.lingbot_depth_refinement != settings.lingbot_depth_refinement;
+        project.settings.depth_refinement_backend != settings.depth_refinement_backend
+            || project.settings.lingbot_depth_refinement != settings.lingbot_depth_refinement;
     project.settings = settings;
     if depth_refinement_changed {
         for artifact in [
@@ -6452,6 +6473,7 @@ mod tests {
             "imuGyroRangeDps",
             "liveMapMemoryMib",
             "lingbotDepthRefinement",
+            "depthRefinementBackend",
             "experimentalRgbPreview",
         ] {
             object.remove(field);
@@ -6464,6 +6486,7 @@ mod tests {
         assert_eq!(settings.imu_accel_rate_hz, 0);
         assert_eq!(settings.live_map_memory_mib, 1024);
         assert!(!settings.lingbot_depth_refinement);
+        assert_eq!(settings.depth_refinement_backend, "off");
         assert!(!settings.experimental_rgb_preview);
     }
 

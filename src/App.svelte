@@ -1221,12 +1221,12 @@
 
   async function startBuild(resume = false): Promise<void> {
     if (!project || busy || capturing || photoLocalizationActive) return;
-    if (project.mediaSources.some((source) => source.kind === 'video') && !runtime?.geometryWorkerAvailable) {
-      message = 'Video reconstruction requires the isolated LingBot geometry runtime.';
+    if (project.mediaSources.length && !runtime?.geometryWorkerAvailable) {
+      message = 'Photo/video reconstruction requires the isolated learned-geometry runtime.';
       return;
     }
-    if (project.settings.lingbotDepthRefinement && !runtime?.geometryWorkerAvailable) {
-      message = 'LingBot depth refinement requires the isolated geometry runtime.';
+    if (project.settings.depthRefinementBackend !== 'off' && !runtime?.geometryWorkerAvailable) {
+      message = 'Learned depth refinement requires the isolated geometry runtime.';
       return;
     }
     if (resume && activeJob) {
@@ -2224,12 +2224,19 @@
 
         {#if !mediaOnlyProject}
           <details class="panel collapsible-panel" open>
-            <summary><span>DEPTH REFINEMENT</span><strong>{project.settings.lingbotDepthRefinement ? 'LINGBOT V0.5' : 'SENSOR ONLY'}</strong></summary>
+            <summary><span>DEPTH REFINEMENT</span><strong>{project.settings.depthRefinementBackend === 'mapanything' ? 'MAPANYTHING' : project.settings.depthRefinementBackend === 'lingbot' ? 'LINGBOT V0.5' : 'SENSOR ONLY'}</strong></summary>
             <div class="collapsible-body settings mesh-repair-settings">
-              <label class="toggle"><input type="checkbox" checked={project.settings.lingbotDepthRefinement} on:change={(event) => updateSetting('lingbotDepthRefinement', inputChecked(event))} disabled={processing || !runtime?.geometryWorkerAvailable}/><span></span><div><strong>Fill RGB-D depth gaps with LingBot-Depth</strong><small>Runs in the isolated geometry worker after camera tracking; preserves measured depth and accepts only metric, RGB-aligned, multi-view-consistent predictions</small></div></label>
+              <label>Completion backend
+                <select value={project.settings.depthRefinementBackend} on:change={(event) => updateSetting('depthRefinementBackend', inputValue(event) as 'off' | 'lingbot' | 'mapanything')} disabled={processing || !runtime?.geometryWorkerAvailable}>
+                  <option value="off">Sensor depth only</option>
+                  <option value="lingbot">LingBot-Depth v0.5</option>
+                  <option value="mapanything">MapAnything Apache</option>
+                </select>
+              </label>
+              <p>MapAnything proposals are locally calibrated against independent held-out sensor anchors. Both learned backends preserve every measured pixel and accept only metric, RGB-aligned, multi-view-consistent completion.</p>
               <p>Generated pixels carry lower fusion weight and are exported with confidence and provenance masks. Camera poses always remain tied to the original sensor depth.</p>
               {#if !runtime?.geometryWorkerAvailable}
-                <p class="warning">The isolated learned-geometry runtime is required for offline LingBot-Depth inference.</p>
+                <p class="warning">The isolated learned-geometry runtime is required for offline completion.</p>
               {:else if project.depthRefinement?.enabled}
                 <div class="repair-result" class:warning={(project.depthRefinement.acceptedFrameCount ?? 0) < (project.depthRefinement.frameCount ?? 0)}>
                   <span>LAST QUALITY GATE</span>

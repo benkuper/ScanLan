@@ -11,24 +11,28 @@ or remaining resident while a later large model starts.
 | --- | --- | --- | --- |
 | LingBot-Map long | `1f480aeb8a47a24656090d46d053115b7fe60435` | `204754b72bb24f561f8d7e7e1e4e4cd9e809adf9` | Ordered streaming camera, depth, confidence, and dense seeds |
 | LingBot-Depth v0.5 | `f3a237e434ae987bc38281476d6cfb5df3e4d739` | `79204ed6b837f4fdd192cf563e59481fecfa0295` | Metric RGB-D refinement and hole proposals |
+| MapAnything Apache | `3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9` | `00f9c245bbcb60522d1ed7f9e9d88462c6e3f38a` | RGB-D completion and bounded photo/short-video camera-depth challenger |
 
 Both runtimes and their model assets are verified during packaging and remain available offline.
 The implementation follows the upstream
 [LingBot-Map streaming API](https://github.com/Robbyant/lingbot-map) and the recommended
-[LingBot-Depth v0.5 metric model](https://github.com/Robbyant/lingbot-depth). ScanLan retains
+[LingBot-Depth v0.5 metric model](https://github.com/Robbyant/lingbot-depth), and the
+[Apache MapAnything checkpoint](https://huggingface.co/facebook/map-anything-apache). ScanLan retains
 its stricter confidence, metric, free-space, multiview, and production-camera gates outside the
 model process.
 
 ## Commands
 
 ```text
-scanlan-geometry.exe diagnostics [--require-lingbot] [--require-lingbot-depth] [--require-flashinfer]
+scanlan-geometry.exe diagnostics [--require-lingbot] [--require-lingbot-depth] [--require-mapanything] [--require-flashinfer]
 scanlan-geometry.exe infer-lingbot-map --request REQUEST.json --progress PROGRESS.json
+scanlan-geometry.exe infer-mapanything --request REQUEST.json --progress PROGRESS.json
 scanlan-geometry.exe refine-rgbd-depth --request REQUEST.json --progress PROGRESS.json
+scanlan-geometry.exe refine-rgbd-depth-mapanything --request REQUEST.json --progress PROGRESS.json
 ```
 
 Diagnostics loads the pinned assets when required. It also executes the real FlashInfer paged
-attention shape and a BF16 LingBot-Depth inference on the installed CUDA device; package
+attention shape plus BF16 LingBot-Depth and MapAnything inference on the installed CUDA device; package
 discovery alone is not considered acceleration validation.
 
 ## LingBot-Map IPC contract
@@ -65,3 +69,15 @@ implementations used before P4. The migration changes process ownership, not mod
 formats. Automated equivalence tests round-trip every LingBot-Map output array bit-for-bit and
 route the existing LingBot-Depth schema unchanged. Camera agreement, depth validation, fusion,
 and final output publication remain in their previous owning workers.
+
+## MapAnything contract
+
+The pinned Apache model is loaded from a verified local `config.json` and
+`model.safetensors`. Construction redirects UniCeption's Torch Hub call to MapAnything's bundled
+DINOv2 source with `pretrained=False`; the complete checkpoint then supplies the weights. Frozen
+diagnostics run with an empty Torch cache and offline Hugging Face flags.
+
+RGB-D requests publish source-aligned depth, validity, and confidence arrays in bounded windows.
+Image-only requests publish the same typed camera/dense-seed archive as LingBot, with an explicit
+`MODEL_METRIC_UNVERIFIED` scale label. The media solver aligns both learned proposals to COLMAP
+and uses the accepted lower-residual candidate; failed challengers cannot replace the baseline.

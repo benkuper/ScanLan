@@ -763,13 +763,13 @@ fn run_pipeline(
             .arg("15")
             .arg("--maximum-video-frames")
             .arg("3000");
+        let geometry_worker = existing_geometry_runtime(resources)?;
+        prepare.arg("--geometry-worker").arg(geometry_worker);
         if project
             .media_sources
             .iter()
             .any(|source| source.kind == "video")
         {
-            let geometry_worker = existing_geometry_runtime(resources)?;
-            prepare.arg("--geometry-worker").arg(geometry_worker);
             if project.settings.experimental_rgb_preview {
                 prepare.arg("--progressive-rgb-preview");
             }
@@ -799,7 +799,12 @@ fn run_pipeline(
         return run_command(train, project_root, job, cancel, true);
     }
     let reconstruction = existing_runtime(resources, false)?;
-    let depth_refiner = if project.settings.lingbot_depth_refinement {
+    let depth_refinement_backend = match project.settings.depth_refinement_backend.as_str() {
+        "lingbot" | "mapanything" => project.settings.depth_refinement_backend.as_str(),
+        _ if project.settings.lingbot_depth_refinement => "lingbot",
+        _ => "off",
+    };
+    let depth_refiner = if depth_refinement_backend != "off" {
         Some(existing_geometry_runtime(resources)?)
     } else {
         None
@@ -846,7 +851,7 @@ fn run_pipeline(
         if let Some(refiner) = depth_refiner.as_ref() {
             command
                 .arg("--depth-refinement")
-                .arg("lingbot")
+                .arg(depth_refinement_backend)
                 .arg("--depth-refiner")
                 .arg(refiner);
         }
