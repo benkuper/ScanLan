@@ -176,6 +176,14 @@ Media splats must also pass a deterministic five-view raw-render gate (median PS
 An undertrained or divergent candidate is not published; its final atomic checkpoint is retained so
 the job can resume with a longer optimization budget.
 
+Material-aware production starts from a separate fail-closed foundation. ScanLan converts embedded
+ICC input to canonical sRGB, decodes the exact IEC transfer into content-addressed linear-light
+frames, and keeps material identity separate from overlapping glass, mirror, specular, emissive,
+thin-geometry, dynamic, and sky risks. Frozen commercial/research candidate manifests prevent
+noncommercial or unverified assets from entering a commercial pack. Material Anything, RGB-to-X,
+and DiffusionRenderer remain bake-off candidates until they pass real-capture quality, multiview,
+calibration, and 12 GB memory gates; see [the P13 foundation](docs/material-radiometric-foundation.md).
+
 The dense initialization sidecar is also the shared point/mesh fusion contract. It retains source
 ownership, confidence, provenance, orientation, and footprint. Media-only point and mesh artifacts
 are correctly labeled non-metric. In a hybrid project, learned media geometry is robustly aligned
@@ -235,6 +243,7 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 .\build\worker-venv\Scripts\python.exe -m unittest discover -s worker\tests -v
 .\splat-worker\.venv\Scripts\python.exe -m unittest discover -s splat-worker\tests -v
+.\splat-worker\.venv\Scripts\python.exe -m unittest discover -s material\tests -v
 ```
 
 Native capture workers must also be compiled on Windows against their vendor SDKs; portable header tests cannot validate those SDK calls.

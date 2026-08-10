@@ -376,6 +376,8 @@ if (-not (Test-Path -LiteralPath $GsplatExtension)) {
 }
 & $Python -m pip install --upgrade --force-reinstall --no-deps (Join-Path $ProjectRoot "validation")
 if ($LASTEXITCODE -ne 0) { throw "Shared ScanLan validation engine could not be installed." }
+& $Python -m pip install --upgrade --force-reinstall --no-deps (Join-Path $ProjectRoot "material")
+if ($LASTEXITCODE -ne 0) { throw "Shared ScanLan material foundation could not be installed." }
 & $Python -m pip install --upgrade --force-reinstall --no-deps $PackageRoot
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat worker could not be installed." }
 & $Python -m pip install --upgrade --force-reinstall --no-deps $GeometryPackageRoot
@@ -450,6 +452,7 @@ try {
     "--add-binary", "${PycolmapOnnxCuda};pycolmap.libs",
     "--collect-all", "gsplat", "--collect-all", "pycolmap", "--collect-all", "av",
     "--collect-all", "onnxruntime", "--collect-all", "cv2",
+    "--collect-all", "scanlan_material",
     "--collect-all", "huggingface_hub", "--collect-all", "tvm_ffi",
     "--collect-all", "ninja",
     "--copy-metadata", "torch",
@@ -486,6 +489,7 @@ try {
     "--collect-all", "evo", "--collect-all", "imageio", "--collect-all", "moviepy",
     "--collect-all", "safetensors",
     "--collect-all", "onnxruntime", "--collect-all", "cv2",
+    "--collect-all", "scanlan_material",
     "--collect-all", "huggingface_hub", "--collect-all", "tvm_ffi", "--collect-all", "ninja",
     "--copy-metadata", "torch", "--copy-metadata", "torchvision",
     "--copy-metadata", "lingbot-map", "--copy-metadata", "mdm",

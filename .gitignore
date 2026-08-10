@@ -38,6 +38,8 @@ htmlcov/
 /geometry-worker/*.spec
 /validation/build/
 /validation/dist/
+/material/build/
+/material/dist/
 /media-tools/
 *.spec.bak
 

@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 from PIL import Image, ImageOps
+from scanlan_material.radiometry import to_canonical_srgb
 
 from .da3 import DA3_CODE_REVISION, DA3_MODEL_REVISION, DA3_MODEL_SHA256
 from .lingbot import (
@@ -344,7 +345,7 @@ def _save_canonical_image(
     *,
     exif: bytes | None = None,
 ) -> tuple[int, int]:
-    image = ImageOps.exif_transpose(image).convert("RGB")
+    image, _color_metadata = to_canonical_srgb(image)
     size = _limited_size(image.width, image.height, maximum_dimension)
     if size != image.size:
         image = image.resize(size, Image.Resampling.LANCZOS)
@@ -357,6 +358,7 @@ def _save_canonical_image(
     }
     if exif:
         save_options["exif"] = exif
+    save_options["icc_profile"] = image.info["icc_profile"]
     image.save(destination, **save_options)
     return image.size
 

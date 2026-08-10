@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scanlan-material"
+version = "0.1.0"
+description = "Shared material, radiometric, model-pack, and bake-off contracts for ScanLan"
+license = "GPL-3.0-only"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26,<3", "Pillow>=10.4,<12"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scanlan_material*"]

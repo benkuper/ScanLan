@@ -820,12 +820,19 @@ Implemented with one explicit initialization contract and a bounded source-detai
 
 ## P13 — Material and radiometric foundation
 
-Add:
+Implemented as the fail-closed boundary for every later material stage:
 
-* material contracts;
-* linear-light preparation;
-* model bake-off;
-* commercial/research pack separation.
+* one source-aligned observation contract separates material identity, overlapping optical risk,
+  confidence/validity, and optional linear PBR fields;
+* EXIF and embedded ICC color are normalized to sRGB before the exact IEC transfer is decoded into
+  content-addressed linear-light inputs, while undeclared HDR/wide-gamut input is rejected;
+* a representative-data bake-off uses hard material, optical-risk, multiview, calibration, 12 GB
+  memory, and real-capture gates followed by Pareto ranking rather than a paper-only or weighted
+  leaderboard;
+* frozen candidate revisions and legal terms drive distinct commercial and research manifests;
+  unverified, noncommercial, and output-restricted assets cannot enter the commercial pack;
+* the initial shortlist covers Material Anything, RGB-to-X, and DiffusionRenderer, but P14 cannot
+  package a winner until measured ScanLan evidence and a complete transitive license audit pass.
 
 ## P14 — Two-pass material analysis
 

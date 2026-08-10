@@ -106,6 +106,13 @@ def parser() -> argparse.ArgumentParser:
     neural_sdf.add_argument("--progress", type=Path, default=None)
     neural_sdf.add_argument("--iterations", type=int, default=1_600)
     neural_sdf.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    material = commands.add_parser("prepare-material")
+    material.add_argument("--dataset", type=Path, required=True)
+    material.add_argument("--output", type=Path, required=True)
+    material.add_argument("--frame-index", type=int, action="append", default=None)
+    pack = commands.add_parser("material-pack")
+    pack.add_argument("--pack", choices=["commercial", "research"], required=True)
+    pack.add_argument("--output", type=Path, required=True)
     diagnostics = commands.add_parser("diagnostics")
     diagnostics.add_argument("--require-cuda", action="store_true")
     diagnostics.add_argument("--require-learned-features", action="store_true")
@@ -120,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             import torch
             import gsplat
             from .neural_sdf import NEURAL_SDF_VERSION
+            from scanlan_material import CONTRACT_VERSION, RADIOMETRY_VERSION
 
             cuda_available = torch.cuda.is_available()
             if arguments.require_cuda and cuda_available:
@@ -147,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
                             "version": NEURAL_SDF_VERSION,
                             "cudaAvailable": cuda_available,
                         },
+                        "materialFoundation": {
+                            "contractVersion": CONTRACT_VERSION,
+                            "radiometryVersion": RADIOMETRY_VERSION,
+                        },
                     }
                 )
             )
@@ -160,6 +172,22 @@ def main(argv: list[str] | None = None) -> int:
                 and not adaptive_frames["enabled"]
                 else 0
             )
+        if arguments.command == "prepare-material":
+            from scanlan_material import prepare_dataset_radiometry
+
+            result = prepare_dataset_radiometry(
+                arguments.dataset.resolve(strict=True),
+                arguments.output.resolve(),
+                frame_indices=arguments.frame_index,
+            )
+            print(json.dumps(result))
+            return 0
+        if arguments.command == "material-pack":
+            from scanlan_material import write_pack_manifest
+
+            result = write_pack_manifest(arguments.output.resolve(), arguments.pack)
+            print(json.dumps(result))
+            return 0
         if arguments.command in {"prepare-media", "extract-media"}:
             media_options = MediaPreparationOptions(
                 video_fps=max(0.1, min(arguments.video_fps, 30.0)),
