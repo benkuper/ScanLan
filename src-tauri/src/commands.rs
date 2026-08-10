@@ -510,7 +510,7 @@ fn normalize_project(project: &mut ProjectSummary) -> bool {
     }
     if !matches!(
         project.settings.depth_refinement_backend.as_str(),
-        "off" | "lingbot" | "mapanything"
+        "off" | "lingbot" | "mapanything" | "da3"
     ) {
         project.settings.depth_refinement_backend = "off".to_string();
         changed = true;
@@ -1276,7 +1276,7 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
     }
     if !matches!(
         settings.depth_refinement_backend.as_str(),
-        "off" | "lingbot" | "mapanything"
+        "off" | "lingbot" | "mapanything" | "da3"
     ) {
         return Err("Unknown depth refinement backend".to_string());
     }
@@ -2280,13 +2280,15 @@ pub async fn runtime_info(
                         "diagnostics",
                         "--require-lingbot",
                         "--require-lingbot-depth",
+                        "--require-mapanything",
+                        "--require-da3",
                         "--require-flashinfer",
                     ])
                     .output();
                 match output {
                     Ok(output) if output.status.success() => (
                         true,
-                        "Isolated LingBot-Map and LingBot-Depth runtime ready".to_string(),
+                        "Isolated LingBot, MapAnything, and DA3 Max runtime ready".to_string(),
                     ),
                     Ok(output) => {
                         let detail = output_message(&output);

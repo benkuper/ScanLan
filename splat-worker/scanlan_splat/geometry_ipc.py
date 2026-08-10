@@ -17,6 +17,15 @@ from scanlan_validation import (
     validate_geometry,
 )
 
+from .da3 import (
+    DA3_CODE_REVISION,
+    DA3_MAX_SEEDS,
+    DA3_MODEL_REVISION,
+    DA3_MODEL_SHA256,
+    Da3Predictor,
+    infer_da3_geometry_streaming,
+)
+
 from .lingbot import (
     LINGBOT_CODE_REVISION,
     LINGBOT_MAX_SEEDS,
@@ -54,8 +63,7 @@ def _save_geometry(path: Path, geometry: LingbotGeometry) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     with temporary.open("wb") as handle:
-        np.savez_compressed(
-            handle,
+        values = dict(
             world_from_cameras=geometry.world_from_cameras,
             intrinsics=geometry.intrinsics,
             points=geometry.points,
@@ -65,6 +73,9 @@ def _save_geometry(path: Path, geometry: LingbotGeometry) -> None:
             source_frame_indices=geometry.source_frame_indices,
             frame_confidence=geometry.frame_confidence,
         )
+        if geometry.opacities is not None:
+            values["opacities"] = np.asarray(geometry.opacities, dtype=np.float32)
+        np.savez_compressed(handle, **values)
     os.replace(temporary, path)
 
 
@@ -275,7 +286,7 @@ def _load_geometry(
         "source_frame_indices",
         "frame_confidence",
     }
-    if set(values) != required:
+    if set(values) not in (required, required | {"opacities"}):
         raise RuntimeError("Geometry worker result has an incompatible array contract")
     point_count = len(values["points"])
     if not (
@@ -284,6 +295,10 @@ def _load_geometry(
         and values["scales"].shape == (point_count, 3)
         and values["quaternions"].shape == (point_count, 4)
         and values["source_frame_indices"].shape == (point_count,)
+        and (
+            "opacities" not in values
+            or values["opacities"].shape == (point_count,)
+        )
     ):
         raise RuntimeError("Geometry worker returned inconsistent dense seed arrays")
     camera_count = len(values["world_from_cameras"])
@@ -319,6 +334,13 @@ def _load_geometry(
         or np.any(values["source_frame_indices"] >= camera_count)
         or np.any(values["frame_confidence"] < 0)
         or np.any(values["frame_confidence"] > 1)
+        or (
+            "opacities" in values
+            and (
+                np.any(values["opacities"] < 0)
+                or np.any(values["opacities"] > 1)
+            )
+        )
     ):
         raise RuntimeError("Geometry worker returned values outside the geometry contract")
     processed_size = metadata.get("processedSize")
@@ -340,6 +362,7 @@ def _load_geometry(
         backend=str(metadata.get("backend", "LingBot-Map geometry worker")),
         model_path=str(metadata.get("modelPath", "")),
         processed_size=(int(processed_size[0]), int(processed_size[1])),
+        opacities=values.get("opacities"),
     )
 
 
@@ -552,6 +575,142 @@ def run_mapanything_request(
     return result
 
 
+def run_da3_request(
+    request_path: Path,
+    progress_path: Path,
+    *,
+    predictor: Da3Predictor | None = None,
+) -> dict[str, Any]:
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    if int(request.get("schemaVersion", 0)) != GEOMETRY_REQUEST_SCHEMA:
+        raise ValueError("Unsupported geometry-worker request schema")
+    image_paths = [Path(value).resolve(strict=True) for value in request.get("imagePaths", [])]
+    if len(image_paths) < 3:
+        raise ValueError("DA3 geometry request requires at least three images")
+    cancel_value = str(request.get("cancelPath", "")).strip()
+    cancel_path = Path(cancel_value) if cancel_value else None
+    direct_gaussians = bool(request.get("directGaussians", False))
+
+    def cancelled() -> bool:
+        return cancel_path is not None and cancel_path.is_file()
+
+    def report(
+        stage: str,
+        detail: str,
+        progress: float,
+        backend: str,
+        metrics: dict[str, Any],
+    ) -> None:
+        if cancelled():
+            raise RuntimeError("DA3 geometry inference cancelled")
+        _write_json_atomic(
+            progress_path,
+            {
+                "schemaVersion": GEOMETRY_REQUEST_SCHEMA,
+                "stage": stage,
+                "detail": detail,
+                "progress": progress,
+                "computeBackend": backend,
+                "metrics": metrics,
+            },
+        )
+
+    report(
+        "da3_loading",
+        "Loading pinned DA3 Nested Giant-Large 1.1 checkpoint offline",
+        0.02,
+        "DA3NESTED-GIANT-LARGE-1.1",
+        {"imageCount": len(image_paths), "directGaussians": direct_gaussians},
+    )
+    predictor = predictor or Da3Predictor.load(direct_gaussians=direct_gaussians)
+    direct_gaussians_used = direct_gaussians
+    memory_fallback: str | None = None
+    try:
+        geometry, streaming = infer_da3_geometry_streaming(
+            predictor,
+            image_paths,
+            maximum_seeds=int(request.get("maximumSeeds", DA3_MAX_SEEDS)),
+            window_size=int(request.get("windowSize", 24)),
+            overlap=int(request.get("overlap", 6)),
+            output_indices=request.get("outputIndices"),
+            progress=report,
+            cancelled=cancelled,
+            infer_gaussians=direct_gaussians,
+        )
+    except RuntimeError as error:
+        message = str(error).lower()
+        if not direct_gaussians or not any(
+            marker in message
+            for marker in ("cuda out of memory", "out of memory", "cuda allocation")
+        ):
+            raise
+        memory_fallback = str(error)
+        direct_gaussians_used = False
+        torch = getattr(predictor, "torch", None)
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        report(
+            "da3_memory_fallback",
+            "Direct Gaussian head exceeded safe CUDA memory; retaining DA3 camera/depth geometry",
+            0.03,
+            predictor.backend,
+            {"directGaussiansRequested": True, "memoryFallback": memory_fallback},
+        )
+        geometry, streaming = infer_da3_geometry_streaming(
+            predictor,
+            image_paths,
+            maximum_seeds=int(request.get("maximumSeeds", DA3_MAX_SEEDS)),
+            window_size=int(request.get("windowSize", 24)),
+            overlap=int(request.get("overlap", 6)),
+            output_indices=request.get("outputIndices"),
+            progress=report,
+            cancelled=cancelled,
+            infer_gaussians=False,
+        )
+    streaming = {
+        **streaming,
+        "directGaussiansRequested": direct_gaussians,
+        "directGaussiansUsed": direct_gaussians_used,
+        "memoryFallback": memory_fallback,
+    }
+    if cancelled():
+        raise RuntimeError("DA3 geometry inference cancelled")
+    arrays_path = Path(request["arraysPath"])
+    _save_geometry(arrays_path, geometry)
+    result = {
+        "schemaVersion": GEOMETRY_RESULT_SCHEMA,
+        "status": "complete",
+        "backend": geometry.backend,
+        "modelPath": geometry.model_path,
+        "codeRevision": DA3_CODE_REVISION,
+        "modelRevision": DA3_MODEL_REVISION,
+        "modelSha256": DA3_MODEL_SHA256,
+        "processedSize": list(geometry.processed_size),
+        "cameraCount": len(geometry.world_from_cameras),
+        "pointCount": len(geometry.points),
+        "arraysPath": str(arrays_path),
+        "proposalType": "direct-gaussian" if direct_gaussians_used else "camera-depth",
+        "scaleStatus": "MODEL_METRIC_UNVERIFIED",
+        "streaming": streaming,
+        "license": "CC-BY-NC-4.0",
+    }
+    _write_json_atomic(Path(request["resultPath"]), result)
+    report(
+        "da3_geometry",
+        f"Published {len(geometry.points):,} validated DA3 proposal seeds",
+        1.0,
+        geometry.backend,
+        {
+            "cameraCount": len(geometry.world_from_cameras),
+            "pointCount": len(geometry.points),
+            "directGaussiansRequested": direct_gaussians,
+            "directGaussiansUsed": direct_gaussians_used,
+            **streaming,
+        },
+    )
+    return result
+
+
 def infer_lingbot_geometry_isolated(
     executable: Path,
     image_paths: Sequence[Path],
@@ -756,3 +915,109 @@ def infer_mapanything_geometry_isolated(
     )
     shutil.rmtree(request_root, ignore_errors=True)
     return geometry
+
+
+def infer_da3_geometry_isolated(
+    executable: Path,
+    image_paths: Sequence[Path],
+    *,
+    work_root: Path,
+    cancel_path: Path,
+    maximum_seeds: int = DA3_MAX_SEEDS,
+    output_indices: Sequence[int] | None = None,
+    direct_gaussians: bool = False,
+    progress: ProgressCallback | None = None,
+) -> tuple[LingbotGeometry, dict[str, Any]]:
+    executable = executable.resolve(strict=True)
+    request_root = work_root / f"da3-{uuid.uuid4().hex}"
+    request_root.mkdir(parents=True, exist_ok=False)
+    request_path = request_root / "request.json"
+    progress_path = request_root / "progress.json"
+    result_path = request_root / "result.json"
+    arrays_path = request_root / "geometry.npz"
+    _write_json_atomic(
+        request_path,
+        {
+            "schemaVersion": GEOMETRY_REQUEST_SCHEMA,
+            "imagePaths": [str(Path(path).resolve(strict=True)) for path in image_paths],
+            "maximumSeeds": int(maximum_seeds),
+            "outputIndices": None if output_indices is None else list(map(int, output_indices)),
+            "directGaussians": direct_gaussians,
+            "windowSize": 24,
+            "overlap": 6,
+            "cancelPath": str(cancel_path.resolve()),
+            "arraysPath": str(arrays_path.resolve()),
+            "resultPath": str(result_path.resolve()),
+        },
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    log_path = request_root / "geometry-worker.log"
+    last_progress_mtime = -1
+    with log_path.open("w", encoding="utf-8", newline="\n") as log:
+        process = subprocess.Popen(
+            [str(executable), "infer-da3", "--request", str(request_path), "--progress", str(progress_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            creationflags=flags,
+        )
+        while process.poll() is None:
+            if progress_path.is_file():
+                modified = progress_path.stat().st_mtime_ns
+                if modified != last_progress_mtime:
+                    last_progress_mtime = modified
+                    try:
+                        value = json.loads(progress_path.read_text(encoding="utf-8"))
+                        if progress:
+                            progress(
+                                str(value.get("stage", "da3_geometry")),
+                                str(value.get("detail", "Running bounded DA3 inference")),
+                                float(value.get("progress", 0.0)),
+                                str(value.get("computeBackend", "DA3 geometry worker")),
+                                dict(value.get("metrics") or {}),
+                            )
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        pass
+            if cancel_path.is_file():
+                try:
+                    process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                break
+            time.sleep(0.10)
+        return_code = process.wait()
+    if return_code != 0:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        reported = [line for line in lines if line.startswith("scanlan-geometry:")]
+        detail = (
+            reported[-1]
+            if reported
+            else lines[-1]
+            if lines
+            else "DA3 geometry worker failed without diagnostics"
+        )
+        raise RuntimeError(detail)
+    metadata = json.loads(result_path.read_text(encoding="utf-8"))
+    if int(metadata.get("schemaVersion", 0)) != GEOMETRY_RESULT_SCHEMA:
+        raise RuntimeError("DA3 geometry worker returned an unsupported result schema")
+    if metadata.get("scaleStatus") != "MODEL_METRIC_UNVERIFIED":
+        raise RuntimeError("Unanchored DA3 geometry claimed validated metric scale")
+    proposal_type = metadata.get("proposalType")
+    if proposal_type not in ("direct-gaussian", "camera-depth"):
+        raise RuntimeError("DA3 geometry worker returned the wrong proposal type")
+    if not direct_gaussians and proposal_type != "camera-depth":
+        raise RuntimeError("DA3 geometry worker unexpectedly enabled direct Gaussians")
+    streaming = dict(metadata.get("streaming") or {})
+    if direct_gaussians and proposal_type == "camera-depth" and not streaming.get(
+        "memoryFallback"
+    ):
+        raise RuntimeError("DA3 direct Gaussian request fell back without a memory diagnostic")
+    geometry = _load_geometry(
+        arrays_path,
+        metadata,
+        code_revision=DA3_CODE_REVISION,
+        model_revision=DA3_MODEL_REVISION,
+        model_sha256=DA3_MODEL_SHA256,
+    )
+    shutil.rmtree(request_root, ignore_errors=True)
+    return geometry, streaming

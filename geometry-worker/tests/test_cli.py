@@ -5,10 +5,40 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from scanlan_geometry import cli
 from scanlan_geometry.cli import main
 
 
 class GeometryWorkerCliTests(unittest.TestCase):
+    def test_module_entrypoint_is_declared(self) -> None:
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        self.assertIn('if __name__ == "__main__":', source)
+
+    def test_da3_commands_route_versioned_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = Path(directory) / "request.json"
+            progress = Path(directory) / "progress.json"
+            with patch("scanlan_geometry.cli.run_da3_request") as infer:
+                self.assertEqual(
+                    main(["infer-da3", "--request", str(request), "--progress", str(progress)]),
+                    0,
+                )
+                infer.assert_called_once_with(request, progress)
+            with patch("scanlan_geometry.cli.refine_da3_depth_request") as refine:
+                self.assertEqual(
+                    main(
+                        [
+                            "refine-rgbd-depth-da3",
+                            "--request",
+                            str(request),
+                            "--progress",
+                            str(progress),
+                        ]
+                    ),
+                    0,
+                )
+                refine.assert_called_once_with(request, progress)
+
     def test_mapanything_commands_route_versioned_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = Path(directory) / "request.json"

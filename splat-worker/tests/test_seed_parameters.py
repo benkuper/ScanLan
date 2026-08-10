@@ -15,6 +15,7 @@ from scanlan_splat.train import (
     _exponential_lr_gamma,
     _finish_training_step,
     _metric_surface_scale_limit,
+    _prepare_dense_seed_scales,
     _read_seed_parameters,
     _reset_opacity_if_due,
     _rgbd_gaussian_limit,
@@ -48,6 +49,18 @@ def _write_initialization(path: Path) -> None:
 
 
 class SeedParameterTests(unittest.TestCase):
+    def test_direct_gaussian_prior_preserves_predicted_anisotropic_axis(self) -> None:
+        scales = np.asarray([[0.001, 0.08, 0.12]], dtype=np.float32)
+        direct = _prepare_dense_seed_scales(
+            scales, 0.10, direct_gaussian_prior=True
+        )
+        depth = _prepare_dense_seed_scales(
+            scales, 0.10, direct_gaussian_prior=False
+        )
+
+        np.testing.assert_allclose(direct, [[0.001, 0.08, 0.10]])
+        self.assertAlmostEqual(float(depth[0, 2]), 0.00008, places=7)
+
     def test_training_limits_leave_12_gib_kernel_headroom(self) -> None:
         self.assertEqual(_training_limits(8.0), (720, 1_000_000))
         self.assertEqual(_training_limits(12.0), (960, 2_000_000))

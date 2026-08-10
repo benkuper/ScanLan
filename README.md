@@ -120,14 +120,14 @@ npm run prepare:cuda
 
 The build targets compute capability 12.0 and repackages the extracted worker at `worker\dist\scanlan-worker\scanlan-worker.exe`. Keeping its Open3D/CUDA runtime extracted avoids unpacking almost 1 GB every time preview or reconstruction starts. Set `SCANLAN_DEVICE=cpu` before launching to diagnose the CPU path.
 
-Gaussian reconstruction and optional learned RGB-D refinement use two supervised CUDA runtimes. The splat runtime owns PyCOLMAP, PyAV, gsplat, and training; the separate geometry runtime owns LingBot-Map, LingBot-Depth, and MapAnything so model memory is released with each inference process. Both require Python 3.11 and are built together:
+Gaussian reconstruction and optional learned RGB-D refinement use two supervised CUDA runtimes. The splat runtime owns PyCOLMAP, PyAV, gsplat, and training; the separate geometry runtime owns LingBot-Map, LingBot-Depth, MapAnything, and DA3 Nested Giant-Large 1.1 so model memory is released with each inference process. Both require Python 3.11 and are built together:
 
 ```powershell
 npm run prepare:splat
 npm run package:splat
 ```
 
-The result is `build/ScanLan-splat-portable.zip`, containing `splat-runtime/` and `geometry-runtime/`. The build downloads the pinned Apache-2.0 LingBot and MapAnything assets once, verifies their digests, and bundles them for offline use. RGB-D projects can select **LingBot-Depth** or **MapAnything Apache** under Depth refinement; ordinary media projects use anisotropic 3D Gaussians initialized from the quality-filtered camera solve. Both keep bounded memory, publish atomic checkpoints, and stream a compact preview during training.
+The result is `build/ScanLan-splat-portable.zip`, containing `splat-runtime/` and `geometry-runtime/`. The build downloads pinned model assets once, verifies their digests, and bundles them for offline use. RGB-D projects can select **LingBot-Depth**, **MapAnything Apache**, or **DA3 Max** under Depth refinement. DA3 Max uses the strongest refreshed Nested Giant-Large checkpoint and direct Gaussian head; its checkpoint and derived output are restricted to noncommercial use under CC BY-NC 4.0. All paths keep bounded memory, publish atomic checkpoints, and stream a compact preview during training.
 
 Video-only projects can optionally enable the disabled-by-default **Progressive learned-depth preview**. It publishes bounded local LingBot submaps during ordered inference, colors geometry by confidence, and always labels scale as model-metric unverified. The provisional map is display-only and cannot bypass production camera or alignment gates.
 
@@ -140,6 +140,16 @@ measured-depth/free-space evidence.
 LingBot-Depth consumes the archived RGB8 image that is already aligned to the depth grid and returns the same raster dimensions, so no post-hoc RGB warp is inferred. ScanLan runs it only after metric camera poses have been recovered. Every valid sensor depth remains unchanged; predicted pixels are accepted only in sensor holes after model-mask, depth-edge, metric-scale, calibrated native-RGB field-of-view, independent-viewpoint, and multi-view reprojection gates. Accepted pixels carry explicit provenance and lower fusion/training confidence. If a frame fails the metric gate, its raw calibrated depth is used unchanged.
 
 MapAnything uses the same immutable aligned RGB-D archive but predicts in its processed image grid. ScanLan reverses the cover-resize/center-crop transform, calibrates the smooth model residual from sensor anchors, and validates only on independent held-out anchors. Unsupported large holes and any proposal that fails metric, RGB-coverage, multi-view, or free-space evidence remain sensor-only. For photos and videos of at most 32 selected views, MapAnything also proposes cameras and dense depth as a challenger; COLMAP agreement selects or rejects it, and image-only scale remains `MODEL_METRIC_UNVERIFIED` until anchored.
+
+DA3 Max uses DA3NESTED-GIANT-LARGE-1.1 for any-view cameras, metric-aware pose-conditioned depth,
+and direct Gaussian proposals. Long media runs in bounded 24-frame windows with six-frame overlap;
+every join must pass camera-center and rotation continuity gates before the complete proposal is
+compared with COLMAP and the other learned backends. The direct Gaussian head runs inside those
+same bounded windows. If its measured CUDA allocation exceeds available headroom, the isolated
+worker records that failure and retries with the model's confidence-gated camera/depth output;
+source-resolution gsplat optimization then remains the final quality stage.
+The initialization sidecar preserves the direct head's learned opacity and anisotropic scale axes;
+opacity-free point previews are not used as a quality judgment for this representation.
 
 Recommended starting profile on the specified laptop:
 
@@ -213,7 +223,7 @@ Native capture workers must also be compiled on Windows against their vendor SDK
 - `native/modern-capture/` — Azure Kinect and Femto Mega capture
 - `worker/` — realtime and final Open3D/NumPy reconstruction
 - `splat-worker/` — isolated COLMAP/PyAV media solver and CUDA 2DGS/3DGS trainer
-- `geometry-worker/` — isolated LingBot-Map, LingBot-Depth, and MapAnything model process
+- `geometry-worker/` — isolated LingBot-Map, LingBot-Depth, MapAnything, and DA3 model process
 - `scripts/` — Windows build and packaging entry points
 
 Licensed under [GPL-3.0-only](LICENSE).

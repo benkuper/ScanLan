@@ -27,10 +27,15 @@ $LingbotDepthModelSha256 = "b60cf27ddbd0e51e9b59b03475c0d39d02d2e48ecf8dbb5866f0
 $MapAnythingRevision = "3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9"
 $MapAnythingModelRevision = "00f9c245bbcb60522d1ed7f9e9d88462c6e3f38a"
 $MapAnythingModelSha256 = "fa06c0fdccefc5048e072c85935d5789b1e36b307f3859033c17f9dcb9fd5201"
+$Da3Revision = "3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
+$Da3ModelRevision = "b2359bdf726fb44ef62acca04d629dcf158053e7"
+$Da3ModelSha256 = "8ebe871a022ed58d2fc8fdfb2ebdb31d57b60fe39611c849095851a7b7c6020c"
+$Da3ConfigSha256 = "09adf89474017e717bc05aa86fd3a378708ba8914b036d61874eced328069468"
 $FlashInferRevision = "713358284345314df4f40ddc352f4e981f5bb03e"
 $FlashInferFeatureStamp = Join-Path $SitePackages "flashinfer/scanlan-build.txt"
 $LingbotModels = Join-Path $PackageRoot "models"
 $MapAnythingModels = Join-Path $LingbotModels "map-anything-apache"
+$Da3Models = Join-Path $LingbotModels "da3nested-giant-large-1.1-noncommercial"
 $LingbotModelAssets = @(
   @{
     Name = "lingbot-map-long.pt"
@@ -128,7 +133,8 @@ if ($LASTEXITCODE -ne 0) { throw "The LingBot-compatible torchvision runtime cou
   "click>=8.1,<9" "matplotlib>=3.10,<4" "trimesh>=4.8,<5" `
   "onnxruntime-gpu==1.28.0" "hydra-core==1.3.5" "natsort==8.4.0" `
   "orjson==3.11.9" "pillow-heif==1.5.0" "python-box==7.4.1" `
-  "termcolor==3.3.0" "timm==1.0.28"
+  "termcolor==3.3.0" "timm==1.0.28" "addict>=2.4,<3" "e3nn>=0.5,<1" `
+  "plyfile>=1.1,<2" "evo>=1.33,<2" "imageio>=2.37,<3" "moviepy==1.0.3"
 if ($LASTEXITCODE -ne 0) { throw "ScanLan splat support dependencies could not be installed." }
 & $Python -m pip install --upgrade --force-reinstall --no-deps `
   "git+https://github.com/Robbyant/lingbot-map.git@$LingbotRevision"
@@ -141,6 +147,9 @@ if ($LASTEXITCODE -ne 0) { throw "UniCeption 0.1.7 could not be installed." }
 & $Python -m pip install --upgrade --force-reinstall --no-deps `
   "git+https://github.com/facebookresearch/map-anything.git@$MapAnythingRevision"
 if ($LASTEXITCODE -ne 0) { throw "MapAnything could not be installed." }
+& $Python -m pip install --upgrade --force-reinstall --no-deps `
+  "git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@$Da3Revision"
+if ($LASTEXITCODE -ne 0) { throw "Depth Anything 3 could not be installed." }
 
 # FlashInfer's upstream wheels do not support native Windows. Build the pinned
 # Windows fork's JIT package for the exact Torch/CUDA/GPU combination. It keeps
@@ -283,6 +292,35 @@ foreach ($MapAnythingAsset in @("config.json", "model.safetensors")) {
 if ((Get-FileHash -LiteralPath (Join-Path $MapAnythingModels "model.safetensors") -Algorithm SHA256).Hash -ne $MapAnythingModelSha256) {
   throw "MapAnything Apache did not match its pinned SHA-256 digest."
 }
+$null = New-Item -ItemType Directory -Path $Da3Models -Force
+foreach ($Da3Asset in @("config.json", "model.safetensors")) {
+  $Da3Destination = Join-Path $Da3Models $Da3Asset
+  $Da3Valid = Test-Path -LiteralPath $Da3Destination
+  if ($Da3Valid) {
+    $Da3ExpectedSha256 = if ($Da3Asset -eq "model.safetensors") {
+      $Da3ModelSha256
+    } else {
+      $Da3ConfigSha256
+    }
+    $Da3Valid = (Get-FileHash -LiteralPath $Da3Destination -Algorithm SHA256).Hash -eq $Da3ExpectedSha256
+  }
+  if (-not $Da3Valid) {
+    if (Test-Path -LiteralPath $Da3Destination) {
+      Remove-Item -LiteralPath $Da3Destination -Force
+    }
+    $Da3Downloaded = (& $Python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id='depth-anything/DA3NESTED-GIANT-LARGE-1.1', filename='$Da3Asset', revision='$Da3ModelRevision'))" | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Da3Downloaded)) {
+      throw "DA3 Nested Giant-Large 1.1 asset $Da3Asset could not be downloaded."
+    }
+    Copy-Item -LiteralPath $Da3Downloaded -Destination $Da3Destination -Force
+  }
+}
+if ((Get-FileHash -LiteralPath (Join-Path $Da3Models "model.safetensors") -Algorithm SHA256).Hash -ne $Da3ModelSha256) {
+  throw "DA3 Nested Giant-Large 1.1 did not match its pinned SHA-256 digest."
+}
+if ((Get-FileHash -LiteralPath (Join-Path $Da3Models "config.json") -Algorithm SHA256).Hash -ne $Da3ConfigSha256) {
+  throw "DA3 Nested Giant-Large 1.1 configuration did not match its pinned SHA-256 digest."
+}
 foreach ($Asset in $ColmapModelAssets) {
   $Destination = Join-Path $LingbotModels $Asset.Name
   Get-VerifiedDownload `
@@ -294,6 +332,7 @@ $env:SCANLAN_LINGBOT_MODEL = Join-Path $LingbotModels "lingbot-map-long.pt"
 $env:SCANLAN_LINGBOT_SKY_MODEL = Join-Path $LingbotModels "skyseg_batch.onnx"
 $env:SCANLAN_LINGBOT_DEPTH_MODEL = $LingbotDepthDestination
 $env:SCANLAN_MAPANYTHING_MODEL = $MapAnythingModels
+$env:SCANLAN_DA3_MODEL = $Da3Models
 $env:SCANLAN_COLMAP_ALIKED_MODEL = Join-Path $LingbotModels "aliked-n16rot.onnx"
 $env:SCANLAN_COLMAP_LIGHTGLUE_MODEL = Join-Path $LingbotModels "aliked-lightglue.onnx"
 $env:SCANLAN_FLASHINFER_CACHE_ARCHIVE = $FlashInferCacheArchive
@@ -391,6 +430,7 @@ if ($LASTEXITCODE -ne 0) { throw "ScanLan splat runtime validation failed." }
   --require-lingbot `
   --require-lingbot-depth `
   --require-mapanything `
+  --require-da3 `
   --require-flashinfer
 if ($LASTEXITCODE -ne 0) { throw "ScanLan geometry runtime validation failed." }
 
@@ -437,12 +477,20 @@ try {
     "--noconfirm", "--clean", "--onedir", "--name", "scanlan-geometry",
     "--collect-all", "lingbot_map", "--collect-all", "mdm", "--collect-all", "torchvision",
     "--collect-all", "mapanything", "--collect-all", "uniception",
+    "--collect-all", "depth_anything_3",
+    "--exclude-module", "depth_anything_3.bench",
+    "--exclude-module", "depth_anything_3.app",
+    "--exclude-module", "depth_anything_3.services",
+    "--exclude-module", "depth_anything_3.cli",
+    "--collect-all", "addict", "--collect-all", "e3nn", "--collect-all", "plyfile",
+    "--collect-all", "evo", "--collect-all", "imageio", "--collect-all", "moviepy",
     "--collect-all", "safetensors",
     "--collect-all", "onnxruntime", "--collect-all", "cv2",
     "--collect-all", "huggingface_hub", "--collect-all", "tvm_ffi", "--collect-all", "ninja",
     "--copy-metadata", "torch", "--copy-metadata", "torchvision",
     "--copy-metadata", "lingbot-map", "--copy-metadata", "mdm",
     "--copy-metadata", "mapanything", "--copy-metadata", "uniception",
+    "--copy-metadata", "depth-anything-3", "--copy-metadata", "addict", "--copy-metadata", "e3nn", "--copy-metadata", "plyfile",
     "--copy-metadata", "safetensors"
   )
   if ($FlashInferReady) {
@@ -465,6 +513,10 @@ $PackagedMapAnythingModels = Join-Path $PackagedGeometryModels "map-anything-apa
 $null = New-Item -ItemType Directory -Path $PackagedMapAnythingModels -Force
 Copy-Item -LiteralPath (Join-Path $MapAnythingModels "config.json") -Destination $PackagedMapAnythingModels -Force
 Copy-Item -LiteralPath (Join-Path $MapAnythingModels "model.safetensors") -Destination $PackagedMapAnythingModels -Force
+$PackagedDa3Models = Join-Path $PackagedGeometryModels "da3nested-giant-large-1.1-noncommercial"
+$null = New-Item -ItemType Directory -Path $PackagedDa3Models -Force
+Copy-Item -LiteralPath (Join-Path $Da3Models "config.json") -Destination $PackagedDa3Models -Force
+Copy-Item -LiteralPath (Join-Path $Da3Models "model.safetensors") -Destination $PackagedDa3Models -Force
 if ($FlashInferReady -and (Test-Path -LiteralPath $FlashInferCacheArchive)) {
   Copy-Item -LiteralPath $FlashInferCacheArchive -Destination $PackagedGeometryModels -Force
 }
@@ -474,6 +526,7 @@ Remove-Item Env:SCANLAN_LINGBOT_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_LINGBOT_SKY_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_LINGBOT_DEPTH_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_MAPANYTHING_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:SCANLAN_DA3_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_COLMAP_ALIKED_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_COLMAP_LIGHTGLUE_MODEL -ErrorAction SilentlyContinue
 Remove-Item Env:SCANLAN_FLASHINFER_CACHE_ARCHIVE -ErrorAction SilentlyContinue
@@ -486,6 +539,7 @@ if ($LASTEXITCODE -ne 0) { throw "The packaged ScanLan splat runtime failed vali
   --require-lingbot `
   --require-lingbot-depth `
   --require-mapanything `
+  --require-da3 `
   --require-flashinfer
 if ($LASTEXITCODE -ne 0) { throw "The packaged ScanLan geometry runtime failed validation." }
 

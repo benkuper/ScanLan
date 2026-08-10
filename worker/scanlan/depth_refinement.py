@@ -35,6 +35,10 @@ MAPANYTHING_DEPTH_REFINEMENT_VERSION = "mapanything-apache-sensor-anchored-multi
 MAPANYTHING_CODE_REVISION = "3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9"
 MAPANYTHING_MODEL_REVISION = "00f9c245bbcb60522d1ed7f9e9d88462c6e3f38a"
 MAPANYTHING_MODEL_SHA256 = "fa06c0fdccefc5048e072c85935d5789b1e36b307f3859033c17f9dcb9fd5201"
+DA3_DEPTH_REFINEMENT_VERSION = "da3nested-giant-large-1.1-pose-conditioned-multiview-v1"
+DA3_CODE_REVISION = "3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
+DA3_MODEL_REVISION = "b2359bdf726fb44ef62acca04d629dcf158053e7"
+DA3_MODEL_SHA256 = "8ebe871a022ed58d2fc8fdfb2ebdb31d57b60fe39611c849095851a7b7c6020c"
 MAX_NEIGHBORS = 4
 MINIMUM_CONFIRMATIONS = 2
 GENERATED_DEPTH_CONFIDENCE = 96
@@ -75,6 +79,20 @@ DEPTH_BACKENDS = {
         method=(
             "MapAnything Apache with held-out sensor-anchor, metric, multi-view, "
             "and free-space quality gates"
+        ),
+        sensor_anchor_calibration=True,
+    ),
+    "da3": DepthBackend(
+        name="da3",
+        version=DA3_DEPTH_REFINEMENT_VERSION,
+        code_revision=DA3_CODE_REVISION,
+        model_revision=DA3_MODEL_REVISION,
+        model_sha256=DA3_MODEL_SHA256,
+        command="refine-rgbd-depth-da3",
+        label="DA3 pose-conditioned depth refinement",
+        method=(
+            "DA3 Nested Giant-Large 1.1 pose-conditioned metric depth with "
+            "held-out sensor-anchor, multi-view, and free-space quality gates"
         ),
         sensor_anchor_calibration=True,
     ),
@@ -902,4 +920,19 @@ def prepare_mapanything_depth_refinement(
         executable,
         progress,
         backend_name="mapanything",
+    )
+
+
+def prepare_da3_depth_refinement(
+    frames: list[PosedFrame],
+    project_root: Path,
+    executable: Path,
+    progress: ProgressCallback | None = None,
+) -> DepthRefinementResult:
+    return prepare_depth_refinement(
+        frames,
+        project_root,
+        executable,
+        progress,
+        backend_name="da3",
     )

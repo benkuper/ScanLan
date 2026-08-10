@@ -50,7 +50,7 @@ solve, and retains the prior validated trajectory if the correction is unsafe.
 
 ## Optional learned depth refinement
 
-Depth refinement is an offline production stage after the complete metric trajectory is accepted. Tracking, loop closure, take registration, and pose refinement always use original calibrated sensor depth. The isolated CUDA worker runs either pinned Apache-2.0 LingBot-Depth v0.5 or MapAnything Apache on `color/*.rgb` and `depth/*.u16`; both inputs are already on the depth-camera pixel grid, and every published proposal is restored to exactly that raster size.
+Depth refinement is an offline production stage after the complete metric trajectory is accepted. Tracking, loop closure, take registration, and pose refinement always use original calibrated sensor depth. The isolated CUDA worker runs pinned LingBot-Depth v0.5, MapAnything Apache, or DA3 Nested Giant-Large 1.1 on `color/*.rgb` and `depth/*.u16`; inputs are already on the depth-camera pixel grid, and every published proposal is restored to exactly that raster size. The strongest DA3 checkpoint is CC BY-NC 4.0 and its output is noncommercial.
 
 ScanLan never replaces any nonzero sensor measurement, including one outside the configured fusion range. A prediction may fill only an original zero-valued sensor hole and must pass all of these gates:
 
@@ -65,6 +65,10 @@ holding out every sixteenth anchor. Only the held-out pixels determine metric ac
 pixels cannot validate themselves. The correction support mask prevents unbounded extrapolation
 into large holes; the ordinary independent-view and free-space gates still decide every generated
 pixel.
+
+DA3 receives the accepted camera poses and calibrated intrinsics as explicit conditioning. Its
+nested metric branch proposes scale-aware depth, but ScanLan still calibrates against independent
+sensor anchors and applies the same metric, multiview, RGB-coverage, and free-space rejection path.
 
 Validated caches are fingerprinted by source depth/color files, calibration, poses, implementation version, code revision, model revision, and model SHA-256. Measured and refined rasters are stored separately with generated-pixel masks and 8-bit confidence. Final TSDF/surfel fusion integrates measured depth twice and the measured-plus-generated raster once, giving generated geometry half weight. Canonical 2DGS datasets retain both confidence and provenance masks; generated depth has lower robust-loss weight and lower seed opacity, while measured seeds win voxel conflicts.
 

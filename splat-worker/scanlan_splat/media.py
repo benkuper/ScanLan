@@ -16,12 +16,14 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 from PIL import Image, ImageOps
 
+from .da3 import DA3_CODE_REVISION, DA3_MODEL_REVISION, DA3_MODEL_SHA256
 from .lingbot import (
     LingbotGeometry,
     lingbot_processed_size,
     lingbot_source_pixel_grid,
 )
 from .geometry_ipc import (
+    infer_da3_geometry_isolated,
     infer_lingbot_geometry_isolated,
     infer_mapanything_geometry_isolated,
 )
@@ -315,8 +317,11 @@ def _media_dataset_fingerprint(
     digest = hashlib.sha256()
     # v11 adds conservative confidence/thickness filtering on top of calibrated
     # video rays. Older dense priors must not be reused.
-    digest.update(b"scanlan-media-dataset-v15-lingbot-quality-gated\0")
+    digest.update(b"scanlan-media-dataset-v16-da3-nested-direct-gs-streaming\0")
     digest.update(observation_fingerprint.encode("ascii"))
+    digest.update(DA3_CODE_REVISION.encode("ascii"))
+    digest.update(DA3_MODEL_REVISION.encode("ascii"))
+    digest.update(DA3_MODEL_SHA256.encode("ascii"))
     digest.update(f"{LINGBOT_CONTEXT_FPS}:{LINGBOT_MAX_CONTEXT_FRAMES}".encode("ascii"))
     digest.update(str(options.maximum_features).encode("ascii"))
     return digest.hexdigest()
@@ -1666,15 +1671,18 @@ def _write_initialization_parameters(
     colors: np.ndarray,
     scales: np.ndarray,
     quaternions: np.ndarray,
+    confidence: np.ndarray | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
+    values = dict(
         points=np.asarray(points, dtype=np.float32),
         colors=np.asarray(colors, dtype=np.uint8),
         scales=np.asarray(scales, dtype=np.float32),
         quaternions=np.asarray(quaternions, dtype=np.float32),
     )
+    if confidence is not None:
+        values["confidence"] = np.asarray(confidence, dtype=np.float32)
+    np.savez_compressed(path, **values)
 
 
 def _average_rotation(rotations: np.ndarray) -> np.ndarray:
@@ -1830,6 +1838,7 @@ def _align_lingbot_geometry(
         backend=geometry.backend,
         model_path=geometry.model_path,
         processed_size=geometry.processed_size,
+        opacities=geometry.opacities,
     )
     rotation_residuals = []
     for source, target in zip(poses[indices, :3, :3], target_poses[:, :3, :3], strict=True):
@@ -1997,6 +2006,7 @@ def _anchor_lingbot_geometry(
         backend=geometry.backend,
         model_path=geometry.model_path,
         processed_size=geometry.processed_size,
+        opacities=geometry.opacities,
     )
     center_residuals = np.linalg.norm(
         poses[anchor_indices, :3, 3] - target_centers,
@@ -2047,6 +2057,7 @@ def _restrict_lingbot_seeds_to_frames(
         backend=geometry.backend,
         model_path=geometry.model_path,
         processed_size=geometry.processed_size,
+        opacities=(geometry.opacities[keep] if geometry.opacities is not None else None),
     )
 
 
@@ -2059,6 +2070,7 @@ def _undistort_complete_video(
     geometry: LingbotGeometry,
     *,
     use_colmap_poses: bool,
+    learned_pose_source: str,
 ) -> tuple[list[dict[str, Any]], int]:
     """Undistort every selected video frame and keep validated COLMAP poses."""
     distorted_camera, registered_by_name = _shared_video_camera(reconstruction)
@@ -2104,9 +2116,7 @@ def _undistort_complete_video(
         else:
             world_from_camera = geometry.world_from_cameras[frame_index].reshape(-1)
             pose_confidence = float(geometry.frame_confidence[frame_index])
-            pose_source = (
-                "lingbot_map_aligned" if use_colmap_poses else "lingbot_map"
-            )
+            pose_source = learned_pose_source
             if validated is None:
                 recovered += 1
         source = source_by_name[image_name]
@@ -2328,6 +2338,13 @@ def prepare_media_dataset(
         mapanything_quality: dict[str, Any] = {}
         mapanything_error: str | None = None
         mapanything_evaluated = False
+        da3_geometry: LingbotGeometry | None = None
+        da3_quality: dict[str, Any] = {}
+        da3_error: str | None = None
+        da3_evaluated = False
+        da3_streaming: dict[str, Any] | None = None
+        da3_direct_gaussians = False
+        da3_direct_gaussians_used = False
         reconstruction, solve = _run_sfm(
             input_images,
             sfm_workspace,
@@ -2448,12 +2465,63 @@ def prepare_media_dataset(
                 mapanything_geometry = None
                 mapanything_error = str(error)
             _check_cancelled(project_root)
+        if geometry_worker is not None and len(records) >= 3:
+            da3_evaluated = True
+            # Direct GS has the highest initialization quality. Every input is
+            # already processed in bounded windows; the isolated worker falls
+            # back to the same model's camera/depth head only after a measured
+            # CUDA allocation failure, rather than imposing a view-count guess.
+            da3_direct_gaussians = True
+
+            def report_da3(
+                stage: str,
+                detail: str,
+                progress_value: float,
+                backend: str,
+                metrics: dict[str, Any],
+            ) -> None:
+                _progress(
+                    project_root,
+                    stage,
+                    detail,
+                    0.74 + 0.08 * min(max(progress_value, 0.0), 1.0),
+                    compute_backend=backend,
+                    metrics={**metrics, "challenger": True, "noncommercial": True},
+                )
+
+            try:
+                proposal, da3_streaming = infer_da3_geometry_isolated(
+                    geometry_worker,
+                    [input_images / str(record["image"]) for record in records],
+                    work_root=staging / "geometry-ipc",
+                    cancel_path=project_root / "outputs" / "cancel.flag",
+                    direct_gaussians=da3_direct_gaussians,
+                    progress=report_da3,
+                )
+                da3_direct_gaussians_used = bool(
+                    da3_streaming.get("directGaussiansUsed", False)
+                )
+                da3_geometry, da3_quality = _align_lingbot_geometry(
+                    proposal,
+                    reconstruction,
+                    [str(record["image"]) for record in records],
+                )
+                if not _accept_lingbot_alignment(da3_quality):
+                    da3_geometry = None
+                    da3_error = "camera proposal failed the COLMAP agreement gate"
+            except Exception as error:
+                da3_geometry = None
+                da3_error = str(error)
+            _check_cancelled(project_root)
         chosen_model = staging / "chosen-model"
         chosen_model.mkdir(parents=True, exist_ok=True)
         reconstruction.write(chosen_model)
         alignment_quality: dict[str, Any] = {}
         alignment_accepted = False
         alignment_mode: str | None = None
+        lingbot_alignment_quality: dict[str, Any] = {}
+        lingbot_alignment_accepted = False
+        lingbot_alignment_mode: str | None = None
         recovered_camera_count = 0
         dense_seed_count = 0
         if lingbot_geometry is not None:
@@ -2488,6 +2556,9 @@ def prepare_media_dataset(
                     metrics=alignment_quality,
                 )
                 lingbot_geometry = None
+            lingbot_alignment_quality = dict(alignment_quality)
+            lingbot_alignment_accepted = alignment_accepted
+            lingbot_alignment_mode = alignment_mode
         if single_video and mapanything_geometry is not None:
             map_residual = float(
                 mapanything_quality.get("normalizedMedianCameraCenterResidual", math.inf)
@@ -2500,9 +2571,35 @@ def prepare_media_dataset(
                 alignment_quality = mapanything_quality
                 alignment_accepted = True
                 alignment_mode = "mapanything_global_similarity"
-        photo_mapanything_prior = (
-            mapanything_geometry if not single_video and mapanything_geometry is not None else None
-        )
+        if single_video and da3_geometry is not None:
+            da3_residual = float(
+                da3_quality.get("normalizedMedianCameraCenterResidual", math.inf)
+            )
+            selected_residual = float(
+                alignment_quality.get("normalizedMedianCameraCenterResidual", math.inf)
+            )
+            if lingbot_geometry is None or da3_residual < selected_residual:
+                lingbot_geometry = da3_geometry
+                alignment_quality = da3_quality
+                alignment_accepted = True
+                alignment_mode = "da3_global_similarity"
+        photo_learned_prior: LingbotGeometry | None = None
+        if not single_video:
+            candidates = [
+                (geometry, quality)
+                for geometry, quality in (
+                    (mapanything_geometry, mapanything_quality),
+                    (da3_geometry, da3_quality),
+                )
+                if geometry is not None
+            ]
+            if candidates:
+                photo_learned_prior = min(
+                    candidates,
+                    key=lambda value: float(
+                        value[1].get("normalizedMedianCameraCenterResidual", math.inf)
+                    ),
+                )[0]
         if lingbot_geometry is not None:
             _progress(
                 project_root,
@@ -2520,6 +2617,11 @@ def prepare_media_dataset(
                 reconstruction,
                 lingbot_geometry,
                 use_colmap_poses=alignment_accepted,
+                learned_pose_source={
+                    "global_similarity": "lingbot_map_aligned",
+                    "mapanything_global_similarity": "mapanything_aligned",
+                    "da3_global_similarity": "da3_nested_aligned",
+                }.get(alignment_mode, "learned_geometry"),
             )
             points = lingbot_geometry.points
             colors = lingbot_geometry.colors
@@ -2531,6 +2633,7 @@ def prepare_media_dataset(
                 colors,
                 lingbot_geometry.scales,
                 lingbot_geometry.quaternions,
+                confidence=lingbot_geometry.opacities,
             )
             _sparse_points, _sparse_colors, point_quality = _point_records(reconstruction)
         else:
@@ -2553,18 +2656,19 @@ def prepare_media_dataset(
             else:
                 raise RuntimeError("COLMAP did not publish an undistorted sparse model")
             points, colors, point_quality = _point_records(undistorted_reconstruction)
-            if photo_mapanything_prior is not None:
-                points = photo_mapanything_prior.points
-                colors = photo_mapanything_prior.colors
+            if photo_learned_prior is not None:
+                points = photo_learned_prior.points
+                colors = photo_learned_prior.colors
                 dense_seed_count = len(points)
             _write_initialization(undistorted / "initialization.ply", points, colors)
-            if photo_mapanything_prior is not None:
+            if photo_learned_prior is not None:
                 _write_initialization_parameters(
                     undistorted / "initialization-parameters.npz",
                     points,
                     colors,
-                    photo_mapanything_prior.scales,
-                    photo_mapanything_prior.quaternions,
+                    photo_learned_prior.scales,
+                    photo_learned_prior.quaternions,
+                    confidence=photo_learned_prior.opacities,
                 )
 
             source_by_name = {record["image"]: record for record in records}
@@ -2623,6 +2727,15 @@ def prepare_media_dataset(
                 "MapAnything camera/depth challenger was excluded; "
                 f"{mapanything_error or 'it did not pass COLMAP camera agreement'}."
             )
+        if da3_evaluated and da3_geometry is None:
+            warnings.append(
+                "DA3 Nested Giant-Large challenger was excluded; "
+                f"{da3_error or 'it did not pass COLMAP camera agreement'}."
+            )
+        if da3_evaluated:
+            warnings.append(
+                "DA3 Nested Giant-Large 1.1 model output is restricted to noncommercial use (CC BY-NC 4.0)."
+            )
         if alignment_mode == "rejected_to_colmap":
             warnings.append(
                 "LingBot geometry failed the COLMAP camera-agreement gate and was excluded; "
@@ -2640,7 +2753,8 @@ def prepare_media_dataset(
             )
         elif recovered_camera_count:
             warnings.append(
-                f"COLMAP validated {solve['registeredImageCount']} views; LingBot-Map recovered "
+                f"COLMAP validated {solve['registeredImageCount']} views; "
+                f"{lingbot_geometry.backend if lingbot_geometry is not None else 'learned geometry'} recovered "
                 f"the remaining {recovered_camera_count} trajectory poses for joint optimization."
             )
         if point_quality["medianReprojectionErrorPx"] > 1.5:
@@ -2653,10 +2767,20 @@ def prepare_media_dataset(
             "initialization": "initialization.ply",
             "initializationParameters": (
                 "initialization-parameters.npz"
-                if lingbot_geometry is not None or photo_mapanything_prior is not None
+                if lingbot_geometry is not None or photo_learned_prior is not None
                 else None
             ),
-            "denseGeometryPrior": lingbot_geometry is not None or photo_mapanything_prior is not None,
+            "denseGeometryPrior": lingbot_geometry is not None or photo_learned_prior is not None,
+            "directGaussianPrior": bool(
+                (
+                    lingbot_geometry.opacities
+                    if lingbot_geometry is not None
+                    else photo_learned_prior.opacities
+                    if photo_learned_prior is not None
+                    else None
+                )
+                is not None
+            ),
             "poseRefinement": True,
             # A single video is captured with locked focal length, exposure,
             # white balance, shutter, and ISO. Per-frame color transforms would
@@ -2678,8 +2802,8 @@ def prepare_media_dataset(
                 "geometryBackend": (
                     lingbot_geometry.backend
                     if lingbot_geometry is not None
-                    else photo_mapanything_prior.backend
-                    if photo_mapanything_prior is not None
+                    else photo_learned_prior.backend
+                    if photo_learned_prior is not None
                     else "COLMAP sparse structure-from-motion"
                 ),
                 "trainingViewCount": len(frames),
@@ -2690,16 +2814,27 @@ def prepare_media_dataset(
                     else 0
                 ),
                 "denseSeedCount": dense_seed_count,
-                "lingbotAlignment": alignment_quality or None,
-                "lingbotAlignmentAccepted": alignment_accepted,
-                "lingbotAlignmentMode": alignment_mode,
-                "lingbotCalibratedCameraRays": lingbot_geometry is not None,
+                "selectedGeometryAlignment": alignment_quality or None,
+                "selectedGeometryAlignmentAccepted": alignment_accepted,
+                "selectedGeometryAlignmentMode": alignment_mode,
+                "lingbotAlignment": lingbot_alignment_quality or None,
+                "lingbotAlignmentAccepted": lingbot_alignment_accepted,
+                "lingbotAlignmentMode": lingbot_alignment_mode,
+                "lingbotCalibratedCameraRays": lingbot_context is not None,
                 "lingbotEvaluated": lingbot_context is not None,
                 "lingbotContext": lingbot_context,
                 "mapAnythingEvaluated": mapanything_evaluated,
                 "mapAnythingAlignment": mapanything_quality or None,
                 "mapAnythingAlignmentAccepted": mapanything_geometry is not None,
                 "mapAnythingError": mapanything_error,
+                "da3Evaluated": da3_evaluated,
+                "da3Alignment": da3_quality or None,
+                "da3AlignmentAccepted": da3_geometry is not None,
+                "da3Error": da3_error,
+                "da3Streaming": da3_streaming,
+                "da3DirectGaussiansRequested": da3_direct_gaussians,
+                "da3DirectGaussians": da3_direct_gaussians_used and da3_geometry is not None,
+                "da3License": "CC-BY-NC-4.0" if da3_evaluated else None,
                 "maximumVideoIntrinsicSpread": video_intrinsic_spread,
                 "videoSources": video_statistics,
                 "warnings": warnings,
@@ -2721,7 +2856,7 @@ def prepare_media_dataset(
             "media_ready",
             (
                 f"Prepared {len(frames):,} cameras and {len(points):,} confidence-gated dense learned seeds"
-                if lingbot_geometry is not None or photo_mapanything_prior is not None
+                if lingbot_geometry is not None or photo_learned_prior is not None
                 else f"Solved {len(frames):,} cameras and {len(points):,} sparse seed points"
             ),
             1.0,
@@ -2732,8 +2867,8 @@ def prepare_media_dataset(
                     else f"{lingbot_geometry.backend} + COLMAP calibrated intrinsics"
                 )
                 if lingbot_geometry is not None
-                else f"{photo_mapanything_prior.backend} + COLMAP bundle-adjusted poses/intrinsics"
-                if photo_mapanything_prior is not None
+                else f"{photo_learned_prior.backend} + COLMAP bundle-adjusted poses/intrinsics"
+                if photo_learned_prior is not None
                 else "COLMAP structure-from-motion"
             ),
             metrics={

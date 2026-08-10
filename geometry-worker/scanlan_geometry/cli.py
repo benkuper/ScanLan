@@ -5,7 +5,12 @@ import json
 import sys
 from pathlib import Path
 
-from scanlan_splat.geometry_ipc import run_lingbot_map_request, run_mapanything_request
+from scanlan_splat.da3 import da3_runtime_status, refine_da3_depth_request
+from scanlan_splat.geometry_ipc import (
+    run_da3_request,
+    run_lingbot_map_request,
+    run_mapanything_request,
+)
 from scanlan_splat.lingbot import lingbot_runtime_status
 from scanlan_splat.lingbot_depth import (
     lingbot_depth_runtime_status,
@@ -29,17 +34,24 @@ def parser() -> argparse.ArgumentParser:
     mapanything = commands.add_parser("infer-mapanything")
     mapanything.add_argument("--request", type=Path, required=True)
     mapanything.add_argument("--progress", type=Path, required=True)
+    da3 = commands.add_parser("infer-da3")
+    da3.add_argument("--request", type=Path, required=True)
+    da3.add_argument("--progress", type=Path, required=True)
     refine = commands.add_parser("refine-rgbd-depth")
     refine.add_argument("--request", type=Path, required=True)
     refine.add_argument("--progress", type=Path, required=True)
     refine_mapanything = commands.add_parser("refine-rgbd-depth-mapanything")
     refine_mapanything.add_argument("--request", type=Path, required=True)
     refine_mapanything.add_argument("--progress", type=Path, required=True)
+    refine_da3 = commands.add_parser("refine-rgbd-depth-da3")
+    refine_da3.add_argument("--request", type=Path, required=True)
+    refine_da3.add_argument("--progress", type=Path, required=True)
     diagnostics = commands.add_parser("diagnostics")
     diagnostics.add_argument("--require-lingbot", action="store_true")
     diagnostics.add_argument("--require-lingbot-depth", action="store_true")
     diagnostics.add_argument("--require-flashinfer", action="store_true")
     diagnostics.add_argument("--require-mapanything", action="store_true")
+    diagnostics.add_argument("--require-da3", action="store_true")
     return root
 
 
@@ -52,11 +64,17 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "infer-mapanything":
             run_mapanything_request(arguments.request, arguments.progress)
             return 0
+        if arguments.command == "infer-da3":
+            run_da3_request(arguments.request, arguments.progress)
+            return 0
         if arguments.command == "refine-rgbd-depth":
             refine_depth_request(arguments.request, arguments.progress)
             return 0
         if arguments.command == "refine-rgbd-depth-mapanything":
             refine_mapanything_depth_request(arguments.request, arguments.progress)
+            return 0
+        if arguments.command == "refine-rgbd-depth-da3":
+            refine_da3_depth_request(arguments.request, arguments.progress)
             return 0
         if arguments.command == "diagnostics":
             lingbot_map = lingbot_runtime_status(
@@ -71,15 +89,20 @@ def main(argv: list[str] | None = None) -> int:
                 verify_model=arguments.require_mapanything,
                 smoke_test=arguments.require_mapanything,
             )
+            da3 = da3_runtime_status(
+                verify_model=arguments.require_da3,
+                smoke_test=arguments.require_da3,
+            )
             print(
                 json.dumps(
                     {
                         "schemaVersion": 1,
                         "version": __version__,
-                        "backends": ["lingbot-map", "lingbot-depth", "mapanything"],
+                        "backends": ["lingbot-map", "lingbot-depth", "mapanything", "da3"],
                         "lingbotMap": lingbot_map,
                         "lingbotDepth": lingbot_depth,
                         "mapAnything": mapanything,
+                        "da3": da3,
                     }
                 )
             )
@@ -93,9 +116,15 @@ def main(argv: list[str] | None = None) -> int:
                 and not lingbot_map["flashinferValidated"]
                 or arguments.require_mapanything
                 and not mapanything["available"]
+                or arguments.require_da3
+                and not da3["available"]
                 else 0
             )
         return 2
     except Exception as error:
         print(f"scanlan-geometry: {error}", file=sys.stderr)
         return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

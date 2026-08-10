@@ -22,7 +22,7 @@ def parser() -> argparse.ArgumentParser:
     reconstruct.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     reconstruct.add_argument(
         "--depth-refinement",
-        choices=["off", "lingbot", "mapanything"],
+        choices=["off", "lingbot", "mapanything", "da3"],
         default="off",
     )
     reconstruct.add_argument("--depth-refiner", type=Path, default=None)

@@ -39,6 +39,9 @@ class LingbotGeometry:
     backend: str
     model_path: str
     processed_size: tuple[int, int]
+    # Direct Gaussian heads predict visibility independently from geometric
+    # confidence. Point-cloud backends intentionally leave this unset.
+    opacities: np.ndarray | None = None
 
 
 ProgressCallback = Callable[[str, str, float, str, dict[str, Any]], None]

@@ -305,6 +305,7 @@ fn stage_key(stage: &str) -> Option<&'static str> {
         Some("publish")
     } else if stage.contains("media")
         || stage.contains("lingbot")
+        || stage.contains("da3")
         || stage.contains("camera refinement")
         || stage.contains("feature")
         || stage.contains("camera solving")
@@ -800,7 +801,7 @@ fn run_pipeline(
     }
     let reconstruction = existing_runtime(resources, false)?;
     let depth_refinement_backend = match project.settings.depth_refinement_backend.as_str() {
-        "lingbot" | "mapanything" => project.settings.depth_refinement_backend.as_str(),
+        "lingbot" | "mapanything" | "da3" => project.settings.depth_refinement_backend.as_str(),
         _ if project.settings.lingbot_depth_refinement => "lingbot",
         _ => "off",
     };

@@ -729,12 +729,17 @@ Implemented:
 
 ## P8 — DA3 integration
 
-Add:
+Implemented with the strongest refreshed noncommercial checkpoint:
 
-* photo and video geometry challenger;
-* pose-conditioned depth;
-* streaming evaluation;
-* optional direct-Gaussian initialization.
+* photo and video camera/depth challenger selected only after COLMAP agreement;
+* pose-conditioned metric RGB-D depth behind held-out sensor-anchor and shared validation gates;
+* 24-frame/six-overlap bounded streaming with Sim(3), center-residual, and rotation continuity gates;
+* direct-Gaussian initialization in bounded windows, with an explicit measured-memory depth-seed
+  fallback when the 12 GB quality-preserving memory gate requires it;
+* end-to-end preservation of learned opacity and anisotropic scale orientation, with upstream-style
+  border filtering and no confidence heuristic that discards valid rendered surfaces;
+* pinned offline source/model assets, digest verification, frozen-runtime inference diagnostics,
+  and explicit CC BY-NC 4.0 provenance.
 
 ## P9 — Learned-first production camera solving
 
@@ -906,7 +911,7 @@ The complete program now requires all of the following:
 
 10. Long captures remain bounded through active and completed submaps.
 
-11. Photos and video can later use LingBot, MapAnything and DA3 through the shared geometry contracts.
+11. Photos and video use LingBot, MapAnything and DA3 through the shared geometry contracts.
 
 12. RGB-only video supports progressive reconstruction preview with explicit drift and scale status.
 

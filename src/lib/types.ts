@@ -55,7 +55,7 @@ export interface CaptureSettings {
   /** Run guarded LingBot-Depth completion after metric pose recovery. */
   lingbotDepthRefinement: boolean;
   /** Guarded learned RGB-D completion backend. */
-  depthRefinementBackend: 'off' | 'lingbot' | 'mapanything';
+  depthRefinementBackend: 'off' | 'lingbot' | 'mapanything' | 'da3';
   /** Feature-flagged provisional learned-depth preview for imported video. */
   experimentalRgbPreview: boolean;
 }

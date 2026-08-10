@@ -294,6 +294,24 @@ def _dense_prior_scale_limit(
     return max(float(np.percentile(footprint, 95.0)) * 1.25, scene_scale * 0.003)
 
 
+def _prepare_dense_seed_scales(
+    seeded_scales: np.ndarray,
+    surface_scale_limit: float | None,
+    *,
+    direct_gaussian_prior: bool,
+) -> np.ndarray:
+    result = np.asarray(seeded_scales, dtype=np.float32).copy()
+    if surface_scale_limit is not None:
+        np.minimum(result, surface_scale_limit, out=result)
+    if not direct_gaussian_prior:
+        # Depth-unprojected seeds need an explicit surface-normal axis. A
+        # direct GS head already predicts anisotropy and orientation.
+        result[:, 2] = np.minimum(
+            result[:, 2], np.minimum(result[:, 0], result[:, 1]) * 0.08
+        )
+    return result
+
+
 def _exponential_lr_gamma(total_steps: int) -> float:
     """Match gsplat's position schedule, ending at one percent of the initial LR."""
     return 0.01 ** (1.0 / max(total_steps, 1))
@@ -572,6 +590,7 @@ def train_dataset(
         and seeded_quaternions is not None
     )
     dense_geometry_prior = bool(dataset.get("denseGeometryPrior", False))
+    direct_gaussian_prior = bool(dataset.get("directGaussianPrior", False))
     uses_2dgs = bool(dataset.get("metric"))
     requested_iterations = iterations
     if metric_seeded and not hybrid:
@@ -601,17 +620,10 @@ def train_dataset(
     )
     training_seeded_scales = seeded_scales
     if dense_geometry_prior and seeded_scales is not None:
-        training_seeded_scales = np.asarray(seeded_scales, dtype=np.float32).copy()
-        if surface_scale_limit is not None:
-            np.minimum(
-                training_seeded_scales,
-                surface_scale_limit,
-                out=training_seeded_scales,
-            )
-        training_seeded_scales[:, 2] = np.minimum(
-            training_seeded_scales[:, 2],
-            np.minimum(training_seeded_scales[:, 0], training_seeded_scales[:, 1])
-            * 0.08,
+        training_seeded_scales = _prepare_dense_seed_scales(
+            seeded_scales,
+            surface_scale_limit,
+            direct_gaussian_prior=direct_gaussian_prior,
         )
     metric_opacity_bounds = (
         (float(_logit(0.01)), float(_logit(0.8)))
@@ -644,6 +656,9 @@ def train_dataset(
     )
     sh0 = ((colors - 0.5) / SH_C0).astype(np.float32)[:, None, :]
     initial_opacity = (
+        np.clip(seeded_confidence, 1e-4, 1.0 - 1e-4)
+        if direct_gaussian_prior and seeded_confidence is not None
+        else
         np.clip(seeded_confidence, 0.05, 1.0) * RGBD_SURFACE_OPACITY
         if metric_seeded and seeded_confidence is not None
         else np.full(
@@ -1253,6 +1268,7 @@ def train_dataset(
             else "learned"
         ),
         "denseGeometryPrior": dense_geometry_prior,
+        "directGaussianPrior": direct_gaussian_prior,
         "surfaceScaleMultiplier": (
             RGBD_SURFACE_SCALE_MULTIPLIER if metric_seeded else None
         ),

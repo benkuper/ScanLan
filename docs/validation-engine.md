@@ -48,10 +48,14 @@ Open3D's documented [integration pipeline](https://open3d.org/docs/release/tutor
   residuals on sensor anchors, and applies the shared depth gate only to a deterministic held-out
   anchor set. Photo and short-video camera/depth proposals pass the same camera/geometry gates and
   must agree with COLMAP before becoming a dense prior.
+- DA3 Nested runs camera/depth proposals in bounded overlapping windows. Every overlap must pass
+  center and rotation continuity gates; the assembled proposal must then beat the accepted baseline
+  on normalized COLMAP camera residual. Pose-conditioned RGB-D depth and direct Gaussian seeds pass
+  the same shared geometry, metric, multiview, and free-space gates before publication.
 - Frozen worker builds install this package before packaging either runtime; PyInstaller discovers
   the ordinary imports, so no runtime network access is needed.
 
-Later DA3 adapters must return proposals through this contract. Backend-specific
+Every later backend must return proposals through this contract. Backend-specific
 confidence can tighten a gate but cannot weaken the common minimum evidence or silently relabel
 scale.
 
@@ -81,3 +85,14 @@ calibration then passed all three frames at 2.75-3.25 mm median residual; the in
 free-space gates accepted 15,462 original-hole pixels (2.294% of reliable measured support). A
 frozen BF16 runtime repeated model inference on the RTX 5080 with offline flags and an empty Torch
 cache. These measurements validate the adapter and gates on this capture, not every scene.
+
+The P8 DA3 check used real frames 0, 5, and 10 from the managed `Terrasse` capture. The rebuilt
+frozen worker accepted all three cameras and published 370,992 finite direct Gaussians with exactly
+370,992 learned opacity values (range 0.000002-0.995733), positive scales, and unit quaternions.
+An SH0-plus-opacity gsplat render was visually inspected against the source frame and retained the
+room structure and appearance; an opacity-free point projection was explicitly rejected as an
+invalid way to judge a direct-GS representation. A deliberately incoherent 0/50/100 frame set was
+rejected with mean camera confidence 0.1314 and no accepted cameras. Frozen diagnostics measured
+7,881.1 MiB peak CUDA allocation against the 11,264 MiB safety limit and exercised both the
+pose-conditioned depth and direct-Gaussian heads offline. These are capture-specific integration
+measurements, not universal reconstruction-accuracy claims.

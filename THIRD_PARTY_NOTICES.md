@@ -40,4 +40,17 @@ Carnegie Mellon University, distributed under the BSD 3-Clause License.
 - Source: <https://github.com/castacks/UniCeption>
 - License: <https://opensource.org/license/bsd-3-clause>
 
+## Depth Anything 3
+
+ScanLan's learned-geometry runtime bundles pinned Depth Anything 3 source and the
+DA3NESTED-GIANT-LARGE-1.1 checkpoint, Copyright 2025 ByteDance Ltd. and/or its
+affiliates. The source is Apache License 2.0; the checkpoint is CC BY-NC 4.0 and
+therefore restricts DA3-derived output to noncommercial use.
+
+- Source: `ByteDance-Seed/Depth-Anything-3`, pinned at `3d835ec1a5802d64a8b8b15f817a1ab54809bfe4`
+- Model: `depth-anything/DA3NESTED-GIANT-LARGE-1.1`, pinned at `b2359bdf726fb44ef62acca04d629dcf158053e7`
+- Model SHA-256: `8ebe871a022ed58d2fc8fdfb2ebdb31d57b60fe39611c849095851a7b7c6020c`
+- Source license: <https://www.apache.org/licenses/LICENSE-2.0>
+- Model license: <https://creativecommons.org/licenses/by-nc/4.0/>
+
 The packaged Python distribution metadata retains the upstream license file. ScanLan's own source remains licensed as stated in its root `LICENSE` file.

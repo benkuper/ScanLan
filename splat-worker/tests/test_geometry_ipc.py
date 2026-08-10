@@ -4,12 +4,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from scanlan_splat.geometry_ipc import (
     ProgressivePreviewAccumulator,
     _load_geometry,
+    run_da3_request,
     run_lingbot_map_request,
 )
 from scanlan_splat.lingbot import LingbotGeometry
@@ -39,7 +41,9 @@ class GeometryIpcTests(unittest.TestCase):
             source_frame_indices=(
                 np.arange(point_count, dtype=np.int32) % count + first_frame
             ),
-            frame_confidence=np.asarray([0.9, 0.8, 0.4, 0.9], dtype=np.float32),
+            frame_confidence=np.resize(
+                np.asarray([0.9, 0.8, 0.4, 0.9], dtype=np.float32), count
+            ),
             backend="fixture",
             model_path="fixture.pt",
             processed_size=(4, 3),
@@ -89,6 +93,7 @@ class GeometryIpcTests(unittest.TestCase):
                 backend="fixture backend",
                 model_path="fixture.pt",
                 processed_size=(4, 3),
+                opacities=np.linspace(0.1, 0.9, 5, dtype=np.float32),
             )
             observed: dict[str, object] = {}
 
@@ -129,6 +134,7 @@ class GeometryIpcTests(unittest.TestCase):
                 "quaternions",
                 "source_frame_indices",
                 "frame_confidence",
+                "opacities",
             ):
                 np.testing.assert_array_equal(getattr(restored, field), getattr(expected, field))
             self.assertEqual(restored.backend, expected.backend)
@@ -138,6 +144,51 @@ class GeometryIpcTests(unittest.TestCase):
             incompatible = dict(result, modelRevision="different")
             with self.assertRaisesRegex(RuntimeError, "incompatible LingBot-Map revision"):
                 _load_geometry(root / "geometry.npz", incompatible)
+
+    def test_da3_direct_gaussian_cuda_oom_falls_back_with_explicit_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images = [root / f"{index}.png" for index in range(3)]
+            for path in images:
+                path.write_bytes(b"fixture")
+            request = {
+                "schemaVersion": 1,
+                "imagePaths": [str(path) for path in images],
+                "maximumSeeds": 123,
+                "directGaussians": True,
+                "cancelPath": "",
+                "arraysPath": str(root / "geometry.npz"),
+                "resultPath": str(root / "result.json"),
+            }
+            request_path = root / "request.json"
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+            geometry = self._preview_chunk(0, 3)
+            calls: list[bool] = []
+
+            def infer(_predictor, _paths, **kwargs):
+                direct = bool(kwargs["infer_gaussians"])
+                calls.append(direct)
+                if direct:
+                    raise RuntimeError("CUDA out of memory while allocating direct GS head")
+                return geometry, {"mode": "single_window"}
+
+            class Predictor:
+                backend = "fixture DA3"
+
+            with patch(
+                "scanlan_splat.geometry_ipc.infer_da3_geometry_streaming", infer
+            ):
+                result = run_da3_request(
+                    request_path,
+                    root / "progress.json",
+                    predictor=Predictor(),
+                )
+
+            self.assertEqual(calls, [True, False])
+            self.assertEqual(result["proposalType"], "camera-depth")
+            self.assertTrue(result["streaming"]["directGaussiansRequested"])
+            self.assertFalse(result["streaming"]["directGaussiansUsed"])
+            self.assertIn("out of memory", result["streaming"]["memoryFallback"].lower())
 
 
 if __name__ == "__main__":
