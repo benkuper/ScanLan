@@ -118,9 +118,30 @@ The exported PLY is interoperable with 3DGS tooling by flattening the third scal
 
 ## Photo/video 3D Gaussian splat
 
-Ordinary media uses a separate photoreal path because it has no metric depth surface to constrain 2D discs. Photos are orientation-normalized without upscaling. Video is decoded with the bundled FFmpeg/PyAV runtime, evaluated at three times the target output rate, reduced to the sharpest frame in each time bucket, pruned for near-duplicates, and capped at 600 selected frames by default.
+Ordinary media uses a separate photoreal path because it has no metric depth surface to constrain
+2D discs. Photos are orientation-normalized without upscaling. Video is decoded with the bundled
+FFmpeg/PyAV runtime and evaluated at a 15 fps analysis rate. Optical-flow overlap, camera motion,
+parallax, sharpness, and a two-second maximum gap select adaptive keyframes; 3,000 views is a hard
+crash-safety ceiling rather than a sampling target.
 
-PyCOLMAP extracts bounded high-density SIFT features, uses guided geometric verification, performs exhaustive matching for normal photo sets and quadratic sequential matching for long videos, and incrementally reconstructs multiple candidate models. All frames from one video share one physical camera throughout feature extraction and bundle adjustment; ScanLan rejects a video if canonical intrinsics drift after undistortion. A solve must register at least 45% of the usable input views and produce at least 100 reliable sparse tracks. While mapping runs, registered-camera, best-model, model-attempt, and elapsed-time telemetry is published once per second. The largest consistent model is bundle-adjusted, undistorted at source resolution, and converted into canonical schema-3 pinhole cameras. Registration ratio, excluded views, model count, reprojection error, track length, and warnings remain in `dataset.json`.
+Production camera solving is learned-first but geometry-authoritative. DA3 proposes the ordered
+trajectory before feature matching; MapAnything is the bounded proposal fallback. Finite learned
+centers, view directions, confidence, and video time select a connected, linear-size pair graph.
+PyCOLMAP then extracts source-detail ALIKED/LightGlue features (high-density SIFT fallback), and
+every proposed edge must pass its two-view geometric verification. A learned pose is never inserted
+as an SfM observation. Missing views receive targeted matches to nearby registered learned
+neighbours. If the resulting model misses the registration gate, ScanLan expands to the established
+bounded-sequential or exhaustive graph and keeps the stronger reconstruction.
+
+All frames from one video share one physical camera throughout feature extraction and bundle
+adjustment; ScanLan rejects a video if canonical intrinsics drift after undistortion. A solve must
+register at least 45% of the usable input views and produce at least 100 reliable sparse tracks.
+While mapping runs, registered-camera, best-model, model-attempt, and elapsed-time telemetry is
+published once per second. The largest consistent model receives an explicit robust 100-iteration
+global bundle adjustment, is checked against the learned proposal, undistorted at source resolution,
+and converted into canonical schema-3 pinhole cameras. Proposal backend, guided/recovery/fallback
+pair counts, verified-pair and inlier counts, registration ratio, excluded views, model count,
+reprojection error, track length, and warnings remain in `dataset.json`.
 
 Reliable COLMAP points initialize anisotropic 3D Gaussians with local-spacing-derived scales. Training uses packed gsplat rasterization, L1+SSIM, degree-three spherical harmonics, and bounded camera-pose refinement. Photo sets can use a regularized per-view RGB log-gain/bias model, with the first/median-exposure anchor fixing its gauge. A single locked-settings video keeps appearance fixed so color correction cannot hide geometric disagreement. Checkpoints, live previews, the final canonical PLY, refined cameras, and sidecars use the same atomic publication policy as RGB-D 2DGS.
 

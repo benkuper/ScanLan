@@ -213,3 +213,24 @@ confidence-gated seeds. Automated tests verify ordered chunk publication without
 model outputs, bounded archive/resident-submap compaction, rejected-frame accounting, explicit
 unverified scale, and lossless final geometry IPC. This short physical sequence validates the
 streaming and isolation mechanics; it is not a room-scale drift-quality claim.
+
+### 2026-08-10 P9 learned-first production camera solve
+
+The packaged DA3 geometry executable and CUDA PyCOLMAP runtime processed all 16 repository phone
+photos at a 1,600 px analysis limit through the production `prepare-media` command. DA3 proposed
+the cameras before local-feature work. Its bounded learned graph selected 95 of 120 possible pairs;
+all 95 passed through ALIKED + LightGlue matching and COLMAP two-view verification, yielding 11,695
+geometric inlier matches. No conventional fallback was required.
+
+The geometric solver registered 15/16 cameras (93.75%) with 1,994 reliable sparse points. The
+explicit final Ceres bundle adjustment converged in 55 iterations from 0.470 px to 0.464 px cost;
+the published reconstruction had 0.714 px median reprojection error and 3.415 mean observations per
+track. DA3 then passed the independent agreement gate at 0.00586 normalized median camera-center
+residual and 0.353 degrees median rotation residual. The complete learned proposal, feature solve,
+undistortion, and 750,000-seed direct-Gaussian publication took 87.987 seconds.
+
+The older production-path record above registered 9/16 views on this fixture. That is useful
+historical context, not a controlled P8/P9 A/B: the intervening runtime also moved from SIFT to the
+pinned ALIKED + LightGlue path. The current result establishes the P9 end-to-end quality floor and
+confirms that learned selection can discard 20.8% of candidate pairs without losing the dominant
+15-camera model. Broader video/photo scene and fallback/recovery benchmarks remain release work.

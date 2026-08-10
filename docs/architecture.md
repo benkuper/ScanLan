@@ -91,6 +91,16 @@ transforms, intrinsics, scales, quaternions, ownership, and confidence before us
 No Python object, CUDA tensor, or model state crosses the process boundary. See
 [geometry-worker.md](geometry-worker.md).
 
+For ordinary photos and video, DA3 (or bounded MapAnything fallback) now runs before production
+SfM. The splat worker accepts only a finite full-length proposal, then converts learned centers,
+view directions, confidence, and temporal order into an explicit bounded pair list. COLMAP's
+[imported pair matcher](https://colmap.github.io/pycolmap/pycolmap.html#pycolmap.match_image_pairs)
+still owns descriptor matching and two-view geometry. A targeted second pair list attempts to
+recover missing learned views; a weak result expands to conventional matching. The best geometric
+model receives a final robust global
+[bundle adjustment](https://colmap.github.io/pycolmap/pycolmap.html#pycolmap.bundle_adjustment)
+before alignment gates decide whether learned dense geometry may seed optimization.
+
 When the experimental RGB video preview flag is enabled, the same request also publishes bounded
 eight-frame learned-depth submaps during causal inference. The splat worker converts the latest
 validated snapshot to `build-preview.json`; the desktop displays confidence, drift risk, submap

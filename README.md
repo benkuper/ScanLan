@@ -14,7 +14,8 @@ The application supports two quality-gated source paths: **Capture RGB-D → Rec
 ```mermaid
 flowchart TD
     Camera["RGB-D camera"] --> Capture["Native capture worker"]
-    Media["Photos or video"] --> SfM["Sharp-frame selection · COLMAP SfM · undistortion"]
+    Media["Photos or video"] --> Proposal["DA3 / MapAnything camera proposal"]
+    Proposal --> SfM["Verified guided pairs · COLMAP BA · undistortion"]
     Capture -->|"full sensor rate · SCANRGBD v1"| Tracker["Realtime tracker"]
     Capture -->|"bounded archive queue"| Archive["Schema 3 capture"]
     Tracker --> Live["In-memory points / mesh"]
@@ -164,12 +165,16 @@ Recommended starting profile on the specified laptop:
 Choose **Import photos or video for Gaussian splatting…** in Capture. Imported sources are copied into the project so the job is durable. The production pass then:
 
 1. orientation-normalizes photos and selects the sharpest non-duplicate video frame in each time bucket;
-2. extracts dense SIFT features, performs guided geometric matching, reconstructs all consistent camera models, and selects the largest model;
-3. rejects a solve that registers fewer than half the input views or produces too little reliable structure;
-4. bundle-adjusts and undistorts registered source-resolution images to canonical pinhole cameras;
-5. initializes 3D Gaussians from reliable COLMAP tracks and trains L1+SSIM appearance with degree-three spherical harmonics, bounded camera refinement, and per-view RGB exposure compensation.
+2. asks DA3 (or bounded MapAnything fallback) for a camera proposal and uses it to select a connected, bounded pair graph;
+3. extracts source-detail ALIKED/LightGlue features (SIFT fallback), geometrically verifies every proposed pair, and recovers missing cameras through nearby verified learned views;
+4. expands to conventional matching when the guided solve misses its quality gate, then robustly bundle-adjusts the strongest model and undistorts its registered images to canonical pinhole cameras;
+5. initializes 3D Gaussians from the accepted learned dense prior or reliable COLMAP tracks and trains source-resolution L1+SSIM appearance with degree-three spherical harmonics, bounded camera refinement, and per-view RGB exposure compensation.
 
-The dataset manifest records registration ratio, excluded views, model count, reprojection error, track length, and warnings. Disconnected views are reported rather than forced into the splat. Video defaults to 2 sharp keyframes per second and a 600-frame ceiling.
+The dataset manifest records proposal backend, guided/recovery/fallback pair counts, geometric
+verification evidence, recovered cameras, registration ratio, excluded views, model count,
+reprojection error, track length, and warnings. Disconnected views are reported rather than forced
+into the splat. Video keyframes are selected adaptively from optical flow at a 15 fps analysis rate;
+3,000 retained frames is a crash-safety ceiling, not a sampling target.
 
 For strong results, keep 60-80% overlap, translate as well as rotate the camera, lock focus/exposure when possible, avoid motion blur, and revisit the start of the path. A sparse panorama captured from one fixed point does not contain enough parallax for a full scene reconstruction.
 

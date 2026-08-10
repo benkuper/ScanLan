@@ -6,6 +6,7 @@ import time
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -17,12 +18,14 @@ from scanlan_splat.media import (
     MediaPreparationOptions,
     _adaptive_keyframe_reason,
     _configure_sfm,
+    _camera_recovery_pairs,
     _cpu_match_pairs,
     _descriptor_distance,
     _extract_lingbot_context,
     _extract_video_streaming,
     _feature_extraction_groups,
     _feature_extraction_batch_size,
+    _guided_match_pairs,
     _limited_size,
     _minimum_useful_registration_count,
     _materialize_observation_inputs,
@@ -38,6 +41,17 @@ from scanlan_splat.media import (
 
 
 class MediaPreparationTests(unittest.TestCase):
+    @staticmethod
+    def _camera_proposal(count: int):
+        poses = np.repeat(np.eye(4, dtype=np.float64)[None], count, axis=0)
+        poses[:, 0, 3] = np.linspace(0.0, 3.0, count)
+        poses[:, 2, 3] = 0.1 * np.sin(np.linspace(0.0, np.pi, count))
+        return SimpleNamespace(
+            world_from_cameras=poses,
+            frame_confidence=np.linspace(0.75, 1.0, count),
+            backend="fixture learned cameras",
+        )
+
     def test_default_video_sampling_preserves_handheld_overlap(self) -> None:
         options = MediaPreparationOptions()
 
@@ -137,6 +151,60 @@ class MediaPreparationTests(unittest.TestCase):
         self.assertEqual(len(photo_pairs), 300 * 299 // 2)
         self.assertLess(len(video_pairs), len(photo_pairs) // 5)
         self.assertIn(("000.jpg", "128.jpg"), video_pairs)
+
+    def test_learned_camera_proposal_builds_bounded_connected_pair_graph(self) -> None:
+        names = [f"{index:04}.jpg" for index in range(240)]
+        pairs = _guided_match_pairs(
+            names,
+            self._camera_proposal(len(names)),
+            sequential=True,
+        )
+
+        self.assertLess(len(pairs), len(names) * 40)
+        self.assertIn(("0000.jpg", "0001.jpg"), pairs)
+        self.assertIn(("0000.jpg", "0128.jpg"), pairs)
+        touched = {name for pair in pairs for name in pair}
+        self.assertEqual(touched, set(names))
+
+        photo_names = names[:16]
+        photo_pairs = _guided_match_pairs(
+            photo_names,
+            self._camera_proposal(len(photo_names)),
+            sequential=False,
+        )
+        self.assertLess(len(photo_pairs), len(photo_names) * (len(photo_names) - 1) // 2)
+
+    def test_degenerate_learned_trajectory_cannot_guide_matching(self) -> None:
+        proposal = self._camera_proposal(6)
+        proposal.world_from_cameras[:, :3, 3] = 0.0
+
+        self.assertEqual(
+            _guided_match_pairs(
+                [f"{index}.jpg" for index in range(6)],
+                proposal,
+                sequential=False,
+            ),
+            [],
+        )
+
+    def test_camera_recovery_targets_registered_learned_neighbours(self) -> None:
+        names = [f"{index:02}.jpg" for index in range(8)]
+        registered = {names[index] for index in (0, 1, 2, 5, 6, 7)}
+        pairs = _camera_recovery_pairs(
+            names,
+            self._camera_proposal(len(names)),
+            registered,
+            {("02.jpg", "03.jpg")},
+        )
+
+        self.assertTrue(pairs)
+        self.assertNotIn(("02.jpg", "03.jpg"), pairs)
+        self.assertTrue(
+            all(
+                (left in registered) != (right in registered)
+                for left, right in pairs
+            )
+        )
 
     def test_feature_extraction_batches_bound_native_image_queues(self) -> None:
         self.assertEqual(

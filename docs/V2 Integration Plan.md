@@ -743,13 +743,21 @@ Implemented with the strongest refreshed noncommercial checkpoint:
 
 ## P9 — Learned-first production camera solving
 
-Convert video and photo production reconstruction to:
+Implemented:
 
-* learned proposal;
-* guided pair selection;
-* geometric verification;
-* high-resolution bundle adjustment;
-* camera recovery.
+* DA3 proposes the ordered photo/video trajectory before feature matching, with MapAnything as
+  the bounded Apache-2.0 proposal fallback and conventional SfM retained when neither proposal is
+  valid;
+* learned centers, view directions, confidence, and video time build a bounded connected pair
+  graph instead of making the learned trajectory a camera observation;
+* every proposed edge still passes source-detail ALIKED/LightGlue or SIFT matching and COLMAP
+  two-view geometric verification;
+* missing views receive a targeted learned-neighbour recovery graph, while an under-gate model
+  automatically expands to the established conventional graph and keeps the stronger result;
+* the winning reconstruction receives an explicit robust 100-iteration global bundle adjustment
+  before learned/COLMAP camera-agreement validation and source-resolution undistortion;
+* dataset telemetry records proposal backend, guided/recovery/fallback pair counts, verified
+  pairs, inlier matches, recovered cameras, and final-BA status.
 
 ## P10 — Unified dense fusion
 

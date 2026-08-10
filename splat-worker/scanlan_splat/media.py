@@ -315,9 +315,9 @@ def _media_dataset_fingerprint(
 ) -> str:
     """Fingerprint camera analysis independently from expensive media decoding."""
     digest = hashlib.sha256()
-    # v11 adds conservative confidence/thickness filtering on top of calibrated
-    # video rays. Older dense priors must not be reused.
-    digest.update(b"scanlan-media-dataset-v16-da3-nested-direct-gs-streaming\0")
+    # P9 changes camera-analysis order and pair selection. Older COLMAP-first
+    # solutions must not be mistaken for learned-first verified datasets.
+    digest.update(b"scanlan-media-dataset-v18-learned-first-camera-recovery\0")
     digest.update(observation_fingerprint.encode("ascii"))
     digest.update(DA3_CODE_REVISION.encode("ascii"))
     digest.update(DA3_MODEL_REVISION.encode("ascii"))
@@ -1251,6 +1251,122 @@ def _cpu_match_pairs(
     return pairs
 
 
+def _learned_camera_arrays(
+    proposal: LingbotGeometry | None,
+    image_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Return finite learned camera centers, forward axes, and confidence.
+
+    Learned cameras are proposals only.  They may decide which expensive
+    high-resolution pairs to verify, but never become observations in the SfM
+    model and never bypass COLMAP's two-view geometry or bundle adjustment.
+    """
+    if proposal is None:
+        return None
+    poses = np.asarray(proposal.world_from_cameras, dtype=np.float64)
+    confidence = np.asarray(proposal.frame_confidence, dtype=np.float64).reshape(-1)
+    if poses.shape != (image_count, 4, 4) or confidence.shape != (image_count,):
+        return None
+    if not np.isfinite(poses).all() or not np.isfinite(confidence).all():
+        return None
+    rotations = poses[:, :3, :3]
+    determinants = np.linalg.det(rotations)
+    if np.any(np.abs(determinants - 1.0) > 0.08):
+        return None
+    centers = poses[:, :3, 3]
+    forward = rotations[:, :, 2]
+    forward_norm = np.linalg.norm(forward, axis=1, keepdims=True)
+    if np.any(forward_norm <= 1e-8):
+        return None
+    forward = forward / forward_norm
+    if image_count > 1 and float(np.max(np.linalg.norm(centers - centers[0], axis=1))) <= 1e-7:
+        return None
+    return centers, forward, np.clip(confidence, 0.0, 1.0)
+
+
+def _guided_match_pairs(
+    image_names: Sequence[str],
+    proposal: LingbotGeometry | None,
+    *,
+    sequential: bool,
+) -> list[tuple[str, str]]:
+    """Build a bounded, connected pair graph from a learned trajectory.
+
+    The graph combines spatial nearest neighbours, view-direction agreement,
+    and temporal baselines.  Connecting every view to an earlier spatial
+    neighbour prevents an otherwise plausible learned trajectory from
+    producing disconnected matching islands.
+    """
+    names = list(image_names)
+    learned = _learned_camera_arrays(proposal, len(names))
+    if learned is None:
+        return []
+    centers, forward, confidence = learned
+    pair_indices: set[tuple[int, int]] = set()
+    neighbour_count = min(len(names) - 1, 12 if sequential else 10)
+    for index in range(len(names)):
+        distances = np.linalg.norm(centers - centers[index], axis=1)
+        direction_agreement = np.clip(forward @ forward[index], -1.0, 1.0)
+        confidence_penalty = 0.35 * (1.0 - np.minimum(confidence, confidence[index]))
+        nonzero = distances[distances > 1e-7]
+        local_scale = float(np.median(nonzero)) if len(nonzero) else 1.0
+        score = distances / max(local_scale, 1e-7)
+        score += 0.65 * (1.0 - direction_agreement) + confidence_penalty
+        score[index] = math.inf
+        nearest = np.argpartition(score, neighbour_count - 1)[:neighbour_count]
+        for other in nearest:
+            left, right = sorted((index, int(other)))
+            pair_indices.add((left, right))
+        if index:
+            earlier = np.linalg.norm(centers[:index] - centers[index], axis=1)
+            pair_indices.add((int(np.argmin(earlier)), index))
+
+    if sequential:
+        # Local continuity plus widening baselines supplies parallax and loop
+        # evidence without the quadratic graph used by exhaustive matching.
+        for offset in (*range(1, 9), 16, 32, 64, 128):
+            pair_indices.update(
+                (left, left + offset)
+                for left in range(len(names) - offset)
+            )
+    return [(names[left], names[right]) for left, right in sorted(pair_indices)]
+
+
+def _camera_recovery_pairs(
+    image_names: Sequence[str],
+    proposal: LingbotGeometry | None,
+    registered_names: set[str],
+    existing_pairs: set[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Connect missing learned cameras to nearby verified SfM cameras."""
+    names = list(image_names)
+    learned = _learned_camera_arrays(proposal, len(names))
+    registered_indices = [
+        index for index, name in enumerate(names) if name in registered_names
+    ]
+    if learned is None or len(registered_indices) < 2:
+        return []
+    centers, forward, _confidence = learned
+    recovered: set[tuple[str, str]] = set()
+    registered_array = np.asarray(registered_indices, dtype=np.int64)
+    for index, name in enumerate(names):
+        if name in registered_names:
+            continue
+        distances = np.linalg.norm(centers[registered_array] - centers[index], axis=1)
+        angles = 1.0 - np.clip(forward[registered_array] @ forward[index], -1.0, 1.0)
+        score = distances / max(float(np.median(distances)), 1e-7) + 0.75 * angles
+        # Reach beyond the first-pass neighbourhood. Otherwise a single
+        # missing view would only request the same pairs that already failed
+        # to connect it to the reconstruction.
+        count = min(20, len(registered_array))
+        neighbours = registered_array[np.argpartition(score, count - 1)[:count]]
+        for other in neighbours:
+            pair = tuple(sorted((name, names[int(other)])))
+            if pair not in existing_pairs:
+                recovered.add(pair)
+    return sorted(recovered)
+
+
 def _feature_extraction_batch_size(
     image_count: int,
     *,
@@ -1272,6 +1388,89 @@ def _feature_extraction_batch_size(
     return min(image_count, max(1, min(worker_threads, 8)))
 
 
+def _match_imported_pairs(
+    pycolmap: Any,
+    database: Path,
+    workspace: Path,
+    pairs: Sequence[tuple[str, str]],
+    matching: Any,
+    verification: Any,
+    feature_device: Any,
+    project_root: Path,
+    feature_backend: str,
+    *,
+    progress_start: float,
+    progress_end: float,
+    label: str,
+) -> None:
+    """Match and geometrically verify an explicit pair graph in bounded batches."""
+    if not pairs:
+        return
+    pair_batch_size = max(512, min(4096, int(matching.num_threads) * 128))
+    for batch_index, start in enumerate(range(0, len(pairs), pair_batch_size)):
+        batch = pairs[start : start + pair_batch_size]
+        pair_path = workspace / f"{label}-pairs-{batch_index:05d}.txt"
+        pair_path.write_text(
+            "".join(f"{left} {right}\n" for left, right in batch),
+            encoding="utf-8",
+        )
+        pairing = pycolmap.ImportedPairingOptions()
+        pairing.block_size = min(pair_batch_size, len(batch))
+        pairing.match_list_path = pair_path
+        with _progress_heartbeat(
+            project_root,
+            "feature_matching",
+            f"{label}: verifying pairs {start + 1:,}-{start + len(batch):,} of {len(pairs):,}",
+            progress_start
+            + (progress_end - progress_start) * start / max(len(pairs), 1),
+            compute_backend=feature_backend,
+            metrics={
+                "pairCount": len(pairs),
+                "processedPairs": start,
+                "pairingMode": label,
+            },
+        ):
+            pycolmap.match_image_pairs(
+                database,
+                matching_options=matching,
+                pairing_options=pairing,
+                verification_options=verification,
+                device=feature_device,
+            )
+        pair_path.unlink(missing_ok=True)
+        processed = start + len(batch)
+        _progress(
+            project_root,
+            "feature_matching",
+            f"{label}: verified {processed:,} of {len(pairs):,} image pairs",
+            progress_start
+            + (progress_end - progress_start) * processed / max(len(pairs), 1),
+            compute_backend=feature_backend,
+            metrics={
+                "pairCount": len(pairs),
+                "processedPairs": processed,
+                "pairingMode": label,
+            },
+        )
+        _check_cancelled(project_root)
+
+
+def _rank_reconstructions(models: dict[int, Any]) -> list[Any]:
+    return sorted(
+        models.values(),
+        key=lambda model: (model.num_reg_images(), model.num_points3D()),
+        reverse=True,
+    )
+
+
+def _registered_image_names(reconstruction: Any) -> set[str]:
+    return {
+        str(image.name)
+        for image in reconstruction.images.values()
+        if image.has_pose
+    }
+
+
 def _run_sfm(
     images_root: Path,
     workspace: Path,
@@ -1279,6 +1478,7 @@ def _run_sfm(
     options: MediaPreparationOptions,
     project_root: Path,
     sequential: bool,
+    camera_proposal: LingbotGeometry | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     import pycolmap
 
@@ -1307,7 +1507,7 @@ def _run_sfm(
         project_root,
         "feature_extraction",
         f"Extracting high-detail features from {image_count:,} images with {backend_detail}",
-        0.10,
+        0.20,
         compute_backend=feature_backend,
         metrics={
             "imageCount": image_count,
@@ -1317,6 +1517,9 @@ def _run_sfm(
         },
     )
     image_names = sorted(path.name for path in images_root.iterdir() if path.is_file())
+    proposal_image_names = [str(record["image"]) for record in records]
+    if sorted(proposal_image_names) != image_names:
+        raise RuntimeError("Learned camera proposal order does not match the prepared image set")
     extraction_groups = _feature_extraction_groups(records)
     grouped_names = sorted(
         image_name
@@ -1339,7 +1542,7 @@ def _run_sfm(
             batch = group_names[start : start + batch_size]
             processed_before = processed
             processed_after = processed + len(batch)
-            batch_progress = 0.10 + 0.15 * processed_before / max(image_count, 1)
+            batch_progress = 0.20 + 0.12 * processed_before / max(image_count, 1)
             reader.existing_camera_id = shared_camera_id if shared_camera else -1
             with _progress_heartbeat(
                 project_root,
@@ -1388,7 +1591,7 @@ def _run_sfm(
                 project_root,
                 "feature_extraction",
                 f"Extracted {feature_backend} features from {processed_after:,} of {image_count:,} images",
-                0.10 + 0.15 * processed_after / max(image_count, 1),
+                0.20 + 0.12 * processed_after / max(image_count, 1),
                 compute_backend=feature_backend,
                 metrics={
                     "imageCount": image_count,
@@ -1425,109 +1628,167 @@ def _run_sfm(
         project_root,
         "feature_matching",
         "Matching overlapping views with geometric verification",
-        0.25,
+        0.32,
         compute_backend=feature_backend,
         metrics={"imageCount": image_count},
     )
-    if not feature_runtime["cudaValidated"] and hasattr(pycolmap, "match_image_pairs"):
-        pairs = _cpu_match_pairs(
+    guided_pairs = _guided_match_pairs(
+        proposal_image_names,
+        camera_proposal,
+        sequential=sequential,
+    )
+    proposal_used = bool(guided_pairs)
+    initial_pairs = guided_pairs or _cpu_match_pairs(
+        image_names,
+        sequential=sequential and image_count > 120,
+    )
+    _match_imported_pairs(
+        pycolmap,
+        database,
+        workspace,
+        initial_pairs,
+        matching,
+        verification,
+        feature_device,
+        project_root,
+        feature_backend,
+        progress_start=0.32,
+        progress_end=0.43,
+        label="learned guided matching" if proposal_used else "conventional matching",
+    )
+    _check_cancelled(project_root)
+
+    all_models: list[Any] = []
+
+    def solve_attempt(output_name: str, progress_value: float, detail: str) -> list[Any]:
+        attempt_root = models_root / output_name
+        attempt_root.mkdir(parents=True, exist_ok=True)
+        camera_telemetry = _CameraSolveTelemetry(image_count)
+        with _progress_heartbeat(
+            project_root,
+            "camera_solving",
+            detail,
+            progress_value,
+            compute_backend="COLMAP incremental mapper / CPU",
+            metrics={
+                "imageCount": image_count,
+                "learnedProposal": proposal_used,
+                "guidedPairCount": len(guided_pairs),
+            },
+            progress_provider=camera_telemetry.progress,
+            detail_provider=camera_telemetry.detail,
+            metrics_provider=camera_telemetry.snapshot,
+        ):
+            models = pycolmap.incremental_mapping(
+                database,
+                images_root,
+                attempt_root,
+                options=mapping,
+                initial_image_pair_callback=camera_telemetry.initial_pair_registered,
+                next_image_callback=camera_telemetry.next_image_registered,
+            )
+        ranked_attempt = _rank_reconstructions(models)
+        all_models.extend(ranked_attempt)
+        return ranked_attempt
+
+    ranked = solve_attempt(
+        "guided" if proposal_used else "conventional",
+        0.44,
+        (
+            "Solving cameras from the learned-guided verified view graph"
+            if proposal_used
+            else "Solving cameras and globally refining structure"
+        ),
+    )
+    best = ranked[0] if ranked else None
+    initial_registered = best.num_reg_images() if best is not None else 0
+    matched_pairs = {tuple(sorted(pair)) for pair in initial_pairs}
+    recovery_pairs: list[tuple[str, str]] = []
+    if proposal_used and best is not None and best.num_reg_images() < image_count:
+        recovery_pairs = _camera_recovery_pairs(
+            proposal_image_names,
+            camera_proposal,
+            _registered_image_names(best),
+            matched_pairs,
+        )
+        if recovery_pairs:
+            _match_imported_pairs(
+                pycolmap,
+                database,
+                workspace,
+                recovery_pairs,
+                matching,
+                verification,
+                feature_device,
+                project_root,
+                feature_backend,
+                progress_start=0.52,
+                progress_end=0.57,
+                label="camera recovery",
+            )
+            ranked = solve_attempt(
+                "recovery",
+                0.57,
+                "Recovering missing cameras through learned-neighbour geometric verification",
+            )
+            if ranked and (
+                best is None
+                or (ranked[0].num_reg_images(), ranked[0].num_points3D())
+                > (best.num_reg_images(), best.num_points3D())
+            ):
+                best = ranked[0]
+
+    minimum_registered = _minimum_useful_registration_count(image_count)
+    preferred_registered = max(minimum_registered, math.ceil(image_count * 0.85))
+    needs_fallback = best is None or best.num_reg_images() < preferred_registered
+    fallback_used = False
+    fallback_pairs: list[tuple[str, str]] = []
+    if needs_fallback and proposal_used:
+        conventional_pairs = _cpu_match_pairs(
             image_names,
             sequential=sequential and image_count > 120,
         )
-        pair_batch_size = max(512, int(matching.num_threads) * 64)
-        for batch_index, start in enumerate(range(0, len(pairs), pair_batch_size)):
-            batch = pairs[start : start + pair_batch_size]
-            pair_path = workspace / f"match-pairs-{batch_index:05d}.txt"
-            pair_path.write_text(
-                "".join(f"{left} {right}\n" for left, right in batch),
-                encoding="utf-8",
-            )
-            pairing = pycolmap.ImportedPairingOptions()
-            pairing.block_size = min(pair_batch_size, len(batch))
-            pairing.match_list_path = pair_path
-            pycolmap.match_image_pairs(
+        already_matched = matched_pairs | {
+            tuple(sorted(pair)) for pair in recovery_pairs
+        }
+        fallback_pairs = [
+            pair
+            for pair in conventional_pairs
+            if tuple(sorted(pair)) not in already_matched
+        ]
+        if fallback_pairs:
+            fallback_used = True
+            _match_imported_pairs(
+                pycolmap,
                 database,
-                matching_options=matching,
-                pairing_options=pairing,
-                verification_options=verification,
-                device=feature_device,
-            )
-            pair_path.unlink(missing_ok=True)
-            processed = start + len(batch)
-            _progress(
+                workspace,
+                fallback_pairs,
+                matching,
+                verification,
+                feature_device,
                 project_root,
-                "feature_matching",
-                f"Matched {processed:,} of {len(pairs):,} CPU image pairs",
-                0.25 + 0.18 * processed / max(len(pairs), 1),
-                compute_backend=feature_backend,
-                metrics={
-                    "pairCount": len(pairs),
-                    "processedPairs": processed,
-                    "workerThreads": int(matching.num_threads),
-                },
+                feature_backend,
+                progress_start=0.58,
+                progress_end=0.63,
+                label="quality fallback",
             )
-            _check_cancelled(project_root)
-    else:
-        with _progress_heartbeat(
-            project_root,
-            "feature_matching",
-            "Matching overlapping views with geometric verification",
-            0.25,
-            compute_backend=feature_backend,
-            metrics={"imageCount": image_count},
-        ):
-            if sequential and image_count > 120:
-                pairing = pycolmap.SequentialPairingOptions()
-                pairing.overlap = 16
-                pairing.quadratic_overlap = True
-                pycolmap.match_sequential(
-                    database,
-                    matching_options=matching,
-                    pairing_options=pairing,
-                    verification_options=verification,
-                    device=feature_device,
-                )
-            else:
-                pairing = pycolmap.ExhaustivePairingOptions()
-                pairing.block_size = 50
-                pycolmap.match_exhaustive(
-                    database,
-                    matching_options=matching,
-                    pairing_options=pairing,
-                    verification_options=verification,
-                    device=feature_device,
-                )
-    _check_cancelled(project_root)
-    camera_telemetry = _CameraSolveTelemetry(image_count)
-    with _progress_heartbeat(
-        project_root,
-        "camera_solving",
-        "Solving cameras and globally refining structure",
-        0.45,
-        compute_backend="COLMAP incremental mapper / CPU",
-        metrics={"imageCount": image_count},
-        progress_provider=camera_telemetry.progress,
-        detail_provider=camera_telemetry.detail,
-        metrics_provider=camera_telemetry.snapshot,
-    ):
-        models = pycolmap.incremental_mapping(
-            database,
-            images_root,
-            models_root,
-            options=mapping,
-            initial_image_pair_callback=camera_telemetry.initial_pair_registered,
-            next_image_callback=camera_telemetry.next_image_registered,
-        )
-    if not models:
+            ranked = solve_attempt(
+                "fallback",
+                0.63,
+                "Retrying the camera solve with the conventional verified view graph",
+            )
+            if ranked and (
+                best is None
+                or (ranked[0].num_reg_images(), ranked[0].num_points3D())
+                > (best.num_reg_images(), best.num_points3D())
+            ):
+                best = ranked[0]
+
+    if best is None:
         raise RuntimeError(
             "Camera solving found no consistent reconstruction. Capture more overlap, texture, and parallax."
         )
-    ranked = sorted(
-        models.values(),
-        key=lambda model: (model.num_reg_images(), model.num_points3D()),
-        reverse=True,
-    )
-    reconstruction = ranked[0]
+    reconstruction = best
     registered = reconstruction.num_reg_images()
     minimum_registered = _minimum_useful_registration_count(image_count)
     if registered < minimum_registered:
@@ -1536,15 +1797,68 @@ def _run_sfm(
             f"(minimum {minimum_registered}); capture a slower path with at least "
             "60-80% overlap and avoid motion blur."
         )
+    _progress(
+        project_root,
+        "camera_refinement",
+        "Running final high-resolution global bundle adjustment",
+        0.67,
+        compute_backend="COLMAP Ceres bundle adjustment / CPU",
+        metrics={
+            "registeredCameras": registered,
+            "featureImageLimit": options.maximum_image_dimension,
+        },
+    )
+    bundle_options = pycolmap.BundleAdjustmentOptions()
+    bundle_options.refine_focal_length = True
+    bundle_options.refine_principal_point = False
+    bundle_options.refine_extra_params = True
+    bundle_options.ceres.loss_function_type = pycolmap.LossFunctionType.HUBER
+    bundle_options.ceres.loss_function_scale = 1.0
+    bundle_options.ceres.solver_options.max_num_iterations = 100
+    bundle_options.ceres.solver_options.function_tolerance = 1e-7
+    bundle_options.ceres.solver_options.num_threads = int(mapping.num_threads)
+    with _progress_heartbeat(
+        project_root,
+        "camera_refinement",
+        "Final high-resolution global bundle adjustment",
+        0.67,
+        compute_backend="COLMAP Ceres bundle adjustment / CPU",
+        metrics={"registeredCameras": registered},
+    ):
+        pycolmap.bundle_adjustment(reconstruction, bundle_options)
+    reconstruction.update_point_3d_errors()
+    database_handle = pycolmap.Database.open(database)
+    try:
+        verified_pair_count = int(database_handle.num_verified_image_pairs())
+        inlier_match_count = int(database_handle.num_inlier_matches())
+    finally:
+        database_handle.close()
     statistics = {
         "inputImageCount": image_count,
         "registeredImageCount": registered,
         "registrationRatio": registered / image_count,
         "sparsePointCount": reconstruction.num_points3D(),
-        "modelCount": len(ranked),
+        "modelCount": len(all_models),
         "excludedImageCount": image_count - registered,
         "featureBackend": feature_backend,
-        "matching": "sequential quadratic overlap" if sequential and image_count > 120 else "exhaustive",
+        "matching": (
+            "learned guided + geometric verification"
+            if proposal_used
+            else "sequential bounded" if sequential and image_count > 120 else "exhaustive"
+        ),
+        "cameraSolveOrder": "learned_first" if proposal_used else "conventional_fallback",
+        "learnedProposalBackend": camera_proposal.backend if proposal_used else None,
+        "guidedPairCount": len(guided_pairs),
+        "geometricallyVerifiedPairCount": verified_pair_count,
+        "geometricInlierMatchCount": inlier_match_count,
+        "cameraRecoveryPairCount": len(recovery_pairs),
+        "conventionalFallbackPairCount": len(fallback_pairs),
+        "conventionalFallbackUsed": fallback_used,
+        "preferredRegistrationCount": preferred_registered,
+        "initialRegisteredImageCount": initial_registered,
+        "recoveredImageCount": max(0, registered - initial_registered),
+        "finalBundleAdjustment": True,
+        "bundleAdjustmentFeatureImageLimit": options.maximum_image_dimension,
         "sharedVideoCameraCount": len(shared_video_camera_ids),
     }
     return reconstruction, statistics
@@ -2334,10 +2648,12 @@ def prepare_media_dataset(
         )
         lingbot_geometry: LingbotGeometry | None = None
         lingbot_context: dict[str, Any] | None = None
+        mapanything_proposal: LingbotGeometry | None = None
         mapanything_geometry: LingbotGeometry | None = None
         mapanything_quality: dict[str, Any] = {}
         mapanything_error: str | None = None
         mapanything_evaluated = False
+        da3_proposal: LingbotGeometry | None = None
         da3_geometry: LingbotGeometry | None = None
         da3_quality: dict[str, Any] = {}
         da3_error: str | None = None
@@ -2345,6 +2661,86 @@ def prepare_media_dataset(
         da3_streaming: dict[str, Any] | None = None
         da3_direct_gaussians = False
         da3_direct_gaussians_used = False
+        # P9 reverses the old authority order: a bounded learned model proposes
+        # cameras first, then high-resolution local features decide which of
+        # those relationships survive geometric verification and bundle
+        # adjustment.  A failed proposal remains a transparent COLMAP fallback.
+        if geometry_worker is not None and 3 <= len(records) <= 32:
+            mapanything_evaluated = True
+
+            def report_mapanything(
+                stage: str,
+                detail: str,
+                progress_value: float,
+                backend: str,
+                metrics: dict[str, Any],
+            ) -> None:
+                _progress(
+                    project_root,
+                    stage,
+                    detail,
+                    0.09 + 0.03 * min(max(progress_value, 0.0), 1.0),
+                    compute_backend=backend,
+                    metrics={**metrics, "cameraProposal": True},
+                )
+
+            try:
+                mapanything_proposal = infer_mapanything_geometry_isolated(
+                    geometry_worker,
+                    [input_images / str(record["image"]) for record in records],
+                    work_root=staging / "geometry-ipc",
+                    cancel_path=project_root / "outputs" / "cancel.flag",
+                    progress=report_mapanything,
+                )
+            except Exception as error:
+                mapanything_error = str(error)
+            _check_cancelled(project_root)
+        if geometry_worker is not None and len(records) >= 3:
+            da3_evaluated = True
+            da3_direct_gaussians = True
+
+            def report_da3(
+                stage: str,
+                detail: str,
+                progress_value: float,
+                backend: str,
+                metrics: dict[str, Any],
+            ) -> None:
+                _progress(
+                    project_root,
+                    stage,
+                    detail,
+                    0.12 + 0.07 * min(max(progress_value, 0.0), 1.0),
+                    compute_backend=backend,
+                    metrics={
+                        **metrics,
+                        "cameraProposal": True,
+                        "noncommercial": True,
+                    },
+                )
+
+            try:
+                da3_proposal, da3_streaming = infer_da3_geometry_isolated(
+                    geometry_worker,
+                    [input_images / str(record["image"]) for record in records],
+                    work_root=staging / "geometry-ipc",
+                    cancel_path=project_root / "outputs" / "cancel.flag",
+                    direct_gaussians=da3_direct_gaussians,
+                    progress=report_da3,
+                )
+                da3_direct_gaussians_used = bool(
+                    da3_streaming.get("directGaussiansUsed", False)
+                )
+            except Exception as error:
+                da3_error = str(error)
+            _check_cancelled(project_root)
+        camera_proposal = (
+            da3_proposal
+            if _learned_camera_arrays(da3_proposal, len(records)) is not None
+            else mapanything_proposal
+            if _learned_camera_arrays(mapanything_proposal, len(records)) is not None
+            else None
+        )
         reconstruction, solve = _run_sfm(
             input_images,
             sfm_workspace,
@@ -2352,6 +2748,7 @@ def prepare_media_dataset(
             options,
             project_root,
             sequential=bool(video_statistics),
+            camera_proposal=camera_proposal,
         )
         _check_cancelled(project_root)
         if single_video:
@@ -2423,38 +2820,10 @@ def prepare_media_dataset(
                 preview=publish_rgb_preview if progressive_rgb_preview else None,
             )
             _check_cancelled(project_root)
-        # MapAnything is bounded to the regime where it is a useful challenger
-        # on a laptop GPU. Larger ordered videos retain LingBot's streaming,
-        # bounded-context path.
-        if geometry_worker is not None and 3 <= len(records) <= 32:
-            mapanything_evaluated = True
-
-            def report_mapanything(
-                stage: str,
-                detail: str,
-                progress_value: float,
-                backend: str,
-                metrics: dict[str, Any],
-            ) -> None:
-                _progress(
-                    project_root,
-                    stage,
-                    detail,
-                    0.70 + 0.04 * min(max(progress_value, 0.0), 1.0),
-                    compute_backend=backend,
-                    metrics={**metrics, "challenger": True},
-                )
-
+        if mapanything_proposal is not None:
             try:
-                proposal = infer_mapanything_geometry_isolated(
-                    geometry_worker,
-                    [input_images / str(record["image"]) for record in records],
-                    work_root=staging / "geometry-ipc",
-                    cancel_path=project_root / "outputs" / "cancel.flag",
-                    progress=report_mapanything,
-                )
                 mapanything_geometry, mapanything_quality = _align_lingbot_geometry(
-                    proposal,
+                    mapanything_proposal,
                     reconstruction,
                     [str(record["image"]) for record in records],
                 )
@@ -2465,44 +2834,10 @@ def prepare_media_dataset(
                 mapanything_geometry = None
                 mapanything_error = str(error)
             _check_cancelled(project_root)
-        if geometry_worker is not None and len(records) >= 3:
-            da3_evaluated = True
-            # Direct GS has the highest initialization quality. Every input is
-            # already processed in bounded windows; the isolated worker falls
-            # back to the same model's camera/depth head only after a measured
-            # CUDA allocation failure, rather than imposing a view-count guess.
-            da3_direct_gaussians = True
-
-            def report_da3(
-                stage: str,
-                detail: str,
-                progress_value: float,
-                backend: str,
-                metrics: dict[str, Any],
-            ) -> None:
-                _progress(
-                    project_root,
-                    stage,
-                    detail,
-                    0.74 + 0.08 * min(max(progress_value, 0.0), 1.0),
-                    compute_backend=backend,
-                    metrics={**metrics, "challenger": True, "noncommercial": True},
-                )
-
+        if da3_proposal is not None:
             try:
-                proposal, da3_streaming = infer_da3_geometry_isolated(
-                    geometry_worker,
-                    [input_images / str(record["image"]) for record in records],
-                    work_root=staging / "geometry-ipc",
-                    cancel_path=project_root / "outputs" / "cancel.flag",
-                    direct_gaussians=da3_direct_gaussians,
-                    progress=report_da3,
-                )
-                da3_direct_gaussians_used = bool(
-                    da3_streaming.get("directGaussiansUsed", False)
-                )
                 da3_geometry, da3_quality = _align_lingbot_geometry(
-                    proposal,
+                    da3_proposal,
                     reconstruction,
                     [str(record["image"]) for record in records],
                 )
