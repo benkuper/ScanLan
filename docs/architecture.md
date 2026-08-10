@@ -18,6 +18,12 @@ consistency, and point admissibility. Learned adapters propose geometry; they do
 own acceptance policy. Reports remain serializable across process boundaries. See
 [validation-engine.md](validation-engine.md).
 
+The splat worker also owns the opt-in Max Quality neural-SDF optimizer so its PyTorch/CUDA
+allocation cannot leak into the lightweight reconstruction runtime. The reconstruction worker
+serializes an immutable indexed candidate surface, invokes the isolated process, and validates the
+returned displacement independently before repair or texturing. A worker crash, CUDA error,
+rejected held-out fit, or malformed output therefore cannot replace the baseline mesh.
+
 The realtime engine is started and reports `ready` before the camera is opened. Tauri pipes camera stdout directly into engine stdin and drains engine stdout on a dedicated thread. Sensor stderr goes to `sensor.log`, so a full pipe cannot stall capture.
 
 ## Live data path

@@ -177,6 +177,13 @@ are correctly labeled non-metric. In a hybrid project, learned media geometry is
 through independently localized cameras and can only fill space outside calibrated RGB-D support;
 failed camera agreement excludes it without degrading the metric result.
 
+For the selected mesh, **Neural SDF refinement (Max Quality)** optionally fits a continuous
+signed-distance surface in the isolated CUDA runtime after camera/depth validation. It is strictly
+fail-closed: deterministic held-out SDF error, bounded displacement, triangle orientation,
+degeneracy, and an independent reconstruction-worker check must all pass before the candidate can
+continue to repair and multiview texturing. Otherwise the validated TSDF or learned dense mesh is
+kept unchanged. The exact decision is saved in `outputs/neural-sdf-report.json`.
+
 The dataset manifest records proposal backend, guided/recovery/fallback pair counts, geometric
 verification evidence, recovered cameras, registration ratio, excluded views, model count,
 reprojection error, track length, and warnings. Disconnected views are reported rather than forced

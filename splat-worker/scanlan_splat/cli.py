@@ -99,6 +99,13 @@ def parser() -> argparse.ArgumentParser:
     observations.add_argument("--video-fps", type=float, default=15.0)
     observations.add_argument("--maximum-video-frames", type=int, default=3_000)
     observations.add_argument("--maximum-image-dimension", type=int, default=2560)
+    neural_sdf = commands.add_parser("refine-sdf")
+    neural_sdf.add_argument("--input", type=Path, required=True)
+    neural_sdf.add_argument("--output", type=Path, required=True)
+    neural_sdf.add_argument("--report", type=Path, required=True)
+    neural_sdf.add_argument("--progress", type=Path, default=None)
+    neural_sdf.add_argument("--iterations", type=int, default=1_600)
+    neural_sdf.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     diagnostics = commands.add_parser("diagnostics")
     diagnostics.add_argument("--require-cuda", action="store_true")
     diagnostics.add_argument("--require-learned-features", action="store_true")
@@ -112,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "diagnostics":
             import torch
             import gsplat
+            from .neural_sdf import NEURAL_SDF_VERSION
 
             cuda_available = torch.cuda.is_available()
             if arguments.require_cuda and cuda_available:
@@ -135,6 +143,10 @@ def main(argv: list[str] | None = None) -> int:
                         "pycolmap": feature_runtime,
                         "learnedGeometryIsolation": "scanlan-geometry",
                         "adaptiveFrames": adaptive_frames,
+                        "neuralSdf": {
+                            "version": NEURAL_SDF_VERSION,
+                            "cudaAvailable": cuda_available,
+                        },
                     }
                 )
             )
@@ -176,6 +188,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(result))
             return 0
+        if arguments.command == "refine-sdf":
+            from .neural_sdf import run_refinement
+
+            result = run_refinement(
+                arguments.input.resolve(strict=True),
+                arguments.output.resolve(),
+                arguments.report.resolve(),
+                arguments.progress.resolve() if arguments.progress is not None else None,
+                max(200, min(arguments.iterations, 5_000)),
+                arguments.device,
+            )
+            print(json.dumps(result))
+            return 0 if result["status"] == "accepted" else 3
         result = train_dataset(
             arguments.dataset.resolve(),
             arguments.project.resolve(),

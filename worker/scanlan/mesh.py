@@ -2449,6 +2449,11 @@ def build_mesh_artifacts(
     prebuilt_mesh_method: str | None = None,
     repair_settings: MeshRepairSettings | None = None,
     supplemental_mesh: tuple[np.ndarray, np.ndarray] | None = None,
+    surface_refiner: Callable[
+        [np.ndarray, np.ndarray, float, Callable[..., None] | None],
+        tuple[np.ndarray, np.ndarray, dict[str, Any]],
+    ]
+    | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not frames:
@@ -2534,6 +2539,19 @@ def build_mesh_artifacts(
                 None,
                 0.59,
             )
+    neural_sdf_report: dict[str, Any] = {
+        "status": "disabled",
+        "method": "scanlan-neural-sdf-v1",
+    }
+    if surface_refiner is not None:
+        vertices, triangles, neural_sdf_report = surface_refiner(
+            vertices,
+            triangles,
+            mesh_voxel_size,
+            progress,
+        )
+        if neural_sdf_report.get("status") == "accepted":
+            fusion_method = f"{fusion_method}+validated_neural_sdf"
     repair_settings = repair_settings or MeshRepairSettings()
     vertices, triangles, repair_report = repair_mesh_geometry(
         output_dir,
@@ -2700,6 +2718,7 @@ def build_mesh_artifacts(
         "meshMaterialPath": "outputs/room-mesh.mtl",
         "meshTexturePath": "outputs/room-texture.png",
         "meshFusionMethod": fusion_method,
+        "neuralSdf": neural_sdf_report,
         "learnedMediaTriangleCount": learned_triangle_count,
         "meshCacheHit": mesh_cache_hit,
         "meshRepairEnabled": repair_settings.enabled,

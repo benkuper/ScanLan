@@ -262,10 +262,7 @@ fn stage_plan(job: &ArtifactJob) -> Vec<(&'static str, f32)> {
             .any(|target| matches!(target.as_str(), "pointCloud" | "texturedMesh"));
         let wants_mesh = job.targets.iter().any(|target| target == "texturedMesh");
         let wants_splat = job.targets.iter().any(|target| target == "gaussianSplat");
-        let mut plan = vec![
-            ("prepare", 0.05),
-            ("media", 0.35),
-        ];
+        let mut plan = vec![("prepare", 0.05), ("media", 0.35)];
         if wants_dense {
             plan.push(("fuse", 0.18));
             plan.push(("cloud", 0.12));
@@ -807,9 +804,7 @@ fn run_pipeline(
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if !dense_targets.is_empty()
-            && job.targets.iter().any(|target| target == "gaussianSplat")
-        {
+        if !dense_targets.is_empty() && job.targets.iter().any(|target| target == "gaussianSplat") {
             dense_targets.push("gaussian_splat");
         }
         let dense_targets = dense_targets.join(",");
@@ -825,6 +820,11 @@ fn run_pipeline(
                 .arg(&dataset)
                 .arg("--targets")
                 .arg(&dense_targets);
+            if project.settings.neural_sdf_refinement
+                && job.targets.iter().any(|target| target == "texturedMesh")
+            {
+                fuse.arg("--neural-sdf-worker").arg(&splat_worker);
+            }
             run_command(fuse, project_root, job, cancel, false)?;
         }
         if !job.targets.iter().any(|target| target == "gaussianSplat") {
@@ -856,6 +856,13 @@ fn run_pipeline(
     };
     let depth_refiner = if depth_refinement_backend != "off" {
         Some(existing_geometry_runtime(resources)?)
+    } else {
+        None
+    };
+    let neural_sdf_worker = if project.settings.neural_sdf_refinement
+        && job.targets.iter().any(|target| target == "texturedMesh")
+    {
+        Some(existing_runtime(resources, true)?)
     } else {
         None
     };
@@ -904,6 +911,14 @@ fn run_pipeline(
                 .arg(depth_refinement_backend)
                 .arg("--depth-refiner")
                 .arg(refiner);
+        }
+        if selected_targets
+            .split(',')
+            .any(|target| target == "textured_mesh")
+        {
+            if let Some(worker) = neural_sdf_worker.as_ref() {
+                command.arg("--neural-sdf-worker").arg(worker);
+            }
         }
         command
     };

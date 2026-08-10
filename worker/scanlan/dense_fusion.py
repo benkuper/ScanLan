@@ -450,6 +450,7 @@ def publish_media_dense_artifacts(
     project_root: Path,
     dataset_pointer: Path,
     targets: Sequence[str],
+    neural_sdf_worker: Path | None = None,
 ) -> dict[str, Any]:
     samples, dataset, _root = load_dense_samples(dataset_pointer)
     voxel_size = adaptive_voxel_size(samples)
@@ -465,6 +466,26 @@ def publish_media_dense_artifacts(
 
         mesh_samples, mesh_voxel = bounded_mesh_samples(fused, voxel_size)
         vertices, triangles, vertex_colors = dense_surface_mesh(mesh_samples, mesh_voxel)
+        neural_sdf_report: dict[str, Any] = {
+            "status": "disabled",
+            "method": "scanlan-neural-sdf-v1",
+        }
+        if neural_sdf_worker is not None:
+            from .neural_sdf import refine_surface_with_worker
+
+            vertices, triangles, neural_sdf_report = refine_surface_with_worker(
+                vertices,
+                triangles,
+                project_root=project_root,
+                worker=neural_sdf_worker,
+                voxel_size_m=mesh_voxel,
+                validation_report={
+                    "accepted": True,
+                    "contractVersion": "media-camera-depth-validation-v1",
+                    "scaleStatus": "LEARNED_VALIDATED",
+                    "quality": dataset.get("quality", {}),
+                },
+            )
         atlas, uvs, _resolution = _bake_triangle_atlas(vertex_colors, triangles)
         _write_png(output / "room-texture.png", atlas)
         (output / "room-mesh.mtl").write_text(
@@ -481,7 +502,12 @@ def publish_media_dense_artifacts(
             "meshOutputPath": "outputs/room-mesh.obj",
             "meshMaterialPath": "outputs/room-mesh.mtl",
             "meshTexturePath": "outputs/room-texture.png",
-            "meshFusionMethod": "confidence_weighted_learned_surface_bpa",
+            "meshFusionMethod": (
+                "confidence_weighted_learned_surface_bpa+validated_neural_sdf"
+                if neural_sdf_report.get("status") == "accepted"
+                else "confidence_weighted_learned_surface_bpa"
+            ),
+            "neuralSdf": neural_sdf_report,
             "meshVoxelSize": mesh_voxel,
             "textureSource": "learned_surface_vertex_color_atlas",
         }
@@ -513,6 +539,10 @@ def publish_media_dense_artifacts(
     if "textured_mesh" in targets:
         project["meshTriangleCount"] = result["meshTriangleCount"]
         project["meshOutputPath"] = "outputs/room-mesh.obj"
+        project["neuralSdf"] = result.get(
+            "neuralSdf",
+            {"status": "disabled", "method": "scanlan-neural-sdf-v1"},
+        )
         artifacts["texturedMesh"] = {
             "path": "outputs/room-mesh.obj", "status": "ready",
             "sourceFingerprint": fingerprint, "updatedAt": updated_at,

@@ -71,6 +71,8 @@ pub struct CaptureSettings {
     pub depth_refinement_backend: String,
     #[serde(default)]
     pub experimental_rgb_preview: bool,
+    #[serde(default)]
+    pub neural_sdf_refinement: bool,
 }
 
 fn default_sensor_kind() -> String {
@@ -187,6 +189,7 @@ impl Default for CaptureSettings {
             lingbot_depth_refinement: false,
             depth_refinement_backend: default_depth_refinement_backend(),
             experimental_rgb_preview: false,
+            neural_sdf_refinement: false,
         }
     }
 }
@@ -308,6 +311,8 @@ pub struct ProjectSummary {
     pub watertight_mesh_output_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth_refinement: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neural_sdf: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -361,6 +366,7 @@ impl ProjectSummary {
             mesh_repair_unknown_preserved: None,
             watertight_mesh_output_path: None,
             depth_refinement: None,
+            neural_sdf: None,
         }
     }
 

@@ -58,6 +58,7 @@ export interface CaptureSettings {
   depthRefinementBackend: 'off' | 'lingbot' | 'mapanything' | 'da3';
   /** Feature-flagged provisional learned-depth preview for imported video. */
   experimentalRgbPreview: boolean;
+  neuralSdfRefinement: boolean;
 }
 
 export type ArtifactStatus = 'ready' | 'building' | 'stale' | 'failed';
@@ -151,6 +152,18 @@ export interface ProjectSummary {
     generatedTrainingConfidence?: number;
     modelRevision?: string;
     modelSha256?: string;
+  };
+  neuralSdf?: {
+    status: 'disabled' | 'skipped' | 'accepted' | 'rejected';
+    method: string;
+    reason?: string;
+    cacheHit?: boolean;
+    validation?: {
+      heldOutSdfMaeM?: number;
+      heldOutSdfP95M?: number;
+      medianDisplacementM?: number;
+      p95DisplacementM?: number;
+    };
   };
 }
 

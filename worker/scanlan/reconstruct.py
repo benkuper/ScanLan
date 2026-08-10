@@ -33,7 +33,7 @@ from .validation import validate_posed_frames
 
 Engine = Literal["auto", "numpy", "open3d"]
 Device = Literal["auto", "cpu", "cuda"]
-DepthRefinement = Literal["off", "lingbot", "mapanything"]
+DepthRefinement = Literal["off", "lingbot", "mapanything", "da3"]
 
 
 class ProgressReporter:
@@ -129,6 +129,7 @@ def reconstruct_project(
     mesh_repair_settings: MeshRepairSettings | None = None,
     depth_refinement: DepthRefinement = "off",
     depth_refiner: Path | None = None,
+    neural_sdf_worker: Path | None = None,
 ) -> dict:
     project_root = project_root.resolve()
     project = read_project(project_root)
@@ -389,6 +390,26 @@ def reconstruct_project(
                     + json.dumps(media_fusion.get("alignment", {}), sort_keys=True)
                 ).encode("utf-8")
             ).hexdigest()[:24]
+        surface_refiner = None
+        if neural_sdf_worker is not None and "textured_mesh" in targets:
+            from .neural_sdf import refine_surface_with_worker
+
+            def surface_refiner(
+                surface_vertices: np.ndarray,
+                surface_triangles: np.ndarray,
+                surface_voxel_size: float,
+                surface_progress: object,
+            ) -> tuple[np.ndarray, np.ndarray, dict]:
+                return refine_surface_with_worker(
+                    surface_vertices,
+                    surface_triangles,
+                    project_root=project_root,
+                    worker=neural_sdf_worker,
+                    voxel_size_m=surface_voxel_size,
+                    validation_report=artifact_context.get("validation_report"),
+                    progress=surface_progress if callable(surface_progress) else None,
+                )
+
         mesh = (
             build_mesh_artifacts(
                 output_dir,
@@ -399,6 +420,7 @@ def reconstruct_project(
                 prebuilt_mesh_method=artifact_context.get("fused_mesh_method"),
                 repair_settings=mesh_repair_settings,
                 supplemental_mesh=supplemental_mesh,
+                surface_refiner=surface_refiner,
             )
             if "textured_mesh" in targets
             else {
@@ -532,6 +554,10 @@ def reconstruct_project(
             )
             project["watertightMeshOutputPath"] = result.get(
                 "watertightMeshOutputPath"
+            )
+            project["neuralSdf"] = result.get(
+                "neuralSdf",
+                {"status": "disabled", "method": "scanlan-neural-sdf-v1"},
             )
             artifacts["texturedMesh"] = {
                 "path": "outputs/room-mesh.obj",

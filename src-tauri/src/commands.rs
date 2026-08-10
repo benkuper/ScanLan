@@ -2542,10 +2542,11 @@ pub fn update_project_settings(
     let mesh_repair_changed = project.settings.repair_mesh != settings.repair_mesh
         || project.settings.mesh_repair_profile != settings.mesh_repair_profile
         || project.settings.fill_inferred_mesh_holes != settings.fill_inferred_mesh_holes
-        || project.settings.produce_watertight_mesh != settings.produce_watertight_mesh;
-    let depth_refinement_changed =
-        project.settings.depth_refinement_backend != settings.depth_refinement_backend
-            || project.settings.lingbot_depth_refinement != settings.lingbot_depth_refinement;
+        || project.settings.produce_watertight_mesh != settings.produce_watertight_mesh
+        || project.settings.neural_sdf_refinement != settings.neural_sdf_refinement;
+    let depth_refinement_changed = project.settings.depth_refinement_backend
+        != settings.depth_refinement_backend
+        || project.settings.lingbot_depth_refinement != settings.lingbot_depth_refinement;
     project.settings = settings;
     if depth_refinement_changed {
         for artifact in [
@@ -2575,6 +2576,7 @@ pub fn update_project_settings(
         project.mesh_repair_openings_preserved = None;
         project.mesh_repair_unknown_preserved = None;
         project.watertight_mesh_output_path = None;
+        project.neural_sdf = None;
     }
     storage::write_project(&project)?;
     write_sensor_preference(&app, &project.settings)?;

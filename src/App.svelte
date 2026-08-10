@@ -2247,6 +2247,29 @@
           </details>
         {/if}
 
+        {#if buildTexturedMesh}
+          <details class="panel collapsible-panel" open>
+            <summary><span>MAX QUALITY SURFACE</span><strong>{project.settings.neuralSdfRefinement ? 'NEURAL SDF' : 'BASELINE'}</strong></summary>
+            <div class="collapsible-body settings mesh-repair-settings">
+              <label class="toggle"><input type="checkbox" checked={project.settings.neuralSdfRefinement} on:change={(event) => updateSetting('neuralSdfRefinement', inputChecked(event))} disabled={processing || !runtime?.splatWorkerAvailable}/><span></span><div><strong>Validation-gated neural SDF refinement</strong><small>CUDA Max Quality pass after camera/depth validation</small></div></label>
+              <p>The fitted signed-distance surface may denoise the validated baseline but cannot silently replace it. Excess displacement, held-out SDF error, flipped triangles, or new degeneracy keeps the TSDF/learned dense mesh unchanged.</p>
+              {#if !runtime?.splatWorkerAvailable}<p class="warning">The isolated CUDA reconstruction runtime is required for neural SDF refinement.</p>{/if}
+              {#if project.neuralSdf && project.neuralSdf.status !== 'disabled'}
+                <div class="repair-result" class:warning={project.neuralSdf.status !== 'accepted'}>
+                  <span>LAST PASS · {project.neuralSdf.status.toUpperCase()}</span>
+                  {#if project.neuralSdf.status === 'accepted'}
+                    <div><strong>{((project.neuralSdf.validation?.heldOutSdfMaeM ?? 0) * 1000).toFixed(2)} mm</strong><small>held-out MAE</small></div>
+                    <div><strong>{((project.neuralSdf.validation?.p95DisplacementM ?? 0) * 1000).toFixed(2)} mm</strong><small>p95 movement</small></div>
+                    <div><strong>{project.neuralSdf.cacheHit ? 'REUSED' : 'FITTED'}</strong><small>candidate</small></div>
+                  {:else}
+                    <p>{project.neuralSdf.reason ?? 'The neural candidate did not pass every production surface gate; the baseline mesh was retained.'}</p>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          </details>
+        {/if}
+
         {#if buildTexturedMesh && !mediaOnlyProject}
           <details class="panel collapsible-panel" open>
             <summary><span>MESH REPAIR</span><strong>DEPTH-AWARE</strong></summary>

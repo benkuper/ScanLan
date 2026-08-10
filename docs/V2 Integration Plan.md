@@ -779,7 +779,22 @@ Implemented with one versioned dense-surface sample contract:
 
 ## P11 — Optional neural-SDF production surface
 
-Add only for Max Quality and only after camera/depth validation.
+Implemented as an explicit Max Quality option after camera/depth validation:
+
+* the isolated CUDA worker fits a metric neural signed-distance field to the accepted dense
+  surface with progressive Fourier levels, near-surface signed supervision, and an
+  automatic-differentiation Eikonal constraint;
+* RGB-D, hybrid, photo, and video meshes enter the stage only after their existing trajectory,
+  scale/depth, and dense-geometry gates have passed;
+* a deterministic held-out SDF set measures generalization instead of accepting the training
+  loss as proof of surface quality;
+* the candidate preserves indexed topology and must pass bounded median/p95/maximum displacement,
+  triangle-orientation, and degeneracy gates in the CUDA worker plus an independent displacement
+  check in the reconstruction worker;
+* accepted geometry reaches depth-aware repair and multiview texturing; rejected, failed, or
+  unavailable CUDA refinement leaves the validated TSDF/learned dense surface unchanged;
+* content-addressed candidate/report caches make the optional stage reproducible and expose its
+  exact outcome in `outputs/neural-sdf-report.json`.
 
 ## P12 — Gaussian initialization and production optimization
 

@@ -26,6 +26,7 @@ def parser() -> argparse.ArgumentParser:
         default="off",
     )
     reconstruct.add_argument("--depth-refiner", type=Path, default=None)
+    reconstruct.add_argument("--neural-sdf-worker", type=Path, default=None)
     reconstruct.add_argument(
         "--targets",
         default="point_cloud,textured_mesh",
@@ -118,6 +119,7 @@ def parser() -> argparse.ArgumentParser:
         default="point_cloud,textured_mesh",
         help="Comma-separated point_cloud,textured_mesh targets",
     )
+    fuse_dataset.add_argument("--neural-sdf-worker", type=Path, default=None)
 
     return root
 
@@ -173,7 +175,12 @@ def main(argv: list[str] | None = None) -> int:
             if unknown:
                 raise ValueError(f"Unknown dense artifact targets: {', '.join(sorted(unknown))}")
             result = publish_media_dense_artifacts(
-                arguments.project.resolve(), arguments.dataset.resolve(), targets
+                arguments.project.resolve(),
+                arguments.dataset.resolve(),
+                targets,
+                arguments.neural_sdf_worker.resolve()
+                if arguments.neural_sdf_worker is not None
+                else None,
             )
         elif arguments.command in {"localize-photos", "localize-media"}:
             from .supplemental import localize_supplemental_photos
@@ -246,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
                 repair_settings,
                 arguments.depth_refinement,
                 arguments.depth_refiner,
+                arguments.neural_sdf_worker,
             )
         print(json.dumps(result))
         return 0

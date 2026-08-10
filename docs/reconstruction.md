@@ -73,6 +73,15 @@ sensor anchors and applies the same metric, multiview, RGB-coverage, and free-sp
 Validated caches are fingerprinted by source depth/color files, calibration, poses, implementation version, code revision, model revision, and model SHA-256. Measured and refined rasters are stored separately with generated-pixel masks and 8-bit confidence. Final TSDF/surfel fusion integrates measured depth twice and the measured-plus-generated raster once, giving generated geometry half weight. Canonical datasets and initialization sidecars retain confidence, provenance, surface orientation, footprint, and source-frame ownership under the `dense-surface-samples-v1` contract. Generated and learned samples can fill unobserved voxels, while calibrated measurements win conflicts.
 
 Photo/video point and triangle outputs consume the same learned dense prior as Gaussian initialization. They remain explicitly non-metric, use an adaptive scene-relative voxel size, and publish colored PLY plus OBJ/MTL/PNG artifacts. Hybrid reconstruction robustly aligns that learned prior through at least three media cameras independently localized against the RGB-D map. Normalized camera-center residual and rotation gates reject an incoherent Sim(3); accepted geometry contributes only outside the support of the calibrated TSDF surface.
+
+The opt-in **Neural SDF refinement (Max Quality)** stage runs in the isolated CUDA runtime only
+after those camera/depth gates. It learns a continuous signed-distance approximation with
+progressively enabled Fourier bands, signed near-surface samples, and an Eikonal term, then projects
+the existing indexed surface toward its zero set. The candidate cannot change topology. A held-out
+SDF error gate, displacement bounds, normal-flip and degeneracy checks, plus an independent
+reconstruction-worker check decide whether it may continue to repair and texturing. Failure is a
+quality fallback, not a failed reconstruction: ScanLan retains the validated baseline and records
+the reason in `outputs/neural-sdf-report.json`.
 The real-phone artifact check and measured output counts are recorded in
 [unified-dense-fusion-benchmark.md](unified-dense-fusion-benchmark.md).
 
