@@ -200,6 +200,11 @@ confidence, independent-view, held-out metric residual, displacement, and triang
 Missing material output is a neutral no-op, and protected surfaces move only through a stricter
 multiview recovery gate; see [the P15 geometry policy](docs/material-aware-geometry.md).
 
+P16 converts the fused material surface into confidence-weighted base-color, metallic-roughness,
+transmission, tangent-normal, and emissive atlases while preserving the observed atlas separately.
+It publishes a self-contained standards-compliant GLB and falls back to a safe observed-color rough
+dielectric wherever intrinsic evidence is unsupported; see [PBR reconstruction](docs/pbr-reconstruction.md).
+
 The dense initialization sidecar is also the shared point/mesh fusion contract. It retains source
 ownership, confidence, provenance, orientation, and footprint. Media-only point and mesh artifacts
 are correctly labeled non-metric. In a hybrid project, learned media geometry is robustly aligned

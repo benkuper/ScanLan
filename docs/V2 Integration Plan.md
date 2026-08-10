@@ -871,16 +871,18 @@ Implemented as a conservative post-capture policy rather than an unconditional c
 
 ## P16 — PBR reconstruction and export
 
-Add:
+Implemented as a confidence-preserving intrinsic-material export boundary:
 
-* base color;
-* roughness;
-* metallic;
-* transmission;
-* normal;
-* emission;
-* observed and intrinsic atlases;
-* GLB PBR output.
+* fused linear albedo, roughness, metallic, transmission, world normal, and emission are baked into
+  standards-compliant glTF texture encodings rather than reinterpreting observed RGB as reflectance;
+* unsupported material evidence falls back to observed color and a rough, opaque, nonmetallic,
+  non-emissive dielectric, so inference cannot manufacture high-risk appearance;
+* UV-chart tangents transform fused world normals into OpenGL tangent-space normal maps;
+* observed and intrinsic atlases remain distinct and the observed image is embedded as provenance;
+* one self-contained GLB uses core metallic-roughness PBR plus `KHR_materials_transmission` and
+  `KHR_materials_emissive_strength` when their data requires them;
+* atomic atlas, GLB, and `outputs/pbr-report.json` publication makes channel/color semantics and
+  material coverage explicit.
 
 ## P17 — Material-aware Gaussian reconstruction
 

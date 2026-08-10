@@ -132,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
                 CONTRACT_VERSION,
                 GEOMETRY_POLICY_VERSION,
                 GEOMETRY_RESULT_VERSION,
+                PBR_CONTRACT_VERSION,
                 RADIOMETRY_VERSION,
                 SURFACE_CONTRACT_VERSION,
             )
@@ -169,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                             "surfaceContractVersion": SURFACE_CONTRACT_VERSION,
                             "geometryPolicyVersion": GEOMETRY_POLICY_VERSION,
                             "geometryResultVersion": GEOMETRY_RESULT_VERSION,
+                            "pbrContractVersion": PBR_CONTRACT_VERSION,
                         },
                     }
                 )

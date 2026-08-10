@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scanlan-material"
-version = "0.3.0"
-description = "Shared material analysis, geometry policy, radiometry, fusion, and model policy for ScanLan"
+version = "0.4.0"
+description = "Shared material analysis, geometry policy, PBR reconstruction, radiometry, fusion, and model policy for ScanLan"
 license = "GPL-3.0-only"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26,<3", "Pillow>=10.4,<12"]

@@ -54,6 +54,7 @@ from .packs import (
     resolve_model_pack,
     write_pack_manifest,
 )
+from .pbr import PBR_CONTRACT_VERSION, PbrArtifacts, build_pbr_artifacts
 from .radiometry import (
     RADIOMETRY_VERSION,
     linear_to_srgb,
@@ -83,13 +84,16 @@ __all__ = [
     "ModelCandidate",
     "ModelPack",
     "OPTICAL_RISKS",
+    "PBR_CONTRACT_VERSION",
     "PROVENANCE_GENERATED",
     "PROVENANCE_LEARNED",
     "PROVENANCE_MEASURED",
+    "PbrArtifacts",
     "RADIOMETRY_VERSION",
     "SURFACE_CONTRACT_VERSION",
     "RepairBoundaryDecision",
     "apply_depth_confidence_policy",
+    "build_pbr_artifacts",
     "evaluate_candidate",
     "evaluate_repair_boundary",
     "fuse_material_surface",
