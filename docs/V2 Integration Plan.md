@@ -854,12 +854,20 @@ Implemented without weakening P13's model admission gate:
 
 ## P15 — Material-aware geometry
 
-Add:
+Implemented as a conservative post-capture policy rather than an unconditional completion pass:
 
-* material-dependent depth confidence;
-* reflective/transmissive protection;
-* material-aware repair;
-* second-pass surface refinement.
+* source-aligned and fused material evidence produces monotonic confidence multipliers for measured,
+  generated, and learned depth, so a material prediction can never manufacture authority;
+* strong glass, mirror, thin, dynamic, and sky evidence protects regions from blind filling, while
+  missing material output is an explicit neutral no-op;
+* boundary repair uses bounded nearest-surface material evidence to veto reflective/transmissive,
+  low-authority, and non-static regions without weakening the existing depth/free-space checks;
+* second-pass proposals carry provenance, calibrated confidence, effective independent-view count,
+  and held-out metric residual, with stricter recovery gates for protected regions;
+* accepted displacement is bounded by voxel scale and every changed triangle must pass orientation,
+  collapse, and area-stretch gates before an atomic versioned result can replace the baseline;
+* no transparent-depth checkpoint is packaged until it passes the P13/P14 real-capture, optical-risk,
+  12 GB, visual, and transitive-license gates.
 
 ## P16 — PBR reconstruction and export
 

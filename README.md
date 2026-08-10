@@ -193,6 +193,13 @@ while a strong optical warning from one sound view survives averaging. The versi
 sidecar records support, effective view count, confidence, and connected material/risk regions; see
 [the P14 analysis](docs/two-pass-material-analysis.md).
 
+P15 makes those risks actionable without letting labels hallucinate geometry. Material evidence can
+only reduce measured/generated/learned depth confidence; glass, mirror, thin, dynamic, and sky
+regions conservatively veto unsupported repair. A second-pass proposal must pass provenance-specific
+confidence, independent-view, held-out metric residual, displacement, and triangle-topology gates.
+Missing material output is a neutral no-op, and protected surfaces move only through a stricter
+multiview recovery gate; see [the P15 geometry policy](docs/material-aware-geometry.md).
+
 The dense initialization sidecar is also the shared point/mesh fusion contract. It retains source
 ownership, confidence, provenance, orientation, and footprint. Media-only point and mesh artifacts
 are correctly labeled non-metric. In a hybrid project, learned media geometry is robustly aligned

@@ -130,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
             from scanlan_material import (
                 ANALYSIS_VERSION,
                 CONTRACT_VERSION,
+                GEOMETRY_POLICY_VERSION,
+                GEOMETRY_RESULT_VERSION,
                 RADIOMETRY_VERSION,
                 SURFACE_CONTRACT_VERSION,
             )
@@ -165,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
                             "radiometryVersion": RADIOMETRY_VERSION,
                             "analysisVersion": ANALYSIS_VERSION,
                             "surfaceContractVersion": SURFACE_CONTRACT_VERSION,
+                            "geometryPolicyVersion": GEOMETRY_POLICY_VERSION,
+                            "geometryResultVersion": GEOMETRY_RESULT_VERSION,
                         },
                     }
                 )
