@@ -11,7 +11,7 @@ ScanLan separates realtime latency from archival throughput and final quality. E
 | Reconstruction worker | tracking, relocalization, TSDF, pose graph, point/mesh build | camera SDK |
 | Splat worker | Photo/video decoding, COLMAP camera solving, CUDA 2DGS/3DGS optimization, checkpoints | Learned-model loading, RGB-D capture, tracking, pose recovery, and TSDF quality decisions |
 | Geometry worker | Pinned LingBot-Map, LingBot-Depth, MapAnything, and DA3 Nested Giant-Large CUDA inference, model lifecycle, lossless array publication | Camera solving, production validation, fusion, or Gaussian optimization |
-| Material package | Linear-light preparation, material/risk/PBR contracts, bake-off gates, and model-pack policy | Material inference, capture, geometry mutation, or PBR publication |
+| Material package | Linear-light preparation, two-pass view planning, material/risk/PBR contracts, multiview surface fusion, 3D material regions, bake-off gates, and model-pack policy | Model-specific inference, capture, geometry mutation, or PBR publication |
 
 Both reconstruction runtimes import one versioned, NumPy-only validation engine. It owns generic
 SE(3) camera continuity, robust Sim(3) scale evidence, metric-depth agreement, ray free-space
@@ -20,9 +20,12 @@ own acceptance policy. Reports remain serializable across process boundaries. Se
 [validation-engine.md](validation-engine.md).
 
 The same runtimes import `scanlan-material`. It owns the exact ICC/sRGB-to-linear preparation,
-source-aligned material and optical-risk array semantics, model bake-off gates, and legal model-pack
-resolution. It deliberately owns no inference or output publication. See
-[material-radiometric-foundation.md](material-radiometric-foundation.md).
+source-aligned material and optical-risk array semantics, adaptive coarse/final view planning,
+visibility- and confidence-weighted surface fusion, connected 3D material regions, model bake-off
+gates, and legal model-pack resolution. Model-specific inference remains isolated behind callbacks;
+the shared package cannot silently load an unapproved checkpoint. See
+[material-radiometric-foundation.md](material-radiometric-foundation.md) and
+[two-pass-material-analysis.md](two-pass-material-analysis.md).
 
 The splat worker also owns the opt-in Max Quality neural-SDF optimizer so its PyTorch/CUDA
 allocation cannot leak into the lightweight reconstruction runtime. The reconstruction worker

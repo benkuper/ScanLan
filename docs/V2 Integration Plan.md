@@ -836,11 +836,21 @@ Implemented as the fail-closed boundary for every later material stage:
 
 ## P14 — Two-pass material analysis
 
-Add:
+Implemented without weakening P13's model admission gate:
 
-* coarse optical-risk pass;
-* final multiview material analysis;
-* 3D material-region fusion.
+* calibrated cameras are sampled with path-scale-adaptive translation/rotation k-center selection
+  for a bounded coarse optical-risk pass;
+* final views are selected by incremental visible-surface coverage, with coarse glass, mirror,
+  specular, emissive, thin, dynamic, and sky evidence receiving extra priority;
+* final source-aligned predictions are filtered by pose, visibility/depth agreement, viewing angle,
+  image border, validity, and calibrated confidence before multiview fusion;
+* mutually exclusive identity uses normalized evidence fusion, while independent optical risks use
+  both consensus and a conservative high-confidence peak so one sound warning cannot be averaged
+  away by many opaque views;
+* the versioned surface contract publishes per-vertex probability, confidence, support count,
+  effective view count, optional world-space PBR fields, and connected 3D material/risk regions;
+* inference remains a callback boundary: no candidate checkpoint becomes a packaged default until
+  its real ScanLan annotations, bake-off gates, 12 GB measurement, and transitive license audit pass.
 
 ## P15 — Material-aware geometry
 

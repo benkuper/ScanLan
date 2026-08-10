@@ -184,6 +184,15 @@ noncommercial or unverified assets from entering a commercial pack. Material Any
 and DiffusionRenderer remain bake-off candidates until they pass real-capture quality, multiview,
 calibration, and 12 GB memory gates; see [the P13 foundation](docs/material-radiometric-foundation.md).
 
+The P14 two-pass engine keeps that gate intact while making material inference operationally useful.
+It samples the measured camera path for a bounded coarse optical-risk pass, then chooses final views
+by incremental 3D surface coverage with extra authority for glass, mirror, specular, emissive,
+thin, dynamic, and sky warnings. Calibrated final predictions are visibility-, pose-, angle-, and
+confidence-weighted onto the production surface. Material identity is fused as multiview evidence,
+while a strong optical warning from one sound view survives averaging. The versioned surface
+sidecar records support, effective view count, confidence, and connected material/risk regions; see
+[the P14 analysis](docs/two-pass-material-analysis.md).
+
 The dense initialization sidecar is also the shared point/mesh fusion contract. It retains source
 ownership, confidence, provenance, orientation, and footprint. Media-only point and mesh artifacts
 are correctly labeled non-metric. In a hybrid project, learned media geometry is robustly aligned

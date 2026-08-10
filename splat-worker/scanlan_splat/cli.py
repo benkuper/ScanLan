@@ -127,7 +127,12 @@ def main(argv: list[str] | None = None) -> int:
             import torch
             import gsplat
             from .neural_sdf import NEURAL_SDF_VERSION
-            from scanlan_material import CONTRACT_VERSION, RADIOMETRY_VERSION
+            from scanlan_material import (
+                ANALYSIS_VERSION,
+                CONTRACT_VERSION,
+                RADIOMETRY_VERSION,
+                SURFACE_CONTRACT_VERSION,
+            )
 
             cuda_available = torch.cuda.is_available()
             if arguments.require_cuda and cuda_available:
@@ -158,6 +163,8 @@ def main(argv: list[str] | None = None) -> int:
                         "materialFoundation": {
                             "contractVersion": CONTRACT_VERSION,
                             "radiometryVersion": RADIOMETRY_VERSION,
+                            "analysisVersion": ANALYSIS_VERSION,
+                            "surfaceContractVersion": SURFACE_CONTRACT_VERSION,
                         },
                     }
                 )
