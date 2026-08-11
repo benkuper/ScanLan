@@ -74,7 +74,9 @@ The realtime engine is started and reports `ready` before the camera is opened. 
 
 The packed header is 164 bytes. Readers reject unknown versions, impossible calibration, oversized images, and payload-length mismatches before allocating geometry.
 
-The capture-side stream queue has capacity 3 and discards its oldest unpublished item on overload. The Python reader feeds a latest-frame queue of 4; accepted keyframes feed a mapping queue of 8. None of these queues can grow without bound.
+The capture-side stream queue has capacity 3 and discards its oldest unpublished item on overload. The Python reader feeds a latest-frame queue of 4; accepted keyframes feed a mapping queue of 8. None of these queues can grow without bound. When either image queue discards a frame, its gyroscope delta is composed into the next retained frame instead of being discarded with the pixels, so the odometry prior still spans the complete motion interval.
+
+Live odometry builds a calibrated image capped at 100,000 pixels. Full-resolution depth and color remain untouched for raw recording, independent metric validation, and TSDF integration. CUDA odometry uses an explicit coarse-to-fine `6/3/1` iteration budget with convergence stopping; full-resolution metric correspondences still gate every proposed pose. Consecutive sensor frames may track from the latest integration anchor to limit drift, but any source-sequence gap immediately switches to the latest accepted frame. This prevents one late solve from creating a larger keyframe baseline and a self-amplifying latency/tracking failure.
 
 ## Engine data path
 
@@ -97,6 +99,8 @@ Tauri validates message sizes and stores only the newest point and mesh packets 
 
 Archival depth/aligned-color writes and native-RGB JPEG compression happen behind bounded queues. The camera loop moves frame buffers into the queue and immediately returns to acquisition. If storage cannot keep up, the oldest pending archive frame is discarded and the drop is persisted in phase metadata.
 
+Four consecutive rejected tracking results create `tracking-hold.flag`. The sensor, RGB-D transport, IMU integration, tracker, and relocalizer continue at full rate, but the native worker pauses retained archive submissions until the engine accepts a normal tracking pose after relocalization. The three-frame rejection margin remains raw evidence for offline recovery; a long tracking loss no longer turns into thousands of unusable archived frames. The UI exposes this as a held archive while the sensor remains connected.
+
 Modern-camera RGB controls are applied before video streaming starts. Exposure is represented in microseconds across backends (Femto Mega converts to its 100 microsecond property units), while white balance is Kelvin. Orbbec integer properties are clamped and snapped to the range/step reported by the connected firmware and adjustments are logged. Manual Femto IMU requests select an exact advertised stream profile; a missing profile is a startup error rather than a silent fallback. The requested RGB and IMU configuration is persisted in `phase.json` for capture provenance.
 
 `live.json` is a tiny, atomically replaced sensor heartbeat. During capture the UI reads its monotonic `frameCount`; it does not rescan `frames.csv`. The complete CSV is counted only during recovery or abnormal termination.
@@ -112,7 +116,7 @@ The tracker persists across frames. A finite transform alone is insufficient for
 
 On failure, the map freezes and the tracker searches a rotating bank spanning the complete accepted capture. Local continuation remains subject to strict continuity and IMU limits; a strong saved-keyframe match may instead relocalize anywhere in the known map after three consistent observations. The lock frame is not fused, and mapping resumes only on the next independently validated frame. Tracking acceptance and irreversible fusion use separate gates: a marginal pose may preserve local tracking continuity, but only high-overlap, high-inlier, low-residual keyframes reach the mapping thread.
 
-Every decision is appended asynchronously to `tracking.jsonl`; no image data is duplicated. Raw RGB-D archival is intentionally independent from live pose acceptance: a rejected frame remains recoverable evidence, but it never enters the live TSDF map. The UI therefore reports raw archived, tracked, rejected, and fused-keyframe counts separately. The final loader matches entries by sensor sequence, excludes explicit rejections from the live pose seed, and can recover archived frames during offline optimization. The archive replay command deliberately includes rejected frames and omits derived journal poses so tracker changes remain testable.
+Every decision is appended asynchronously to `tracking.jsonl`; no image data is duplicated. Rejected poses never enter the live TSDF map. The first three consecutive rejections remain archived recovery evidence; sustained loss holds further archive writes until validated tracking resumes. The UI therefore reports raw archived, tracked, rejected, and fused-keyframe counts separately. The final loader matches entries by sensor sequence, excludes explicit rejections from the live pose seed, and can recover retained rejected frames during offline optimization. The archive replay command deliberately includes retained rejected frames and omits derived journal poses so tracker changes remain testable.
 
 ## Shutdown
 
@@ -178,11 +182,14 @@ cached preview triangles. Older mesh caches are discarded before point guidance,
 samples are deterministically compacted. Reaching the hard submap ceiling freezes integration
 while tracking and raw archival continue.
 
-Map publication runs independently from viewport rendering. Normal and tracking overlays
-share bounded point snapshots, coverage is refreshed at a lower adaptive cadence, and mesh
-extraction runs only at degradation level zero. The hysteretic pressure controller first lowers
-publication rates, then pauses mesh/coverage work, and finally integrates fewer keyframes; it
-never reduces archive fidelity or skips pose tracking.
+Map publication runs independently from viewport rendering. Each accepted fusion keyframe adds a
+bounded, calibrated point sample to the active submap's preview cache. Normal, tracking, and
+coverage publications read that cache instead of extracting the entire GPU TSDF on every UI
+refresh; the authoritative TSDF is extracted only when a submap completes. Mesh extraction runs
+only at degradation level zero. The hysteretic pressure controller first lowers publication
+rates, then pauses mesh/coverage work, and finally integrates fewer keyframes; it never skips pose
+tracking. Archive fidelity is unchanged while tracking is valid and is explicitly held during a
+sustained loss as described above.
 
 ## Live relocalization and loop correction
 

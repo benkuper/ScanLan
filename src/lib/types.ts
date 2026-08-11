@@ -188,9 +188,14 @@ export interface RuntimeInfo {
   sensorWorkerAvailable: boolean;
   sensorStatus: string;
   reconstructionWorkerAvailable: boolean;
+  neuralSdfAvailable: boolean;
+  neuralSdfChecking: boolean;
+  neuralSdfStatus: string;
   splatWorkerAvailable: boolean;
+  splatWorkerChecking: boolean;
   splatStatus: string;
   geometryWorkerAvailable: boolean;
+  geometryWorkerChecking: boolean;
   geometryStatus: string;
 }
 

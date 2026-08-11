@@ -12,7 +12,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from scanlan_splat.cli import _publish_failure
+from scanlan_splat.cli import _publish_failure, parser
 from scanlan_splat.media import (
     _CameraSolveTelemetry,
     MediaPreparationOptions,
@@ -105,6 +105,13 @@ class MediaPreparationTests(unittest.TestCase):
         self.assertTrue(status["maximumFramesIsSafetyCeiling"])
         self.assertIn("tracked_overlap", status["signals"])
         self.assertIn("camera_motion", status["signals"])
+
+    def test_neural_sdf_runtime_has_an_independent_diagnostic_lane(self) -> None:
+        arguments = parser().parse_args(["diagnostics", "--require-neural-sdf"])
+
+        self.assertTrue(arguments.require_neural_sdf)
+        self.assertFalse(arguments.require_learned_features)
+        self.assertFalse(arguments.require_adaptive_frames)
 
     def test_adaptive_keyframes_follow_motion_instead_of_elapsed_video_length(self) -> None:
         import cv2

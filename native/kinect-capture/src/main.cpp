@@ -432,6 +432,7 @@ int capture(const Options& options) {
     fs::create_directories(options.phase_root / "color");
     fs::create_directories(options.phase_root / "rgb");
     fs::remove(options.phase_root / "stop.flag");
+    fs::remove(options.phase_root / "tracking-hold.flag");
 
     IKinectSensor* sensor = nullptr;
     IMultiSourceFrameReader* reader = nullptr;
@@ -486,7 +487,8 @@ int capture(const Options& options) {
             continue;
         }
         ++sensor_frames;
-        const bool save_source = scanlan::archive_frame_due(sensor_frames, 30, options.fps);
+        const bool save_source = !fs::exists(options.phase_root / "tracking-hold.flag")
+            && scanlan::archive_frame_due(sensor_frames, 30, options.fps);
 
         IDepthFrameReference* depth_reference = nullptr;
         IColorFrameReference* color_reference = nullptr;

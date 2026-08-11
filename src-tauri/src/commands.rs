@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tauri::{ipc::Response, AppHandle, Manager, State};
 use uuid::Uuid;
 
@@ -158,7 +158,37 @@ pub struct AppState {
     pub active_capture: Arc<Mutex<Option<ActiveCapture>>>,
     pub active_preview: Arc<Mutex<Option<ActiveCapture>>>,
     pub active_photo_localization: Arc<Mutex<bool>>,
+    runtime_diagnostics: Arc<Mutex<RuntimeDiagnostics>>,
     pub jobs: crate::jobs::JobManager,
+}
+
+#[derive(Clone, Default)]
+enum RuntimeProbe {
+    #[default]
+    Pending,
+    Running,
+    Complete {
+        available: bool,
+        status: String,
+    },
+}
+
+impl RuntimeProbe {
+    fn snapshot(&self, checking_status: &str) -> (bool, bool, String) {
+        match self {
+            Self::Pending | Self::Running => (false, true, checking_status.to_string()),
+            Self::Complete { available, status } => (*available, false, status.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RuntimeDiagnostics {
+    splat_worker_key: Option<String>,
+    geometry_worker_key: Option<String>,
+    neural_sdf: RuntimeProbe,
+    splat: RuntimeProbe,
+    geometry: RuntimeProbe,
 }
 
 struct PhotoLocalizationGuard {
@@ -180,6 +210,7 @@ impl Default for AppState {
             active_capture: Arc::new(Mutex::new(None)),
             active_preview: Arc::new(Mutex::new(None)),
             active_photo_localization: Arc::new(Mutex::new(false)),
+            runtime_diagnostics: Arc::new(Mutex::new(RuntimeDiagnostics::default())),
             jobs: crate::jobs::JobManager::default(),
         }
     }
@@ -1470,6 +1501,92 @@ fn output_message(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn worker_runtime_key(worker: Option<&Path>) -> Option<String> {
+    let worker = worker?;
+    let metadata = worker.metadata().ok();
+    let length = metadata.as_ref().map_or(0, fs::Metadata::len);
+    let modified = metadata
+        .and_then(|value| value.modified().ok())
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |value| value.as_nanos());
+    Some(format!("{}:{length}:{modified}", worker.display()))
+}
+
+fn diagnostic_output(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start runtime diagnostics: {error}"))?;
+    let lifetime_guard = match crate::jobs::ChildLifetimeGuard::attach(&child) {
+        Ok(guard) => guard,
+        Err(error) => {
+            child.kill().ok();
+            child.wait().ok();
+            return Err(error);
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not capture runtime diagnostic output".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Could not capture runtime diagnostic errors".to_string())?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stdout;
+        stream.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stderr;
+        stream.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                child.kill().ok();
+                child.wait().ok();
+                drop(lifetime_guard);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "Runtime diagnostics exceeded the {} second startup limit",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                child.kill().ok();
+                child.wait().ok();
+                drop(lifetime_guard);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("Could not monitor runtime diagnostics: {error}"));
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "Runtime diagnostic output reader stopped unexpectedly".to_string())?
+        .map_err(|error| format!("Could not read runtime diagnostic output: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "Runtime diagnostic error reader stopped unexpectedly".to_string())?
+        .map_err(|error| format!("Could not read runtime diagnostic errors: {error}"))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn parse_available_sensors(output: &std::process::Output) -> Vec<AvailableSensor> {
     if !output.status.success() {
         return Vec::new();
@@ -2195,30 +2312,64 @@ pub async fn available_sensors(
     .map_err(|error| format!("Sensor discovery failed: {error}"))
 }
 
-#[tauri::command]
-pub async fn runtime_info(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<RuntimeInfo, String> {
-    let resources = resource_root(&app);
-    let settings = state
-        .project
-        .lock()
-        .map(|project| project.settings.clone())
-        .unwrap_or_default();
-    let runtime = tauri::async_runtime::spawn_blocking(move || {
-        let sensor_capabilities = installed_sensor_capabilities(resources.as_deref());
-        let sensor_worker_available = sensor_capabilities
-            .iter()
-            .any(|capability| capability == &settings.sensor_kind);
-        let reconstruction_worker_available = first_existing(
-            storage::candidate_reconstruction_worker_paths(resources.as_deref()),
-        )
-        .is_some();
-        let splat_worker =
-            first_existing(storage::candidate_splat_worker_paths(resources.as_deref()));
-        let (splat_worker_available, splat_status) = match splat_worker {
-            Some(worker) => {
+#[derive(Clone, Copy)]
+enum RuntimeProbeKind {
+    NeuralSdf,
+    Splat,
+    Geometry,
+}
+
+fn launch_runtime_probe(
+    diagnostics: Arc<Mutex<RuntimeDiagnostics>>,
+    kind: RuntimeProbeKind,
+    worker: PathBuf,
+    worker_key: String,
+) {
+    thread::spawn(move || {
+        let (available, status) = match kind {
+            RuntimeProbeKind::NeuralSdf => {
+                let mut command = worker_command(&worker);
+                command.args(["diagnostics", "--require-neural-sdf"]);
+                match diagnostic_output(command, Duration::from_secs(90)) {
+                    Ok(output) => {
+                        let report = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            .unwrap_or_default();
+                        let cuda = report
+                            .get("cuda")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let validated = report
+                            .pointer("/neuralSdf/cudaValidated")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let device = report
+                            .get("device")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("CUDA device");
+                        if output.status.success() && cuda && validated {
+                            (true, format!("Neural SDF CUDA runtime ready on {device}"))
+                        } else if !cuda {
+                            (
+                                false,
+                                "Neural SDF runtime is installed, but CUDA is unavailable"
+                                    .to_string(),
+                            )
+                        } else {
+                            let detail = output_message(&output);
+                            (
+                                false,
+                                if detail.is_empty() {
+                                    "Neural SDF CUDA diagnostics failed".to_string()
+                                } else {
+                                    detail
+                                },
+                            )
+                        }
+                    }
+                    Err(error) => (false, error),
+                }
+            }
+            RuntimeProbeKind::Splat => {
                 let mut command = worker_command(&worker);
                 command.args([
                     "diagnostics",
@@ -2226,16 +2377,15 @@ pub async fn runtime_info(
                     "--require-learned-features",
                     "--require-adaptive-frames",
                 ]);
-                match command.output() {
+                match diagnostic_output(command, Duration::from_secs(180)) {
                     Ok(output) => {
-                        let diagnostics =
-                            serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                                .unwrap_or_default();
-                        let cuda = diagnostics
+                        let report = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            .unwrap_or_default();
+                        let cuda = report
                             .get("cuda")
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false);
-                        let device = diagnostics
+                        let device = report
                             .get("device")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("CUDA device");
@@ -2261,33 +2411,20 @@ pub async fn runtime_info(
                             )
                         }
                     }
-                    Err(error) => (
-                        false,
-                        format!("Could not start splat runtime diagnostics: {error}"),
-                    ),
+                    Err(error) => (false, error),
                 }
             }
-            None => (
-                false,
-                "Not installed; run npm run prepare:splat".to_string(),
-            ),
-        };
-        let geometry_worker = first_existing(storage::candidate_geometry_worker_paths(
-            resources.as_deref(),
-        ));
-        let (geometry_worker_available, geometry_status) = match geometry_worker {
-            Some(worker) => {
-                let output = worker_command(&worker)
-                    .args([
-                        "diagnostics",
-                        "--require-lingbot",
-                        "--require-lingbot-depth",
-                        "--require-mapanything",
-                        "--require-da3",
-                        "--require-flashinfer",
-                    ])
-                    .output();
-                match output {
+            RuntimeProbeKind::Geometry => {
+                let mut command = worker_command(&worker);
+                command.args([
+                    "diagnostics",
+                    "--require-lingbot",
+                    "--require-lingbot-depth",
+                    "--require-mapanything",
+                    "--require-da3",
+                    "--require-flashinfer",
+                ]);
+                match diagnostic_output(command, Duration::from_secs(300)) {
                     Ok(output) if output.status.success() => (
                         true,
                         "Isolated LingBot, MapAnything, and DA3 Max runtime ready".to_string(),
@@ -2303,17 +2440,159 @@ pub async fn runtime_info(
                             },
                         )
                     }
-                    Err(error) => (
-                        false,
-                        format!("Could not start learned geometry diagnostics: {error}"),
-                    ),
+                    Err(error) => (false, error),
                 }
             }
-            None => (
-                false,
-                "Not installed; run npm run prepare:splat".to_string(),
-            ),
         };
+        if let Ok(mut state) = diagnostics.lock() {
+            let current_key = match kind {
+                RuntimeProbeKind::NeuralSdf | RuntimeProbeKind::Splat => &state.splat_worker_key,
+                RuntimeProbeKind::Geometry => &state.geometry_worker_key,
+            };
+            if current_key.as_deref() != Some(worker_key.as_str()) {
+                return;
+            }
+            let probe = match kind {
+                RuntimeProbeKind::NeuralSdf => &mut state.neural_sdf,
+                RuntimeProbeKind::Splat => &mut state.splat,
+                RuntimeProbeKind::Geometry => &mut state.geometry,
+            };
+            *probe = RuntimeProbe::Complete { available, status };
+        }
+    });
+}
+
+#[tauri::command]
+pub async fn runtime_info(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RuntimeInfo, String> {
+    let resources = resource_root(&app);
+    let settings = state
+        .project
+        .lock()
+        .map(|project| project.settings.clone())
+        .unwrap_or_default();
+    let diagnostics = Arc::clone(&state.runtime_diagnostics);
+    tauri::async_runtime::spawn_blocking(move || {
+        let sensor_capabilities = installed_sensor_capabilities(resources.as_deref());
+        let sensor_worker_available = sensor_capabilities
+            .iter()
+            .any(|capability| capability == &settings.sensor_kind);
+        let reconstruction_worker_available = first_existing(
+            storage::candidate_reconstruction_worker_paths(resources.as_deref()),
+        )
+        .is_some();
+        let splat_worker =
+            first_existing(storage::candidate_splat_worker_paths(resources.as_deref()));
+        let geometry_worker = first_existing(storage::candidate_geometry_worker_paths(
+            resources.as_deref(),
+        ));
+        let splat_key = worker_runtime_key(splat_worker.as_deref());
+        let geometry_key = worker_runtime_key(geometry_worker.as_deref());
+        let mut launch = None;
+        let (neural_sdf_available, neural_sdf_checking, neural_sdf_status);
+        let (splat_worker_available, splat_worker_checking, splat_status);
+        let (geometry_worker_available, geometry_worker_checking, geometry_status);
+        {
+            let mut probe_state = diagnostics
+                .lock()
+                .map_err(|_| "Runtime diagnostic state is unavailable".to_string())?;
+            if probe_state.splat_worker_key != splat_key {
+                probe_state.splat_worker_key = splat_key.clone();
+                probe_state.neural_sdf = RuntimeProbe::Pending;
+                probe_state.splat = RuntimeProbe::Pending;
+            }
+            if probe_state.geometry_worker_key != geometry_key {
+                probe_state.geometry_worker_key = geometry_key.clone();
+                probe_state.geometry = RuntimeProbe::Pending;
+            }
+            if splat_worker.is_none() {
+                let status = "Not installed; run npm run prepare:splat".to_string();
+                probe_state.neural_sdf = RuntimeProbe::Complete {
+                    available: false,
+                    status: status.clone(),
+                };
+                probe_state.splat = RuntimeProbe::Complete {
+                    available: false,
+                    status,
+                };
+            }
+            if geometry_worker.is_none() {
+                probe_state.geometry = RuntimeProbe::Complete {
+                    available: false,
+                    status: "Not installed; run npm run prepare:splat".to_string(),
+                };
+            }
+
+            // Resolve one heavy runtime at a time. Neural SDF is intentionally
+            // first because it has a small, independent Torch CUDA probe. The
+            // former sequential command made it wait behind multi-model learned
+            // geometry diagnostics for several minutes.
+            if matches!(probe_state.neural_sdf, RuntimeProbe::Pending) {
+                if let Some(worker) = splat_worker.clone() {
+                    probe_state.neural_sdf = RuntimeProbe::Running;
+                    launch = splat_key
+                        .clone()
+                        .map(|key| (RuntimeProbeKind::NeuralSdf, worker, key));
+                }
+            } else if !matches!(probe_state.neural_sdf, RuntimeProbe::Running)
+                && matches!(probe_state.splat, RuntimeProbe::Pending)
+            {
+                let neural_ready = matches!(
+                    probe_state.neural_sdf,
+                    RuntimeProbe::Complete {
+                        available: true,
+                        ..
+                    }
+                );
+                if neural_ready {
+                    if let Some(worker) = splat_worker.clone() {
+                        probe_state.splat = RuntimeProbe::Running;
+                        launch = splat_key
+                            .clone()
+                            .map(|key| (RuntimeProbeKind::Splat, worker, key));
+                    }
+                } else {
+                    let status = match &probe_state.neural_sdf {
+                        RuntimeProbe::Complete { status, .. } => status.clone(),
+                        _ => "CUDA diagnostics did not complete".to_string(),
+                    };
+                    probe_state.splat = RuntimeProbe::Complete {
+                        available: false,
+                        status,
+                    };
+                }
+            } else if !matches!(
+                probe_state.splat,
+                RuntimeProbe::Pending | RuntimeProbe::Running
+            ) && matches!(probe_state.geometry, RuntimeProbe::Pending)
+            {
+                if let Some(worker) = geometry_worker.clone() {
+                    probe_state.geometry = RuntimeProbe::Running;
+                    launch = geometry_key
+                        .clone()
+                        .map(|key| (RuntimeProbeKind::Geometry, worker, key));
+                }
+            }
+
+            (neural_sdf_available, neural_sdf_checking, neural_sdf_status) = probe_state
+                .neural_sdf
+                .snapshot("Checking the neural SDF CUDA runtime...");
+            (splat_worker_available, splat_worker_checking, splat_status) = probe_state
+                .splat
+                .snapshot("Waiting for CUDA runtime diagnostics...");
+            (
+                geometry_worker_available,
+                geometry_worker_checking,
+                geometry_status,
+            ) = probe_state
+                .geometry
+                .snapshot("Waiting for prioritized CUDA diagnostics...");
+        }
+        if let Some((kind, worker, key)) = launch {
+            launch_runtime_probe(Arc::clone(&diagnostics), kind, worker, key);
+        }
         let sensor_status = if sensor_worker_available {
             format!(
                 "{} capture support ready; the camera opens when recording starts",
@@ -2326,31 +2605,25 @@ pub async fn runtime_info(
             )
         };
 
-        RuntimeInfo {
+        Ok(RuntimeInfo {
             platform: std::env::consts::OS.to_string(),
             sensor_capabilities,
             sensor_worker_available,
             sensor_status,
             reconstruction_worker_available,
+            neural_sdf_available,
+            neural_sdf_checking,
+            neural_sdf_status,
             splat_worker_available,
+            splat_worker_checking,
             splat_status,
             geometry_worker_available,
+            geometry_worker_checking,
             geometry_status,
-        }
+        })
     })
     .await
-    .unwrap_or_else(|error| RuntimeInfo {
-        platform: std::env::consts::OS.to_string(),
-        sensor_capabilities: Vec::new(),
-        sensor_worker_available: false,
-        sensor_status: format!("Sensor connection check failed: {error}"),
-        reconstruction_worker_available: false,
-        splat_worker_available: false,
-        splat_status: "Splat runtime detection failed".to_string(),
-        geometry_worker_available: false,
-        geometry_status: "Learned geometry runtime detection failed".to_string(),
-    });
-    Ok(runtime)
+    .map_err(|error| format!("Runtime detection task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -3316,6 +3589,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
     }
 
     if let Some((phase_root, phase_id, realtime, recording)) = active_snapshot {
+        let tracking_held = recording && phase_root.join("tracking-hold.flag").exists();
         let live = live_worker_status(&phase_root);
         let frame_count = live
             .as_ref()
@@ -3371,16 +3645,23 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             capturing: recording,
             previewing: !recording,
             sensor_connected: live.is_some(),
-            sensor_paused: false,
+            sensor_paused: tracking_held,
             sensor_status: live
                 .as_ref()
                 .map(|status| {
-                    format!(
-                        "{} {} at {:.1} fps",
-                        selected_sensor_name,
-                        if recording { "recording" } else { "previewing" },
-                        status.stream_fps
-                    )
+                    if tracking_held {
+                        format!(
+                            "{} streaming at {:.1} fps; retained recording waits for tracking",
+                            selected_sensor_name, status.stream_fps
+                        )
+                    } else {
+                        format!(
+                            "{} {} at {:.1} fps",
+                            selected_sensor_name,
+                            if recording { "recording" } else { "previewing" },
+                            status.stream_fps
+                        )
+                    }
                 })
                 .unwrap_or_else(|| "Waiting for the next sensor frame".to_string()),
             sensor_name: selected_sensor_name,

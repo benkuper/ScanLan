@@ -384,6 +384,7 @@ def benchmark_live_capture(
     tracking_snapshots = 0
     latest_coverage: dict[str, Any] | None = None
     latest_submaps: dict[str, Any] | None = None
+    latest_point_payload: bytes | None = None
     read_error: list[BaseException] = []
 
     def latency_for(sequence: int, arrived: float) -> float | None:
@@ -394,6 +395,7 @@ def benchmark_live_capture(
     def read_messages() -> None:
         nonlocal point_snapshots, mesh_snapshots, final_point_count, final_triangle_count
         nonlocal coverage_snapshots, tracking_snapshots, latest_coverage, latest_submaps
+        nonlocal latest_point_payload
         try:
             while True:
                 try:
@@ -409,6 +411,7 @@ def benchmark_live_capture(
                         pose_latencies_ms.append(latency)
                 elif kind == ENGINE_POINTS:
                     point_snapshots += 1
+                    latest_point_payload = payload
                     if len(payload) >= 24:
                         _, _, _, _, final_point_count = struct.unpack("<4sIQfI", payload[:24])
                     if latency is not None:
@@ -481,6 +484,14 @@ def benchmark_live_capture(
     monitor.join(timeout=3.0)
     wall_seconds = time.monotonic() - started
     stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+
+    # An explicitly retained benchmark session is also a visual QA artifact.
+    # Keep the exact desktop point-packet contract so it can be inspected or
+    # converted by the same tooling as an actual capture preview.
+    if owned_session is None and latest_point_payload is not None:
+        (session_root / "live-reconstruction.preview.bin").write_bytes(
+            latest_point_payload
+        )
 
     journal_path = session_root / "tracking.jsonl"
     journal_entries = []

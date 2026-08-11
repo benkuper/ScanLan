@@ -17,8 +17,10 @@ from scanlan.realtime import (
     EngineMessageWriter,
     TrackedFrame,
     TrackingJournal,
+    TrackingArchiveGate,
     RealtimeTracker,
     _recovery_pose_is_credible,
+    _tracking_frame,
     evaluate_depth_alignment,
     frame_point_cloud,
     mesh_packet,
@@ -150,6 +152,62 @@ class RealtimeQualityTests(unittest.TestCase):
         self.assertEqual(points.shape, (120 * 160, 3))
         self.assertTrue(np.allclose(points[:, 2], -2.0))
         self.assertEqual(colors[0].tolist(), [25, 50, 75])
+
+    def test_live_odometry_uses_bounded_pixels_without_changing_capture_frame(self) -> None:
+        camera = StreamCamera(640, 576, 440.0, 442.0, 320.0, 288.0, 1000.0, 0.25, 7.0)
+        source = RgbdFrame(
+            1,
+            100_000,
+            100_000,
+            camera,
+            np.full((576, 640), 1500, dtype=np.uint16),
+            np.full((576, 640, 3), 120, dtype=np.uint8),
+            None,
+            None,
+        )
+
+        tracking = _tracking_frame(source)
+
+        self.assertEqual(tracking.depth.shape, (288, 320))
+        self.assertEqual(tracking.color.shape, (288, 320, 3))
+        self.assertEqual((tracking.camera.fx, tracking.camera.cx), (220.0, 160.0))
+        self.assertEqual(source.depth.shape, (576, 640))
+
+    def test_sustained_loss_holds_archive_until_validated_tracking_resumes(self) -> None:
+        source = RgbdFrame(1, 100_000, 100_000, self.camera, self.depth, None, None, None)
+        rejected = TrackedFrame(
+            source,
+            None,
+            AlignmentQuality(False, 0.1, 0.1, 0.1, 10, "lost"),
+            False,
+            "searching",
+            "lost",
+        )
+        relocalized = TrackedFrame(
+            source,
+            np.eye(4),
+            AlignmentQuality(True, 0.8, 0.9, 0.01, 500, "accepted"),
+            False,
+            "relocalized",
+            "relocalized",
+        )
+        tracking = TrackedFrame(
+            source,
+            np.eye(4),
+            relocalized.quality,
+            True,
+            "tracking",
+            "tracking",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            gate = TrackingArchiveGate(Path(temporary))
+            for _ in range(3):
+                self.assertFalse(gate.observe(rejected))
+            self.assertTrue(gate.observe(rejected))
+            self.assertTrue((Path(temporary) / "tracking-hold.flag").is_file())
+            self.assertTrue(gate.observe(relocalized))
+            self.assertFalse(gate.observe(tracking))
+            self.assertFalse((Path(temporary) / "tracking-hold.flag").exists())
 
     def test_mesh_packet_reverses_winding_for_mirrored_display_axes(self) -> None:
         packet = mesh_packet(

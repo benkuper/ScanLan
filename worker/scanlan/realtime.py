@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
-import gc
 import os
 import queue
 import struct
@@ -30,6 +30,7 @@ from .live_mapping import (
     CoverageField,
     SubmapLimits,
     VOXEL_BLOCK_BYTES,
+    frame_world_samples,
     rotation_degrees as live_rotation_degrees,
     tracking_colors,
 )
@@ -68,11 +69,13 @@ POINT_MAGIC = b"K2P1"
 MESH_MAGIC = b"K2M2"
 MAX_PREVIEW_POINTS = 150_000
 MAX_PREVIEW_TRIANGLES = 150_000
+MAX_TRACKING_PIXELS = 100_000
 TRACKING_ANCHOR_TRANSLATION_M = 0.08
 TRACKING_ANCHOR_ROTATION_DEGREES = 6.0
 MAX_TRACKING_ANCHORS = 48
 RECENT_TRACKING_ANCHORS = 8
-RELOCALIZATION_CANDIDATES_PER_FRAME = 4
+RELOCALIZATION_CANDIDATES_PER_FRAME = 1
+ARCHIVE_HOLD_REJECTION_FRAMES = 4
 RECOVERY_CONFIRMATION_FRAMES = 3
 RECOVERY_MAX_TRANSLATION_M = 0.15
 RECOVERY_MAX_ROTATION_DEGREES = 10.0
@@ -136,6 +139,36 @@ class TrackingStateUpdate:
     timestamp_us: int
     state: str
     confidence: float
+
+
+class TrackingArchiveGate:
+    """Pause retained recording after sustained loss while recovery keeps running."""
+
+    def __init__(self, root: Path | None) -> None:
+        self.path = root / "tracking-hold.flag" if root is not None else None
+        self.consecutive_rejections = 0
+        self.held = False
+        if self.path is not None:
+            self.path.unlink(missing_ok=True)
+
+    def observe(self, tracked: TrackedFrame) -> bool:
+        recovered = (
+            tracked.world_to_camera is not None
+            and tracked.state in {TrackingState.TRACKING.value, TrackingState.FROZEN.value}
+        )
+        if recovered:
+            self.consecutive_rejections = 0
+            if self.held and self.path is not None:
+                self.path.unlink(missing_ok=True)
+            self.held = False
+            return self.held
+
+        self.consecutive_rejections += 1
+        if self.consecutive_rejections >= ARCHIVE_HOLD_REJECTION_FRAMES:
+            self.held = True
+            if self.path is not None:
+                self.path.touch(exist_ok=True)
+        return self.held
 
 
 class TrackingJournal:
@@ -594,6 +627,36 @@ def _intrinsic_matrix(camera: StreamCamera) -> np.ndarray:
     )
 
 
+def _tracking_frame(frame: RgbdFrame) -> RgbdFrame:
+    """Build the bounded image used only for live pose estimation.
+
+    Full calibrated depth and color remain untouched for archival and TSDF
+    integration. Odometry does not need every sensor pixel to estimate a
+    six-degree-of-freedom pose at video rate.
+    """
+
+    pixel_count = frame.camera.width * frame.camera.height
+    stride = max(1, int(math.ceil(math.sqrt(pixel_count / MAX_TRACKING_PIXELS))))
+    if stride == 1:
+        return frame
+    depth = np.ascontiguousarray(frame.depth[::stride, ::stride])
+    color = (
+        np.ascontiguousarray(frame.color[::stride, ::stride])
+        if frame.color is not None
+        else None
+    )
+    camera = replace(
+        frame.camera,
+        width=depth.shape[1],
+        height=depth.shape[0],
+        fx=frame.camera.fx / stride,
+        fy=frame.camera.fy / stride,
+        cx=frame.camera.cx / stride,
+        cy=frame.camera.cy / stride,
+    )
+    return replace(frame, camera=camera, depth=depth, color=color)
+
+
 class RealtimeTracker:
     def __init__(
         self,
@@ -605,6 +668,7 @@ class RealtimeTracker:
         self.backend = backend
         self.voxel_size_m = voxel_size_m
         self.camera: StreamCamera | None = None
+        self.tracking_camera: StreamCamera | None = None
         self.first_captured_pose: np.ndarray | None = None
         self.world_to_camera = np.eye(4, dtype=np.float64)
         self.previous_frame: RgbdFrame | None = None
@@ -655,10 +719,12 @@ class RealtimeTracker:
         return guess
 
     def _representation(self, frame: RgbdFrame) -> Any:
+        tracking = _tracking_frame(frame)
+        self.tracking_camera = tracking.camera
         return (
-            _tensor_rgbd(self.o3d, frame, self.backend.device)
+            _tensor_rgbd(self.o3d, tracking, self.backend.device)
             if self.backend.uses_cuda
-            else _cpu_rgbd(self.o3d, frame)
+            else _cpu_rgbd(self.o3d, tracking)
         )
 
     def _odometry(
@@ -668,7 +734,7 @@ class RealtimeTracker:
         frame: RgbdFrame,
         initial: np.ndarray,
     ) -> tuple[bool, np.ndarray]:
-        camera = frame.camera
+        camera = self.tracking_camera or _tracking_frame(frame).camera
         if self.backend.uses_cuda:
             result = self.o3d.t.pipelines.odometry.rgbd_odometry_multi_scale(
                 source,
@@ -685,6 +751,17 @@ class RealtimeTracker:
                 ),
                 depth_scale=camera.depth_scale,
                 depth_max=camera.max_depth_m,
+                criteria_list=[
+                    self.o3d.t.pipelines.odometry.OdometryConvergenceCriteria(
+                        6, 1e-4, 1e-4
+                    ),
+                    self.o3d.t.pipelines.odometry.OdometryConvergenceCriteria(
+                        3, 1e-4, 1e-4
+                    ),
+                    self.o3d.t.pipelines.odometry.OdometryConvergenceCriteria(
+                        1, 1e-4, 1e-4
+                    ),
+                ],
                 method=self.o3d.t.pipelines.odometry.Method.Hybrid,
                 params=self.o3d.t.pipelines.odometry.OdometryLossParams(
                     depth_outlier_trunc=max(0.05, self.voxel_size_m * 4.0),
@@ -700,6 +777,7 @@ class RealtimeTracker:
         )
         option = self.o3d.pipelines.odometry.OdometryOption()
         option.depth_diff_max = max(0.05, self.voxel_size_m * 4.0)
+        option.iteration_number_per_pyramid_level = [8, 4, 2]
         success, transformation, _ = self.o3d.pipelines.odometry.compute_rgbd_odometry(
             source,
             current,
@@ -961,16 +1039,21 @@ class RealtimeTracker:
             self.gyro_since_accept = incremental_gyro @ self.gyro_since_accept
             self.gyro_samples_since_accept += 1
         initial = self.gyro_since_accept.copy()
-        # Track directly from the latest integration keyframe whenever it is
-        # older than the immediately preceding frame.  Chaining every 30 Hz
-        # frame compounds sub-millimetre errors into visible duplicate walls;
-        # a bounded keyframe baseline estimates the whole local motion in one
-        # solve while previous-frame tracking remains the fallback.
+        # A contiguous stream keeps the established integration-keyframe path
+        # for its lower accumulated drift. As soon as a queue/transport gap is
+        # visible, use the latest accepted frame: stretching an already-late
+        # solve back to a sparse keyframe creates a larger baseline and a
+        # self-amplifying latency/tracking failure. Older anchors are reserved
+        # for recovery.
         source_frame = self.previous_frame
         source_representation = previous_representation
         source_world_to_camera = self.world_to_camera
         keyframe_tracking = False
-        if self.anchors and self.anchors[-1].frame.sequence != self.previous_frame.sequence:
+        if (
+            frame.sequence == self.previous_frame.sequence + 1
+            and self.anchors
+            and self.anchors[-1].frame.sequence != self.previous_frame.sequence
+        ):
             anchor = self.anchors[-1]
             source_frame = anchor.frame
             source_representation = anchor.representation
@@ -1531,6 +1614,8 @@ class _ActiveLiveSubmap:
     integrated_frames: int
     confidence_sum: float
     confidence_samples: int
+    preview_points: np.ndarray
+    preview_colors: np.ndarray
     last_point_count: int = 0
     bounds_min: tuple[float, float, float] = (0.0, 0.0, 0.0)
     bounds_max: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -1621,6 +1706,8 @@ class LiveSubmapManager:
             integrated_frames=0,
             confidence_sum=0.0,
             confidence_samples=0,
+            preview_points=np.empty((0, 3), dtype=np.float32),
+            preview_colors=np.empty((0, 3), dtype=np.uint8),
         )
         self.next_submap_index += 1
         self.frozen_reason = None
@@ -1663,6 +1750,38 @@ class LiveSubmapManager:
             @ self.active.global_from_local
         )
         self.active.volume.integrate(tracked, local_world_to_camera)
+        preview_points, _ = frame_world_samples(
+            tracked.frame,
+            local_world_to_camera,
+            stride=4,
+        )
+        sampled_depth = np.asarray(tracked.frame.depth[::4, ::4], dtype=np.float32)
+        preview_valid = (
+            (sampled_depth / tracked.frame.camera.depth_scale)
+            >= tracked.frame.camera.min_depth_m
+        ) & (
+            (sampled_depth / tracked.frame.camera.depth_scale)
+            <= tracked.frame.camera.max_depth_m
+        )
+        if tracked.frame.color is not None:
+            preview_colors = np.asarray(
+                tracked.frame.color[::4, ::4][preview_valid], dtype=np.uint8
+            )
+        else:
+            preview_colors = np.full((len(preview_points), 3), 180, dtype=np.uint8)
+        if len(preview_points) and len(preview_colors) == len(preview_points):
+            self.active.preview_points = np.concatenate(
+                (self.active.preview_points, preview_points), axis=0
+            )
+            self.active.preview_colors = np.concatenate(
+                (self.active.preview_colors, preview_colors), axis=0
+            )
+            if len(self.active.preview_points) > MAX_PREVIEW_POINTS:
+                retained = _bounded_indices(
+                    len(self.active.preview_points), MAX_PREVIEW_POINTS
+                )
+                self.active.preview_points = self.active.preview_points[retained]
+                self.active.preview_colors = self.active.preview_colors[retained]
         confidence = tracking_confidence(tracked.quality)
         self.active.last_sequence = tracked.frame.sequence
         self.active.integrated_frames += 1
@@ -1972,7 +2091,8 @@ class LiveSubmapManager:
             )
             color_batches.append(submap.colors)
         if self.active is not None:
-            points, colors = self.active.volume.raw_points()
+            points = self.active.preview_points
+            colors = self.active.preview_colors
             self.active.last_point_count = len(points)
             if len(points):
                 self.active.bounds_min = tuple(np.min(points, axis=0).tolist())
@@ -2454,6 +2574,7 @@ def run_realtime_engine(
     reader_thread.start()
     mapper_thread.start()
     tracker = RealtimeTracker(o3d, backend, voxel_size_m)
+    archive_gate = TrackingArchiveGate(session_root)
     last_sequence: int | None = None
     last_status_at = 0.0
     last_raw_preview_at = 0.0
@@ -2584,6 +2705,7 @@ def run_realtime_engine(
             pose_started = time.perf_counter()
             tracked = tracker.track(frame)
             pose_latency_ms = (time.perf_counter() - pose_started) * 1000.0
+            archive_held = archive_gate.observe(tracked)
             position_uncertainty_mm, rotation_uncertainty_degrees = pose_uncertainty(
                 tracked.quality
             )
@@ -2619,7 +2741,14 @@ def run_realtime_engine(
                     {
                         "active": True,
                         "state": tracked.state,
-                        "detail": tracked.detail,
+                        "detail": (
+                            tracked.detail
+                            + (
+                                " - recording held until tracking is recovered"
+                                if archive_held
+                                else ""
+                            )
+                        ),
                         "backend": backend.label,
                         "processedFrames": snapshot["processed"],
                         "acceptedFrames": snapshot["accepted"],

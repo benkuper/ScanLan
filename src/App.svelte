@@ -125,11 +125,13 @@
   let sensorScanInFlight = false;
   let statusInFlight = false;
   let geometryInFlight = false;
+  let runtimeInFlight = false;
   let resultInFlight = false;
   let message = 'Initializing the RGB-D engine…';
   let fatalError = '';
   let statusTimer: number | undefined;
   let geometryTimer: number | undefined;
+  let runtimeTimer: number | undefined;
   let settingsTimer: number | undefined;
   let settingsRevision = 0;
   let projectGeneration = 0;
@@ -943,6 +945,27 @@
     }
   }
 
+  function runtimeChecksPending(info = runtime): boolean {
+    return !info || info.neuralSdfChecking || info.splatWorkerChecking || info.geometryWorkerChecking;
+  }
+
+  async function pollRuntimeChecks(): Promise<void> {
+    if (runtimeInFlight || !runtimeChecksPending()) return;
+    runtimeInFlight = true;
+    try {
+      runtime = await runtimeInfo();
+      if (!runtimeChecksPending() && runtimeTimer) {
+        window.clearInterval(runtimeTimer);
+        runtimeTimer = undefined;
+      }
+    } catch {
+      // Keep the last known state; the next poll can recover from a transient
+      // desktop-command failure while startup diagnostics are still running.
+    } finally {
+      runtimeInFlight = false;
+    }
+  }
+
   function parsePointPacket(buffer: ArrayBuffer): PackedPreviewFrame | null {
     if (buffer.byteLength < 24) return null;
     const bytes = new Uint8Array(buffer);
@@ -1735,6 +1758,8 @@
         if (workspace === 'capture' && !processing) await ensureSensorPreview();
         statusTimer = window.setInterval(() => void pollStatus(), 300);
         geometryTimer = window.setInterval(() => void pollLiveGeometry(), 75);
+        runtimeTimer = window.setInterval(() => void pollRuntimeChecks(), 1000);
+        void pollRuntimeChecks();
       } catch (error) {
         fatalError = errorText(error);
         message = fatalError;
@@ -1745,6 +1770,7 @@
   onDestroy(() => {
     if (statusTimer) window.clearInterval(statusTimer);
     if (geometryTimer) window.clearInterval(geometryTimer);
+    if (runtimeTimer) window.clearInterval(runtimeTimer);
     if (settingsTimer) window.clearTimeout(settingsTimer);
     stopPhotoProgressPolling();
   });
@@ -1754,21 +1780,6 @@
 <svelte:window on:keydown={handleEditShortcut} />
 
 <div class="app-shell">
-  <header class="topbar">
-    <div class="brand"><span class="brand-mark">SL</span><div><strong>ScanLan</strong><small>Photos · video · RGB-D reconstruction</small></div></div>
-    <button class="project-title" on:click={() => showProjectManager()} disabled={!project} title="Manage projects"><span>ACTIVE PROJECT</span><strong>{project?.name ?? 'Loading…'}</strong></button>
-    <div class="runtime-state">
-      <span class:ready={Boolean(runtime?.sensorWorkerAvailable)}><i></i>Capture</span>
-      <span class:ready={Boolean(runtime?.reconstructionWorkerAvailable)}><i></i>Reconstruct</span>
-      <span class:ready={Boolean(runtime?.splatWorkerAvailable)}><i></i>Gaussian CUDA</span>
-      <span class:ready={Boolean(runtime?.geometryWorkerAvailable)} title={runtime?.geometryStatus}><i></i>Learned geometry</span>
-    </div>
-    <div class="header-actions">
-      <button class="ghost compact" on:click={() => showProjectManager()} disabled={busy || !project}>Projects</button>
-      <button class="ghost compact" on:click={() => showProjectManager(true)} disabled={busy || capturing || processing || photoLocalizationActive}>New project</button>
-    </div>
-  </header>
-
   {#if projectManagerOpen && project}
     <div class="modal-backdrop">
       <button class="modal-dismiss" aria-label="Close project manager" on:click={closeProjectManager}></button>
@@ -1829,6 +1840,9 @@
   {/if}
 
   <nav class="workflow" aria-label="Workflow">
+    <button class:active={projectManagerOpen} on:click={() => showProjectManager()} disabled={busy || !project} title="Manage projects">
+      <span>00</span><div><strong>Project</strong><small>{project?.name ?? 'Loading...'}</small></div>
+    </button>
     <button class:active={workspace === 'capture'} class:done={completedCaptures > 0} on:click={() => void showCaptureWorkspace()}>
       <span>01</span><div><strong>Capture</strong><small>{capturing ? 'Recording now' : `${completedCaptures} take${completedCaptures === 1 ? '' : 's'}`}</small></div>
     </button>
@@ -2161,7 +2175,7 @@
               <div class="tracking-title"><i></i><div><strong>{sensor.trackingStatus}</strong><small>{sensor.liveReconstructionBackend ?? 'Realtime engine'}</small></div></div>
               <div class="mini-grid">
                 <div><span>Sensor</span><strong>{sensor.streamFps.toFixed(1)} fps</strong></div>
-                <div><span>{capturing ? 'Raw archive' : 'Recording'}</span><strong>{capturing ? sensor.frameCount : 'OFF'}</strong></div>
+                <div><span>{capturing ? sensor.sensorPaused ? 'Archive held' : 'Raw archive' : 'Recording'}</span><strong>{capturing ? sensor.frameCount : 'OFF'}</strong></div>
                 <div><span>{capturing ? 'Tracked' : 'Frames seen'}</span><strong>{capturing ? Math.max(0, sensor.liveProcessedFrameCount - sensor.liveRejectedFrameCount) : sensor.liveProcessedFrameCount}</strong></div>
                 <div><span>Rejected</span><strong>{sensor.liveRejectedFrameCount}</strong></div>
                 <div><span>Source drops</span><strong>{sensor.sourceDropCount}</strong></div>
@@ -2250,11 +2264,22 @@
 
         {#if buildTexturedMesh}
           <details class="panel collapsible-panel" open>
-            <summary><span>MAX QUALITY SURFACE</span><strong>{project.settings.neuralSdfRefinement ? 'NEURAL SDF' : 'BASELINE'}</strong></summary>
+            <summary><span>MAX QUALITY SURFACE</span><strong>{!runtime || runtime.neuralSdfChecking ? 'CHECKING CUDA' : !runtime.neuralSdfAvailable ? 'CUDA UNAVAILABLE' : project.settings.neuralSdfRefinement ? 'NEURAL SDF' : 'BASELINE'}</strong></summary>
             <div class="collapsible-body settings mesh-repair-settings">
-              <label class="toggle"><input type="checkbox" checked={project.settings.neuralSdfRefinement} on:change={(event) => updateSetting('neuralSdfRefinement', inputChecked(event))} disabled={processing || !runtime?.splatWorkerAvailable}/><span></span><div><strong>Validation-gated neural SDF refinement</strong><small>CUDA Max Quality pass after camera/depth validation</small></div></label>
+              <label class="toggle" class:unavailable={!runtime?.neuralSdfAvailable} title={runtime && !runtime.neuralSdfChecking && !runtime.neuralSdfAvailable ? `Unavailable: ${runtime.neuralSdfStatus}` : undefined}><input type="checkbox" checked={project.settings.neuralSdfRefinement} on:change={(event) => updateSetting('neuralSdfRefinement', inputChecked(event))} disabled={processing || !runtime?.neuralSdfAvailable} aria-describedby={!runtime?.neuralSdfAvailable ? 'neural-sdf-availability' : undefined}/><span></span><div><strong>Validation-gated neural SDF refinement</strong><small>CUDA Max Quality pass after camera/depth validation</small>{#if !runtime || runtime.neuralSdfChecking}<em>CHECKING RUNTIME</em>{:else if !runtime.neuralSdfAvailable}<em>UNAVAILABLE</em>{/if}</div></label>
               <p>The fitted signed-distance surface may denoise the validated baseline but cannot silently replace it. Excess displacement, held-out SDF error, flipped triangles, or new degeneracy keeps the TSDF/learned dense mesh unchanged.</p>
-              {#if !runtime?.splatWorkerAvailable}<p class="warning">The isolated CUDA reconstruction runtime is required for neural SDF refinement.</p>{/if}
+              {#if !runtime || runtime.neuralSdfChecking}
+                <div class="capability-notice checking" id="neural-sdf-availability" role="status"><strong>Checking CUDA runtime...</strong><span>This option unlocks only after the isolated reconstruction runtime passes its diagnostics.</span></div>
+              {:else if !runtime.neuralSdfAvailable}
+                <div class="capability-notice unavailable" id="neural-sdf-availability" role="status">
+                  <strong>Unavailable in this session</strong>
+                  <span>{runtime.neuralSdfStatus}</span>
+                  {#if runtime.neuralSdfStatus.includes('Not installed')}
+                    <code>npm run prepare:splat</code>
+                    <span>Restart ScanLan after preparation completes.</span>
+                  {/if}
+                </div>
+              {/if}
               {#if project.neuralSdf && project.neuralSdf.status !== 'disabled'}
                 <div class="repair-result" class:warning={project.neuralSdf.status !== 'accepted'}>
                   <span>LAST PASS · {project.neuralSdf.status.toUpperCase()}</span>
@@ -2530,6 +2555,13 @@
     <p>{message}</p>
     {#if sensor?.imuActive}<span class="footer-metric">IMU {sensor.imuRateHz.toFixed(0)} Hz</span>{/if}
     {#if sensor?.liveReconstructionBackend}<span class="footer-metric">{sensor.liveReconstructionBackend}</span>{/if}
+    <div class="runtime-state footer-runtime" aria-label="Engine availability">
+      <span class:ready={Boolean(runtime?.sensorWorkerAvailable)} class:checking={!runtime} class:unavailable={Boolean(runtime && !runtime.sensorWorkerAvailable)} title={runtime?.sensorStatus}><i></i><b>Capture</b><small>{!runtime ? 'CHECKING' : runtime.sensorWorkerAvailable ? 'READY' : 'UNAVAILABLE'}</small></span>
+      <span class:ready={Boolean(runtime?.reconstructionWorkerAvailable)} class:checking={!runtime} class:unavailable={Boolean(runtime && !runtime.reconstructionWorkerAvailable)}><i></i><b>Reconstruct</b><small>{!runtime ? 'CHECKING' : runtime.reconstructionWorkerAvailable ? 'READY' : 'UNAVAILABLE'}</small></span>
+      <span class:ready={Boolean(runtime?.neuralSdfAvailable)} class:checking={Boolean(!runtime || runtime.neuralSdfChecking)} class:unavailable={Boolean(runtime && !runtime.neuralSdfChecking && !runtime.neuralSdfAvailable)} title={runtime?.neuralSdfStatus}><i></i><b>Neural SDF</b><small>{!runtime || runtime.neuralSdfChecking ? 'CHECKING' : runtime.neuralSdfAvailable ? 'READY' : 'UNAVAILABLE'}</small></span>
+      <span class:ready={Boolean(runtime?.splatWorkerAvailable)} class:checking={Boolean(!runtime || runtime.splatWorkerChecking)} class:unavailable={Boolean(runtime && !runtime.splatWorkerChecking && !runtime.splatWorkerAvailable)} title={runtime?.splatStatus}><i></i><b>Gaussian</b><small>{!runtime || runtime.splatWorkerChecking ? 'CHECKING' : runtime.splatWorkerAvailable ? 'READY' : 'UNAVAILABLE'}</small></span>
+      <span class:ready={Boolean(runtime?.geometryWorkerAvailable)} class:checking={Boolean(!runtime || runtime.geometryWorkerChecking)} class:unavailable={Boolean(runtime && !runtime.geometryWorkerChecking && !runtime.geometryWorkerAvailable)} title={runtime?.geometryStatus}><i></i><b>Geometry AI</b><small>{!runtime || runtime.geometryWorkerChecking ? 'CHECKING' : runtime.geometryWorkerAvailable ? 'READY' : 'UNAVAILABLE'}</small></span>
+    </div>
   </footer>
 </div>
 
@@ -2541,28 +2573,26 @@
   :global(button), :global(input), :global(select) { font: inherit; }
   :global(button) { color: inherit; }
 
-  .app-shell { --panel: #191c21; --panel-soft: #1e2228; --line: #2b3038; --muted: #8a929d; --cyan: #6c9eff; --mint: #54b78d; --amber: #d2a04f; display: grid; grid-template-rows: 64px 58px minmax(0, 1fr) 34px; gap: 8px; width: 100%; height: 100%; padding: 8px; background: #101216; }
-  .topbar { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(220px, 1fr) auto auto; align-items: center; gap: 24px; padding: 0 16px; border: 1px solid var(--line); border-radius: 6px; background: #15181d; }
-  .brand, .project-title, .runtime-state, .tracking-title, .job-meta, .button-row { display: flex; align-items: center; }
-  .brand { gap: 11px; }
-  .brand-mark { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid #3a4658; border-radius: 5px; background: #20252c; color: var(--cyan); font-size: 12px; font-weight: 850; letter-spacing: .06em; }
-  .brand div, .project-title { display: grid; gap: 2px; }
-  .brand strong { font-size: 16px; letter-spacing: .01em; }
-  .brand small, .project-title span { color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
-  .project-title { justify-items: start; min-width: 0; padding: 8px 10px; border-radius: 4px; background: transparent; text-align: left; }
-  .project-title:hover:not(:disabled) { background: #20242a; }
-  .project-title strong { max-width: 360px; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-  .header-actions { display: flex; gap: 7px; }
-  .runtime-state { gap: 8px; }
-  .runtime-state span { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 4px; color: #777f8a; font-size: 10px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; }
-  .runtime-state span i { width: 6px; height: 6px; border-radius: 50%; background: #53636b; }
-  .runtime-state span.ready { color: #b2b8c1; }
-  .runtime-state span.ready i { background: var(--mint); }
+  .app-shell { --panel: #191c21; --panel-soft: #1e2228; --line: #2b3038; --muted: #8a929d; --cyan: #6c9eff; --mint: #54b78d; --amber: #d2a04f; display: grid; grid-template-rows: 58px minmax(0, 1fr) 42px; gap: 8px; width: 100%; height: 100%; padding: 8px; background: #101216; }
+  .runtime-state, .tracking-title, .job-meta, .button-row { display: flex; align-items: center; }
+  .runtime-state { gap: 6px; }
+  .runtime-state > span { display: grid; grid-template-columns: 7px auto; align-items: center; column-gap: 6px; min-width: 88px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; color: #777f8a; text-transform: uppercase; }
+  .runtime-state > span i { grid-row: 1 / 3; width: 6px; height: 6px; border-radius: 50%; background: #53636b; }
+  .runtime-state > span b { font-size: 9px; letter-spacing: .04em; white-space: nowrap; }
+  .runtime-state > span small { color: #68717b; font-size: 7px; font-weight: 850; letter-spacing: .08em; }
+  .runtime-state > span.ready { border-color: #30483f; color: #b2b8c1; }
+  .runtime-state > span.ready i { background: var(--mint); }
+  .runtime-state > span.ready small { color: var(--mint); }
+  .runtime-state > span.checking { border-color: #4f432f; color: #c1b49d; }
+  .runtime-state > span.checking i { background: var(--amber); animation: pulse 1s infinite; }
+  .runtime-state > span.checking small { color: var(--amber); }
+  .runtime-state > span.unavailable { border-color: #453536; color: #948487; }
+  .runtime-state > span.unavailable i { background: #a65f62; }
+  .runtime-state > span.unavailable small { color: #b76f70; }
   button { border: 0; cursor: pointer; }
   button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .43; }
   .ghost { padding: 10px 13px; border: 1px solid var(--line); border-radius: 5px; background: #1b1f24; color: #b6bbc3; font-size: 12px; font-weight: 700; }
   .ghost:hover:not(:disabled) { border-color: #46536a; background: #22272e; }
-  .ghost.compact { white-space: nowrap; }
   .ghost.full, .primary.full { width: 100%; }
   .primary { padding: 11px 15px; border-radius: 5px; background: #4f82e8; color: #f7f9fc; font-size: 12px; font-weight: 800; }
   .primary:hover:not(:disabled) { background: #5b8df0; }
@@ -2605,7 +2635,7 @@
   .new-project-button:hover:not(:disabled) { border-color: #53688b; background: #202630; }
   .project-manager-error { color: #df9388; font-size: 10px; }
 
-  .workflow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden; padding: 0 12px; border: 1px solid var(--line); border-radius: 6px; background: #13161a; }
+  .workflow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; overflow: hidden; padding: 0 12px; border: 1px solid var(--line); border-radius: 6px; background: #13161a; }
   .workflow button { position: relative; display: flex; align-items: center; gap: 12px; padding: 0 18px; background: transparent; color: #708792; text-align: left; }
   .workflow button::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: transparent; content: ''; }
   .workflow button.active { color: #e2e5e9; background: #191d23; }
@@ -2667,6 +2697,18 @@
   .toggle div { display: grid; min-width: 0; gap: 2px; }
   .toggle strong { color: #bfd1d8; font-size: 11px; }
   .toggle small { color: #657c87; font-size: 9px; font-weight: 500; }
+  .toggle em { width: max-content; margin-top: 3px; padding: 2px 5px; border: 1px solid #5b4830; border-radius: 3px; background: #271f17; color: var(--amber); font-size: 7px; font-style: normal; font-weight: 850; letter-spacing: .09em; }
+  .toggle.unavailable { cursor: not-allowed; }
+  .toggle.unavailable > span { border: 1px solid #444951; background: #25292f; }
+  .toggle.unavailable > span::after { top: 2px; left: 2px; background: #626973; }
+  .toggle.unavailable strong, .toggle.unavailable small { color: #77828a; }
+  .capability-notice { display: grid; gap: 5px; padding: 10px; border: 1px solid #58482f; border-radius: 5px; background: #241f18; }
+  .capability-notice strong { color: var(--amber); font-size: 10px; }
+  .capability-notice span { color: #a08f78; font-size: 9px; line-height: 1.45; }
+  .capability-notice code { width: max-content; max-width: 100%; padding: 5px 7px; overflow: hidden; border-radius: 3px; background: #151719; color: #b9cbd2; font-size: 9px; text-overflow: ellipsis; }
+  .capability-notice.checking { border-color: #34485b; background: #182029; }
+  .capability-notice.checking strong { color: var(--cyan); }
+  .capability-notice.checking span { color: #748c98; }
   .rebuild-policy .cache-policy-note { color: #718894; font-size: 9px; line-height: 1.5; }
 
   .capture-button { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; height: 48px; margin-bottom: 9px; border-radius: 5px; background: #3ca178; color: #07140f; font-size: 13px; font-weight: 900; }
@@ -2805,7 +2847,7 @@
   .export-progress { display: block; height: 3px; overflow: hidden; border-radius: 4px; background: #172a35; }
   .export-progress i { display: block; width: 35%; height: 100%; border-radius: inherit; background: var(--cyan); animation: export-slide 1.1s ease-in-out infinite; }
 
-  .live-metrics { position: absolute; top: 24px; right: 24px; display: grid; grid-template-columns: repeat(3, minmax(80px, 1fr)); gap: 1px; overflow: hidden; border: 1px solid #31363e; border-radius: 5px; background: #31363e; }
+  .live-metrics { position: absolute; z-index: 4; right: 24px; bottom: 24px; display: grid; grid-template-columns: repeat(3, minmax(80px, 1fr)); gap: 1px; overflow: hidden; border: 1px solid #31363e; border-radius: 5px; background: #31363e; }
   .live-metrics div { display: grid; gap: 3px; padding: 8px 10px; background: #171b20; }
   .live-metrics span { color: #6f8792; font-size: 8px; text-transform: uppercase; }
   .live-metrics strong { font-size: 10px; }
@@ -2821,13 +2863,17 @@
   .job-overlay .job-quality { justify-content: flex-start; }
   .job-overlay p { margin-top: 8px; color: #78909c; font-size: 9px; }
 
-  footer { display: flex; align-items: center; gap: 8px; padding: 0 14px; border: 1px solid var(--line); border-radius: 6px; background: #14171b; color: #858c96; font-size: 9px; }
+  footer { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: #14171b; color: #858c96; font-size: 9px; }
   footer strong { color: #9bb1bb; font-size: 9px; letter-spacing: .08em; }
-  footer p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  footer p { flex: 1; min-width: 40px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   footer.error p { color: #d8988e; }
   .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--mint); }
   .status-dot.busy { background: var(--amber); animation: pulse 1s infinite; }
   .footer-metric { padding-left: 12px; border-left: 1px solid var(--line); color: #607984; }
+  .footer-runtime { flex: 0 0 auto; gap: 4px; margin-left: 4px; }
+  .footer-runtime > span { min-width: 70px; padding: 3px 5px; }
+  .footer-runtime > span b { font-size: 8px; }
+  .footer-runtime > span small { font-size: 6px; }
   .spinner { width: 24px; height: 24px; margin-bottom: 12px; border: 2px solid rgba(99,199,231,.16); border-top-color: var(--cyan); border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes pulse { 50% { opacity: .35; } }
@@ -2835,8 +2881,8 @@
 
   @media (max-width: 1120px) {
     main { grid-template-columns: minmax(0, 1fr) 340px; }
-    .topbar { grid-template-columns: auto 1fr auto; }
-    .project-title { display: none; }
+    .workflow button { gap: 8px; padding: 0 10px; }
     .live-metrics { grid-template-columns: repeat(2, minmax(80px, 1fr)); }
+    .footer-runtime > span { min-width: 62px; padding-right: 4px; padding-left: 4px; }
   }
 </style>

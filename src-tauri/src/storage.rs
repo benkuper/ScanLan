@@ -247,8 +247,8 @@ pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf
         .join("Scripts")
         .join("scanlan-splat.exe");
     if cfg!(debug_assertions) {
-        candidates.push(packaged_binary.clone());
         candidates.push(development_binary.clone());
+        candidates.push(packaged_binary.clone());
     }
     if let Some(root) = resource_root {
         candidates.push(root.join("splat-runtime").join("scanlan-splat.exe"));

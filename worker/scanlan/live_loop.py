@@ -123,15 +123,10 @@ class LocalAnchorDatabase(Generic[AnchorT]):
             )
             if pending is not None:
                 selected.append(pending)
-        if len(selected) < limit and all(
-            self._sequence(entry) != self._sequence(available[0])
-            for entry in selected
-        ):
-            selected.append(available[0])
         selected_sequences = {self._sequence(entry) for entry in selected}
         rotating = [
             entry
-            for entry in available[1:]
+            for entry in available
             if self._sequence(entry) not in selected_sequences
         ]
         budget = limit - len(selected)

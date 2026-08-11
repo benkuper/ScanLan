@@ -389,9 +389,14 @@ pub struct RuntimeInfo {
     pub sensor_worker_available: bool,
     pub sensor_status: String,
     pub reconstruction_worker_available: bool,
+    pub neural_sdf_available: bool,
+    pub neural_sdf_checking: bool,
+    pub neural_sdf_status: String,
     pub splat_worker_available: bool,
+    pub splat_worker_checking: bool,
     pub splat_status: String,
     pub geometry_worker_available: bool,
+    pub geometry_worker_checking: bool,
     pub geometry_status: String,
 }
 

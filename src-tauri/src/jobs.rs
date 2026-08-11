@@ -95,11 +95,11 @@ fn acquire_accelerator_lock() -> Result<File, String> {
 }
 
 #[cfg(windows)]
-struct ChildLifetimeGuard(HANDLE);
+pub(crate) struct ChildLifetimeGuard(HANDLE);
 
 #[cfg(windows)]
 impl ChildLifetimeGuard {
-    fn attach(child: &Child) -> Result<Self, String> {
+    pub(crate) fn attach(child: &Child) -> Result<Self, String> {
         // A kill-on-close Job Object makes Windows terminate the worker even if
         // the app is force-closed or the Tauri dev runner replaces the process.
         // Without it, an orphan can keep writing the shared project progress and
@@ -149,11 +149,11 @@ impl Drop for ChildLifetimeGuard {
 }
 
 #[cfg(not(windows))]
-struct ChildLifetimeGuard;
+pub(crate) struct ChildLifetimeGuard;
 
 #[cfg(not(windows))]
 impl ChildLifetimeGuard {
-    fn attach(_child: &Child) -> Result<Self, String> {
+    pub(crate) fn attach(_child: &Child) -> Result<Self, String> {
         Ok(Self)
     }
 }

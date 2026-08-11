@@ -51,6 +51,29 @@ def _cuda_smoke_test() -> None:
         raise RuntimeError("gsplat CUDA backward smoke test produced invalid gradients")
 
 
+def _neural_sdf_cuda_smoke_test() -> None:
+    """Validate the Torch CUDA/autograd path used by neural SDF refinement.
+
+    Keep this probe independent from gsplat, PyCOLMAP, and adaptive media
+    selection. Those capabilities are required for Gaussian reconstruction,
+    but they must not delay or disable the otherwise compatible neural SDF
+    refinement lane.
+    """
+    import torch
+
+    coordinates = torch.tensor(
+        [[-0.5, 0.25, 0.75], [0.4, -0.2, 0.1]],
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    values = (coordinates.square().sum(dim=1) - 0.5).tanh()
+    values.sum().backward()
+    torch.cuda.synchronize()
+    if coordinates.grad is None or not torch.isfinite(coordinates.grad).all():
+        raise RuntimeError("neural SDF CUDA autograd smoke test produced invalid gradients")
+
+
 def _publish_failure(project_root: Path, error: Exception) -> None:
     """Leave a structured failure for the desktop process instead of only stderr."""
     progress_path = project_root / "outputs" / "splat-progress.json"
@@ -117,6 +140,7 @@ def parser() -> argparse.ArgumentParser:
     diagnostics.add_argument("--require-cuda", action="store_true")
     diagnostics.add_argument("--require-learned-features", action="store_true")
     diagnostics.add_argument("--require-adaptive-frames", action="store_true")
+    diagnostics.add_argument("--require-neural-sdf", action="store_true")
     return root
 
 
@@ -125,9 +149,43 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.command == "diagnostics":
             import torch
+            from .neural_sdf import NEURAL_SDF_VERSION
+
+            cuda_available = torch.cuda.is_available()
+            if arguments.require_neural_sdf:
+                if cuda_available:
+                    _neural_sdf_cuda_smoke_test()
+                print(
+                    json.dumps(
+                        {
+                            "version": __version__,
+                            "cuda": cuda_available,
+                            "cudaSmokeTest": cuda_available,
+                            "device": (
+                                torch.cuda.get_device_name(0)
+                                if cuda_available
+                                else None
+                            ),
+                            "cudaCapability": (
+                                ".".join(
+                                    map(str, torch.cuda.get_device_capability(0))
+                                )
+                                if cuda_available
+                                else None
+                            ),
+                            "torch": torch.__version__,
+                            "neuralSdf": {
+                                "version": NEURAL_SDF_VERSION,
+                                "cudaAvailable": cuda_available,
+                                "cudaValidated": cuda_available,
+                            },
+                        }
+                    )
+                )
+                return 0 if cuda_available else 2
+
             import gsplat
             from .appearance import GAUSSIAN_MATERIAL_CONTRACT
-            from .neural_sdf import NEURAL_SDF_VERSION
             from scanlan_material import (
                 ANALYSIS_VERSION,
                 CONTRACT_VERSION,
@@ -138,7 +196,6 @@ def main(argv: list[str] | None = None) -> int:
                 SURFACE_CONTRACT_VERSION,
             )
 
-            cuda_available = torch.cuda.is_available()
             if arguments.require_cuda and cuda_available:
                 _cuda_smoke_test()
             feature_runtime = pycolmap_feature_runtime()
