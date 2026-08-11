@@ -2536,6 +2536,7 @@
 <style>
   :global(*) { box-sizing: border-box; }
   :global(html, body, #app) { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+  :global(#app) { position: fixed; inset: 0; }
   :global(body) { background: #101216; color: #d7dbe1; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   :global(button), :global(input), :global(select) { font: inherit; }
   :global(button) { color: inherit; }
@@ -2656,13 +2657,14 @@
   .unit-input { position: relative; }
   .unit-input input { padding-right: 35px; }
   .unit-input span { position: absolute; top: 50%; right: 10px; color: #637b86; transform: translateY(-50%); }
-  .toggle { grid-template-columns: auto auto 1fr; align-items: center; cursor: pointer; }
-  .toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .toggle { position: relative; grid-template-columns: 34px minmax(0, 1fr); align-items: center; cursor: pointer; }
+  .toggle input { position: absolute; z-index: 1; top: 50%; left: 0; width: 34px; height: 19px; margin: 0; padding: 0; opacity: 0; transform: translateY(-50%); cursor: inherit; }
   .toggle > span { position: relative; width: 34px; height: 19px; border-radius: 10px; background: #343a43; transition: .2s; }
+  .toggle input:focus-visible + span { outline: 2px solid rgba(108,158,255,.72); outline-offset: 2px; }
   .toggle > span::after { position: absolute; top: 3px; left: 3px; width: 13px; height: 13px; border-radius: 50%; background: #8499a3; transition: .2s; content: ''; }
   .toggle input:checked + span { background: #315f4d; }
   .toggle input:checked + span::after { left: 18px; background: var(--mint); }
-  .toggle div { display: grid; gap: 2px; }
+  .toggle div { display: grid; min-width: 0; gap: 2px; }
   .toggle strong { color: #bfd1d8; font-size: 11px; }
   .toggle small { color: #657c87; font-size: 9px; font-weight: 500; }
   .rebuild-policy .cache-policy-note { color: #718894; font-size: 9px; line-height: 1.5; }
