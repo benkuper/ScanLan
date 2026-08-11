@@ -26,6 +26,17 @@ from .backend_policy import (
     packaged_benchmark_manifest_path,
     select_backend_policy,
 )
+from .release_matrix import (
+    RELEASE_EVIDENCE_VERSION,
+    RELEASE_MATRIX_VERSION,
+    ReleaseMatrixError,
+    evaluate_release_matrix,
+    load_release_evidence,
+    load_release_requirements,
+    packaged_release_requirements_path,
+    write_default_promotion,
+    write_release_matrix_report,
+)
 
 __all__ = [
     "VALIDATION_CONTRACT_VERSION",
@@ -50,4 +61,13 @@ __all__ = [
     "load_benchmark_manifest",
     "packaged_benchmark_manifest_path",
     "select_backend_policy",
+    "RELEASE_EVIDENCE_VERSION",
+    "RELEASE_MATRIX_VERSION",
+    "ReleaseMatrixError",
+    "evaluate_release_matrix",
+    "load_release_evidence",
+    "load_release_requirements",
+    "packaged_release_requirements_path",
+    "write_default_promotion",
+    "write_release_matrix_report",
 ]

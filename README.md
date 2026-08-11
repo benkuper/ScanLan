@@ -138,6 +138,12 @@ RGB-D worker emit the same versioned reports, and frozen runtimes package the va
 offline use. Learned backends may propose geometry but cannot promote unverified scale or bypass
 measured-depth/free-space evidence.
 
+Global backend defaults are protected separately by the
+[`V2 release matrix`](docs/v2-release-validation.md). It requires representative real-input,
+quality, memory, artifact-digest, and visual-review evidence for every supported lane. The current
+dated audit is intentionally incomplete, so no adaptive backend has been promoted to a global
+default from the narrower integration smokes.
+
 LingBot-Depth consumes the archived RGB8 image that is already aligned to the depth grid and returns the same raster dimensions, so no post-hoc RGB warp is inferred. ScanLan runs it only after metric camera poses have been recovered. Every valid sensor depth remains unchanged; predicted pixels are accepted only in sensor holes after model-mask, depth-edge, metric-scale, calibrated native-RGB field-of-view, independent-viewpoint, and multi-view reprojection gates. Accepted pixels carry explicit provenance and lower fusion/training confidence. If a frame fails the metric gate, its raw calibrated depth is used unchanged.
 
 MapAnything uses the same immutable aligned RGB-D archive but predicts in its processed image grid. ScanLan reverses the cover-resize/center-crop transform, calibrates the smooth model residual from sensor anchors, and validates only on independent held-out anchors. Unsupported large holes and any proposal that fails metric, RGB-coverage, multi-view, or free-space evidence remain sensor-only. For photos and videos of at most 32 selected views, MapAnything also proposes cameras and dense depth as a challenger; COLMAP agreement selects or rejects it, and image-only scale remains `MODEL_METRIC_UNVERIFIED` until anchored.

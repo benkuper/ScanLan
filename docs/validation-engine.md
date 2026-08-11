@@ -73,6 +73,10 @@ depth scale rejection, ray support/free-space/occlusion classification, and fail
 filtering. Worker integration tests protect production phase boundaries and hole-only depth
 completion.
 
+P19 adds a separate release-matrix layer above these per-output validators. It requires independent
+real-scene, latency, memory, cancellation/resume, artifact-digest, and visual evidence before a
+backend can become a global default. See [v2-release-validation.md](v2-release-validation.md).
+
 The retained physical Femto/LingBot depth run provides a representative gate check: all 267
 validated production cameras passed, with a maximum 0.141 m selected-keyframe step and 13.52
 degree rotation. Twenty sampled learned-depth frames all passed metric agreement (12.38-19.48 mm

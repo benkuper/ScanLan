@@ -920,18 +920,26 @@ Implemented as a versioned, fail-closed selection boundary:
 
 ## P19 — Full validation and default selection
 
-Run the complete:
+Implemented as a fail-closed release boundary:
 
-* RGB-D;
-* video;
-* photos;
-* hybrid;
-* material;
-* reflective/transmissive;
-* 12 GB memory;
-* cancellation/resume;
+* one versioned matrix independently requires room-scale Kinect v2, Azure Kinect, and Femto Mega,
+  multi-scene video/photo/hybrid, annotated material and reflective/transmissive, actual 12 GB, and
+  cancellation/resume evidence;
+* a successful process, unit test, installed runtime, synthetic fixture, or different hardware tier
+  cannot substitute for representative real input and task-specific metrics;
+* every accepted visual product is bound to a SHA-256 artifact and an independent timestamped
+  inspection, while artifact verification streams with bounded memory;
+* missing, duplicate, malformed, failed, or below-threshold evidence keeps its scenario red and
+  the complete matrix incomplete;
+* the default-promotion artifact is structurally impossible to publish until all required scenarios
+  pass; explicit P18 adaptive choices remain available without becoming global defaults;
+* the dated first audit records the existing real evidence and intentionally leaves defaults
+  unchanged: the Femto smoke misses room-scale/10 Hz coverage, video registers 46.96%, photo is a
+  one-scene camera success with a failed Gaussian quality gate, and the hybrid, annotated optical,
+  true 12 GB, and full cancellation/resume matrices remain unproven.
 
-release matrix before changing defaults.
+See `docs/v2-release-validation.md` and the machine-readable
+`docs/v2-release-matrix-report.json`.
 
 ---
 
