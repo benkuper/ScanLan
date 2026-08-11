@@ -55,6 +55,8 @@ pub struct CaptureSettings {
     #[serde(default)]
     pub imu_gyro_range_dps: u32,
     pub live_reconstruction: String,
+    #[serde(default = "default_live_map_memory_mib")]
+    pub live_map_memory_mib: u32,
     #[serde(default = "default_repair_mesh")]
     pub repair_mesh: bool,
     #[serde(default = "default_mesh_repair_profile")]
@@ -65,6 +67,12 @@ pub struct CaptureSettings {
     pub produce_watertight_mesh: bool,
     #[serde(default)]
     pub lingbot_depth_refinement: bool,
+    #[serde(default = "default_depth_refinement_backend")]
+    pub depth_refinement_backend: String,
+    #[serde(default)]
+    pub experimental_rgb_preview: bool,
+    #[serde(default)]
+    pub neural_sdf_refinement: bool,
 }
 
 fn default_sensor_kind() -> String {
@@ -123,12 +131,20 @@ fn default_live_reconstruction() -> String {
     "points".to_string()
 }
 
+fn default_live_map_memory_mib() -> u32 {
+    1024
+}
+
 fn default_repair_mesh() -> bool {
     true
 }
 
 fn default_mesh_repair_profile() -> String {
     "faithful".to_string()
+}
+
+fn default_depth_refinement_backend() -> String {
+    "off".to_string()
 }
 
 impl Default for CaptureSettings {
@@ -165,11 +181,15 @@ impl Default for CaptureSettings {
             imu_gyro_rate_hz: 0,
             imu_gyro_range_dps: 0,
             live_reconstruction: default_live_reconstruction(),
+            live_map_memory_mib: default_live_map_memory_mib(),
             repair_mesh: default_repair_mesh(),
             mesh_repair_profile: default_mesh_repair_profile(),
             fill_inferred_mesh_holes: false,
             produce_watertight_mesh: false,
             lingbot_depth_refinement: false,
+            depth_refinement_backend: default_depth_refinement_backend(),
+            experimental_rgb_preview: false,
+            neural_sdf_refinement: false,
         }
     }
 }
@@ -178,6 +198,10 @@ impl Default for CaptureSettings {
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactSummary {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refined_camera_path: Option<String>,
     pub status: String,
     pub source_fingerprint: String,
     pub updated_at: String,
@@ -291,6 +315,8 @@ pub struct ProjectSummary {
     pub watertight_mesh_output_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth_refinement: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neural_sdf: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,6 +370,7 @@ impl ProjectSummary {
             mesh_repair_unknown_preserved: None,
             watertight_mesh_output_path: None,
             depth_refinement: None,
+            neural_sdf: None,
         }
     }
 
@@ -362,14 +389,22 @@ pub struct RuntimeInfo {
     pub sensor_worker_available: bool,
     pub sensor_status: String,
     pub reconstruction_worker_available: bool,
+    pub neural_sdf_available: bool,
+    pub neural_sdf_checking: bool,
+    pub neural_sdf_status: String,
     pub splat_worker_available: bool,
+    pub splat_worker_checking: bool,
     pub splat_status: String,
+    pub geometry_worker_available: bool,
+    pub geometry_worker_checking: bool,
+    pub geometry_status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureStatus {
     pub project: ProjectSummary,
+    pub live_contract_version: u16,
     pub preview: Vec<PreviewPoint>,
     pub capturing: bool,
     pub previewing: bool,
@@ -383,6 +418,8 @@ pub struct CaptureStatus {
     pub stream_fps: f32,
     pub tracking: bool,
     pub tracking_status: String,
+    pub tracking_state: String,
+    pub tracking_confidence: f32,
     pub imu_active: bool,
     pub imu_rate_hz: f32,
     pub live_reconstruction_active: bool,
@@ -395,7 +432,25 @@ pub struct CaptureStatus {
     pub source_drop_count: u64,
     pub tracking_queue_drop_count: u64,
     pub mapping_drop_count: u64,
+    pub tracking_queue_depth: u32,
+    pub mapping_queue_depth: u32,
     pub tracking_overlap: f32,
+    pub pose_uncertainty_mm: Option<f32>,
+    pub pose_uncertainty_degrees: Option<f32>,
+    pub pose_latency_ms: Option<f32>,
+    pub map_update_latency_ms: Option<f32>,
+    pub map_update_hz: f32,
+    pub allocated_live_map_bytes: u64,
+    pub active_voxel_count: u64,
+    pub active_surfel_count: u64,
+    pub resident_submap_count: u32,
+    pub host_cached_submap_count: u32,
+    pub dropped_preview_job_count: u64,
+    pub degradation_level: u8,
+    pub loop_closure_count: u32,
+    pub loop_correction_active: bool,
+    pub live_scale_status: String,
+    pub integration_frozen: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depth_rmse_mm: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -450,6 +505,8 @@ pub struct LiveWorkerStatus {
 #[serde(rename_all = "camelCase")]
 pub struct LiveReconstructionStatus {
     #[serde(default)]
+    pub contract_version: u16,
+    #[serde(default)]
     pub active: bool,
     #[serde(default)]
     pub mode: String,
@@ -458,7 +515,13 @@ pub struct LiveReconstructionStatus {
     #[serde(default)]
     pub tracking_status: String,
     #[serde(default)]
+    pub tracking_state: String,
+    #[serde(default)]
+    pub tracking_confidence: f32,
+    #[serde(default)]
     pub processed_frames: u32,
+    #[serde(default)]
+    pub accepted_frames: u32,
     #[serde(default)]
     pub integrated_frames: u32,
     #[serde(default)]
@@ -481,6 +544,42 @@ pub struct LiveReconstructionStatus {
     pub overlap: f32,
     #[serde(default)]
     pub depth_rmse_mm: Option<f32>,
+    #[serde(default)]
+    pub pose_uncertainty_mm: Option<f32>,
+    #[serde(default)]
+    pub pose_uncertainty_degrees: Option<f32>,
+    #[serde(default)]
+    pub pose_latency_ms: Option<f32>,
+    #[serde(default)]
+    pub map_update_latency_ms: Option<f32>,
+    #[serde(default)]
+    pub map_update_hz: f32,
+    #[serde(default)]
+    pub allocated_live_map_bytes: u64,
+    #[serde(default)]
+    pub active_voxel_count: u64,
+    #[serde(default)]
+    pub active_surfel_count: u64,
+    #[serde(default)]
+    pub resident_submap_count: u32,
+    #[serde(default)]
+    pub host_cached_submap_count: u32,
+    #[serde(default)]
+    pub dropped_preview_jobs: u64,
+    #[serde(default)]
+    pub tracking_queue_depth: u32,
+    #[serde(default)]
+    pub mapping_queue_depth: u32,
+    #[serde(default)]
+    pub degradation_level: u8,
+    #[serde(default)]
+    pub loop_closure_count: u32,
+    #[serde(default)]
+    pub loop_correction_active: bool,
+    #[serde(default)]
+    pub scale_status: String,
+    #[serde(default)]
+    pub integration_frozen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,6 +671,20 @@ pub struct ArtifactJob {
     pub elapsed_seconds: Option<u32>,
     #[serde(default)]
     pub compute_backend: Option<String>,
+    #[serde(default)]
+    pub rgb_preview_active: bool,
+    #[serde(default)]
+    pub rgb_preview_scale_status: Option<String>,
+    #[serde(default)]
+    pub rgb_preview_confidence: Option<f32>,
+    #[serde(default)]
+    pub rgb_preview_drift_risk: Option<f32>,
+    #[serde(default)]
+    pub rgb_preview_submap_count: Option<u32>,
+    #[serde(default)]
+    pub rgb_preview_accepted_frames: Option<u32>,
+    #[serde(default)]
+    pub rgb_preview_rejected_frames: Option<u32>,
     pub status: String,
     pub created_at: String,
     #[serde(default)]

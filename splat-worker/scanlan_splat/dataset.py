@@ -111,4 +111,23 @@ def load_dataset(path: Path) -> tuple[Path, dict[str, Any]]:
         or not (root / initialization).is_file()
     ):
         raise FileNotFoundError("Gaussian sparse initialization is missing or unsafe")
+    material = dataset.get("gaussianMaterial")
+    if material is not None:
+        if not isinstance(material, dict) or int(material.get("schemaVersion", 0)) != 1:
+            raise ValueError("Unsupported Gaussian material contract schema")
+        if material.get("contract") != "scanlan-gaussian-material-v1":
+            raise ValueError("Unsupported Gaussian material contract")
+        if material.get("colorSpace") != "linear-srgb":
+            raise ValueError("Gaussian material contract must declare linear-srgb")
+        material_parameters = Path(str(material.get("parameters", "")))
+        if (
+            not material_parameters.parts
+            or material_parameters.is_absolute()
+            or ".." in material_parameters.parts
+            or str(material_parameters) != str(dataset.get("initializationParameters", ""))
+            or not (root / material_parameters).is_file()
+        ):
+            raise ValueError(
+                "Gaussian material contract must use the safe initialization parameter sidecar"
+            )
     return root, dataset

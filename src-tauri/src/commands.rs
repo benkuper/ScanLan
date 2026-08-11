@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tauri::{ipc::Response, AppHandle, Manager, State};
 use uuid::Uuid;
 
@@ -56,7 +56,11 @@ struct RealtimeEngineSnapshot {
     status: LiveReconstructionStatus,
     camera_points: Option<LiveGeometryFrame>,
     points: Option<LiveGeometryFrame>,
+    coverage_points: Option<LiveGeometryFrame>,
+    tracking_points: Option<LiveGeometryFrame>,
     mesh: Option<LiveGeometryFrame>,
+    coverage: Option<serde_json::Value>,
+    submaps: Option<serde_json::Value>,
     error: Option<String>,
 }
 
@@ -64,12 +68,16 @@ struct RealtimeEngineSnapshot {
 enum RealtimeGeometry {
     CameraPoints,
     FusedPoints,
+    CoveragePoints,
+    TrackingPoints,
     Mesh,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct RealtimeEngineStatusMessage {
+    #[serde(default)]
+    contract_version: u16,
     #[serde(default)]
     active: bool,
     #[serde(default)]
@@ -80,6 +88,8 @@ struct RealtimeEngineStatusMessage {
     backend: String,
     #[serde(default)]
     processed_frames: u32,
+    #[serde(default)]
+    accepted_frames: u32,
     #[serde(default)]
     rejected_frames: u32,
     #[serde(default)]
@@ -100,6 +110,46 @@ struct RealtimeEngineStatusMessage {
     overlap: f32,
     #[serde(default)]
     depth_rmse_mm: Option<f32>,
+    #[serde(default)]
+    tracking_state: String,
+    #[serde(default)]
+    tracking_confidence: f32,
+    #[serde(default)]
+    pose_uncertainty_mm: Option<f32>,
+    #[serde(default)]
+    pose_uncertainty_degrees: Option<f32>,
+    #[serde(default)]
+    pose_latency_ms: Option<f32>,
+    #[serde(default)]
+    map_update_latency_ms: Option<f32>,
+    #[serde(default)]
+    map_update_hz: f32,
+    #[serde(default)]
+    allocated_live_map_bytes: u64,
+    #[serde(default)]
+    active_voxel_count: u64,
+    #[serde(default)]
+    active_surfel_count: u64,
+    #[serde(default)]
+    resident_submap_count: u32,
+    #[serde(default)]
+    host_cached_submap_count: u32,
+    #[serde(default)]
+    dropped_preview_jobs: u64,
+    #[serde(default)]
+    tracking_queue_depth: u32,
+    #[serde(default)]
+    mapping_queue_depth: u32,
+    #[serde(default)]
+    degradation_level: u8,
+    #[serde(default)]
+    loop_closure_count: u32,
+    #[serde(default)]
+    loop_correction_active: bool,
+    #[serde(default)]
+    scale_status: String,
+    #[serde(default)]
+    integration_frozen: bool,
 }
 
 #[derive(Clone)]
@@ -108,7 +158,37 @@ pub struct AppState {
     pub active_capture: Arc<Mutex<Option<ActiveCapture>>>,
     pub active_preview: Arc<Mutex<Option<ActiveCapture>>>,
     pub active_photo_localization: Arc<Mutex<bool>>,
+    runtime_diagnostics: Arc<Mutex<RuntimeDiagnostics>>,
     pub jobs: crate::jobs::JobManager,
+}
+
+#[derive(Clone, Default)]
+enum RuntimeProbe {
+    #[default]
+    Pending,
+    Running,
+    Complete {
+        available: bool,
+        status: String,
+    },
+}
+
+impl RuntimeProbe {
+    fn snapshot(&self, checking_status: &str) -> (bool, bool, String) {
+        match self {
+            Self::Pending | Self::Running => (false, true, checking_status.to_string()),
+            Self::Complete { available, status } => (*available, false, status.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RuntimeDiagnostics {
+    splat_worker_key: Option<String>,
+    geometry_worker_key: Option<String>,
+    neural_sdf: RuntimeProbe,
+    splat: RuntimeProbe,
+    geometry: RuntimeProbe,
 }
 
 struct PhotoLocalizationGuard {
@@ -130,6 +210,7 @@ impl Default for AppState {
             active_capture: Arc::new(Mutex::new(None)),
             active_preview: Arc::new(Mutex::new(None)),
             active_photo_localization: Arc::new(Mutex::new(false)),
+            runtime_diagnostics: Arc::new(Mutex::new(RuntimeDiagnostics::default())),
             jobs: crate::jobs::JobManager::default(),
         }
     }
@@ -451,9 +532,28 @@ fn restore_sensor_preference(app: &AppHandle, project: &mut ProjectSummary) -> b
 
 fn normalize_project(project: &mut ProjectSummary) -> bool {
     let mut changed = false;
+    if project.settings.depth_refinement_backend == "off"
+        && project.settings.lingbot_depth_refinement
+    {
+        project.settings.depth_refinement_backend = "lingbot".to_string();
+        project.settings.lingbot_depth_refinement = false;
+        changed = true;
+    }
+    if !matches!(
+        project.settings.depth_refinement_backend.as_str(),
+        "off" | "auto" | "lingbot" | "mapanything" | "da3"
+    ) {
+        project.settings.depth_refinement_backend = "off".to_string();
+        changed = true;
+    }
     let safe_voxel_size = project.settings.voxel_size_mm.clamp(1, 40);
     if safe_voxel_size != project.settings.voxel_size_mm {
         project.settings.voxel_size_mm = safe_voxel_size;
+        changed = true;
+    }
+    let safe_live_memory = project.settings.live_map_memory_mib.clamp(256, 4096);
+    if safe_live_memory != project.settings.live_map_memory_mib {
+        project.settings.live_map_memory_mib = safe_live_memory;
         changed = true;
     }
     if !matches!(
@@ -1198,11 +1298,18 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
     if !matches!(settings.live_reconstruction.as_str(), "points" | "mesh") {
         return Err("Unknown live reconstruction mode".to_string());
     }
+    settings.live_map_memory_mib = settings.live_map_memory_mib.clamp(256, 4096);
     if !matches!(
         settings.mesh_repair_profile.as_str(),
         "faithful" | "architectural" | "natural"
     ) {
         return Err("Unknown mesh repair profile".to_string());
+    }
+    if !matches!(
+        settings.depth_refinement_backend.as_str(),
+        "off" | "auto" | "lingbot" | "mapanything" | "da3"
+    ) {
+        return Err("Unknown depth refinement backend".to_string());
     }
     Ok(())
 }
@@ -1248,8 +1355,12 @@ fn start_realtime_engine(
         .arg(&settings.live_reconstruction)
         .arg("--voxel-size")
         .arg(live_voxel_size_m.to_string())
+        .arg("--live-map-mib")
+        .arg(settings.live_map_memory_mib.to_string())
         .arg("--session")
         .arg(phase_root)
+        .arg("--sensor-kind")
+        .arg(&settings.sensor_kind)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
@@ -1390,6 +1501,92 @@ fn output_message(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn worker_runtime_key(worker: Option<&Path>) -> Option<String> {
+    let worker = worker?;
+    let metadata = worker.metadata().ok();
+    let length = metadata.as_ref().map_or(0, fs::Metadata::len);
+    let modified = metadata
+        .and_then(|value| value.modified().ok())
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |value| value.as_nanos());
+    Some(format!("{}:{length}:{modified}", worker.display()))
+}
+
+fn diagnostic_output(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start runtime diagnostics: {error}"))?;
+    let lifetime_guard = match crate::jobs::ChildLifetimeGuard::attach(&child) {
+        Ok(guard) => guard,
+        Err(error) => {
+            child.kill().ok();
+            child.wait().ok();
+            return Err(error);
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not capture runtime diagnostic output".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Could not capture runtime diagnostic errors".to_string())?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stdout;
+        stream.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stderr;
+        stream.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                child.kill().ok();
+                child.wait().ok();
+                drop(lifetime_guard);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "Runtime diagnostics exceeded the {} second startup limit",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                child.kill().ok();
+                child.wait().ok();
+                drop(lifetime_guard);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("Could not monitor runtime diagnostics: {error}"));
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "Runtime diagnostic output reader stopped unexpectedly".to_string())?
+        .map_err(|error| format!("Could not read runtime diagnostic output: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "Runtime diagnostic error reader stopped unexpectedly".to_string())?
+        .map_err(|error| format!("Could not read runtime diagnostic errors: {error}"))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn parse_available_sensors(output: &std::process::Output) -> Vec<AvailableSensor> {
     if !output.status.success() {
         return Vec::new();
@@ -1476,16 +1673,28 @@ fn read_realtime_engine_stream(
                 1 => {
                     let message: RealtimeEngineStatusMessage = serde_json::from_slice(&payload)
                         .map_err(|error| format!("Realtime engine status is invalid: {error}"))?;
+                    let tracking_state = if message.tracking_state.is_empty() {
+                        message.state.clone()
+                    } else {
+                        message.tracking_state.clone()
+                    };
                     snapshot.status = LiveReconstructionStatus {
+                        contract_version: message.contract_version,
                         active: message.active,
                         mode: mode.clone(),
-                        tracking: message.state == "tracking",
+                        tracking: matches!(
+                            tracking_state.as_str(),
+                            "tracking" | "relocalized" | "frozen"
+                        ),
                         tracking_status: if message.detail.is_empty() {
-                            message.state
+                            tracking_state.clone()
                         } else {
                             message.detail
                         },
+                        tracking_state,
+                        tracking_confidence: message.tracking_confidence,
                         processed_frames: message.processed_frames,
+                        accepted_frames: message.accepted_frames,
                         integrated_frames: message.integrated_frames,
                         rejected_frames: message.rejected_frames,
                         point_count: message.point_count,
@@ -1497,9 +1706,27 @@ fn read_realtime_engine_stream(
                         mapping_drops: message.mapping_drops,
                         overlap: message.overlap,
                         depth_rmse_mm: message.depth_rmse_mm,
+                        pose_uncertainty_mm: message.pose_uncertainty_mm,
+                        pose_uncertainty_degrees: message.pose_uncertainty_degrees,
+                        pose_latency_ms: message.pose_latency_ms,
+                        map_update_latency_ms: message.map_update_latency_ms,
+                        map_update_hz: message.map_update_hz,
+                        allocated_live_map_bytes: message.allocated_live_map_bytes,
+                        active_voxel_count: message.active_voxel_count,
+                        active_surfel_count: message.active_surfel_count,
+                        resident_submap_count: message.resident_submap_count,
+                        host_cached_submap_count: message.host_cached_submap_count,
+                        dropped_preview_jobs: message.dropped_preview_jobs,
+                        tracking_queue_depth: message.tracking_queue_depth,
+                        mapping_queue_depth: message.mapping_queue_depth,
+                        degradation_level: message.degradation_level,
+                        loop_closure_count: message.loop_closure_count,
+                        loop_correction_active: message.loop_correction_active,
+                        scale_status: message.scale_status,
+                        integration_frozen: message.integration_frozen,
                     };
                 }
-                2 | 4 => {
+                2 | 4 | 7 | 8 => {
                     if payload.len() < 24 || &payload[0..4] != b"K2P1" {
                         return Err("Realtime point packet has an invalid header".to_string());
                     }
@@ -1519,8 +1746,12 @@ fn read_realtime_engine_stream(
                     if kind == 2 {
                         snapshot.status.point_count = point_count as u64;
                         snapshot.points = Some(frame);
-                    } else {
+                    } else if kind == 4 {
                         snapshot.camera_points = Some(frame);
+                    } else if kind == 7 {
+                        snapshot.coverage_points = Some(frame);
+                    } else {
+                        snapshot.tracking_points = Some(frame);
                     }
                 }
                 3 => {
@@ -1549,6 +1780,26 @@ fn read_realtime_engine_stream(
                         packet: Arc::new(payload),
                     });
                 }
+                5 | 6 => {
+                    let message: serde_json::Value =
+                        serde_json::from_slice(&payload).map_err(|error| {
+                            format!("Realtime contract message is invalid: {error}")
+                        })?;
+                    if message
+                        .get("contractVersion")
+                        .and_then(|value| value.as_u64())
+                        != Some(2)
+                    {
+                        return Err(
+                            "Realtime contract message has an unsupported version".to_string()
+                        );
+                    }
+                    if kind == 5 {
+                        snapshot.coverage = Some(message);
+                    } else {
+                        snapshot.submaps = Some(message);
+                    }
+                }
                 _ => return Err("Realtime engine emitted an unknown message kind".to_string()),
             }
         }
@@ -1575,6 +1826,8 @@ fn realtime_packet(
     let geometry = match geometry {
         RealtimeGeometry::CameraPoints => snapshot.camera_points.as_ref(),
         RealtimeGeometry::FusedPoints => snapshot.points.as_ref(),
+        RealtimeGeometry::CoveragePoints => snapshot.coverage_points.as_ref(),
+        RealtimeGeometry::TrackingPoints => snapshot.tracking_points.as_ref(),
         RealtimeGeometry::Mesh => snapshot.mesh.as_ref(),
     };
     match geometry {
@@ -1584,6 +1837,7 @@ fn realtime_packet(
 }
 
 const LIVE_CAPTURE_PREVIEW_FILE: &str = "live-reconstruction.preview.bin";
+const LIVE_ARTIFACT_DIRECTORY: &str = "live";
 
 fn valid_packed_point_preview(packet: &[u8]) -> bool {
     if packet.len() < 24 || &packet[0..4] != b"K2P1" {
@@ -1596,13 +1850,129 @@ fn valid_packed_point_preview(packet: &[u8]) -> bool {
     point_count <= 150_000 && packet.len() == 24 + point_count * 15
 }
 
+fn packed_point_preview_to_ply(packet: &[u8]) -> Result<Vec<u8>, String> {
+    if !valid_packed_point_preview(packet) {
+        return Err("Realtime point preview is incomplete".to_string());
+    }
+    let point_count = u32::from_le_bytes(packet[20..24].try_into().unwrap());
+    let header = format!(
+        concat!(
+            "ply\n",
+            "format binary_little_endian 1.0\n",
+            "comment ScanLan provisional live reconstruction\n",
+            "element vertex {}\n",
+            "property float x\nproperty float y\nproperty float z\n",
+            "property uchar red\nproperty uchar green\nproperty uchar blue\n",
+            "end_header\n"
+        ),
+        point_count
+    );
+    let mut output = Vec::with_capacity(header.len() + packet.len() - 24);
+    output.extend_from_slice(header.as_bytes());
+    output.extend_from_slice(&packet[24..]);
+    Ok(output)
+}
+
+fn packed_point_preview_to_glb(packet: &[u8]) -> Result<Vec<u8>, String> {
+    if !valid_packed_point_preview(packet) {
+        return Err("Realtime point preview is incomplete".to_string());
+    }
+    let point_count = u32::from_le_bytes(packet[20..24].try_into().unwrap()) as usize;
+    let mut positions = Vec::with_capacity(point_count * 12);
+    let mut colors = Vec::with_capacity(point_count * 3 + 3);
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for record in packet[24..].chunks_exact(15) {
+        positions.extend_from_slice(&record[..12]);
+        colors.extend_from_slice(&record[12..15]);
+        for axis in 0..3 {
+            let start = axis * 4;
+            let value = f32::from_le_bytes(record[start..start + 4].try_into().unwrap());
+            minimum[axis] = minimum[axis].min(value);
+            maximum[axis] = maximum[axis].max(value);
+        }
+    }
+    while colors.len() % 4 != 0 {
+        colors.push(0);
+    }
+    if point_count == 0 {
+        minimum = [0.0; 3];
+        maximum = [0.0; 3];
+    }
+    let position_bytes = positions.len();
+    let binary_bytes = position_bytes + colors.len();
+    let document = serde_json::json!({
+        "asset": {"version": "2.0", "generator": "ScanLan Reconstruction 2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"name": "Provisional live map", "primitives": [{
+            "attributes": {"POSITION": 0, "COLOR_0": 1},
+            "mode": 0
+        }]}],
+        "buffers": [{"byteLength": binary_bytes}],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": position_bytes, "target": 34962},
+            {"buffer": 0, "byteOffset": position_bytes, "byteLength": point_count * 3, "target": 34962}
+        ],
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": point_count,
+                "type": "VEC3",
+                "min": minimum,
+                "max": maximum
+            },
+            {
+                "bufferView": 1,
+                "componentType": 5121,
+                "normalized": true,
+                "count": point_count,
+                "type": "VEC3"
+            }
+        ]
+    });
+    let mut json = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+    while json.len() % 4 != 0 {
+        json.push(b' ');
+    }
+    let mut binary = positions;
+    binary.extend_from_slice(&colors);
+    while binary.len() % 4 != 0 {
+        binary.push(0);
+    }
+    let total_length = 12 + 8 + json.len() + 8 + binary.len();
+    let mut output = Vec::with_capacity(total_length);
+    output.extend_from_slice(b"glTF");
+    output.extend_from_slice(&2_u32.to_le_bytes());
+    output.extend_from_slice(&(total_length as u32).to_le_bytes());
+    output.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    output.extend_from_slice(&0x4E4F534A_u32.to_le_bytes());
+    output.extend_from_slice(&json);
+    output.extend_from_slice(&(binary.len() as u32).to_le_bytes());
+    output.extend_from_slice(&0x004E4942_u32.to_le_bytes());
+    output.extend_from_slice(&binary);
+    Ok(output)
+}
+
+fn live_map_fingerprint(packet: &[u8]) -> String {
+    let hash = packet.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("fnv1a64:{hash:016x}")
+}
+
 fn save_live_reconstruction_preview(
+    project_root: &Path,
     phase_root: &Path,
     realtime: &Arc<Mutex<RealtimeEngineSnapshot>>,
 ) -> Result<bool, String> {
-    let packet = realtime
+    let snapshot = realtime
         .lock()
         .map_err(|_| "Realtime preview state is unavailable".to_string())?
+        .clone();
+    let packet = snapshot
         .points
         .as_ref()
         .map(|frame| Arc::clone(&frame.packet));
@@ -1614,6 +1984,98 @@ fn save_live_reconstruction_preview(
     }
     fs::write(phase_root.join(LIVE_CAPTURE_PREVIEW_FILE), packet.as_ref())
         .map_err(|error| format!("Could not preserve the live reconstruction: {error}"))?;
+    let live_root = project_root.join("outputs").join(LIVE_ARTIFACT_DIRECTORY);
+    fs::create_dir_all(live_root.join("submaps")).map_err(|error| error.to_string())?;
+    fs::create_dir_all(live_root.join("coverage")).map_err(|error| error.to_string())?;
+    write_export(&live_root.join("latest-preview.bin"), packet.as_ref())?;
+    write_export(
+        &live_root.join("latest-preview.ply"),
+        &packed_point_preview_to_ply(packet.as_ref())?,
+    )?;
+    write_export(
+        &live_root.join("latest-preview.glb"),
+        &packed_point_preview_to_glb(packet.as_ref())?,
+    )?;
+    let journal = phase_root.join("tracking.jsonl");
+    if let Ok(bytes) = fs::read(&journal) {
+        write_export(&live_root.join("poses.jsonl"), &bytes)?;
+    }
+    let loop_journal = phase_root.join("live_loops.jsonl");
+    let loop_decisions = fs::read_to_string(&loop_journal)
+        .ok()
+        .map(|value| {
+            value
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Ok(bytes) = fs::read(&loop_journal) {
+        write_export(&live_root.join("loops.jsonl"), &bytes)?;
+    }
+    if let Some(coverage) = &snapshot.coverage {
+        storage::write_json(&live_root.join("coverage").join("latest.json"), coverage)?;
+    }
+    if let Some(submaps) = &snapshot.submaps {
+        storage::write_json(&live_root.join("submaps").join("descriptors.json"), submaps)?;
+    }
+    let phase_manifest = File::open(phase_root.join("phase.json"))
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
+    let session = serde_json::json!({
+        "schemaVersion": 1,
+        "contractVersion": 2,
+        "sourceType": "rgbd",
+        "liveEngineRevision": env!("CARGO_PKG_VERSION"),
+        "phaseId": phase_root.file_name().map(|value| value.to_string_lossy()),
+        "calibration": phase_manifest.as_ref().and_then(|value| value.get("camera")),
+        "sensor": phase_manifest.as_ref().and_then(|value| value.get("sensor")),
+        "submaps": snapshot.submaps.as_ref().and_then(|value| value.get("submaps")).cloned().unwrap_or_else(|| serde_json::json!([])),
+        "poseGraph": snapshot.submaps.as_ref().and_then(|value| value.get("poseGraph")).cloned(),
+        "coverage": snapshot.coverage.clone(),
+        "provisionalScaleStatus": if snapshot.status.scale_status.is_empty() { "SENSOR_METRIC" } else { snapshot.status.scale_status.as_str() },
+        "trackingStatistics": {
+            "processedFrames": snapshot.status.processed_frames,
+            "acceptedFrames": snapshot.status.accepted_frames,
+            "rejectedFrames": snapshot.status.rejected_frames,
+            "integratedFrames": snapshot.status.integrated_frames,
+            "trackingConfidence": snapshot.status.tracking_confidence
+        },
+        "acceptedLoops": loop_decisions.iter().filter(|value| value.get("accepted").and_then(|accepted| accepted.as_bool()).unwrap_or(false)).cloned().collect::<Vec<_>>(),
+        "rejectedLoops": loop_decisions.iter().filter(|value| !value.get("accepted").and_then(|accepted| accepted.as_bool()).unwrap_or(false)).cloned().collect::<Vec<_>>(),
+        "queueDrops": {
+            "source": snapshot.status.source_drops,
+            "tracking": snapshot.status.tracking_queue_drops,
+            "mapping": snapshot.status.mapping_drops,
+            "preview": snapshot.status.dropped_preview_jobs
+        },
+        "peakMemory": {
+            "allocatedLiveMapBytes": snapshot.status.allocated_live_map_bytes
+        },
+        "loopClosureCount": snapshot.status.loop_closure_count,
+        "finalLiveMapFingerprint": live_map_fingerprint(packet.as_ref()),
+        "preview": {
+            "frameSequence": snapshot.points.as_ref().map(|frame| frame.frame_count),
+            "pointCount": snapshot.status.point_count,
+            "ply": "latest-preview.ply",
+            "glb": "latest-preview.glb"
+        },
+        "publishedAt": Utc::now().to_rfc3339()
+    });
+    storage::write_json(&live_root.join("session.json"), &session)?;
+    storage::write_json(
+        &live_root.join("tracking-summary.json"),
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "state": snapshot.status.tracking_state,
+            "confidence": snapshot.status.tracking_confidence,
+            "processedFrames": snapshot.status.processed_frames,
+            "acceptedFrames": snapshot.status.accepted_frames,
+            "rejectedFrames": snapshot.status.rejected_frames,
+            "integratedFrames": snapshot.status.integrated_frames,
+            "integrationFrozen": snapshot.status.integration_frozen
+        }),
+    )?;
     Ok(true)
 }
 
@@ -1660,25 +2122,82 @@ pub async fn live_reconstruction_mesh(
 }
 
 #[tauri::command]
+pub async fn live_reconstruction_overlay(
+    mode: String,
+    after_frame: u32,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let geometry = match mode.as_str() {
+        "coverage" => RealtimeGeometry::CoveragePoints,
+        "tracking" | "confidence" => RealtimeGeometry::TrackingPoints,
+        _ => return Err("Live overlay mode must be coverage, tracking, or confidence".to_string()),
+    };
+    let realtime = state
+        .active_capture
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|capture| Arc::clone(&capture.realtime)));
+    let body = realtime
+        .map(|snapshot| realtime_packet(&snapshot, geometry, after_frame))
+        .unwrap_or_default();
+    Ok(tauri::ipc::Response::new(body))
+}
+
+#[tauri::command]
+pub fn live_reconstruction_guidance(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let realtime = state
+        .active_capture
+        .lock()
+        .map_err(|_| "Capture state is unavailable".to_string())?
+        .as_ref()
+        .map(|capture| Arc::clone(&capture.realtime));
+    let Some(realtime) = realtime else {
+        return Ok(serde_json::json!({
+            "contractVersion": 2,
+            "coverage": null,
+            "submaps": null
+        }));
+    };
+    let snapshot = realtime
+        .lock()
+        .map_err(|_| "Realtime reconstruction state is unavailable".to_string())?;
+    Ok(serde_json::json!({
+        "contractVersion": 2,
+        "coverage": snapshot.coverage,
+        "submaps": snapshot.submaps
+    }))
+}
+
+#[tauri::command]
 pub async fn load_capture_draft(project_path: String) -> Result<tauri::ipc::Response, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = PathBuf::from(project_path);
         let project = storage::read_project(&root)?;
-        let packet = project
-            .phases
-            .iter()
-            .rev()
-            .filter(|phase| phase.status == "complete")
-            .find_map(|phase| {
-                fs::read(
-                    root.join("phases")
-                        .join(&phase.id)
-                        .join(LIVE_CAPTURE_PREVIEW_FILE),
-                )
-                .ok()
-            })
-            .filter(|packet| valid_packed_point_preview(packet))
-            .unwrap_or_default();
+        let packet = fs::read(
+            root.join("outputs")
+                .join(LIVE_ARTIFACT_DIRECTORY)
+                .join("latest-preview.bin"),
+        )
+        .ok()
+        .or_else(|| {
+            project
+                .phases
+                .iter()
+                .rev()
+                .filter(|phase| phase.status == "complete")
+                .find_map(|phase| {
+                    fs::read(
+                        root.join("phases")
+                            .join(&phase.id)
+                            .join(LIVE_CAPTURE_PREVIEW_FILE),
+                    )
+                    .ok()
+                })
+        })
+        .filter(|packet| valid_packed_point_preview(packet))
+        .unwrap_or_default();
         Ok(tauri::ipc::Response::new(packet))
     })
     .await
@@ -1793,50 +2312,80 @@ pub async fn available_sensors(
     .map_err(|error| format!("Sensor discovery failed: {error}"))
 }
 
-#[tauri::command]
-pub async fn runtime_info(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<RuntimeInfo, String> {
-    let resources = resource_root(&app);
-    let settings = state
-        .project
-        .lock()
-        .map(|project| project.settings.clone())
-        .unwrap_or_default();
-    let runtime = tauri::async_runtime::spawn_blocking(move || {
-        let sensor_capabilities = installed_sensor_capabilities(resources.as_deref());
-        let sensor_worker_available = sensor_capabilities
-            .iter()
-            .any(|capability| capability == &settings.sensor_kind);
-        let reconstruction_worker_available = first_existing(
-            storage::candidate_reconstruction_worker_paths(resources.as_deref()),
-        )
-        .is_some();
-        let splat_worker =
-            first_existing(storage::candidate_splat_worker_paths(resources.as_deref()));
-        let (splat_worker_available, splat_status) = match splat_worker {
-            Some(worker) => {
+#[derive(Clone, Copy)]
+enum RuntimeProbeKind {
+    NeuralSdf,
+    Splat,
+    Geometry,
+}
+
+fn launch_runtime_probe(
+    diagnostics: Arc<Mutex<RuntimeDiagnostics>>,
+    kind: RuntimeProbeKind,
+    worker: PathBuf,
+    worker_key: String,
+) {
+    thread::spawn(move || {
+        let (available, status) = match kind {
+            RuntimeProbeKind::NeuralSdf => {
+                let mut command = worker_command(&worker);
+                command.args(["diagnostics", "--require-neural-sdf"]);
+                match diagnostic_output(command, Duration::from_secs(90)) {
+                    Ok(output) => {
+                        let report = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            .unwrap_or_default();
+                        let cuda = report
+                            .get("cuda")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let validated = report
+                            .pointer("/neuralSdf/cudaValidated")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let device = report
+                            .get("device")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("CUDA device");
+                        if output.status.success() && cuda && validated {
+                            (true, format!("Neural SDF CUDA runtime ready on {device}"))
+                        } else if !cuda {
+                            (
+                                false,
+                                "Neural SDF runtime is installed, but CUDA is unavailable"
+                                    .to_string(),
+                            )
+                        } else {
+                            let detail = output_message(&output);
+                            (
+                                false,
+                                if detail.is_empty() {
+                                    "Neural SDF CUDA diagnostics failed".to_string()
+                                } else {
+                                    detail
+                                },
+                            )
+                        }
+                    }
+                    Err(error) => (false, error),
+                }
+            }
+            RuntimeProbeKind::Splat => {
                 let mut command = worker_command(&worker);
                 command.args([
                     "diagnostics",
                     "--require-cuda",
                     "--require-learned-features",
-                    "--require-lingbot",
-                    "--require-lingbot-depth",
-                    "--require-flashinfer",
                     "--require-adaptive-frames",
                 ]);
-                match command.output() {
+                match diagnostic_output(command, Duration::from_secs(180)) {
                     Ok(output) => {
-                        let diagnostics =
-                            serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                                .unwrap_or_default();
-                        let cuda = diagnostics
+                        let report = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            .unwrap_or_default();
+                        let cuda = report
                             .get("cuda")
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false);
-                        let device = diagnostics
+                        let device = report
                             .get("device")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("CUDA device");
@@ -1862,17 +2411,188 @@ pub async fn runtime_info(
                             )
                         }
                     }
-                    Err(error) => (
-                        false,
-                        format!("Could not start splat runtime diagnostics: {error}"),
-                    ),
+                    Err(error) => (false, error),
                 }
             }
-            None => (
-                false,
-                "Not installed; run npm run prepare:splat".to_string(),
-            ),
+            RuntimeProbeKind::Geometry => {
+                let mut command = worker_command(&worker);
+                command.args([
+                    "diagnostics",
+                    "--require-lingbot",
+                    "--require-lingbot-depth",
+                    "--require-mapanything",
+                    "--require-da3",
+                    "--require-flashinfer",
+                ]);
+                match diagnostic_output(command, Duration::from_secs(300)) {
+                    Ok(output) if output.status.success() => (
+                        true,
+                        "Isolated LingBot, MapAnything, and DA3 Max runtime ready".to_string(),
+                    ),
+                    Ok(output) => {
+                        let detail = output_message(&output);
+                        (
+                            false,
+                            if detail.is_empty() {
+                                "Learned geometry runtime diagnostics failed".to_string()
+                            } else {
+                                detail
+                            },
+                        )
+                    }
+                    Err(error) => (false, error),
+                }
+            }
         };
+        if let Ok(mut state) = diagnostics.lock() {
+            let current_key = match kind {
+                RuntimeProbeKind::NeuralSdf | RuntimeProbeKind::Splat => &state.splat_worker_key,
+                RuntimeProbeKind::Geometry => &state.geometry_worker_key,
+            };
+            if current_key.as_deref() != Some(worker_key.as_str()) {
+                return;
+            }
+            let probe = match kind {
+                RuntimeProbeKind::NeuralSdf => &mut state.neural_sdf,
+                RuntimeProbeKind::Splat => &mut state.splat,
+                RuntimeProbeKind::Geometry => &mut state.geometry,
+            };
+            *probe = RuntimeProbe::Complete { available, status };
+        }
+    });
+}
+
+#[tauri::command]
+pub async fn runtime_info(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RuntimeInfo, String> {
+    let resources = resource_root(&app);
+    let settings = state
+        .project
+        .lock()
+        .map(|project| project.settings.clone())
+        .unwrap_or_default();
+    let diagnostics = Arc::clone(&state.runtime_diagnostics);
+    tauri::async_runtime::spawn_blocking(move || {
+        let sensor_capabilities = installed_sensor_capabilities(resources.as_deref());
+        let sensor_worker_available = sensor_capabilities
+            .iter()
+            .any(|capability| capability == &settings.sensor_kind);
+        let reconstruction_worker_available = first_existing(
+            storage::candidate_reconstruction_worker_paths(resources.as_deref()),
+        )
+        .is_some();
+        let splat_worker =
+            first_existing(storage::candidate_splat_worker_paths(resources.as_deref()));
+        let geometry_worker = first_existing(storage::candidate_geometry_worker_paths(
+            resources.as_deref(),
+        ));
+        let splat_key = worker_runtime_key(splat_worker.as_deref());
+        let geometry_key = worker_runtime_key(geometry_worker.as_deref());
+        let mut launch = None;
+        let (neural_sdf_available, neural_sdf_checking, neural_sdf_status);
+        let (splat_worker_available, splat_worker_checking, splat_status);
+        let (geometry_worker_available, geometry_worker_checking, geometry_status);
+        {
+            let mut probe_state = diagnostics
+                .lock()
+                .map_err(|_| "Runtime diagnostic state is unavailable".to_string())?;
+            if probe_state.splat_worker_key != splat_key {
+                probe_state.splat_worker_key = splat_key.clone();
+                probe_state.neural_sdf = RuntimeProbe::Pending;
+                probe_state.splat = RuntimeProbe::Pending;
+            }
+            if probe_state.geometry_worker_key != geometry_key {
+                probe_state.geometry_worker_key = geometry_key.clone();
+                probe_state.geometry = RuntimeProbe::Pending;
+            }
+            if splat_worker.is_none() {
+                let status = "Not installed; run npm run prepare:splat".to_string();
+                probe_state.neural_sdf = RuntimeProbe::Complete {
+                    available: false,
+                    status: status.clone(),
+                };
+                probe_state.splat = RuntimeProbe::Complete {
+                    available: false,
+                    status,
+                };
+            }
+            if geometry_worker.is_none() {
+                probe_state.geometry = RuntimeProbe::Complete {
+                    available: false,
+                    status: "Not installed; run npm run prepare:splat".to_string(),
+                };
+            }
+
+            // Resolve one heavy runtime at a time. Neural SDF is intentionally
+            // first because it has a small, independent Torch CUDA probe. The
+            // former sequential command made it wait behind multi-model learned
+            // geometry diagnostics for several minutes.
+            if matches!(probe_state.neural_sdf, RuntimeProbe::Pending) {
+                if let Some(worker) = splat_worker.clone() {
+                    probe_state.neural_sdf = RuntimeProbe::Running;
+                    launch = splat_key
+                        .clone()
+                        .map(|key| (RuntimeProbeKind::NeuralSdf, worker, key));
+                }
+            } else if !matches!(probe_state.neural_sdf, RuntimeProbe::Running)
+                && matches!(probe_state.splat, RuntimeProbe::Pending)
+            {
+                let neural_ready = matches!(
+                    probe_state.neural_sdf,
+                    RuntimeProbe::Complete {
+                        available: true,
+                        ..
+                    }
+                );
+                if neural_ready {
+                    if let Some(worker) = splat_worker.clone() {
+                        probe_state.splat = RuntimeProbe::Running;
+                        launch = splat_key
+                            .clone()
+                            .map(|key| (RuntimeProbeKind::Splat, worker, key));
+                    }
+                } else {
+                    let status = match &probe_state.neural_sdf {
+                        RuntimeProbe::Complete { status, .. } => status.clone(),
+                        _ => "CUDA diagnostics did not complete".to_string(),
+                    };
+                    probe_state.splat = RuntimeProbe::Complete {
+                        available: false,
+                        status,
+                    };
+                }
+            } else if !matches!(
+                probe_state.splat,
+                RuntimeProbe::Pending | RuntimeProbe::Running
+            ) && matches!(probe_state.geometry, RuntimeProbe::Pending)
+            {
+                if let Some(worker) = geometry_worker.clone() {
+                    probe_state.geometry = RuntimeProbe::Running;
+                    launch = geometry_key
+                        .clone()
+                        .map(|key| (RuntimeProbeKind::Geometry, worker, key));
+                }
+            }
+
+            (neural_sdf_available, neural_sdf_checking, neural_sdf_status) = probe_state
+                .neural_sdf
+                .snapshot("Checking the neural SDF CUDA runtime...");
+            (splat_worker_available, splat_worker_checking, splat_status) = probe_state
+                .splat
+                .snapshot("Waiting for CUDA runtime diagnostics...");
+            (
+                geometry_worker_available,
+                geometry_worker_checking,
+                geometry_status,
+            ) = probe_state
+                .geometry
+                .snapshot("Waiting for prioritized CUDA diagnostics...");
+        }
+        if let Some((kind, worker, key)) = launch {
+            launch_runtime_probe(Arc::clone(&diagnostics), kind, worker, key);
+        }
         let sensor_status = if sensor_worker_available {
             format!(
                 "{} capture support ready; the camera opens when recording starts",
@@ -1885,27 +2605,25 @@ pub async fn runtime_info(
             )
         };
 
-        RuntimeInfo {
+        Ok(RuntimeInfo {
             platform: std::env::consts::OS.to_string(),
             sensor_capabilities,
             sensor_worker_available,
             sensor_status,
             reconstruction_worker_available,
+            neural_sdf_available,
+            neural_sdf_checking,
+            neural_sdf_status,
             splat_worker_available,
+            splat_worker_checking,
             splat_status,
-        }
+            geometry_worker_available,
+            geometry_worker_checking,
+            geometry_status,
+        })
     })
     .await
-    .unwrap_or_else(|error| RuntimeInfo {
-        platform: std::env::consts::OS.to_string(),
-        sensor_capabilities: Vec::new(),
-        sensor_worker_available: false,
-        sensor_status: format!("Sensor connection check failed: {error}"),
-        reconstruction_worker_available: false,
-        splat_worker_available: false,
-        splat_status: "Splat runtime detection failed".to_string(),
-    });
-    Ok(runtime)
+    .map_err(|error| format!("Runtime detection task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2099,9 +2817,11 @@ pub fn update_project_settings(
     let mesh_repair_changed = project.settings.repair_mesh != settings.repair_mesh
         || project.settings.mesh_repair_profile != settings.mesh_repair_profile
         || project.settings.fill_inferred_mesh_holes != settings.fill_inferred_mesh_holes
-        || project.settings.produce_watertight_mesh != settings.produce_watertight_mesh;
-    let depth_refinement_changed =
-        project.settings.lingbot_depth_refinement != settings.lingbot_depth_refinement;
+        || project.settings.produce_watertight_mesh != settings.produce_watertight_mesh
+        || project.settings.neural_sdf_refinement != settings.neural_sdf_refinement;
+    let depth_refinement_changed = project.settings.depth_refinement_backend
+        != settings.depth_refinement_backend
+        || project.settings.lingbot_depth_refinement != settings.lingbot_depth_refinement;
     project.settings = settings;
     if depth_refinement_changed {
         for artifact in [
@@ -2131,6 +2851,7 @@ pub fn update_project_settings(
         project.mesh_repair_openings_preserved = None;
         project.mesh_repair_unknown_preserved = None;
         project.watertight_mesh_output_path = None;
+        project.neural_sdf = None;
     }
     storage::write_project(&project)?;
     write_sensor_preference(&app, &project.settings)?;
@@ -2718,7 +3439,12 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
         drain_live_reconstruction(&mut capture, Duration::from_secs(1));
         stop_live_reconstruction(&mut capture, Duration::from_secs(2));
-        save_live_reconstruction_preview(&capture.phase_root, &capture.realtime).ok();
+        save_live_reconstruction_preview(
+            &capture.project_root,
+            &capture.phase_root,
+            &capture.realtime,
+        )
+        .ok();
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
         let detail = read_sensor_log(&capture.phase_root);
         let frame_count = indexed_frame_count(&capture.phase_root);
@@ -2751,6 +3477,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         let selected_sensor_name = sensor_name(&project.settings).to_string();
         return Ok(CaptureStatus {
             project: project.clone(),
+            live_contract_version: 2,
             preview: Vec::new(),
             capturing: false,
             previewing: false,
@@ -2768,6 +3495,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             stream_fps: 0.0,
             tracking: false,
             tracking_status: "Tracking stopped".to_string(),
+            tracking_state: "complete".to_string(),
+            tracking_confidence: 0.0,
             imu_active: false,
             imu_rate_hz: 0.0,
             live_reconstruction_active: false,
@@ -2780,7 +3509,25 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             source_drop_count: 0,
             tracking_queue_drop_count: 0,
             mapping_drop_count: 0,
+            tracking_queue_depth: 0,
+            mapping_queue_depth: 0,
             tracking_overlap: 0.0,
+            pose_uncertainty_mm: None,
+            pose_uncertainty_degrees: None,
+            pose_latency_ms: None,
+            map_update_latency_ms: None,
+            map_update_hz: 0.0,
+            allocated_live_map_bytes: 0,
+            active_voxel_count: 0,
+            active_surfel_count: 0,
+            resident_submap_count: 0,
+            host_cached_submap_count: 0,
+            dropped_preview_job_count: 0,
+            degradation_level: 0,
+            loop_closure_count: 0,
+            loop_correction_active: false,
+            live_scale_status: "SENSOR_METRIC".to_string(),
+            integration_frozen: false,
             depth_rmse_mm: None,
             live_reconstruction_backend: None,
             reconstruction,
@@ -2842,6 +3589,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
     }
 
     if let Some((phase_root, phase_id, realtime, recording)) = active_snapshot {
+        let tracking_held = recording && phase_root.join("tracking-hold.flag").exists();
         let live = live_worker_status(&phase_root);
         let frame_count = live
             .as_ref()
@@ -2884,6 +3632,11 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             .unwrap_or_else(|| sensor_name(&project.settings).to_string());
         return Ok(CaptureStatus {
             project: project.clone(),
+            live_contract_version: live_reconstruction
+                .as_ref()
+                .map(|status| status.contract_version)
+                .filter(|version| *version > 0)
+                .unwrap_or(1),
             preview_point_count: live_reconstruction
                 .as_ref()
                 .map(|status| status.point_count)
@@ -2892,16 +3645,23 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             capturing: recording,
             previewing: !recording,
             sensor_connected: live.is_some(),
-            sensor_paused: false,
+            sensor_paused: tracking_held,
             sensor_status: live
                 .as_ref()
                 .map(|status| {
-                    format!(
-                        "{} {} at {:.1} fps",
-                        selected_sensor_name,
-                        if recording { "recording" } else { "previewing" },
-                        status.stream_fps
-                    )
+                    if tracking_held {
+                        format!(
+                            "{} streaming at {:.1} fps; retained recording waits for tracking",
+                            selected_sensor_name, status.stream_fps
+                        )
+                    } else {
+                        format!(
+                            "{} {} at {:.1} fps",
+                            selected_sensor_name,
+                            if recording { "recording" } else { "previewing" },
+                            status.stream_fps
+                        )
+                    }
                 })
                 .unwrap_or_else(|| "Waiting for the next sensor frame".to_string()),
             sensor_name: selected_sensor_name,
@@ -2918,6 +3678,15 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
                 .map(|status| status.tracking_status.clone())
                 .or_else(|| live.as_ref().map(|status| status.tracking_status.clone()))
                 .unwrap_or_else(|| "Initializing camera tracking".to_string()),
+            tracking_state: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking_state.clone())
+                .filter(|state| !state.is_empty())
+                .unwrap_or_else(|| if recording { "searching" } else { "preview" }.to_string()),
+            tracking_confidence: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking_confidence)
+                .unwrap_or(0.0),
             imu_active: live
                 .as_ref()
                 .map(|status| status.imu_active)
@@ -2966,10 +3735,79 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
                 .as_ref()
                 .map(|status| status.mapping_drops)
                 .unwrap_or(0),
+            tracking_queue_depth: live_reconstruction
+                .as_ref()
+                .map(|status| status.tracking_queue_depth)
+                .unwrap_or(0),
+            mapping_queue_depth: live_reconstruction
+                .as_ref()
+                .map(|status| status.mapping_queue_depth)
+                .unwrap_or(0),
             tracking_overlap: live_reconstruction
                 .as_ref()
                 .map(|status| status.overlap)
                 .unwrap_or(0.0),
+            pose_uncertainty_mm: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.pose_uncertainty_mm),
+            pose_uncertainty_degrees: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.pose_uncertainty_degrees),
+            pose_latency_ms: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.pose_latency_ms),
+            map_update_latency_ms: live_reconstruction
+                .as_ref()
+                .and_then(|status| status.map_update_latency_ms),
+            map_update_hz: live_reconstruction
+                .as_ref()
+                .map(|status| status.map_update_hz)
+                .unwrap_or(0.0),
+            allocated_live_map_bytes: live_reconstruction
+                .as_ref()
+                .map(|status| status.allocated_live_map_bytes)
+                .unwrap_or(0),
+            active_voxel_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.active_voxel_count)
+                .unwrap_or(0),
+            active_surfel_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.active_surfel_count)
+                .unwrap_or(0),
+            resident_submap_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.resident_submap_count)
+                .unwrap_or(0),
+            host_cached_submap_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.host_cached_submap_count)
+                .unwrap_or(0),
+            dropped_preview_job_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.dropped_preview_jobs)
+                .unwrap_or(0),
+            degradation_level: live_reconstruction
+                .as_ref()
+                .map(|status| status.degradation_level)
+                .unwrap_or(0),
+            loop_closure_count: live_reconstruction
+                .as_ref()
+                .map(|status| status.loop_closure_count)
+                .unwrap_or(0),
+            loop_correction_active: live_reconstruction
+                .as_ref()
+                .map(|status| status.loop_correction_active)
+                .unwrap_or(false),
+            live_scale_status: live_reconstruction
+                .as_ref()
+                .map(|status| status.scale_status.clone())
+                .filter(|status| !status.is_empty())
+                .unwrap_or_else(|| "SENSOR_METRIC".to_string()),
+            integration_frozen: live_reconstruction
+                .as_ref()
+                .map(|status| status.integration_frozen)
+                .unwrap_or(false),
             depth_rmse_mm: live_reconstruction
                 .as_ref()
                 .and_then(|status| status.depth_rmse_mm),
@@ -2995,6 +3833,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         let selected_sensor_name = sensor_name(&project.settings).to_string();
         return Ok(CaptureStatus {
             project: project.clone(),
+            live_contract_version: 2,
             preview_point_count: preview.len() as u64,
             preview,
             capturing: false,
@@ -3008,6 +3847,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             stream_fps: 0.0,
             tracking: false,
             tracking_status: "Reconstruction preview".to_string(),
+            tracking_state: "complete".to_string(),
+            tracking_confidence: 0.0,
             imu_active: false,
             imu_rate_hz: 0.0,
             live_reconstruction_active: false,
@@ -3020,7 +3861,25 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
             source_drop_count: 0,
             tracking_queue_drop_count: 0,
             mapping_drop_count: 0,
+            tracking_queue_depth: 0,
+            mapping_queue_depth: 0,
             tracking_overlap: 0.0,
+            pose_uncertainty_mm: None,
+            pose_uncertainty_degrees: None,
+            pose_latency_ms: None,
+            map_update_latency_ms: None,
+            map_update_hz: 0.0,
+            allocated_live_map_bytes: 0,
+            active_voxel_count: 0,
+            active_surfel_count: 0,
+            resident_submap_count: 0,
+            host_cached_submap_count: 0,
+            dropped_preview_job_count: 0,
+            degradation_level: 0,
+            loop_closure_count: 0,
+            loop_correction_active: false,
+            live_scale_status: "SENSOR_METRIC".to_string(),
+            integration_frozen: false,
             depth_rmse_mm: None,
             live_reconstruction_backend: None,
             reconstruction: reconstruction_progress(&project_root),
@@ -3032,6 +3891,7 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
     let selected_sensor_name = sensor_name(&project.settings).to_string();
     Ok(CaptureStatus {
         project: project.clone(),
+        live_contract_version: 2,
         preview_point_count: preview.len() as u64,
         preview,
         capturing: false,
@@ -3045,6 +3905,8 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         stream_fps: 0.0,
         tracking: false,
         tracking_status: "Ready to capture".to_string(),
+        tracking_state: "ready".to_string(),
+        tracking_confidence: 0.0,
         imu_active: false,
         imu_rate_hz: 0.0,
         live_reconstruction_active: false,
@@ -3057,7 +3919,25 @@ pub fn capture_status(state: State<'_, AppState>) -> Result<CaptureStatus, Strin
         source_drop_count: 0,
         tracking_queue_drop_count: 0,
         mapping_drop_count: 0,
+        tracking_queue_depth: 0,
+        mapping_queue_depth: 0,
         tracking_overlap: 0.0,
+        pose_uncertainty_mm: None,
+        pose_uncertainty_degrees: None,
+        pose_latency_ms: None,
+        map_update_latency_ms: None,
+        map_update_hz: 0.0,
+        allocated_live_map_bytes: 0,
+        active_voxel_count: 0,
+        active_surfel_count: 0,
+        resident_submap_count: 0,
+        host_cached_submap_count: 0,
+        dropped_preview_job_count: 0,
+        degradation_level: 0,
+        loop_closure_count: 0,
+        loop_correction_active: false,
+        live_scale_status: "SENSOR_METRIC".to_string(),
+        integration_frozen: false,
         depth_rmse_mm: None,
         live_reconstruction_backend: None,
         reconstruction: reconstruction_progress(&project_root),
@@ -3179,8 +4059,12 @@ pub async fn stop_sensor_phase(state: State<'_, AppState>) -> Result<ProjectSumm
         drain_sensor_relay(&mut capture, Duration::from_secs(3));
         drain_live_reconstruction(&mut capture, Duration::from_secs(3));
         stop_live_reconstruction(&mut capture, Duration::from_secs(5));
-        let live_preview_error =
-            save_live_reconstruction_preview(&capture.phase_root, &capture.realtime).err();
+        let live_preview_error = save_live_reconstruction_preview(
+            &capture.project_root,
+            &capture.phase_root,
+            &capture.realtime,
+        )
+        .err();
         drain_sensor_relay(&mut capture, Duration::from_secs(1));
 
         let manifest_path = capture.phase_root.join("phase.json");
@@ -5086,6 +5970,18 @@ fn export_gaussian_splat_blocking(
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("room-splat");
+    let material_source = root.join("outputs").join("room-splat-material.npz");
+    let material_destination = destination.with_file_name(format!("{stem}.material.npz"));
+    let material_exported = clip_bounds.is_none() && material_source.is_file();
+    if material_exported {
+        let material_bytes = fs::read(&material_source)
+            .map_err(|error| format!("Could not read Gaussian material sidecar: {error}"))?;
+        write_export(&material_destination, &material_bytes)?;
+    } else if material_destination.is_file() {
+        fs::remove_file(&material_destination).map_err(|error| {
+            format!("Could not remove stale Gaussian material sidecar: {error}")
+        })?;
+    }
     for (source_name, suffix) in [
         ("room-splat.transform.json", "transform.json"),
         ("splat-manifest.json", "manifest.json"),
@@ -5143,6 +6039,39 @@ fn export_gaussian_splat_blocking(
                             serde_json::Value::String("flip_z".to_string()),
                         );
                     }
+                    if let Some(material) = object.get_mut("material") {
+                        if material_exported {
+                            if let Some(material) = material.as_object_mut() {
+                                material.insert(
+                                    "path".to_string(),
+                                    serde_json::Value::String(format!("{stem}.material.npz")),
+                                );
+                                material.insert(
+                                    "alignedWith".to_string(),
+                                    serde_json::Value::String(format!(
+                                        "{} vertex order",
+                                        destination
+                                            .file_name()
+                                            .and_then(|value| value.to_str())
+                                            .unwrap_or("Gaussian PLY")
+                                    )),
+                                );
+                            }
+                        } else {
+                            object.remove("material");
+                            object.insert(
+                                "materialExport".to_string(),
+                                serde_json::json!({
+                                    "status": "omitted",
+                                    "reason": if clip_bounds.is_some() {
+                                        "bounding-box clipping changes Gaussian row alignment"
+                                    } else {
+                                        "the source material sidecar is unavailable"
+                                    }
+                                }),
+                            );
+                        }
+                    }
                 }
                 sidecar_bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
                     format!("Could not serialize Gaussian manifest metadata: {error}")
@@ -5159,15 +6088,17 @@ fn export_gaussian_splat_blocking(
 mod tests {
     use super::{
         append_sensor_args, clipped_binary_ply, clipped_obj, compact_splat_preview,
-        convert_3dgs_ply_to_splat, gaussian_edit_matrix, gaussian_splat_preview_is_live,
-        managed_media_source_path, matrix_product, normalize_project, pack_preview_mesh,
-        quaternion_matrix, read_supplemental_photo_manifest, save_live_reconstruction_preview,
-        transformed_cloud_ply, transformed_gaussian_ply, transformed_normal, transformed_obj,
-        transformed_position, unity_compatible_gaussian_ply, unity_compatible_obj,
-        unity_compatible_ply, valid_packed_preview_mesh, validate_sensor_settings,
-        LiveGeometryFrame, RealtimeEngineSnapshot,
+        convert_3dgs_ply_to_splat, export_gaussian_splat_blocking, gaussian_edit_matrix,
+        gaussian_splat_preview_is_live, managed_media_source_path, matrix_product,
+        normalize_project, pack_preview_mesh, quaternion_matrix, read_supplemental_photo_manifest,
+        save_live_reconstruction_preview, transformed_cloud_ply, transformed_gaussian_ply,
+        transformed_normal, transformed_obj, transformed_position, unity_compatible_gaussian_ply,
+        unity_compatible_obj, unity_compatible_ply, valid_packed_preview_mesh,
+        validate_sensor_settings, LiveGeometryFrame, RealtimeEngineSnapshot,
     };
-    use crate::models::{BoundingBoxClip, CaptureSettings, CloudTransform, ProjectSummary};
+    use crate::models::{
+        ArtifactSummary, BoundingBoxClip, CaptureSettings, CloudTransform, ProjectSummary,
+    };
     use std::sync::{Arc, Mutex};
     use std::{fs, process::Command};
 
@@ -5187,6 +6118,111 @@ mod tests {
         ] {
             assert!(managed_media_source_path(&root, unsafe_path).is_err());
         }
+    }
+
+    #[test]
+    fn gaussian_export_preserves_material_alignment_or_omits_it_when_clipped() {
+        let root = std::env::temp_dir().join(format!(
+            "scanlan-material-splat-export-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut project = crate::storage::create_project(&root).unwrap();
+        project.artifacts.gaussian_splat = Some(ArtifactSummary {
+            path: "outputs/room-splat.ply".to_string(),
+            material_path: Some("outputs/room-splat-material.npz".to_string()),
+            refined_camera_path: None,
+            status: "ready".to_string(),
+            source_fingerprint: "fixture".to_string(),
+            updated_at: "2026-08-11T00:00:00Z".to_string(),
+            metric: true,
+            stale: false,
+        });
+        crate::storage::write_project(&project).unwrap();
+        let mut names = vec![
+            "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
+        ];
+        let rest = (0..45)
+            .map(|index| format!("f_rest_{index}"))
+            .collect::<Vec<_>>();
+        let trailing = [
+            "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let properties = names
+            .drain(..)
+            .map(str::to_string)
+            .chain(rest)
+            .chain(trailing.into_iter().map(str::to_string))
+            .collect::<Vec<_>>();
+        let header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex 1\n{}end_header\n",
+            properties
+                .iter()
+                .map(|name| format!("property float {name}\n"))
+                .collect::<String>()
+        );
+        let mut ply = header.into_bytes();
+        for index in 0..properties.len() {
+            let value = match properties[index].as_str() {
+                "scale_0" | "scale_1" | "scale_2" => -2.0_f32,
+                "rot_0" => 1.0_f32,
+                _ => 0.0_f32,
+            };
+            ply.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(root.join("outputs/room-splat.ply"), ply).unwrap();
+        fs::write(
+            root.join("outputs/room-splat-material.npz"),
+            b"material fixture",
+        )
+        .unwrap();
+        fs::write(
+            root.join("outputs/splat-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "coordinateConvention": {},
+                "material": {"path": "room-splat-material.npz"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let destination = root.join("export.ply");
+        let transform = CloudTransform {
+            position: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: [1.0; 3],
+        };
+
+        export_gaussian_splat_blocking(
+            root.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+            transform.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(root.join("export.material.npz")).unwrap(),
+            b"material fixture"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("export.manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["material"]["path"], "export.material.npz");
+
+        export_gaussian_splat_blocking(
+            root.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+            transform,
+            Some(BoundingBoxClip {
+                min: [-1.0; 3],
+                max: [1.0; 3],
+            }),
+        )
+        .unwrap();
+        assert!(!root.join("export.material.npz").exists());
+        let clipped_manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("export.manifest.json")).unwrap()).unwrap();
+        assert!(clipped_manifest.get("material").is_none());
+        assert_eq!(clipped_manifest["materialExport"]["status"], "omitted");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5220,7 +6256,13 @@ mod tests {
     fn final_live_point_packet_is_preserved_with_the_capture() {
         let root =
             std::env::temp_dir().join(format!("scanlan-live-preview-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
+        let phase_root = root.join("phases").join("phase-1");
+        fs::create_dir_all(&phase_root).unwrap();
+        fs::write(
+            phase_root.join("live_loops.jsonl"),
+            b"{\"schemaVersion\":1,\"accepted\":true,\"requiresProductionRevalidation\":true}\n",
+        )
+        .unwrap();
         let mut packet = Vec::new();
         packet.extend_from_slice(b"K2P1");
         packet.extend_from_slice(&7_u32.to_le_bytes());
@@ -5237,10 +6279,30 @@ mod tests {
             packet: Arc::new(packet.clone()),
         });
 
-        assert!(save_live_reconstruction_preview(&root, &Arc::new(Mutex::new(snapshot)),).unwrap());
+        assert!(save_live_reconstruction_preview(
+            &root,
+            &phase_root,
+            &Arc::new(Mutex::new(snapshot)),
+        )
+        .unwrap());
         assert_eq!(
-            fs::read(root.join("live-reconstruction.preview.bin")).unwrap(),
+            fs::read(phase_root.join("live-reconstruction.preview.bin")).unwrap(),
             packet
+        );
+        assert!(root.join("outputs/live/session.json").is_file());
+        assert!(root.join("outputs/live/loops.jsonl").is_file());
+        let session: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("outputs/live/session.json")).unwrap())
+                .unwrap();
+        assert_eq!(session["acceptedLoops"].as_array().unwrap().len(), 1);
+        let ply = fs::read(root.join("outputs/live/latest-preview.ply")).unwrap();
+        let glb = fs::read(root.join("outputs/live/latest-preview.glb")).unwrap();
+        assert!(ply.starts_with(b"ply\nformat binary_little_endian 1.0\n"));
+        assert_eq!(&glb[..4], b"glTF");
+        assert_eq!(u32::from_le_bytes(glb[4..8].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(glb[8..12].try_into().unwrap()) as usize,
+            glb.len()
         );
         fs::remove_dir_all(root).ok();
     }
@@ -5848,7 +6910,10 @@ mod tests {
             "imuAccelRangeG",
             "imuGyroRateHz",
             "imuGyroRangeDps",
+            "liveMapMemoryMib",
             "lingbotDepthRefinement",
+            "depthRefinementBackend",
+            "experimentalRgbPreview",
         ] {
             object.remove(field);
         }
@@ -5858,7 +6923,10 @@ mod tests {
         assert!(settings.rgb_auto_white_balance);
         assert_eq!(settings.rgb_exposure_us, 8_330);
         assert_eq!(settings.imu_accel_rate_hz, 0);
+        assert_eq!(settings.live_map_memory_mib, 1024);
         assert!(!settings.lingbot_depth_refinement);
+        assert_eq!(settings.depth_refinement_backend, "off");
+        assert!(!settings.experimental_rgb_preview);
     }
 
     #[test]

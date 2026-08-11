@@ -68,6 +68,8 @@ class PosedFrame:
     generated_depth_mask_path: Path | None = None
     depth_confidence_path: Path | None = None
     depth_refinement_metrics: dict[str, Any] | None = None
+    media_source_path: str | None = None
+    media_timestamp_seconds: float | None = None
 
 
 def load_posed_depth(frame: PosedFrame, *, measured_only: bool = False) -> np.ndarray:
@@ -338,6 +340,16 @@ def load_supplemental_observation_frames(
                 depthless=True,
                 localization_inliers=int(photo.get("inlierCount", 0)),
                 localization_rmse_px=float(photo.get("reprojectionRmsePixels", 0.0)),
+                media_source_path=(
+                    str(photo["mediaSourcePath"])
+                    if photo.get("mediaSourcePath")
+                    else None
+                ),
+                media_timestamp_seconds=(
+                    float(photo["sourceTimestampSeconds"])
+                    if photo.get("sourceTimestampSeconds") is not None
+                    else None
+                ),
             )
         )
     return result
@@ -2386,6 +2398,48 @@ def _write_mesh_cache(
     temporary.replace(path)
 
 
+def _merge_supplemental_surface(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    supplemental_mesh: tuple[np.ndarray, np.ndarray] | None,
+    voxel_size_m: float,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Add learned media surfaces only where the metric surface has no support."""
+    if supplemental_mesh is None:
+        return vertices, triangles, 0
+    learned_vertices, learned_triangles = supplemental_mesh
+    if not len(learned_triangles):
+        return vertices, triangles, 0
+    try:
+        import open3d as o3d
+
+        reference = o3d.geometry.PointCloud()
+        reference.points = o3d.utility.Vector3dVector(vertices.astype(np.float64, copy=False))
+        learned = o3d.geometry.PointCloud()
+        learned.points = o3d.utility.Vector3dVector(
+            learned_vertices.astype(np.float64, copy=False)
+        )
+        distances = np.asarray(learned.compute_point_cloud_distance(reference))
+        unsupported = distances > max(float(voxel_size_m) * 2.5, 0.02)
+    except Exception:
+        # Failure to establish non-overlap must never make learned geometry
+        # eligible everywhere in a calibrated reconstruction.
+        return vertices, triangles, 0
+    keep = np.count_nonzero(unsupported[learned_triangles], axis=1) >= 2
+    learned_triangles = learned_triangles[keep]
+    if not len(learned_triangles):
+        return vertices, triangles, 0
+    used = np.unique(learned_triangles)
+    remap = np.full(len(learned_vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used), dtype=np.int64)
+    learned_triangles = remap[learned_triangles] + len(vertices)
+    return (
+        np.concatenate((vertices, learned_vertices[used])).astype(np.float32, copy=False),
+        np.concatenate((triangles, learned_triangles)).astype(np.int64, copy=False),
+        len(learned_triangles),
+    )
+
+
 def build_mesh_artifacts(
     output_dir: Path,
     frames: list[PosedFrame],
@@ -2394,6 +2448,12 @@ def build_mesh_artifacts(
     prebuilt_mesh: Any | None = None,
     prebuilt_mesh_method: str | None = None,
     repair_settings: MeshRepairSettings | None = None,
+    supplemental_mesh: tuple[np.ndarray, np.ndarray] | None = None,
+    surface_refiner: Callable[
+        [np.ndarray, np.ndarray, float, Callable[..., None] | None],
+        tuple[np.ndarray, np.ndarray, dict[str, Any]],
+    ]
+    | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not frames:
@@ -2463,6 +2523,35 @@ def build_mesh_artifacts(
                 None,
                 0.58,
             )
+    vertices, triangles, learned_triangle_count = _merge_supplemental_surface(
+        vertices,
+        triangles,
+        supplemental_mesh,
+        mesh_voxel_size,
+    )
+    if learned_triangle_count:
+        fusion_method = f"{fusion_method}+confidence_gated_learned_surface"
+        if progress:
+            progress(
+                "Meshing",
+                f"Added {learned_triangle_count:,} non-overlapping learned media triangles",
+                0,
+                None,
+                0.59,
+            )
+    neural_sdf_report: dict[str, Any] = {
+        "status": "disabled",
+        "method": "scanlan-neural-sdf-v1",
+    }
+    if surface_refiner is not None:
+        vertices, triangles, neural_sdf_report = surface_refiner(
+            vertices,
+            triangles,
+            mesh_voxel_size,
+            progress,
+        )
+        if neural_sdf_report.get("status") == "accepted":
+            fusion_method = f"{fusion_method}+validated_neural_sdf"
     repair_settings = repair_settings or MeshRepairSettings()
     vertices, triangles, repair_report = repair_mesh_geometry(
         output_dir,
@@ -2629,6 +2718,8 @@ def build_mesh_artifacts(
         "meshMaterialPath": "outputs/room-mesh.mtl",
         "meshTexturePath": "outputs/room-texture.png",
         "meshFusionMethod": fusion_method,
+        "neuralSdf": neural_sdf_report,
+        "learnedMediaTriangleCount": learned_triangle_count,
         "meshCacheHit": mesh_cache_hit,
         "meshRepairEnabled": repair_settings.enabled,
         "meshRepairProfile": repair_settings.profile,

@@ -1,0 +1,153 @@
+{
+  "schemaVersion": 1,
+  "revision": "scanlan-p18-2026-08-11",
+  "records": [
+    {
+      "benchmarkId": "p3-femto-rtx5080-live-cuda",
+      "lane": "liveRgbd",
+      "backend": "open3d-cuda-tsdf",
+      "accepted": true,
+      "commercialUseAllowed": true,
+      "requiresRuntimes": ["open3d-cuda"],
+      "runtimeRevisions": {
+        "open3d-cuda": "0.19.0"
+      },
+      "source": {
+        "kinds": ["rgbd", "hybrid"],
+        "sensorKinds": ["femto_mega"],
+        "minimumFrames": 40,
+        "maximumFrames": 120,
+        "maximumImageDimension": 4096,
+        "characteristics": ["physical-capture", "short-static-smoke"]
+      },
+      "hardware": {
+        "requiresCuda": true,
+        "gpuNames": ["NVIDIA GeForce RTX 5080 Laptop GPU"],
+        "minimumCudaCapability": "12.0",
+        "minimumVramMiB": 11264,
+        "reserveVramMiB": 1024
+      },
+      "gates": {
+        "rawArchivePreserved": true,
+        "unsafeIntegrationFrozen": true,
+        "provisionalArtifactAvailable": true,
+        "liveMapMemoryBounded": true
+      },
+      "metrics": {
+        "acceptedFrameRatio": 0.9877,
+        "poseP95Ms": 62.6,
+        "pointMapP95Ms": 365.8,
+        "peakAllocatedLiveMapMiB": 895.97
+      }
+    },
+    {
+      "benchmarkId": "p9-phone16-da3-guided-colmap",
+      "lane": "productionCamera",
+      "backend": "da3-guided-colmap",
+      "accepted": true,
+      "commercialUseAllowed": false,
+      "requiresRuntimes": ["da3", "colmap-learned"],
+      "runtimeRevisions": {
+        "da3": "3d835ec1a5802d64a8b8b15f817a1ab54809bfe4",
+        "colmap-learned": "4.1.1"
+      },
+      "source": {
+        "kinds": ["photos"],
+        "minimumFrames": 12,
+        "maximumFrames": 20,
+        "maximumImageDimension": 1600,
+        "characteristics": ["overlapping-phone-photos"]
+      },
+      "hardware": {
+        "requiresCuda": true,
+        "gpuNames": ["NVIDIA GeForce RTX 5080 Laptop GPU"],
+        "minimumCudaCapability": "12.0",
+        "minimumVramMiB": 11264,
+        "reserveVramMiB": 1024
+      },
+      "gates": {
+        "learnedCamerasAreProposalsOnly": true,
+        "localFeatureVerification": true,
+        "globalBundleAdjustment": true,
+        "cameraAgreement": true
+      },
+      "metrics": {
+        "registrationRatio": 0.9375,
+        "medianCameraResidual": 0.00586,
+        "medianReprojectionErrorPx": 0.714,
+        "wallSeconds": 87.987,
+        "peakVramMiB": 7881.1
+      }
+    },
+    {
+      "benchmarkId": "p7-femto-mapanything-depth",
+      "lane": "depthCompletion",
+      "backend": "mapanything",
+      "accepted": true,
+      "commercialUseAllowed": true,
+      "requiresRuntimes": ["mapanything"],
+      "runtimeRevisions": {
+        "mapanything": "3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9"
+      },
+      "source": {
+        "kinds": ["rgbd", "hybrid"],
+        "sensorKinds": ["femto_mega"],
+        "minimumFrames": 3,
+        "maximumFrames": 400,
+        "maximumImageDimension": 4096,
+        "characteristics": ["physical-capture"]
+      },
+      "hardware": {
+        "requiresCuda": true,
+        "gpuNames": ["NVIDIA GeForce RTX 5080 Laptop GPU"],
+        "minimumCudaCapability": "12.0",
+        "minimumVramMiB": 11264,
+        "reserveVramMiB": 1024
+      },
+      "gates": {
+        "heldOutMetricAnchors": true,
+        "multiviewAgreement": true,
+        "freeSpace": true,
+        "measuredDepthImmutable": true
+      },
+      "metrics": {
+        "medianResidualMm": 3.0,
+        "inlierRatio": 0.95,
+        "acceptedHoleRatio": 0.02294
+      }
+    },
+    {
+      "benchmarkId": "p6-femto-lingbot-depth",
+      "lane": "depthCompletion",
+      "backend": "lingbot",
+      "accepted": true,
+      "commercialUseAllowed": true,
+      "requiresRuntimes": ["lingbot-depth"],
+      "source": {
+        "kinds": ["rgbd", "hybrid"],
+        "sensorKinds": ["femto_mega"],
+        "minimumFrames": 20,
+        "maximumFrames": 400,
+        "maximumImageDimension": 4096,
+        "characteristics": ["physical-capture"]
+      },
+      "hardware": {
+        "requiresCuda": true,
+        "gpuNames": ["NVIDIA GeForce RTX 5080 Laptop GPU"],
+        "minimumCudaCapability": "12.0",
+        "minimumVramMiB": 11264,
+        "reserveVramMiB": 1024
+      },
+      "gates": {
+        "metricAgreement": true,
+        "multiviewAgreement": true,
+        "freeSpace": true,
+        "measuredDepthImmutable": true
+      },
+      "metrics": {
+        "medianResidualMm": 15.93,
+        "inlierRatio": 0.935
+      }
+    }
+  ]
+}

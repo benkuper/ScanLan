@@ -17,6 +17,7 @@ LINGBOT_CODE_REVISION = "1f480aeb8a47a24656090d46d053115b7fe60435"
 LINGBOT_MODEL_REPOSITORY = "robbyant/lingbot-map"
 LINGBOT_MODEL_REVISION = "204754b72bb24f561f8d7e7e1e4e4cd9e809adf9"
 LINGBOT_MODEL_FILENAME = "lingbot-map-long.pt"
+LINGBOT_MODEL_SHA256 = "832bc82cbae0bc9bbe946ef5ee1f7226abd8c0e183ccf8beddbb3d133576f409"
 LINGBOT_SKY_MODEL_FILENAME = "skyseg_batch.onnx"
 LINGBOT_IMAGE_SIZE = 518
 LINGBOT_PATCH_SIZE = 14
@@ -38,9 +39,13 @@ class LingbotGeometry:
     backend: str
     model_path: str
     processed_size: tuple[int, int]
+    # Direct Gaussian heads predict visibility independently from geometric
+    # confidence. Point-cloud backends intentionally leave this unset.
+    opacities: np.ndarray | None = None
 
 
 ProgressCallback = Callable[[str, str, float, str, dict[str, Any]], None]
+StreamCallback = Callable[[LingbotGeometry, int, int], None]
 
 
 def lingbot_processed_size(width: int, height: int) -> tuple[int, int]:
@@ -685,6 +690,218 @@ def _surface_seeds(
     )
 
 
+def _inference_streaming_progressive(
+    model: Any,
+    images: Any,
+    *,
+    torch: Any,
+    num_scale_frames: int,
+    keyframe_interval: int,
+    output_device: Any,
+    chunk_frames: int,
+    on_chunk: Callable[[int, dict[str, Any]], None],
+) -> dict[str, Any]:
+    """Mirror upstream GCT streaming while publishing completed frame chunks."""
+    if len(images.shape) == 4:
+        images = images.unsqueeze(0)
+    _, sequence_length, _, _, _ = images.shape
+    scale_frames = min(num_scale_frames, sequence_length)
+    model.clean_kv_cache()
+    model_device = next(model.parameters()).device
+
+    def to_output(value: Any) -> Any:
+        return value.to(output_device) if output_device is not None else value
+
+    def output_slice(values: dict[str, Any], frame_images: Any) -> dict[str, Any]:
+        selected = {
+            name: to_output(values[name])
+            for name in ("pose_enc", "depth", "depth_conf")
+            if name in values
+        }
+        selected["images"] = to_output(frame_images)
+        return selected
+
+    scale_images = images[:, :scale_frames].to(model_device, non_blocking=True)
+    torch.compiler.cudagraph_mark_step_begin()
+    scale_output = model.forward(
+        scale_images,
+        num_frame_for_scale=scale_frames,
+        num_frame_per_block=scale_frames,
+        causal_inference=True,
+    )
+    all_pose_enc = [to_output(scale_output["pose_enc"])]
+    all_depth = [to_output(scale_output["depth"])]
+    all_depth_conf = [to_output(scale_output["depth_conf"])]
+    all_world_points = (
+        [to_output(scale_output["world_points"])]
+        if "world_points" in scale_output
+        else []
+    )
+    all_world_points_conf = (
+        [to_output(scale_output["world_points_conf"])]
+        if "world_points_conf" in scale_output
+        else []
+    )
+    on_chunk(0, output_slice(scale_output, images[:, :scale_frames]))
+    del scale_output
+
+    pending: dict[str, list[Any]] = {
+        "pose_enc": [],
+        "depth": [],
+        "depth_conf": [],
+    }
+    pending_start = scale_frames
+    for frame_index in range(scale_frames, sequence_length):
+        frame_image = images[:, frame_index : frame_index + 1].to(
+            model_device,
+            non_blocking=True,
+        )
+        is_keyframe = keyframe_interval <= 1 or (
+            (frame_index - scale_frames) % keyframe_interval == 0
+        )
+        if not is_keyframe:
+            model._set_skip_append(True)
+        torch.compiler.cudagraph_mark_step_begin()
+        frame_output = model.forward(
+            frame_image,
+            num_frame_for_scale=scale_frames,
+            num_frame_per_block=1,
+            causal_inference=True,
+        )
+        if not is_keyframe:
+            model._set_skip_append(False)
+        pose = to_output(frame_output["pose_enc"])
+        depth = to_output(frame_output["depth"])
+        confidence = to_output(frame_output["depth_conf"])
+        all_pose_enc.append(pose)
+        all_depth.append(depth)
+        all_depth_conf.append(confidence)
+        pending["pose_enc"].append(pose)
+        pending["depth"].append(depth)
+        pending["depth_conf"].append(confidence)
+        if "world_points" in frame_output:
+            all_world_points.append(to_output(frame_output["world_points"]))
+        if "world_points_conf" in frame_output:
+            all_world_points_conf.append(to_output(frame_output["world_points_conf"]))
+        pending_count = frame_index + 1 - pending_start
+        if pending_count >= chunk_frames or frame_index + 1 == sequence_length:
+            chunk = {
+                name: torch.cat(values, dim=1)
+                for name, values in pending.items()
+            }
+            chunk["images"] = to_output(images[:, pending_start : frame_index + 1])
+            on_chunk(pending_start, chunk)
+            pending = {"pose_enc": [], "depth": [], "depth_conf": []}
+            pending_start = frame_index + 1
+        del frame_output
+
+    images_out = to_output(images)
+    if output_device is not None:
+        model.clean_kv_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    predictions = {
+        "pose_enc": torch.cat(all_pose_enc, dim=1),
+        "depth": torch.cat(all_depth, dim=1),
+        "depth_conf": torch.cat(all_depth_conf, dim=1),
+        "images": images_out,
+    }
+    if all_world_points:
+        predictions["world_points"] = torch.cat(all_world_points, dim=1)
+    if all_world_points_conf:
+        predictions["world_points_conf"] = torch.cat(all_world_points_conf, dim=1)
+    if model.pred_normalization:
+        predictions = model._normalize_predictions(predictions)
+    return predictions
+
+
+def _geometry_from_predictions(
+    predictions: dict[str, Any],
+    fallback_images: Any,
+    selected_indices: np.ndarray,
+    *,
+    pose_encoding_to_extri_intri: Callable[..., tuple[Any, Any]],
+    closed_form_inverse_se3_general: Callable[[Any], Any],
+    maximum_seeds: int,
+    normalized_rays: np.ndarray | None,
+    backend: str,
+    model_path: Path,
+    processed_size: tuple[int, int],
+    source_frame_offset: int = 0,
+) -> LingbotGeometry:
+    import torch
+
+    height, width = processed_size[1], processed_size[0]
+    pose_encoding = predictions["pose_enc"]
+    camera_from_world, intrinsics = pose_encoding_to_extri_intri(
+        pose_encoding,
+        (height, width),
+    )
+    camera_from_world_4x4 = torch.zeros(
+        (*camera_from_world.shape[:-2], 4, 4),
+        dtype=camera_from_world.dtype,
+        device=camera_from_world.device,
+    )
+    camera_from_world_4x4[..., :3, :4] = camera_from_world
+    camera_from_world_4x4[..., 3, 3] = 1.0
+    world_from_cameras = closed_form_inverse_se3_general(camera_from_world_4x4)
+    depths = predictions["depth"].float().cpu().numpy()
+    confidences = predictions["depth_conf"].float().cpu().numpy()
+    while depths.ndim > 4 and depths.shape[0] == 1:
+        depths = depths[0]
+    if depths.shape[-1] == 1:
+        depths = depths[..., 0]
+    while confidences.ndim > 3 and confidences.shape[0] == 1:
+        confidences = confidences[0]
+    world_from_cameras_np = world_from_cameras.float().cpu().numpy()
+    intrinsics_np = intrinsics.float().cpu().numpy()
+    if world_from_cameras_np.ndim == 4:
+        world_from_cameras_np = world_from_cameras_np[0]
+    if intrinsics_np.ndim == 4:
+        intrinsics_np = intrinsics_np[0]
+    image_values = predictions.get("images", fallback_images).float().cpu().numpy()
+    while image_values.ndim > 4 and image_values.shape[0] == 1:
+        image_values = image_values[0]
+    image_values = np.rint(
+        np.clip(np.transpose(image_values, (0, 2, 3, 1)), 0.0, 1.0) * 255.0
+    ).astype(np.uint8)
+    depths = depths[selected_indices]
+    confidences = confidences[selected_indices]
+    world_from_cameras_np = world_from_cameras_np[selected_indices]
+    intrinsics_np = intrinsics_np[selected_indices]
+    image_values = image_values[selected_indices]
+    (
+        points,
+        colors,
+        scales,
+        quaternions,
+        source_frame_indices,
+        frame_confidence,
+    ) = _surface_seeds(
+        depths,
+        confidences,
+        image_values,
+        intrinsics_np,
+        world_from_cameras_np,
+        maximum_seeds,
+        normalized_rays=normalized_rays,
+    )
+    source_frame_indices = source_frame_indices + int(source_frame_offset)
+    return LingbotGeometry(
+        world_from_cameras=world_from_cameras_np.astype(np.float64),
+        intrinsics=intrinsics_np.astype(np.float64),
+        points=points,
+        colors=colors,
+        scales=scales,
+        quaternions=quaternions,
+        source_frame_indices=source_frame_indices,
+        frame_confidence=frame_confidence,
+        backend=backend,
+        model_path=str(model_path),
+        processed_size=processed_size,
+    )
+
+
 def infer_lingbot_geometry(
     image_paths: Sequence[Path],
     *,
@@ -692,6 +909,8 @@ def infer_lingbot_geometry(
     normalized_rays: np.ndarray | None = None,
     output_indices: Sequence[int] | None = None,
     progress: ProgressCallback | None = None,
+    stream: StreamCallback | None = None,
+    stream_chunk_frames: int = 8,
 ) -> LingbotGeometry:
     import torch
 
@@ -803,8 +1022,58 @@ def infer_lingbot_geometry(
             },
         )
     torch.cuda.empty_cache()
+
+    def emit_stream_chunk(start_index: int, chunk: dict[str, Any]) -> None:
+        if stream is None:
+            return
+        chunk_count = int(chunk["pose_enc"].shape[1])
+        try:
+            geometry = _geometry_from_predictions(
+                chunk,
+                chunk["images"],
+                np.arange(chunk_count, dtype=np.int64),
+                pose_encoding_to_extri_intri=pose_encoding_to_extri_intri,
+                closed_form_inverse_se3_general=closed_form_inverse_se3_general,
+                maximum_seeds=min(
+                    30_000,
+                    max(5_000, int(maximum_seeds * chunk_count / len(paths))),
+                ),
+                normalized_rays=normalized_rays,
+                backend=backend,
+                model_path=model_path,
+                processed_size=(width, height),
+                source_frame_offset=start_index,
+            )
+        except RuntimeError as error:
+            if progress:
+                progress(
+                    "rgb_preview_searching",
+                    f"Provisional RGB geometry rejected for frames {start_index + 1}-{start_index + chunk_count}",
+                    0.10 + 0.09 * ((start_index + chunk_count) / len(paths)),
+                    backend,
+                    {
+                        "processedFrameCount": start_index + chunk_count,
+                        "contextFrameCount": len(paths),
+                        "integrationFrozen": True,
+                        "rejectionReason": str(error),
+                    },
+                )
+            return
+        stream(geometry, start_index, start_index + chunk_count)
+
     def run_inference(loaded: Any, interval: int) -> dict[str, Any]:
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+            if stream is not None:
+                return _inference_streaming_progressive(
+                    loaded,
+                    images,
+                    torch=torch,
+                    num_scale_frames=min(LINGBOT_SCALE_FRAMES, len(paths)),
+                    keyframe_interval=interval,
+                    output_device=torch.device("cpu"),
+                    chunk_frames=max(2, int(stream_chunk_frames)),
+                    on_chunk=emit_stream_chunk,
+                )
             return loaded.inference_streaming(
                 images,
                 num_scale_frames=min(LINGBOT_SCALE_FRAMES, len(paths)),
@@ -853,47 +1122,6 @@ def infer_lingbot_geometry(
             "LingBot checkpoint did not produce required outputs: "
             + ", ".join(sorted(absent_outputs))
         )
-    pose_encoding = predictions["pose_enc"]
-    camera_from_world, intrinsics = pose_encoding_to_extri_intri(
-        pose_encoding,
-        (height, width),
-    )
-    camera_from_world_4x4 = torch.zeros(
-        (*camera_from_world.shape[:-2], 4, 4),
-        dtype=camera_from_world.dtype,
-        device=camera_from_world.device,
-    )
-    camera_from_world_4x4[..., :3, :4] = camera_from_world
-    camera_from_world_4x4[..., 3, 3] = 1.0
-    world_from_cameras = closed_form_inverse_se3_general(camera_from_world_4x4)
-    depths = predictions["depth"].float().cpu().numpy()
-    confidences = predictions["depth_conf"].float().cpu().numpy()
-    while depths.ndim > 4 and depths.shape[0] == 1:
-        depths = depths[0]
-    if depths.shape[-1] == 1:
-        depths = depths[..., 0]
-    while confidences.ndim > 3 and confidences.shape[0] == 1:
-        confidences = confidences[0]
-    world_from_cameras_np = world_from_cameras.float().cpu().numpy()
-    intrinsics_np = intrinsics.float().cpu().numpy()
-    if world_from_cameras_np.ndim == 4:
-        world_from_cameras_np = world_from_cameras_np[0]
-    if intrinsics_np.ndim == 4:
-        intrinsics_np = intrinsics_np[0]
-    image_values = predictions.get("images", images)
-    image_values = image_values.float().cpu().numpy()
-    while image_values.ndim > 4 and image_values.shape[0] == 1:
-        image_values = image_values[0]
-    image_values = np.rint(np.clip(np.transpose(image_values, (0, 2, 3, 1)), 0.0, 1.0) * 255.0).astype(np.uint8)
-    depths = depths[selected_indices]
-    confidences = confidences[selected_indices]
-    world_from_cameras_np = world_from_cameras_np[selected_indices]
-    intrinsics_np = intrinsics_np[selected_indices]
-    image_values = image_values[selected_indices]
-    del predictions, pose_encoding, camera_from_world, camera_from_world_4x4, intrinsics
-    del model, images
-    gc.collect()
-    torch.cuda.empty_cache()
     if progress:
         progress(
             "lingbot_geometry",
@@ -906,32 +1134,19 @@ def infer_lingbot_geometry(
                 "maximumSeedCount": maximum_seeds,
             },
         )
-    (
-        points,
-        colors,
-        scales,
-        quaternions,
-        source_frame_indices,
-        frame_confidence,
-    ) = _surface_seeds(
-        depths,
-        confidences,
-        image_values,
-        intrinsics_np,
-        world_from_cameras_np,
-        maximum_seeds,
+    geometry = _geometry_from_predictions(
+        predictions,
+        images,
+        selected_indices,
+        pose_encoding_to_extri_intri=pose_encoding_to_extri_intri,
+        closed_form_inverse_se3_general=closed_form_inverse_se3_general,
+        maximum_seeds=maximum_seeds,
         normalized_rays=normalized_rays,
-    )
-    return LingbotGeometry(
-        world_from_cameras=world_from_cameras_np.astype(np.float64),
-        intrinsics=intrinsics_np.astype(np.float64),
-        points=points,
-        colors=colors,
-        scales=scales,
-        quaternions=quaternions,
-        source_frame_indices=source_frame_indices,
-        frame_confidence=frame_confidence,
         backend=backend,
-        model_path=str(model_path),
+        model_path=model_path,
         processed_size=(width, height),
     )
+    del predictions, model, images
+    gc.collect()
+    torch.cuda.empty_cache()
+    return geometry

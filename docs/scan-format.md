@@ -12,6 +12,7 @@ scan-project/
 │       ├── phase.json
 │       ├── frames.csv
 │       ├── tracking.jsonl
+│       ├── backend-policy.json          # live lane selection evidence
 │       ├── imu.csv                 # when enabled
 │       ├── sensor.log
 │       ├── depth/000000.u16
@@ -26,11 +27,13 @@ scan-project/
     ├── room-mesh.mtl
     ├── room-texture.png
     ├── room-splat.ply
+    ├── room-splat-material.npz       # when a declared material prior is available
     ├── room-splat.preview.splat
     ├── room-splat.transform.json
     ├── splat-manifest.json
     ├── camera-poses.json
     ├── photo-localization-progress.json
+    ├── backend-policy.json
     ├── preview.json
     ├── result.json
     └── progress.json
@@ -155,6 +158,42 @@ index,source_sequence,timestamp_us,depth_path,color_path,rgb_path,rgb_timestamp_
 
 The production loader matches the journal to archived frames by `source_sequence`. Explicitly rejected frames are excluded. A complete accepted trajectory is inverted to camera-to-world and validated before being used as the final-pass seed.
 
+`live_loops.jsonl` is schema 1, one record per bounded nonlocal submap query. Each record stores
+the source and target submap IDs, sensor sequence, accepted state, ICP fitness/RMSE and
+correspondence count, row-major target-from-source transform, 6 x 6 information matrix,
+pose-graph safety result, and `requiresProductionRevalidation: true`. An accepted live record
+is not permission for production fusion; the offline solver independently verifies the raw
+observations and may reject it.
+
+## Provisional live-session artifact
+
+Stopping a capture atomically publishes the latest validated live map beneath `outputs/live/`:
+
+```text
+outputs/live/
+|-- session.json
+|-- poses.jsonl
+|-- loops.jsonl
+|-- tracking-summary.json
+|-- latest-preview.bin
+|-- latest-preview.ply
+|-- latest-preview.glb
+|-- submaps/
+`-- coverage/
+```
+
+`session.json` schema 1 uses live contract 2. It identifies the source phase, calibration,
+sensor, scale status, tracking counts, queue losses, memory telemetry, loop decisions, preview
+paths, and deterministic final-map fingerprint. The PLY and GLB are explicitly provisional
+point representations; production outputs never overwrite them. `latest-preview.bin` retains
+the bounded internal `K2P1` packet so the desktop can reopen the exact final live view without
+converting the raw capture. `poses.jsonl` is a snapshot of the fail-closed tracking journal.
+
+Live contract 2 defines these tracking states: `ready`, `preview`, `tracking`, `searching`,
+`relocalized`, `frozen`, `failed`, and `complete`. It also reserves engine message kind 5 for
+coverage summaries and kind 6 for submap descriptors. Both are UTF-8 JSON with
+`contractVersion: 2`; geometry messages remain the bounded binary point/mesh packets.
+
 ## IMU
 
 `imu.csv` fields are:
@@ -185,3 +224,19 @@ filled an original sensor hole. Native RGB is undistorted while it is
 resampled, rather than producing an intermediate 2K/4K depth map. 2DGS rejects
 distorted inputs because its rasterizer traces pinhole rays. There is no COLMAP
 or arbitrary-scale media path.
+## Dense surface initialization
+
+Canonical datasets may reference `initialization-2dgs.npz` or
+`initialization-parameters.npz`. Both implement `dense-surface-samples-v1` and contain matching
+first dimensions for:
+
+- `points` (`float32`, N×3) and `colors` (`uint8`, N×3);
+- `scales` (`float32`, N×3) and normalized `quaternions` (`float32`, N×4, wxyz), defining an
+  oriented surface footprint whose local +Z axis is the normal;
+- `fusion_confidence` (`float32`, N) for learned media, or `confidence` for canonical RGB-D;
+- `provenance` (`uint8`, N): 0 measured, 1 validated generated depth, 2 learned media geometry;
+- `source_frame_indices` (`int32`, N), or -1 where ownership is not applicable.
+
+Extra Gaussian-specific `confidence` values may represent direct-head opacity and are not silently
+reinterpreted as geometric confidence. Media datasets therefore publish `fusion_confidence`
+separately. All arrays are shape/finiteness/range validated before point or mesh fusion.

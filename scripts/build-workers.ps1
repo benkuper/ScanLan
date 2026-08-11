@@ -127,9 +127,15 @@ $RuntimeKey = if ($CudaWheel) {
 $WorkerSources = @(
   Get-ChildItem -Path (Join-Path $ProjectRoot "worker/scanlan") -Recurse -File |
     Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' }
+  Get-ChildItem -Path (Join-Path $ProjectRoot "validation/scanlan_validation") -Recurse -File |
+    Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' }
+  Get-ChildItem -Path (Join-Path $ProjectRoot "material/scanlan_material") -Recurse -File |
+    Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' }
   Get-Item -Path (Join-Path $ProjectRoot "worker/entry.py")
   Get-Item -Path (Join-Path $ProjectRoot "worker/pyproject.toml")
   Get-Item -Path (Join-Path $ProjectRoot "worker/scanlan-worker.spec")
+  Get-Item -Path (Join-Path $ProjectRoot "validation/pyproject.toml")
+  Get-Item -Path (Join-Path $ProjectRoot "material/pyproject.toml")
   Get-Item -Path (Join-Path $ProjectRoot "scripts/build-workers.ps1")
 )
 $NewestWorkerSource = $WorkerSources | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
@@ -178,6 +184,11 @@ if ($NeedsWorkerBuild) {
     }
   }
 
+  & $WorkerPython -m pip install --upgrade --force-reinstall --no-deps "$ProjectRoot/validation"
+  if ($LASTEXITCODE -ne 0) { throw "Shared ScanLan validation engine could not be installed." }
+  & $WorkerPython -m pip install --upgrade --force-reinstall --no-deps "$ProjectRoot/material"
+  if ($LASTEXITCODE -ne 0) { throw "Shared ScanLan material foundation could not be installed." }
+
   if ($CudaWheel) {
     Write-Host "Using CUDA-enabled Open3D wheel: $($CudaWheel.FullName)"
     & $WorkerPython -m pip install -e "$ProjectRoot/worker[build]"
@@ -195,7 +206,7 @@ if ($NeedsWorkerBuild) {
     # Open3D plus CUDA is close to 1 GB. A one-file executable unpacked that
     # payload on every preview/reconstruction launch and made the UI appear to
     # freeze. Keep the runtime extracted once and launch it directly instead.
-    & $WorkerPython -m PyInstaller --noconfirm --clean --onedir --name scanlan-worker --collect-all open3d entry.py
+    & $WorkerPython -m PyInstaller --noconfirm --clean --onedir --name scanlan-worker --collect-all open3d --collect-all scanlan_material --collect-all scanlan_validation entry.py
     if ($LASTEXITCODE -ne 0) { throw "Reconstruction worker packaging failed." }
   } finally {
     Pop-Location

@@ -247,8 +247,8 @@ pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf
         .join("Scripts")
         .join("scanlan-splat.exe");
     if cfg!(debug_assertions) {
-        candidates.push(packaged_binary.clone());
         candidates.push(development_binary.clone());
+        candidates.push(packaged_binary.clone());
     }
     if let Some(root) = resource_root {
         candidates.push(root.join("splat-runtime").join("scanlan-splat.exe"));
@@ -281,6 +281,41 @@ pub fn candidate_splat_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf
                     .join("Scripts")
                     .join("scanlan-splat.exe"),
             );
+        }
+    }
+    if !cfg!(debug_assertions) {
+        candidates.push(packaged_binary);
+        candidates.push(development_binary);
+    }
+    candidates
+}
+
+pub fn candidate_geometry_worker_paths(resource_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let packaged_binary = project_root
+        .join("geometry-worker")
+        .join("dist")
+        .join("scanlan-geometry")
+        .join("scanlan-geometry.exe");
+    let development_binary = project_root
+        .join("splat-worker")
+        .join(".venv")
+        .join("Scripts")
+        .join("scanlan-geometry.exe");
+    if cfg!(debug_assertions) {
+        candidates.push(packaged_binary.clone());
+        candidates.push(development_binary.clone());
+    }
+    if let Some(root) = resource_root {
+        candidates.push(root.join("geometry-runtime").join("scanlan-geometry.exe"));
+        candidates.push(root.join("scanlan-geometry.exe"));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            for root in [parent.to_path_buf(), parent.join("resources")] {
+                candidates.push(root.join("geometry-runtime").join("scanlan-geometry.exe"));
+            }
         }
     }
     if !cfg!(debug_assertions) {

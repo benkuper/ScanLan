@@ -14,7 +14,8 @@ The application supports two quality-gated source paths: **Capture RGB-D → Rec
 ```mermaid
 flowchart TD
     Camera["RGB-D camera"] --> Capture["Native capture worker"]
-    Media["Photos or video"] --> SfM["Sharp-frame selection · COLMAP SfM · undistortion"]
+    Media["Photos or video"] --> Proposal["DA3 / MapAnything camera proposal"]
+    Proposal --> SfM["Verified guided pairs · COLMAP BA · undistortion"]
     Capture -->|"full sensor rate · SCANRGBD v1"| Tracker["Realtime tracker"]
     Capture -->|"bounded archive queue"| Archive["Schema 3 capture"]
     Tracker --> Live["In-memory points / mesh"]
@@ -34,7 +35,19 @@ Realtime processing uses three independent stages:
 
 1. decode and edge-aware depth-speckle rejection;
 2. persistent RGB-D odometry with an optional calibrated gyro prior, deliberate handheld-motion limits, metric overlap/RMSE gates, and fail-closed recovery that must remain within 15 cm / 10 degrees of the last trusted pose and agree for three consecutive frames before integration;
-3. weighted TSDF integration with asynchronous point extraction and an optional 1 Hz mesh.
+3. bounded sparse-TSDF submaps with compact host caching, adaptive point/coverage publication,
+   tracking-confidence overlays, and an optional 1 Hz mesh that pauses under pressure.
+
+The live map has a hard memory ceiling. Travel, rotation, voxel pressure, keyframe count, or a
+tracking discontinuity closes the active submap; completed submaps remain visible as immutable
+host geometry and can later move through pose-graph corrections. The capture viewport can
+switch between normal color, coverage, tracking, and confidence views without changing the
+sensor, archive, tracking, or fusion rates.
+
+Nonlocal live loops are queried only at bounded submap boundaries and accepted only after
+strict metric ICP verification. Accepted pose-graph corrections move existing rigid submaps
+over 350 ms without reintegration or duplicate geometry, while `live_loops.jsonl` records every
+decision for independent production revalidation.
 
 The compact `tracking.jsonl` journal feeds accepted live poses into the production pass. A rejected live pose does not discard its archived pixels: the final pass keeps consecutive RGB-D frames for fresh offline odometry, then refines short trajectory fragments, verifies nonlocal loop candidates, globally optimizes a pose graph, registers separate takes, and rebuilds the selected outputs from archived calibrated RGB-D data.
 
@@ -108,16 +121,43 @@ npm run prepare:cuda
 
 The build targets compute capability 12.0 and repackages the extracted worker at `worker\dist\scanlan-worker\scanlan-worker.exe`. Keeping its Open3D/CUDA runtime extracted avoids unpacking almost 1 GB every time preview or reconstruction starts. Set `SCANLAN_DEVICE=cpu` before launching to diagnose the CPU path.
 
-Gaussian reconstruction and optional learned RGB-D refinement use an isolated CUDA runtime. It requires Python 3.11 and packages gsplat, PyCOLMAP, PyAV, LingBot-Map, and LingBot-Depth for RGB-D, photo, and video projects:
+Gaussian reconstruction and optional learned RGB-D refinement use two supervised CUDA runtimes. The splat runtime owns PyCOLMAP, PyAV, gsplat, and training; the separate geometry runtime owns LingBot-Map, LingBot-Depth, MapAnything, and DA3 Nested Giant-Large 1.1 so model memory is released with each inference process. Both require Python 3.11 and are built together:
 
 ```powershell
 npm run prepare:splat
 npm run package:splat
 ```
 
-The result is `build/ScanLan-splat-portable.zip`. The build downloads the Apache-2.0 LingBot-Depth v0.5 checkpoint once, verifies its pinned SHA-256 digest, and bundles the roughly 1.28 GB model for offline use. RGB-D projects can enable **Depth refinement** in Reconstruct; ordinary media projects use anisotropic 3D Gaussians initialized from the quality-filtered camera solve. Both keep bounded memory, publish atomic checkpoints, and stream a compact preview during training.
+The result is `build/ScanLan-splat-portable.zip`, containing `splat-runtime/` and `geometry-runtime/`. The build downloads pinned model assets once, verifies their digests, and bundles them for offline use. RGB-D projects can select **Adaptive · benchmark gated**, **LingBot-Depth**, **MapAnything Apache**, or **DA3 Max** under Depth refinement. Adaptive mode chooses only from compatible release-gated source/hardware/runtime evidence and otherwise keeps sensor-only depth; see [the P18 backend policy](docs/adaptive-backend-policy.md). DA3 Max uses the strongest refreshed Nested Giant-Large checkpoint and direct Gaussian head; its checkpoint and derived output are restricted to noncommercial use under CC BY-NC 4.0. All paths keep bounded memory, publish atomic checkpoints, and stream a compact preview during training.
+
+Video-only projects can optionally enable the disabled-by-default **Progressive learned-depth preview**. It publishes bounded local LingBot submaps during ordered inference, colors geometry by confidence, and always labels scale as model-metric unverified. The provisional map is display-only and cannot bypass production camera or alignment gates.
+
+Camera, scale, depth, free-space, and point acceptance are defined once in the shared
+[`scanlan-validation` engine](docs/validation-engine.md). The RGB-only preview and production
+RGB-D worker emit the same versioned reports, and frozen runtimes package the validator for
+offline use. Learned backends may propose geometry but cannot promote unverified scale or bypass
+measured-depth/free-space evidence.
+
+Global backend defaults are protected separately by the
+[`V2 release matrix`](docs/v2-release-validation.md). It requires representative real-input,
+quality, memory, artifact-digest, and visual-review evidence for every supported lane. The current
+dated audit is intentionally incomplete, so no adaptive backend has been promoted to a global
+default from the narrower integration smokes.
 
 LingBot-Depth consumes the archived RGB8 image that is already aligned to the depth grid and returns the same raster dimensions, so no post-hoc RGB warp is inferred. ScanLan runs it only after metric camera poses have been recovered. Every valid sensor depth remains unchanged; predicted pixels are accepted only in sensor holes after model-mask, depth-edge, metric-scale, calibrated native-RGB field-of-view, independent-viewpoint, and multi-view reprojection gates. Accepted pixels carry explicit provenance and lower fusion/training confidence. If a frame fails the metric gate, its raw calibrated depth is used unchanged.
+
+MapAnything uses the same immutable aligned RGB-D archive but predicts in its processed image grid. ScanLan reverses the cover-resize/center-crop transform, calibrates the smooth model residual from sensor anchors, and validates only on independent held-out anchors. Unsupported large holes and any proposal that fails metric, RGB-coverage, multi-view, or free-space evidence remain sensor-only. For photos and videos of at most 32 selected views, MapAnything also proposes cameras and dense depth as a challenger; COLMAP agreement selects or rejects it, and image-only scale remains `MODEL_METRIC_UNVERIFIED` until anchored.
+
+DA3 Max uses DA3NESTED-GIANT-LARGE-1.1 for any-view cameras, metric-aware pose-conditioned depth,
+and direct Gaussian proposals. Long media runs in bounded 24-frame windows with six-frame overlap;
+every join must pass camera-center and rotation continuity gates before the complete proposal is
+compared with COLMAP and the other learned backends. The direct Gaussian head runs inside those
+same bounded windows. If its measured CUDA allocation exceeds available headroom, the isolated
+worker records that failure and retries with the model's confidence-gated camera/depth output;
+source-resolution gsplat optimization then remains the final quality stage. A versioned manifest
+distinguishes sparse SfM, dense surface, and direct learned initialization. The sidecar preserves the
+direct head's learned opacity independently from geometric confidence and retains anisotropic scale
+axes; opacity-free point previews are not used as a quality judgment for this representation.
 
 Recommended starting profile on the specified laptop:
 
@@ -132,12 +172,69 @@ Recommended starting profile on the specified laptop:
 Choose **Import photos or video for Gaussian splatting…** in Capture. Imported sources are copied into the project so the job is durable. The production pass then:
 
 1. orientation-normalizes photos and selects the sharpest non-duplicate video frame in each time bucket;
-2. extracts dense SIFT features, performs guided geometric matching, reconstructs all consistent camera models, and selects the largest model;
-3. rejects a solve that registers fewer than half the input views or produces too little reliable structure;
-4. bundle-adjusts and undistorts registered source-resolution images to canonical pinhole cameras;
-5. initializes 3D Gaussians from reliable COLMAP tracks and trains L1+SSIM appearance with degree-three spherical harmonics, bounded camera refinement, and per-view RGB exposure compensation.
+2. asks DA3 (or bounded MapAnything fallback) for a camera proposal and uses it to select a connected, bounded pair graph;
+3. extracts source-detail ALIKED/LightGlue features (SIFT fallback), geometrically verifies every proposed pair, and recovers missing cameras through nearby verified learned views;
+4. expands to conventional matching when the guided solve misses its quality gate, then robustly bundle-adjusts the strongest model and undistorts its registered images to canonical pinhole cameras;
+5. publishes learned-scale colored points and a confidence-gated triangle surface from the accepted dense prior when selected;
+6. initializes Gaussians through the explicit sparse/dense/direct contract, trains bounded global L1+SSIM appearance with degree-three spherical harmonics, bounded camera refinement, and per-view RGB exposure compensation, then covers every calibrated source-resolution tile before publication.
 
-The dataset manifest records registration ratio, excluded views, model count, reprojection error, track length, and warnings. Disconnected views are reported rather than forced into the splat. Video defaults to 2 sharp keyframes per second and a 600-frame ceiling.
+Media splats must also pass a deterministic five-view raw-render gate (median PSNR, SSIM, and L1).
+An undertrained or divergent candidate is not published; its final atomic checkpoint is retained so
+the job can resume with a longer optimization budget.
+
+Material-aware production starts from a separate fail-closed foundation. ScanLan converts embedded
+ICC input to canonical sRGB, decodes the exact IEC transfer into content-addressed linear-light
+frames, and keeps material identity separate from overlapping glass, mirror, specular, emissive,
+thin-geometry, dynamic, and sky risks. Frozen commercial/research candidate manifests prevent
+noncommercial or unverified assets from entering a commercial pack. Material Anything, RGB-to-X,
+and DiffusionRenderer remain bake-off candidates until they pass real-capture quality, multiview,
+calibration, and 12 GB memory gates; see [the P13 foundation](docs/material-radiometric-foundation.md).
+
+The P14 two-pass engine keeps that gate intact while making material inference operationally useful.
+It samples the measured camera path for a bounded coarse optical-risk pass, then chooses final views
+by incremental 3D surface coverage with extra authority for glass, mirror, specular, emissive,
+thin, dynamic, and sky warnings. Calibrated final predictions are visibility-, pose-, angle-, and
+confidence-weighted onto the production surface. Material identity is fused as multiview evidence,
+while a strong optical warning from one sound view survives averaging. The versioned surface
+sidecar records support, effective view count, confidence, and connected material/risk regions; see
+[the P14 analysis](docs/two-pass-material-analysis.md).
+
+P15 makes those risks actionable without letting labels hallucinate geometry. Material evidence can
+only reduce measured/generated/learned depth confidence; glass, mirror, thin, dynamic, and sky
+regions conservatively veto unsupported repair. A second-pass proposal must pass provenance-specific
+confidence, independent-view, held-out metric residual, displacement, and triangle-topology gates.
+Missing material output is a neutral no-op, and protected surfaces move only through a stricter
+multiview recovery gate; see [the P15 geometry policy](docs/material-aware-geometry.md).
+
+P16 converts the fused material surface into confidence-weighted base-color, metallic-roughness,
+transmission, tangent-normal, and emissive atlases while preserving the observed atlas separately.
+It publishes a self-contained standards-compliant GLB and falls back to a safe observed-color rough
+dielectric wherever intrinsic evidence is unsupported; see [PBR reconstruction](docs/pbr-reconstruction.md).
+
+P17 carries those intrinsic priors into Gaussian optimization. The production trainer now keeps
+diffuse, higher-order view dependence, emission, and transmission separate, including distinct
+geometric and optical opacity. Material-free datasets remain an exact neutral compatibility path;
+material-aware jobs publish a lossless aligned sidecar beside the standard PLY. See
+[material-aware Gaussian reconstruction](docs/material-aware-gaussians.md).
+
+The dense initialization sidecar is also the shared point/mesh fusion contract. It retains source
+ownership, confidence, provenance, orientation, and footprint. Media-only point and mesh artifacts
+are correctly labeled non-metric. In a hybrid project, learned media geometry is robustly aligned
+through independently localized cameras and can only fill space outside calibrated RGB-D support;
+failed camera agreement excludes it without degrading the metric result.
+
+For the selected mesh, **Neural SDF refinement (Max Quality)** optionally fits a continuous
+signed-distance surface in the isolated CUDA runtime after camera/depth validation. It is strictly
+fail-closed: deterministic held-out SDF error, bounded displacement, triangle orientation,
+degeneracy, and an independent reconstruction-worker check must all pass before the candidate can
+continue to repair and multiview texturing. Otherwise the validated TSDF or learned dense mesh is
+kept unchanged. The exact decision is saved in `outputs/neural-sdf-report.json`.
+
+The dataset manifest records proposal backend, guided/recovery/fallback pair counts, geometric
+verification evidence, recovered cameras, registration ratio, excluded views, model count,
+reprojection error, track length, and warnings. Disconnected views are reported rather than forced
+into the splat. Video keyframes are selected adaptively from optical flow at a 15 fps analysis rate;
+3,000 retained frames is a crash-safety ceiling, not a sampling target.
 
 For strong results, keep 60-80% overlap, translate as well as rotate the camera, lock focus/exposure when possible, avoid motion blur, and revisit the start of the path. A sparse panorama captured from one fixed point does not contain enough parallax for a full scene reconstruction.
 
@@ -145,6 +242,7 @@ The standalone preparation path is:
 
 ```powershell
 scanlan-splat.exe prepare-media --project C:\path\to\project --source C:\photos\view-01.jpg --source C:\capture.mp4
+scanlan-worker.exe fuse-dataset C:\path\to\project C:\path\to\project\outputs\cache\datasets\media-current.json --targets point_cloud,textured_mesh
 scanlan-splat.exe train --project C:\path\to\project --dataset C:\path\to\project\outputs\cache\datasets\current.json --iterations 30000
 ```
 
@@ -178,6 +276,7 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 .\build\worker-venv\Scripts\python.exe -m unittest discover -s worker\tests -v
 .\splat-worker\.venv\Scripts\python.exe -m unittest discover -s splat-worker\tests -v
+.\splat-worker\.venv\Scripts\python.exe -m unittest discover -s material\tests -v
 ```
 
 Native capture workers must also be compiled on Windows against their vendor SDKs; portable header tests cannot validate those SDK calls.
@@ -191,6 +290,7 @@ Native capture workers must also be compiled on Windows against their vendor SDK
 - `native/modern-capture/` — Azure Kinect and Femto Mega capture
 - `worker/` — realtime and final Open3D/NumPy reconstruction
 - `splat-worker/` — isolated COLMAP/PyAV media solver and CUDA 2DGS/3DGS trainer
+- `geometry-worker/` — isolated LingBot-Map, LingBot-Depth, MapAnything, and DA3 model process
 - `scripts/` — Windows build and packaging entry points
 
 Licensed under [GPL-3.0-only](LICENSE).

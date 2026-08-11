@@ -22,10 +22,11 @@ def parser() -> argparse.ArgumentParser:
     reconstruct.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     reconstruct.add_argument(
         "--depth-refinement",
-        choices=["off", "lingbot"],
+        choices=["off", "auto", "lingbot", "mapanything", "da3"],
         default="off",
     )
     reconstruct.add_argument("--depth-refiner", type=Path, default=None)
+    reconstruct.add_argument("--neural-sdf-worker", type=Path, default=None)
     reconstruct.add_argument(
         "--targets",
         default="point_cloud,textured_mesh",
@@ -63,13 +64,41 @@ def parser() -> argparse.ArgumentParser:
     )
     realtime.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     realtime.add_argument(
+        "--live-map-mib",
+        type=int,
+        default=1024,
+        help="Hard memory budget for the active sparse live submap",
+    )
+    realtime.add_argument(
         "--session", type=Path, required=True, help="Capture directory for the tracking journal"
     )
+    realtime.add_argument(
+        "--sensor-kind", default="unknown", help="Source sensor family for backend policy matching"
+    )
+    realtime.add_argument("--expected-frame-count", type=int, default=None)
 
     replay = commands.add_parser(
         "replay", help="Emit a recorded RGB-D capture using the live stream protocol"
     )
     replay.add_argument("capture", type=Path)
+
+    benchmark_live = commands.add_parser(
+        "benchmark-live",
+        help="Replay a capture through the realtime engine and report latency and memory",
+    )
+    benchmark_live.add_argument("capture", type=Path)
+    benchmark_live.add_argument("--mode", choices=["points", "mesh"], default="mesh")
+    benchmark_live.add_argument("--voxel-size", type=float, default=0.01)
+    benchmark_live.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    benchmark_live.add_argument("--live-map-mib", type=int, default=1024)
+    benchmark_live.add_argument("--session", type=Path, default=None)
+    benchmark_live.add_argument("--report", type=Path, default=None)
+    benchmark_live.add_argument(
+        "--realtime-pacing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Replay using capture timestamps (disable for an overload stress run)",
+    )
 
     localize = commands.add_parser(
         "localize-photos",
@@ -83,6 +112,18 @@ def parser() -> argparse.ArgumentParser:
     )
     localize_media.add_argument("project", type=Path)
     localize_media.add_argument("manifest", type=Path)
+    fuse_dataset = commands.add_parser(
+        "fuse-dataset",
+        help="Publish point-cloud and mesh artifacts from the shared dense dataset contract",
+    )
+    fuse_dataset.add_argument("project", type=Path)
+    fuse_dataset.add_argument("dataset", type=Path)
+    fuse_dataset.add_argument(
+        "--targets",
+        default="point_cloud,textured_mesh",
+        help="Comma-separated point_cloud,textured_mesh targets",
+    )
+    fuse_dataset.add_argument("--neural-sdf-worker", type=Path, default=None)
 
     return root
 
@@ -106,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
                 voxel_size_m=arguments.voxel_size,
                 requested_device=arguments.device,
                 session_root=arguments.session,
+                live_map_mib=arguments.live_map_mib,
+                sensor_kind=arguments.sensor_kind,
+                expected_frame_count=arguments.expected_frame_count,
             )
             return 0
         if arguments.command == "replay":
@@ -113,7 +157,38 @@ def main(argv: list[str] | None = None) -> int:
 
             replay_archive(arguments.capture, sys.stdout.buffer)
             return 0
-        if arguments.command in {"localize-photos", "localize-media"}:
+        if arguments.command == "benchmark-live":
+            from .live_benchmark import benchmark_live_capture
+
+            result = benchmark_live_capture(
+                arguments.capture,
+                mode=arguments.mode,
+                voxel_size_m=arguments.voxel_size,
+                live_map_mib=arguments.live_map_mib,
+                device=arguments.device,
+                paced=arguments.realtime_pacing,
+                session_root=arguments.session,
+            )
+            if arguments.report is not None:
+                write_json(arguments.report, result)
+            print(json.dumps(result, indent=2))
+            return 0
+        if arguments.command == "fuse-dataset":
+            from .dense_fusion import publish_media_dense_artifacts
+
+            targets = tuple(value.strip() for value in arguments.targets.split(",") if value.strip())
+            unknown = set(targets) - {"point_cloud", "textured_mesh", "gaussian_splat"}
+            if unknown:
+                raise ValueError(f"Unknown dense artifact targets: {', '.join(sorted(unknown))}")
+            result = publish_media_dense_artifacts(
+                arguments.project.resolve(),
+                arguments.dataset.resolve(),
+                targets,
+                arguments.neural_sdf_worker.resolve()
+                if arguments.neural_sdf_worker is not None
+                else None,
+            )
+        elif arguments.command in {"localize-photos", "localize-media"}:
             from .supplemental import localize_supplemental_photos
 
             if arguments.command == "localize-media":
@@ -184,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
                 repair_settings,
                 arguments.depth_refinement,
                 arguments.depth_refiner,
+                arguments.neural_sdf_worker,
             )
         print(json.dumps(result))
         return 0

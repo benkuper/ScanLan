@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -145,7 +146,10 @@ public:
             std::lock_guard lock(mutex_);
             if(closed_) return;
             if(queue_.size() == capacity_) {
+                auto dropped = std::move(queue_.front());
                 queue_.pop_front();
+                if(queue_.empty()) prepend_gyro_delta(frame, dropped);
+                else prepend_gyro_delta(queue_.front(), dropped);
                 ++dropped_;
             }
             queue_.push_back(std::move(frame));
@@ -174,6 +178,48 @@ public:
     bool failed() const { return failed_.load(); }
 
 private:
+    static std::array<float, 4> multiply_quaternions(
+        const std::array<float, 4>& left,
+        const std::array<float, 4>& right) {
+        const auto [lx, ly, lz, lw] = left;
+        const auto [rx, ry, rz, rw] = right;
+        std::array<float, 4> value{
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        };
+        const float norm = std::sqrt(
+            value[0] * value[0] + value[1] * value[1]
+            + value[2] * value[2] + value[3] * value[3]);
+        if(!std::isfinite(norm) || norm <= 1e-9F) return {0, 0, 0, 1};
+        for(auto& component : value) component /= norm;
+        return value;
+    }
+
+    static void prepend_gyro_delta(
+        RgbdStreamFrame& target,
+        const RgbdStreamFrame& dropped) {
+        if((dropped.header.flags & RgbdHasImuDelta) == 0) return;
+        std::array<float, 4> earlier{};
+        std::copy(
+            dropped.header.gyro_delta_xyzw,
+            dropped.header.gyro_delta_xyzw + 4,
+            earlier.begin());
+        std::array<float, 4> combined = earlier;
+        if((target.header.flags & RgbdHasImuDelta) != 0) {
+            std::array<float, 4> later{};
+            std::copy(
+                target.header.gyro_delta_xyzw,
+                target.header.gyro_delta_xyzw + 4,
+                later.begin());
+            combined = multiply_quaternions(later, earlier);
+        }
+        std::copy(
+            combined.begin(), combined.end(), target.header.gyro_delta_xyzw);
+        target.header.flags |= RgbdHasImuDelta;
+    }
+
     void run() {
         for(;;) {
             RgbdStreamFrame frame;

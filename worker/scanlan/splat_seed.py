@@ -23,6 +23,11 @@ class GaussianSeeds:
     scales: np.ndarray
     quaternions: np.ndarray
     confidence: np.ndarray | None = None
+    # 0 = calibrated sensor measurement, 1 = validated generated depth.
+    # Learned RGB-only geometry uses code 2 in the shared dense-fusion
+    # contract written by the media worker.
+    provenance: np.ndarray | None = None
+    source_frame_indices: np.ndarray | None = None
 
 
 def _integral_image(values: np.ndarray) -> np.ndarray:
@@ -294,6 +299,8 @@ def compact_seed_batches(
             empty3,
             np.empty((0, 4), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.uint8),
+            np.empty((0,), dtype=np.int32),
         )
     points = np.concatenate([batch.points for batch in batches])
     colors = np.concatenate([batch.colors for batch in batches])
@@ -304,6 +311,22 @@ def compact_seed_batches(
             np.ones(len(batch.points), dtype=np.float32)
             if batch.confidence is None
             else np.asarray(batch.confidence, dtype=np.float32)
+            for batch in batches
+        ]
+    )
+    provenance = np.concatenate(
+        [
+            np.zeros(len(batch.points), dtype=np.uint8)
+            if batch.provenance is None
+            else np.asarray(batch.provenance, dtype=np.uint8)
+            for batch in batches
+        ]
+    )
+    source_frame_indices = np.concatenate(
+        [
+            np.full(len(batch.points), -1, dtype=np.int32)
+            if batch.source_frame_indices is None
+            else np.asarray(batch.source_frame_indices, dtype=np.int32)
             for batch in batches
         ]
     )
@@ -325,4 +348,6 @@ def compact_seed_batches(
         scales[selected],
         quaternions[selected],
         confidence[selected],
+        provenance[selected],
+        source_frame_indices[selected],
     )

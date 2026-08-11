@@ -14,7 +14,21 @@ from PIL import Image
 
 from .dataset import load_dataset
 from .depth_loss import depth_weight, masked_robust_depth_loss
-from .export import SH_C0, export_3dgs_ply, export_splat_preview, write_splat_sidecars
+from .appearance import (
+    compose_material_render_state,
+    linear_to_srgb_tensor,
+    material_regularization,
+    resolve_gaussian_material_seeds,
+    srgb_to_linear_tensor,
+)
+from .export import (
+    SH_C0,
+    export_3dgs_ply,
+    export_material_gaussians,
+    export_splat_preview,
+    write_splat_sidecars,
+)
+from .initialization import resolve_initialization_contract
 from .pose import (
     constrain_pose_offsets_,
     pose_correction_statistics,
@@ -26,11 +40,15 @@ from .pose import (
 FRAME_REUSE_PER_LOAD = 4
 LOSS_EMA_ALPHA = 0.005
 RGBD_GAUSSIAN_MULTIPLIER = 3
-TRAINER_VERSION = "lingbot-dense-video-prior-3dgs-rgbd-hybrid-2dgs-v9-depth-confidence"
+TRAINER_VERSION = "material-aware-components-source-resolution-v11"
 RGBD_SURFACE_SCALE_MULTIPLIER = 1.3
 RGBD_SURFACE_OPACITY = 0.45
 DENSE_PRIOR_INITIAL_OPACITY = 0.01
 MAX_METRIC_ITERATIONS = 2_000
+MINIMUM_SOURCE_RESOLUTION_FRACTION = 0.20
+MINIMUM_PRODUCTION_PSNR_DB = 18.0
+MINIMUM_PRODUCTION_SSIM = 0.55
+MAXIMUM_PRODUCTION_L1 = 0.15
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
@@ -120,16 +138,17 @@ def _read_seed_parameters(
     np.ndarray | None,
     np.ndarray | None,
     np.ndarray | None,
+    np.ndarray | None,
 ]:
     points, colors = _read_initialization(
         root / dataset.get("initialization", "initialization.ply")
     )
     parameters_path = dataset.get("initializationParameters")
     if not parameters_path:
-        return points, colors, None, None, None
+        return points, colors, None, None, None, None
     path = root / parameters_path
     if not path.is_file():
-        return points, colors, None, None, None
+        return points, colors, None, None, None, None
     with np.load(path, allow_pickle=False) as values:
         seeded_points = np.asarray(values["points"], dtype=np.float32)
         seeded_colors = np.asarray(values["colors"], dtype=np.float32)
@@ -140,6 +159,11 @@ def _read_seed_parameters(
             if "confidence" in values
             else np.ones(len(seeded_points), dtype=np.float32)
         )
+        seeded_opacity = (
+            np.asarray(values["opacity"], dtype=np.float32)
+            if "opacity" in values
+            else None
+        )
     if seeded_colors.size and seeded_colors.max() > 1.0:
         seeded_colors /= 255.0
     count = len(seeded_points)
@@ -149,6 +173,7 @@ def _read_seed_parameters(
         or seeded_scales.shape != (count, 3)
         or seeded_quaternions.shape != (count, 4)
         or seeded_confidence.shape != (count,)
+        or (seeded_opacity is not None and seeded_opacity.shape != (count,))
         or not all(
             np.isfinite(value).all()
             for value in (
@@ -157,10 +182,15 @@ def _read_seed_parameters(
                 seeded_scales,
                 seeded_quaternions,
                 seeded_confidence,
+                *(() if seeded_opacity is None else (seeded_opacity,)),
             )
         )
         or np.any(seeded_scales <= 0.0)
         or np.any((seeded_confidence < 0.0) | (seeded_confidence > 1.0))
+        or (
+            seeded_opacity is not None
+            and np.any((seeded_opacity < 0.0) | (seeded_opacity > 1.0))
+        )
     ):
         raise ValueError("RGB-D Gaussian initialization parameters are invalid")
     return (
@@ -169,6 +199,7 @@ def _read_seed_parameters(
         seeded_scales,
         seeded_quaternions,
         seeded_confidence,
+        seeded_opacity,
     )
 
 
@@ -176,6 +207,70 @@ def _sh_preview_colors(sh0: Any) -> Any:
     import torch
 
     return torch.clamp(sh0[:, 0, :] * SH_C0 + 0.5, 0.0, 1.0)
+
+
+def _inverse_sigmoid_numpy(value: np.ndarray) -> np.ndarray:
+    bounded = np.clip(np.asarray(value, dtype=np.float32), 1e-4, 1.0 - 1e-4)
+    return np.log(bounded / (1.0 - bounded)).astype(np.float32)
+
+
+def _material_parameter_initialization(
+    colors_srgb: np.ndarray,
+    material_seeds: Any | None,
+) -> dict[str, np.ndarray]:
+    from scanlan_material.radiometry import srgb_to_linear
+
+    count = len(colors_srgb)
+    observed_linear = srgb_to_linear(np.clip(colors_srgb, 0.0, 1.0)).astype(np.float32)
+    if material_seeds is None:
+        confidence = np.zeros(count, dtype=np.float32)
+        # Preserve the established display-space trainer exactly when no
+        # intrinsic prior is declared. A neutral branch must be a true no-op.
+        diffuse = np.asarray(colors_srgb, dtype=np.float32)
+        roughness = np.ones(count, dtype=np.float32)
+        metallic = np.zeros(count, dtype=np.float32)
+        transmission = np.full(count, 1e-4, dtype=np.float32)
+        emission = np.full((count, 3), math.exp(-16.0), dtype=np.float32)
+    else:
+        confidence = np.asarray(material_seeds.confidence, dtype=np.float32)
+        diffuse = (
+            confidence[:, None] * material_seeds.albedo_linear
+            + (1.0 - confidence[:, None]) * observed_linear
+        ).astype(np.float32)
+        roughness = confidence * material_seeds.roughness + (1.0 - confidence)
+        metallic = confidence * material_seeds.metallic
+        transmission = np.clip(confidence * material_seeds.transmission, 1e-4, 1.0 - 1e-4)
+        emission = np.maximum(
+            confidence[:, None] * material_seeds.emission_linear,
+            math.exp(-16.0),
+        ).astype(np.float32)
+    transmission_logits = _inverse_sigmoid_numpy(transmission)
+    emission_log = np.log(emission).astype(np.float32)
+    return {
+        "diffuse_sh0": ((diffuse - 0.5) / SH_C0).astype(np.float32)[:, None, :],
+        "view_shN": np.zeros((count, 15, 3), dtype=np.float32),
+        "emission_log": emission_log,
+        "transmission_logits": transmission_logits,
+        "roughness_logits": _inverse_sigmoid_numpy(roughness),
+        "metallic_logits": _inverse_sigmoid_numpy(metallic),
+        "material_confidence": confidence.astype(np.float32),
+        "emission_anchor_log": emission_log.copy(),
+        "transmission_anchor_logits": transmission_logits.copy(),
+    }
+
+
+def _material_preview_colors(parameters: Any, material_aware: bool) -> Any:
+    if not material_aware:
+        return _sh_preview_colors(parameters["diffuse_sh0"])
+    import torch
+
+    diffuse_linear = torch.clamp(
+        parameters["diffuse_sh0"][:, 0, :] * SH_C0 + 0.5,
+        0.0,
+        1.0,
+    )
+    emission_linear = torch.exp(parameters["emission_log"].clamp(-16.0, 4.0))
+    return linear_to_srgb_tensor(diffuse_linear + emission_linear).clamp(0.0, 1.0)
 
 
 def _preview_log_scales(log_scales: Any, flatten_2d: bool = True) -> Any:
@@ -257,6 +352,17 @@ def _update_smoothed_loss(previous: float | None, current: float) -> float:
     return previous + LOSS_EMA_ALPHA * (current - previous)
 
 
+def _photometric_quality_accepted(metrics: dict[str, float]) -> bool:
+    return bool(
+        math.isfinite(metrics.get("medianPsnrDb", math.nan))
+        and math.isfinite(metrics.get("medianSsim", math.nan))
+        and math.isfinite(metrics.get("medianL1", math.nan))
+        and metrics["medianPsnrDb"] >= MINIMUM_PRODUCTION_PSNR_DB
+        and metrics["medianSsim"] >= MINIMUM_PRODUCTION_SSIM
+        and metrics["medianL1"] <= MAXIMUM_PRODUCTION_L1
+    )
+
+
 def _rgbd_gaussian_limit(initial_count: int, hardware_limit: int) -> int:
     """Keep dense metric seeds from immediately expanding to the VRAM ceiling."""
     return min(
@@ -292,6 +398,24 @@ def _dense_prior_scale_limit(
         return None
     footprint = np.max(np.asarray(seeded_scales)[:, :2], axis=1)
     return max(float(np.percentile(footprint, 95.0)) * 1.25, scene_scale * 0.003)
+
+
+def _prepare_dense_seed_scales(
+    seeded_scales: np.ndarray,
+    surface_scale_limit: float | None,
+    *,
+    direct_gaussian_prior: bool,
+) -> np.ndarray:
+    result = np.asarray(seeded_scales, dtype=np.float32).copy()
+    if surface_scale_limit is not None:
+        np.minimum(result, surface_scale_limit, out=result)
+    if not direct_gaussian_prior:
+        # Depth-unprojected seeds need an explicit surface-normal axis. A
+        # direct GS head already predicts anisotropy and orientation.
+        result[:, 2] = np.minimum(
+            result[:, 2], np.minimum(result[:, 0], result[:, 1]) * 0.08
+        )
+    return result
 
 
 def _exponential_lr_gamma(total_steps: int) -> float:
@@ -435,7 +559,81 @@ def _ssim(predicted: Any, target: Any, mask: Any | None = None) -> Any:
     return valid_scores.mean() if valid_scores.numel() else score.mean()
 
 
-def _frame_tensors(root: Path, frame: dict[str, Any], max_dimension: int) -> dict[str, Any]:
+def _source_resolution_crop(
+    frame: dict[str, Any],
+    sample: int,
+    maximum_raster_dimension: int,
+) -> tuple[int, int, int, int] | None:
+    """Return a deterministic bounded tile in the source camera pixel grid."""
+    intrinsics = frame["intrinsics"]
+    width = int(intrinsics["width"])
+    height = int(intrinsics["height"])
+    if max(width, height) <= maximum_raster_dimension:
+        return None
+    tile_width = min(width, maximum_raster_dimension)
+    tile_height = min(height, maximum_raster_dimension)
+    columns = math.ceil(width / tile_width)
+    rows = math.ceil(height / tile_height)
+    tile_count = columns * rows
+    # A frame-specific rotation prevents synchronized cameras from training on
+    # the same corner while sample % tile_count guarantees complete coverage.
+    tile_index = (sample + int(frame.get("frameIndex", 0)) * 17) % tile_count
+    row, column = divmod(tile_index, columns)
+    left = 0 if columns == 1 else round(column * (width - tile_width) / (columns - 1))
+    top = 0 if rows == 1 else round(row * (height - tile_height) / (rows - 1))
+    return left, top, tile_width, tile_height
+
+
+def _source_resolution_tile_count(
+    frame: dict[str, Any], maximum_raster_dimension: int
+) -> int:
+    intrinsics = frame["intrinsics"]
+    return math.ceil(int(intrinsics["width"]) / maximum_raster_dimension) * math.ceil(
+        int(intrinsics["height"]) / maximum_raster_dimension
+    )
+
+
+def _source_resolution_start_step(
+    frames: list[dict[str, Any]],
+    iterations: int,
+    maximum_raster_dimension: int,
+) -> int:
+    """Reserve enough final iterations to expose every calibrated source tile."""
+    minimum_steps = math.ceil(iterations * MINIMUM_SOURCE_RESOLUTION_FRACTION)
+    coverage_steps = sum(
+        _source_resolution_tile_count(frame, maximum_raster_dimension)
+        for frame in frames
+    )
+    return max(1, iterations - max(minimum_steps, coverage_steps))
+
+
+def _source_resolution_frame_order(
+    frames: list[dict[str, Any]], maximum_raster_dimension: int
+) -> np.ndarray:
+    """Schedule every source tile once while retaining cache-local camera blocks."""
+    camera_order = np.random.default_rng(0x5CA11A).permutation(len(frames))
+    return np.concatenate(
+        [
+            np.full(
+                _source_resolution_tile_count(frames[int(index)], maximum_raster_dimension),
+                int(index),
+                dtype=np.int64,
+            )
+            for index in camera_order
+        ]
+    )
+
+
+def _uses_source_resolution(step: int, start_step: int) -> bool:
+    return step >= start_step
+
+
+def _frame_tensors(
+    root: Path,
+    frame: dict[str, Any],
+    max_dimension: int,
+    source_crop: tuple[int, int, int, int] | None = None,
+) -> dict[str, Any]:
     import torch
 
     with Image.open(root / frame["image"]) as source:
@@ -447,20 +645,46 @@ def _frame_tensors(root: Path, frame: dict[str, Any], max_dimension: int) -> dic
             int(declared["height"]),
         ):
             raise ValueError("Canonical RGB dimensions do not match their pinhole intrinsics")
-        requested_scale = min(1.0, max_dimension / max(image.size))
-        if requested_scale < 1.0:
+        crop_left = 0
+        crop_top = 0
+        if source_crop is not None:
+            crop_left, crop_top, crop_width, crop_height = source_crop
+            if (
+                crop_left < 0
+                or crop_top < 0
+                or crop_width <= 0
+                or crop_height <= 0
+                or crop_left + crop_width > source_width
+                or crop_top + crop_height > source_height
+            ):
+                raise ValueError("Source-resolution training crop escapes its calibrated image")
+            image = image.crop(
+                (crop_left, crop_top, crop_left + crop_width, crop_top + crop_height)
+            )
+            requested_scale = 1.0
+        else:
+            requested_scale = min(1.0, max_dimension / max(image.size))
+        if source_crop is None and requested_scale < 1.0:
             image = image.resize(
                 (round(image.width * requested_scale), round(image.height * requested_scale)),
                 Image.Resampling.LANCZOS,
             )
         rgb = torch.from_numpy(np.asarray(image, dtype=np.uint8).copy())
-    scale_x = image.width / source_width
-    scale_y = image.height / source_height
+    scale_x = 1.0 if source_crop is not None else image.width / source_width
+    scale_y = 1.0 if source_crop is not None else image.height / source_height
     intrinsics = frame["intrinsics"]
     intrinsic = torch.tensor(
         [
-            [intrinsics["fx"] * scale_x, 0.0, (intrinsics["cx"] + 0.5) * scale_x - 0.5],
-            [0.0, intrinsics["fy"] * scale_y, (intrinsics["cy"] + 0.5) * scale_y - 0.5],
+            [
+                intrinsics["fx"] * scale_x,
+                0.0,
+                (intrinsics["cx"] + 0.5) * scale_x - 0.5 - crop_left,
+            ],
+            [
+                0.0,
+                intrinsics["fy"] * scale_y,
+                (intrinsics["cy"] + 0.5) * scale_y - 0.5 - crop_top,
+            ],
             [0.0, 0.0, 1.0],
         ],
         dtype=torch.float32,
@@ -473,19 +697,55 @@ def _frame_tensors(root: Path, frame: dict[str, Any], max_dimension: int) -> dic
         "view": torch.linalg.inv(world_from_camera),
         "width": image.width,
         "height": image.height,
+        "sourceCrop": source_crop,
+        "sourceResolution": requested_scale == 1.0,
     }
     if frame.get("depth"):
         with Image.open(root / frame["depth"]) as source:
-            depth_image = source.resize((image.width, image.height), Image.Resampling.NEAREST)
+            if source_crop is not None:
+                if source.size != (source_width, source_height):
+                    raise ValueError("Source-resolution RGB and registered depth dimensions differ")
+                depth_image = source.crop(
+                    (
+                        crop_left,
+                        crop_top,
+                        crop_left + image.width,
+                        crop_top + image.height,
+                    )
+                )
+            else:
+                depth_image = source.resize((image.width, image.height), Image.Resampling.NEAREST)
             depth = torch.from_numpy(np.asarray(depth_image, dtype=np.uint16).copy())
         with Image.open(root / frame["depthMask"]) as source:
-            mask_image = source.resize((image.width, image.height), Image.Resampling.NEAREST)
+            mask_image = (
+                source.crop(
+                    (
+                        crop_left,
+                        crop_top,
+                        crop_left + image.width,
+                        crop_top + image.height,
+                    )
+                )
+                if source_crop is not None
+                else source.resize((image.width, image.height), Image.Resampling.NEAREST)
+            )
             mask = torch.from_numpy(np.asarray(mask_image, dtype=np.uint8).copy())
         value.update(depth=depth, mask=mask)
         if frame.get("depthConfidence"):
             with Image.open(root / frame["depthConfidence"]) as source:
-                confidence_image = source.resize(
-                    (image.width, image.height), Image.Resampling.NEAREST
+                confidence_image = (
+                    source.crop(
+                        (
+                            crop_left,
+                            crop_top,
+                            crop_left + image.width,
+                            crop_top + image.height,
+                        )
+                    )
+                    if source_crop is not None
+                    else source.resize(
+                        (image.width, image.height), Image.Resampling.NEAREST
+                    )
                 )
                 confidence = torch.from_numpy(
                     np.asarray(confidence_image, dtype=np.uint8).copy()
@@ -497,7 +757,9 @@ def _frame_tensors(root: Path, frame: dict[str, Any], max_dimension: int) -> dic
     return value
 
 
-def _frame_to_device(frame: dict[str, Any], device: Any) -> dict[str, Any]:
+def _frame_to_device(
+    frame: dict[str, Any], device: Any, *, linear_rgb: bool = False
+) -> dict[str, Any]:
     import torch
 
     result: dict[str, Any] = {}
@@ -508,6 +770,8 @@ def _frame_to_device(frame: dict[str, Any], device: Any) -> dict[str, Any]:
         transferred = value.to(device, non_blocking=True)
         if key == "rgb":
             transferred = transferred.float().div_(255.0)
+            if linear_rgb:
+                transferred = srgb_to_linear_tensor(transferred)
         elif key == "depth":
             transferred = transferred.float().div_(1000.0)
         elif key == "mask":
@@ -540,6 +804,7 @@ def train_dataset(
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     root, dataset = load_dataset(dataset_path)
+    initialization = resolve_initialization_contract(dataset)
     frames = dataset.get("frames", [])
     if len(frames) < 2:
         raise ValueError("At least two registered RGB views are required for Gaussian training")
@@ -561,24 +826,49 @@ def train_dataset(
     output_root = project_root / "outputs"
     checkpoint_path = output_root / "splat-checkpoint.pt"
     progress_path = output_root / "splat-progress.json"
-    points, colors, seeded_scales, seeded_quaternions, seeded_confidence = (
+    (
+        points,
+        colors,
+        seeded_scales,
+        seeded_quaternions,
+        seeded_confidence,
+        seeded_opacity,
+    ) = (
         _read_seed_parameters(root, dataset)
     )
     if len(points) == 0:
         raise ValueError("Sparse or RGB-D initialization contains no points")
-    metric_seeded = bool(
-        dataset.get("metric")
-        and seeded_scales is not None
-        and seeded_quaternions is not None
-    )
-    dense_geometry_prior = bool(dataset.get("denseGeometryPrior", False))
-    uses_2dgs = bool(dataset.get("metric"))
+    material_seeds = resolve_gaussian_material_seeds(root, dataset, len(points))
+    material_aware = material_seeds is not None
+    if initialization.is_dense and (
+        seeded_scales is None or seeded_quaternions is None
+    ):
+        raise ValueError("Dense Gaussian initialization parameter sidecar is unavailable")
+    if initialization.is_direct and seeded_opacity is None:
+        raise ValueError("Direct Gaussian initialization is missing predicted opacity")
+    metric_seeded = bool(dataset.get("metric") and initialization.is_dense)
+    dense_geometry_prior = initialization.is_dense and not metric_seeded
+    direct_gaussian_prior = initialization.is_direct
+    uses_2dgs = initialization.uses_2dgs
     requested_iterations = iterations
     if metric_seeded and not hybrid:
         # Dense RGB-D already supplies the measured surface and appearance. A
         # short bounded pass is enough to validate it and conservatively refine
         # camera poses; longer runs add no surface detail in fixed-surface mode.
         iterations = min(iterations, MAX_METRIC_ITERATIONS)
+    required_source_steps = sum(
+        _source_resolution_tile_count(frame, training_dimension) for frame in frames
+    )
+    # A requested iteration count is a speed preference, not permission to
+    # skip source pixels. Extend the run only when one complete tiled pass
+    # cannot fit; the manifest reports requested and effective counts.
+    iterations = max(iterations, required_source_steps + 1)
+    source_resolution_start_step = _source_resolution_start_step(
+        frames, iterations, training_dimension
+    )
+    source_resolution_frame_order = _source_resolution_frame_order(
+        frames, training_dimension
+    )
 
     centred = points - np.median(points, axis=0, keepdims=True)
     scene_scale = max(float(np.percentile(np.linalg.norm(centred, axis=1), 90)), 1e-3)
@@ -601,17 +891,10 @@ def train_dataset(
     )
     training_seeded_scales = seeded_scales
     if dense_geometry_prior and seeded_scales is not None:
-        training_seeded_scales = np.asarray(seeded_scales, dtype=np.float32).copy()
-        if surface_scale_limit is not None:
-            np.minimum(
-                training_seeded_scales,
-                surface_scale_limit,
-                out=training_seeded_scales,
-            )
-        training_seeded_scales[:, 2] = np.minimum(
-            training_seeded_scales[:, 2],
-            np.minimum(training_seeded_scales[:, 0], training_seeded_scales[:, 1])
-            * 0.08,
+        training_seeded_scales = _prepare_dense_seed_scales(
+            seeded_scales,
+            surface_scale_limit,
+            direct_gaussian_prior=direct_gaussian_prior,
         )
     metric_opacity_bounds = (
         (float(_logit(0.01)), float(_logit(0.8)))
@@ -642,8 +925,11 @@ def train_dataset(
             (len(points), 1),
         )
     )
-    sh0 = ((colors - 0.5) / SH_C0).astype(np.float32)[:, None, :]
+    appearance_parameters = _material_parameter_initialization(colors, material_seeds)
     initial_opacity = (
+        np.clip(seeded_opacity, 1e-4, 1.0 - 1e-4)
+        if direct_gaussian_prior and seeded_opacity is not None
+        else
         np.clip(seeded_confidence, 0.05, 1.0) * RGBD_SURFACE_OPACITY
         if metric_seeded and seeded_confidence is not None
         else np.full(
@@ -663,8 +949,10 @@ def train_dataset(
         "opacities": _logit(
             torch.from_numpy(np.asarray(initial_opacity, dtype=np.float32))
         ),
-        "sh0": torch.from_numpy(sh0),
-        "shN": torch.zeros((len(points), 15, 3), dtype=torch.float32),
+        **{
+            name: torch.from_numpy(value)
+            for name, value in appearance_parameters.items()
+        },
     }
     start_step = 0
     checkpoint = None
@@ -744,8 +1032,15 @@ def train_dataset(
         "scales": 0.0 if metric_seeded else 2.5e-3 if dense_geometry_prior else 5e-3,
         "quats": 0.0 if metric_seeded else 1e-3,
         "opacities": 1e-2 if hybrid and metric_seeded else 0.0 if metric_seeded else 5e-2,
-        "sh0": 2.5e-3 if hybrid and metric_seeded else 0.0 if metric_seeded else 2.5e-3,
-        "shN": 1.25e-4 if hybrid and metric_seeded else 0.0 if metric_seeded else 1.25e-4,
+        "diffuse_sh0": 2.5e-3 if hybrid and metric_seeded else 0.0 if metric_seeded else 2.5e-3,
+        "view_shN": 1.25e-4 if hybrid and metric_seeded else 0.0 if metric_seeded else 1.25e-4,
+        "emission_log": 1e-3 if material_aware else 0.0,
+        "transmission_logits": 5e-4 if material_aware else 0.0,
+        "roughness_logits": 0.0,
+        "metallic_logits": 0.0,
+        "material_confidence": 0.0,
+        "emission_anchor_log": 0.0,
+        "transmission_anchor_logits": 0.0,
     }
     optimizers = {
         name: torch.optim.Adam(
@@ -777,7 +1072,7 @@ def train_dataset(
     pose_refine_start = max(500, iterations // 20)
     strategy = None
     strategy_state: dict[str, Any] = {}
-    if not metric_seeded:
+    if initialization.adaptive_densification:
         if uses_2dgs:
             strategy = DefaultStrategy(
                 # gsplat's 2DGS densification signal is `gradient_2dgs`; unlike the
@@ -842,6 +1137,7 @@ def train_dataset(
                 ),
                 "strategy": strategy_state,
                 "scaler": scaler.state_dict(),
+                "sourceResolutionSamples": source_resolution_samples,
             },
             torch.save,
         )
@@ -849,7 +1145,9 @@ def train_dataset(
     # RGB-D keyframes stay in a small pinned host-memory LRU. Keeping an entire
     # capture resident on CUDA made VRAM usage grow with session duration and
     # was the main source of 12 GB laptop-GPU failures.
-    cached_frames: OrderedDict[int, dict[str, Any]] = OrderedDict()
+    cached_frames: OrderedDict[
+        tuple[int, tuple[int, int, int, int] | None], dict[str, Any]
+    ] = OrderedDict()
     started = time.perf_counter()
     last_live_preview_at = 0.0
     last_loss = 0.0
@@ -857,6 +1155,33 @@ def train_dataset(
     frame_epoch = -1
     frame_order = _training_frame_order(frames, 0, host_cache_size)
     densification_stopped_at: int | None = None
+    source_resolution_steps = 0
+    source_resolution_tiles: set[tuple[int, tuple[int, int, int, int] | None]] = set()
+    source_resolution_samples = [0] * len(frames)
+    if checkpoint is not None and checkpoint.get("sourceResolutionSamples") is not None:
+        restored_source_samples = [
+            int(value) for value in checkpoint["sourceResolutionSamples"]
+        ]
+        if len(restored_source_samples) != len(frames) or any(
+            value < 0 for value in restored_source_samples
+        ):
+            raise RuntimeError(
+                "Splat checkpoint belongs to an incompatible source-resolution schedule; start a new job"
+            )
+        source_resolution_samples = restored_source_samples
+        source_resolution_steps = sum(restored_source_samples)
+        for restored_frame_index, restored_count in enumerate(restored_source_samples):
+            for restored_sample in range(restored_count):
+                source_resolution_tiles.add(
+                    (
+                        restored_frame_index,
+                        _source_resolution_crop(
+                            frames[restored_frame_index],
+                            restored_sample,
+                            training_dimension,
+                        ),
+                    )
+                )
 
     def publish_live_preview() -> None:
         nonlocal last_live_preview_at
@@ -867,11 +1192,22 @@ def train_dataset(
                 if len(parameters["means"]) > preview_count
                 else slice(None)
             )
+            preview_parameters = {
+                name: value[preview_indices] for name, value in parameters.items()
+            }
+            _preview_coefficients, preview_optical_opacity, _preview_material = (
+                compose_material_render_state(
+                    preview_parameters, material_aware, SH_C0
+                )
+            )
             export_splat_preview(
                 output_root / "room-splat.preview.splat",
                 parameters["means"][preview_indices].detach().cpu().numpy(),
-                _sh_preview_colors(parameters["sh0"][preview_indices]).detach().cpu().numpy(),
-                parameters["opacities"][preview_indices].detach().cpu().numpy(),
+                _material_preview_colors(
+                    preview_parameters,
+                    material_aware,
+                ).detach().cpu().numpy(),
+                _logit(preview_optical_opacity).detach().cpu().numpy(),
                 _preview_log_scales(
                     parameters["scales"][preview_indices],
                     flatten_2d=uses_2dgs,
@@ -884,26 +1220,52 @@ def train_dataset(
         if (output_root / "cancel.flag").exists():
             save_checkpoint(step - 1)
             raise RuntimeError("Gaussian training cancelled; checkpoint saved")
-        next_epoch = step // len(frame_order)
-        if next_epoch != frame_epoch:
-            frame_epoch = next_epoch
-            frame_order = _training_frame_order(
-                frames,
-                frame_epoch,
-                host_cache_size,
+        source_resolution_active = _uses_source_resolution(
+            step, source_resolution_start_step
+        )
+        if source_resolution_active:
+            frame_index = int(
+                source_resolution_frame_order[
+                    (step - source_resolution_start_step)
+                    % len(source_resolution_frame_order)
+                ]
             )
-        frame_index = int(frame_order[step % len(frame_order)])
-        if frame_index not in cached_frames:
-            cached_frames[frame_index] = _frame_tensors(
+        else:
+            next_epoch = step // len(frame_order)
+            if next_epoch != frame_epoch:
+                frame_epoch = next_epoch
+                frame_order = _training_frame_order(
+                    frames,
+                    frame_epoch,
+                    host_cache_size,
+                )
+            frame_index = int(frame_order[step % len(frame_order)])
+        source_crop = None
+        if source_resolution_active:
+            source_crop = _source_resolution_crop(
+                frames[frame_index],
+                source_resolution_samples[frame_index],
+                training_dimension,
+            )
+            source_resolution_samples[frame_index] += 1
+        cache_key = (frame_index, source_crop)
+        if source_resolution_active:
+            source_resolution_steps += 1
+            source_resolution_tiles.add(cache_key)
+        if cache_key not in cached_frames:
+            cached_frames[cache_key] = _frame_tensors(
                 root,
                 frames[frame_index],
                 training_dimension,
+                source_crop,
             )
             if len(cached_frames) > host_cache_size:
                 cached_frames.popitem(last=False)
         else:
-            cached_frames.move_to_end(frame_index)
-        frame = _frame_to_device(cached_frames[frame_index], device)
+            cached_frames.move_to_end(cache_key)
+        frame = _frame_to_device(
+            cached_frames[cache_key], device, linear_rgb=material_aware
+        )
         for optimizer in optimizers.values():
             optimizer.zero_grad(set_to_none=True)
         pose_active = pose_optimizer is not None and step >= pose_refine_start
@@ -923,12 +1285,16 @@ def train_dataset(
             sh_degree = min(3, step // max(iterations // 4, 1))
             pose_regularization_value = torch.zeros((), device=device)
             appearance_regularization_value = torch.zeros((), device=device)
+            material_regularization_value = torch.zeros((), device=device)
             normalized_quaternions = torch.nn.functional.normalize(
                 parameters["quats"], dim=-1
             )
             render_normals = None
             surface_normals = None
             render_distortion = None
+            render_coefficients, optical_opacities, _material_state = (
+                compose_material_render_state(parameters, material_aware, SH_C0)
+            )
             if uses_2dgs:
                 (
                     rendering,
@@ -942,8 +1308,8 @@ def train_dataset(
                     means=parameters["means"],
                     quats=normalized_quaternions,
                     scales=torch.exp(parameters["scales"]).clamp(1e-5, scene_scale),
-                    opacities=torch.sigmoid(parameters["opacities"]),
-                    colors=torch.cat((parameters["sh0"], parameters["shN"]), dim=1),
+                    opacities=optical_opacities,
+                    colors=render_coefficients,
                     viewmats=refined_view.unsqueeze(0),
                     Ks=frame["K"].unsqueeze(0),
                     width=frame["width"],
@@ -960,8 +1326,8 @@ def train_dataset(
                     means=parameters["means"],
                     quats=normalized_quaternions,
                     scales=torch.exp(parameters["scales"]).clamp(1e-5, scene_scale),
-                    opacities=torch.sigmoid(parameters["opacities"]),
-                    colors=torch.cat((parameters["sh0"], parameters["shN"]), dim=1),
+                    opacities=optical_opacities,
+                    colors=render_coefficients,
                     viewmats=refined_view.unsqueeze(0),
                     Ks=frame["K"].unsqueeze(0),
                     width=frame["width"],
@@ -998,6 +1364,10 @@ def train_dataset(
             )
             if appearance_active:
                 loss = loss + 1e-4 * appearance_regularization_value
+            material_regularization_value, _material_loss_parts = material_regularization(
+                parameters, material_aware
+            )
+            loss = loss + material_regularization_value
             depth_value = torch.zeros((), device=device)
             normal_value = torch.zeros((), device=device)
             distortion_value = torch.zeros((), device=device)
@@ -1087,6 +1457,16 @@ def train_dataset(
                     min=metric_opacity_bounds[0],
                     max=metric_opacity_bounds[1],
                 )
+        if material_aware:
+            with torch.no_grad():
+                parameters["emission_log"].clamp_(-16.0, math.log(16.0))
+                parameters["transmission_logits"].clamp_(
+                    float(_logit(1e-4)), float(_logit(1.0 - 1e-4))
+                )
+                parameters["diffuse_sh0"].clamp_(
+                    min=-0.5 / SH_C0,
+                    max=0.5 / SH_C0,
+                )
         if len(parameters["means"]) > maximum_gaussians:
             raise RuntimeError(
                 f"Adaptive densification exceeded the {maximum_gaussians:,}-Gaussian "
@@ -1120,7 +1500,40 @@ def train_dataset(
                 if dense_geometry_prior
                 else "Optimized 2DGS" if uses_2dgs else "Optimized photoreal 3DGS"
             )
-            _write_json_atomic(progress_path, {"stage": "splat_training", "detail": f"{progress_action} iteration {step + 1:,} of {iterations:,} · loss {last_loss:.4f} · rolling {smoothed_loss:.4f} · {training_dimension}px · {len(parameters['means']):,} Gaussians", "progress": progress_start + (1.0 - progress_start) * stage_progress, "stageProgress": stage_progress, "iteration": step + 1, "totalIterations": iterations, "loss": last_loss, "smoothedLoss": smoothed_loss, "rgbLoss": float(rgb_l1.detach()), "depthLoss": float(depth_value.detach()), "normalLoss": float(normal_value.detach()), "distortionLoss": float(distortion_value.detach()), "poseRegularizationLoss": float(pose_regularization_value.detach()), "appearanceRegularizationLoss": float(appearance_regularization_value.detach()), "maximumPoseTranslationMm": maximum_pose_translation_mm, "gaussianCount": len(parameters["means"]), "maximumGaussians": maximum_gaussians, "etaSeconds": eta, "stageEtaSeconds": eta, "elapsedSeconds": round(elapsed), "computeBackend": f"{torch.cuda.get_device_name(device)} · CUDA AMP / gsplat {'2DGS' if uses_2dgs else '3DGS'}"})
+            raster_label = (
+                f"source {frame['width']}×{frame['height']} tile"
+                if frame["sourceResolution"]
+                else f"global {frame['width']}×{frame['height']}"
+            )
+            _write_json_atomic(
+                progress_path,
+                {
+                    "stage": "splat_training",
+                    "detail": f"{progress_action} iteration {step + 1:,} of {iterations:,} · loss {last_loss:.4f} · rolling {smoothed_loss:.4f} · {raster_label} · {len(parameters['means']):,} Gaussians",
+                    "progress": progress_start + (1.0 - progress_start) * stage_progress,
+                    "stageProgress": stage_progress,
+                    "iteration": step + 1,
+                    "totalIterations": iterations,
+                    "loss": last_loss,
+                    "smoothedLoss": smoothed_loss,
+                    "rgbLoss": float(rgb_l1.detach()),
+                    "depthLoss": float(depth_value.detach()),
+                    "normalLoss": float(normal_value.detach()),
+                    "distortionLoss": float(distortion_value.detach()),
+                    "poseRegularizationLoss": float(pose_regularization_value.detach()),
+                    "appearanceRegularizationLoss": float(appearance_regularization_value.detach()),
+                    "materialRegularizationLoss": float(material_regularization_value.detach()),
+                    "maximumPoseTranslationMm": maximum_pose_translation_mm,
+                    "gaussianCount": len(parameters["means"]),
+                    "maximumGaussians": maximum_gaussians,
+                    "sourceResolution": frame["sourceResolution"],
+                    "sourceCrop": frame["sourceCrop"],
+                    "etaSeconds": eta,
+                    "stageEtaSeconds": eta,
+                    "elapsedSeconds": round(elapsed),
+                    "computeBackend": f"{torch.cuda.get_device_name(device)} · CUDA AMP / gsplat {'2DGS' if uses_2dgs else '3DGS'}",
+                },
+            )
         preview_due = step == start_step or step + 1 == iterations or (
             step > 0
             and step % 250 == 0
@@ -1131,10 +1544,163 @@ def train_dataset(
         if step > 0 and step % 1000 == 0:
             save_checkpoint(step)
 
-    colors_out = _sh_preview_colors(parameters["sh0"]).detach().cpu().numpy()
-    sh_out = torch.cat((parameters["sh0"], parameters["shN"]), dim=1).detach().cpu().numpy()
+    expected_source_tiles = len(source_resolution_frame_order)
+    source_resolution_coverage = len(source_resolution_tiles) / max(
+        expected_source_tiles, 1
+    )
+    if source_resolution_coverage < 1.0:
+        raise RuntimeError(
+            "Gaussian optimization did not cover every calibrated source-resolution tile"
+        )
+
+    quality_report: dict[str, Any] = {
+        "schemaVersion": 1,
+        "status": "not_applicable" if metric_seeded else "evaluating",
+        "reason": (
+            "fixed calibrated metric surface"
+            if metric_seeded
+            else "bounded multiview training-camera photometric gate"
+        ),
+        "trainingColorSpace": "linear-srgb" if material_aware else "srgb",
+        "metricColorSpace": "srgb",
+        "thresholds": {
+            "minimumMedianPsnrDb": MINIMUM_PRODUCTION_PSNR_DB,
+            "minimumMedianSsim": MINIMUM_PRODUCTION_SSIM,
+            "maximumMedianL1": MAXIMUM_PRODUCTION_L1,
+        },
+    }
+    if not metric_seeded:
+        evaluation_indices = np.linspace(
+            0,
+            len(frames) - 1,
+            min(5, len(frames)),
+            dtype=np.int64,
+        )
+        evaluation_records: list[dict[str, float | int]] = []
+        with torch.no_grad():
+            for evaluation_index in evaluation_indices:
+                frame_index = int(evaluation_index)
+                evaluation_frame = _frame_to_device(
+                    _frame_tensors(root, frames[frame_index], training_dimension),
+                    device,
+                    linear_rgb=material_aware,
+                )
+                evaluation_camera_to_world = evaluation_frame["cameraToWorld"]
+                if pose_refinement_enabled:
+                    evaluation_camera_to_world = evaluation_camera_to_world @ pose_delta_matrix(
+                        pose_offsets[frame_index] * pose_refinement_mask[frame_index]
+                    )
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    evaluation_coefficients, evaluation_opacity, _evaluation_material = (
+                        compose_material_render_state(
+                            parameters, material_aware, SH_C0
+                        )
+                    )
+                    evaluation_render, _evaluation_alpha, _evaluation_info = rasterization(
+                        means=parameters["means"],
+                        quats=torch.nn.functional.normalize(parameters["quats"], dim=-1),
+                        scales=torch.exp(parameters["scales"]).clamp(1e-5, scene_scale),
+                        opacities=evaluation_opacity,
+                        colors=evaluation_coefficients,
+                        viewmats=torch.linalg.inv(evaluation_camera_to_world).unsqueeze(0),
+                        Ks=evaluation_frame["K"].unsqueeze(0),
+                        width=evaluation_frame["width"],
+                        height=evaluation_frame["height"],
+                        packed=True,
+                        render_mode="RGB",
+                        sh_degree=3,
+                    )
+                    predicted = evaluation_render[0, ..., :3].clamp(0.0, 1.0)
+                    target = evaluation_frame["rgb"]
+                    quality_predicted = (
+                        linear_to_srgb_tensor(predicted).clamp(0.0, 1.0)
+                        if material_aware
+                        else predicted
+                    )
+                    quality_target = (
+                        linear_to_srgb_tensor(target).clamp(0.0, 1.0)
+                        if material_aware
+                        else target
+                    )
+                    difference = quality_predicted - quality_target
+                    mse = float(difference.square().mean())
+                    l1 = float(difference.abs().mean())
+                    ssim = float(_ssim(quality_predicted, quality_target))
+                evaluation_records.append(
+                    {
+                        "frameIndex": frame_index,
+                        "psnrDb": -10.0 * math.log10(max(mse, 1e-10)),
+                        "ssim": ssim,
+                        "l1": l1,
+                    }
+                )
+        quality_metrics = {
+            "medianPsnrDb": float(
+                np.median([record["psnrDb"] for record in evaluation_records])
+            ),
+            "medianSsim": float(
+                np.median([record["ssim"] for record in evaluation_records])
+            ),
+            "medianL1": float(
+                np.median([record["l1"] for record in evaluation_records])
+            ),
+        }
+        quality_accepted = _photometric_quality_accepted(quality_metrics)
+        quality_report.update(
+            status="accepted" if quality_accepted else "rejected",
+            metrics=quality_metrics,
+            frames=evaluation_records,
+        )
+        _write_json_atomic(output_root / "splat-quality-report.json", quality_report)
+        if not quality_accepted:
+            save_checkpoint(iterations - 1)
+            raise RuntimeError(
+                "Gaussian candidate failed the production photometric quality gate; "
+                "the final checkpoint was preserved for additional optimization"
+            )
+    else:
+        _write_json_atomic(output_root / "splat-quality-report.json", quality_report)
+
+    with torch.no_grad():
+        _material_coefficients, optical_opacity, final_material = (
+            compose_material_render_state(parameters, material_aware, SH_C0)
+        )
+        colors_out = _material_preview_colors(parameters, material_aware).cpu().numpy()
+        diffuse_linear_out = torch.clamp(
+            parameters["diffuse_sh0"][:, 0, :] * SH_C0 + 0.5,
+            0.0,
+            1.0,
+        ).cpu().numpy()
+        view_sh_out = parameters["view_shN"].cpu().numpy()
+        geometric_opacity_out = torch.sigmoid(parameters["opacities"]).cpu().numpy()
+        optical_opacity_out = optical_opacity.cpu().numpy()
+        opacities_out = _logit(optical_opacity).cpu().numpy()
+        if material_aware:
+            emission_out = final_material["emission"].cpu().numpy()
+            transmission_out = final_material["transmission"].cpu().numpy()
+            roughness_out = final_material["roughness"].cpu().numpy()
+            metallic_out = final_material["metallic"].cpu().numpy()
+            material_confidence_out = final_material["confidence"].cpu().numpy()
+            base_linear = np.maximum(diffuse_linear_out + emission_out, 0.0)
+            display_derivative = np.where(
+                base_linear <= 0.0031308,
+                12.92,
+                (1.055 / 2.4)
+                * np.power(np.maximum(base_linear, 1e-6), 1.0 / 2.4 - 1.0),
+            ).astype(np.float32)
+            display_view_sh = view_sh_out * display_derivative[:, None, :]
+        else:
+            emission_out = np.zeros_like(diffuse_linear_out)
+            transmission_out = np.zeros(len(diffuse_linear_out), dtype=np.float32)
+            roughness_out = np.ones(len(diffuse_linear_out), dtype=np.float32)
+            metallic_out = np.zeros(len(diffuse_linear_out), dtype=np.float32)
+            material_confidence_out = np.zeros(len(diffuse_linear_out), dtype=np.float32)
+            display_view_sh = view_sh_out
+        # The standard PLY is a first-order display-space compatibility
+        # projection. The adjacent NPZ retains the exact linear decomposition.
+        display_dc = ((colors_out - 0.5) / SH_C0).astype(np.float32)[:, None, :]
+        sh_out = np.concatenate((display_dc, display_view_sh), axis=1)
     means_out = parameters["means"].detach().cpu().numpy()
-    opacities_out = parameters["opacities"].detach().cpu().numpy()
     scales_out = _preview_log_scales(
         parameters["scales"],
         flatten_2d=uses_2dgs,
@@ -1158,6 +1724,21 @@ def train_dataset(
         quaternions_out,
         limit=500_000,
     )
+    if material_aware:
+        export_material_gaussians(
+            output_root / "room-splat-material.npz",
+            diffuse_linear=diffuse_linear_out,
+            view_sh_linear=view_sh_out,
+            emission_linear=emission_out,
+            transmission=transmission_out,
+            roughness=roughness_out,
+            metallic=metallic_out,
+            confidence=material_confidence_out,
+            geometric_opacity=geometric_opacity_out,
+            optical_opacity=optical_opacity_out,
+        )
+    else:
+        (output_root / "room-splat-material.npz").unlink(missing_ok=True)
     with torch.no_grad():
         pose_corrections = pose_delta_matrix(pose_offsets).detach().cpu().numpy()
         appearance_corrections = appearance_offsets.detach().cpu().numpy()
@@ -1228,6 +1809,13 @@ def train_dataset(
         "device": torch.cuda.get_device_name(device),
         "vramGiB": round(vram_gib, 2),
         "trainingMaxDimension": training_dimension,
+        "trainingRasterPolicy": "global bounded previews then calibrated source-resolution tiles",
+        "sourceResolutionStartIteration": source_resolution_start_step,
+        "sourceResolutionSteps": source_resolution_steps,
+        "sourceResolutionTileCount": len(source_resolution_tiles),
+        "expectedSourceResolutionTileCount": expected_source_tiles,
+        "sourceResolutionCoverage": source_resolution_coverage,
+        "photometricQuality": quality_report,
         "hostFrameCache": host_cache_size,
         "frameReusePerLoad": FRAME_REUSE_PER_LOAD,
         "maximumGaussians": maximum_gaussians,
@@ -1253,13 +1841,24 @@ def train_dataset(
             else "learned"
         ),
         "denseGeometryPrior": dense_geometry_prior,
+        "directGaussianPrior": direct_gaussian_prior,
+        "initializationContract": {
+            "kind": str(initialization.kind),
+            "representation": str(initialization.representation),
+            "adaptiveDensification": initialization.adaptive_densification,
+            "source": initialization.source,
+        },
         "surfaceScaleMultiplier": (
             RGBD_SURFACE_SCALE_MULTIPLIER if metric_seeded else None
         ),
         "surfaceOpacity": RGBD_SURFACE_OPACITY if metric_seeded else None,
         "gaussianCount": len(parameters["means"]),
         "sphericalHarmonicsDegree": 3,
-        "rgbLoss": "L1+SSIM with bounded per-view exposure compensation",
+        "rgbLoss": (
+            "linear-sRGB L1+SSIM with bounded per-view exposure compensation"
+            if material_aware
+            else "L1+SSIM with bounded per-view exposure compensation"
+        ),
         "depthLoss": "masked robust Huber with annealed weight" if uses_depth else "disabled",
         "normalLoss": (
             "disabled for fixed metric surface"
@@ -1282,18 +1881,74 @@ def train_dataset(
             "anchorFrameIndex": appearance_anchor_index if appearance_optimization_enabled else None,
             "model": "per-view RGB log-gain and bias",
         },
+        "materialDecomposition": {
+            "contract": "scanlan-gaussian-material-v1",
+            "enabled": material_aware,
+            "priorAvailable": material_aware,
+            "trainingColorSpace": "linear-srgb" if material_aware else "srgb compatibility",
+            "components": ["diffuse", "view-dependent", "emissive", "transmissive"],
+            "opacity": "geometric occupancy separated from optical transmission",
+            "specularGradientGate": material_aware,
+            "meanTransmission": float(np.mean(transmission_out)),
+            "emissiveGaussianCount": int(
+                np.count_nonzero(np.max(emission_out, axis=1) > 1e-3)
+            ),
+            "supportedGaussianCount": int(
+                np.count_nonzero(material_confidence_out > 0.0)
+            ),
+        },
         "sourceQuality": dataset.get("quality"),
     }
-    write_splat_sidecars(output_root, dataset.get("fingerprint", ""), bool(dataset.get("metric")), versions, training)
+    material_manifest = {
+        "schemaVersion": 1,
+        "contract": "scanlan-gaussian-material-v1",
+        "path": "room-splat-material.npz",
+        "alignedWith": "room-splat.ply vertex order",
+        "colorSpace": "linear-srgb",
+        "components": {
+            "diffuse": "diffuse_linear Nx3",
+            "viewDependent": "view_sh_linear Nx15x3",
+            "emissive": "emission_linear Nx3",
+            "transmissive": "transmission N",
+        },
+        "opacity": {
+            "geometric": "geometric_opacity N",
+            "optical": "optical_opacity = geometric_opacity * (1 - transmission)",
+        },
+        "priorAvailable": material_aware,
+        "plyCompatibility": "first-order linear-to-sRGB projection; NPZ is lossless",
+    }
+    write_splat_sidecars(
+        output_root,
+        dataset.get("fingerprint", ""),
+        bool(dataset.get("metric")),
+        versions,
+        training,
+        material=material_manifest if material_aware else None,
+    )
     project_path = project_root / "project.json"
     project = json.loads(project_path.read_text(encoding="utf-8"))
-    project.setdefault("artifacts", {})["gaussianSplat"] = {"path": "outputs/room-splat.ply", "refinedCameraPath": "outputs/room-splat-cameras.json", "status": "ready", "sourceFingerprint": dataset.get("fingerprint", ""), "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "metric": bool(dataset.get("metric")), "stale": False}
+    project.setdefault("artifacts", {})["gaussianSplat"] = {
+        "path": "outputs/room-splat.ply",
+        "refinedCameraPath": "outputs/room-splat-cameras.json",
+        "status": "ready",
+        "sourceFingerprint": dataset.get("fingerprint", ""),
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "metric": bool(dataset.get("metric")),
+        "stale": False,
+    }
+    if material_aware:
+        project["artifacts"]["gaussianSplat"]["materialPath"] = (
+            "outputs/room-splat-material.npz"
+        )
     project["processingStatus"] = "complete"
     project.pop("processingError", None)
     _write_json_atomic(project_path, project)
     checkpoint_path.unlink(missing_ok=True)
     published_description = (
-        "calibrated RGB-D splats"
+        "material-aware Gaussian components"
+        if material_aware
+        else "calibrated RGB-D splats"
         if metric_seeded
         else "optimized 2D Gaussians" if uses_2dgs else "photoreal 3D Gaussians"
     )

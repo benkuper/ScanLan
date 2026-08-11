@@ -95,11 +95,11 @@ fn acquire_accelerator_lock() -> Result<File, String> {
 }
 
 #[cfg(windows)]
-struct ChildLifetimeGuard(HANDLE);
+pub(crate) struct ChildLifetimeGuard(HANDLE);
 
 #[cfg(windows)]
 impl ChildLifetimeGuard {
-    fn attach(child: &Child) -> Result<Self, String> {
+    pub(crate) fn attach(child: &Child) -> Result<Self, String> {
         // A kill-on-close Job Object makes Windows terminate the worker even if
         // the app is force-closed or the Tauri dev runner replaces the process.
         // Without it, an orphan can keep writing the shared project progress and
@@ -149,11 +149,11 @@ impl Drop for ChildLifetimeGuard {
 }
 
 #[cfg(not(windows))]
-struct ChildLifetimeGuard;
+pub(crate) struct ChildLifetimeGuard;
 
 #[cfg(not(windows))]
 impl ChildLifetimeGuard {
-    fn attach(_child: &Child) -> Result<Self, String> {
+    pub(crate) fn attach(_child: &Child) -> Result<Self, String> {
         Ok(Self)
     }
 }
@@ -256,12 +256,25 @@ fn progress_file(project_root: &Path, splat: bool) -> PathBuf {
 
 fn stage_plan(job: &ArtifactJob) -> Vec<(&'static str, f32)> {
     if job.source_kind == "media" {
-        return vec![
-            ("prepare", 0.05),
-            ("media", 0.35),
-            ("splat", 0.55),
-            ("publish", 0.05),
-        ];
+        let wants_dense = job
+            .targets
+            .iter()
+            .any(|target| matches!(target.as_str(), "pointCloud" | "texturedMesh"));
+        let wants_mesh = job.targets.iter().any(|target| target == "texturedMesh");
+        let wants_splat = job.targets.iter().any(|target| target == "gaussianSplat");
+        let mut plan = vec![("prepare", 0.05), ("media", 0.35)];
+        if wants_dense {
+            plan.push(("fuse", 0.18));
+            plan.push(("cloud", 0.12));
+        }
+        if wants_mesh {
+            plan.push(("mesh", 0.20));
+        }
+        if wants_splat {
+            plan.push(("splat", 0.55));
+        }
+        plan.push(("publish", 0.05));
+        return plan;
     }
     if job.source_kind == "hybrid" {
         return vec![
@@ -305,6 +318,7 @@ fn stage_key(stage: &str) -> Option<&'static str> {
         Some("publish")
     } else if stage.contains("media")
         || stage.contains("lingbot")
+        || stage.contains("da3")
         || stage.contains("camera refinement")
         || stage.contains("feature")
         || stage.contains("camera solving")
@@ -326,6 +340,7 @@ fn stage_key(stage: &str) -> Option<&'static str> {
     } else if stage.contains("building") || stage.contains("cleaning cloud") {
         Some("cloud")
     } else if stage.contains("fusing")
+        || stage.contains("fusion")
         || stage.contains("previewing")
         || stage.contains("loading cache")
     {
@@ -465,6 +480,41 @@ fn merge_progress(project_root: &Path, job: &mut ArtifactJob, splat: bool) {
         .map(str::to_string)
         .or_else(|| splat.then(|| "CUDA AMP / gsplat".to_string()))
         .or_else(|| job.compute_backend.clone());
+    if let Some(preview) = value
+        .get("metrics")
+        .and_then(|metrics| metrics.get("rgbPreview"))
+    {
+        job.rgb_preview_active = preview
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        job.rgb_preview_scale_status = preview
+            .get("scaleStatus")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        job.rgb_preview_confidence = preview
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32);
+        job.rgb_preview_drift_risk = preview
+            .get("driftRisk")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32);
+        job.rgb_preview_submap_count = preview
+            .get("residentSubmapCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        job.rgb_preview_accepted_frames = preview
+            .get("acceptedFrameCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        job.rgb_preview_rejected_frames = preview
+            .get("rejectedFrameCount")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+    } else if job.stage != "rgb_preview_streaming" {
+        job.rgb_preview_active = false;
+    }
     update_job_elapsed(job);
     job.updated_at = Utc::now().to_rfc3339();
     let _ = write_job(project_root, job);
@@ -579,6 +629,15 @@ fn existing_runtime(resources: Option<&Path>, splat: bool) -> Result<PathBuf, St
             } else {
                 "Reconstruction support is missing from this app build".to_string()
             }
+        })
+}
+
+fn existing_geometry_runtime(resources: Option<&Path>) -> Result<PathBuf, String> {
+    storage::candidate_geometry_worker_paths(resources)
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "Learned geometry support is not installed. Run npm run prepare:splat.".to_string()
         })
 }
 
@@ -701,6 +760,7 @@ fn run_pipeline(
     if !resume {
         invalidate_pipeline_cache(project_root, job)?;
     }
+    let project = storage::read_project(project_root)?;
     if job.source_kind == "media" {
         let splat_worker = existing_runtime(resources, true)?;
         job.stage = "media_preparation".to_string();
@@ -718,16 +778,62 @@ fn run_pipeline(
             .arg("15")
             .arg("--maximum-video-frames")
             .arg("3000");
+        let geometry_worker = existing_geometry_runtime(resources)?;
+        prepare.arg("--geometry-worker").arg(geometry_worker);
+        if project
+            .media_sources
+            .iter()
+            .any(|source| source.kind == "video")
+        {
+            if project.settings.experimental_rgb_preview {
+                prepare.arg("--progressive-rgb-preview");
+            }
+        }
         run_command(prepare, project_root, job, cancel, true)?;
-        job.stage = "splat_training".to_string();
-        job.detail = "Initializing photoreal 3D Gaussian optimization".to_string();
-        job.stage_progress = Some(0.0);
-        write_job(project_root, job)?;
         let dataset = project_root
             .join("outputs")
             .join("cache")
             .join("datasets")
-            .join("current.json");
+            .join("media-current.json");
+        let mut dense_targets = job
+            .targets
+            .iter()
+            .filter_map(|target| match target.as_str() {
+                "pointCloud" => Some("point_cloud"),
+                "texturedMesh" => Some("textured_mesh"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !dense_targets.is_empty() && job.targets.iter().any(|target| target == "gaussianSplat") {
+            dense_targets.push("gaussian_splat");
+        }
+        let dense_targets = dense_targets.join(",");
+        if !dense_targets.is_empty() {
+            job.stage = "dense_fusion".to_string();
+            job.detail = "Fusing confidence-gated learned surfaces".to_string();
+            job.stage_progress = Some(0.0);
+            write_job(project_root, job)?;
+            let reconstruction = existing_runtime(resources, false)?;
+            let mut fuse = worker_command(&reconstruction);
+            fuse.arg("fuse-dataset")
+                .arg(project_root)
+                .arg(&dataset)
+                .arg("--targets")
+                .arg(&dense_targets);
+            if project.settings.neural_sdf_refinement
+                && job.targets.iter().any(|target| target == "texturedMesh")
+            {
+                fuse.arg("--neural-sdf-worker").arg(&splat_worker);
+            }
+            run_command(fuse, project_root, job, cancel, false)?;
+        }
+        if !job.targets.iter().any(|target| target == "gaussianSplat") {
+            return Ok(());
+        }
+        job.stage = "splat_training".to_string();
+        job.detail = "Initializing photoreal 3D Gaussian optimization".to_string();
+        job.stage_progress = Some(0.0);
+        write_job(project_root, job)?;
         let mut train = worker_command(&splat_worker);
         train
             .arg("train")
@@ -743,8 +849,21 @@ fn run_pipeline(
         return run_command(train, project_root, job, cancel, true);
     }
     let reconstruction = existing_runtime(resources, false)?;
-    let project = storage::read_project(project_root)?;
-    let depth_refiner = if project.settings.lingbot_depth_refinement {
+    let depth_refinement_backend = match project.settings.depth_refinement_backend.as_str() {
+        "auto" | "lingbot" | "mapanything" | "da3" => {
+            project.settings.depth_refinement_backend.as_str()
+        }
+        _ if project.settings.lingbot_depth_refinement => "lingbot",
+        _ => "off",
+    };
+    let depth_refiner = if depth_refinement_backend != "off" {
+        Some(existing_geometry_runtime(resources)?)
+    } else {
+        None
+    };
+    let neural_sdf_worker = if project.settings.neural_sdf_refinement
+        && job.targets.iter().any(|target| target == "texturedMesh")
+    {
         Some(existing_runtime(resources, true)?)
     } else {
         None
@@ -791,9 +910,17 @@ fn run_pipeline(
         if let Some(refiner) = depth_refiner.as_ref() {
             command
                 .arg("--depth-refinement")
-                .arg("lingbot")
+                .arg(depth_refinement_backend)
                 .arg("--depth-refiner")
                 .arg(refiner);
+        }
+        if selected_targets
+            .split(',')
+            .any(|target| target == "textured_mesh")
+        {
+            if let Some(worker) = neural_sdf_worker.as_ref() {
+                command.arg("--neural-sdf-worker").arg(worker);
+            }
         }
         command
     };
@@ -805,15 +932,27 @@ fn run_pipeline(
         run_command(base, project_root, job, cancel, false)?;
 
         let splat_worker = existing_runtime(resources, true)?;
+        let wants_dense_media = job
+            .targets
+            .iter()
+            .any(|target| matches!(target.as_str(), "pointCloud" | "texturedMesh"));
         let mut extract = worker_command(&splat_worker);
         extract
-            .arg("extract-media")
+            .arg(if wants_dense_media {
+                "prepare-media"
+            } else {
+                "extract-media"
+            })
             .arg("--project")
             .arg(project_root)
             .arg("--video-fps")
             .arg("15")
             .arg("--maximum-video-frames")
             .arg("3000");
+        if wants_dense_media {
+            let geometry_worker = existing_geometry_runtime(resources)?;
+            extract.arg("--geometry-worker").arg(geometry_worker);
+        }
         run_command(extract, project_root, job, cancel, true)?;
 
         let observation_manifest = current_media_observation_manifest(project_root)?;
@@ -928,6 +1067,7 @@ fn spawn_job(
     fs::remove_file(project_root.join("outputs").join("splat-progress.json")).ok();
     if !resume {
         fs::remove_file(project_root.join("outputs").join("build-preview.json")).ok();
+        fs::remove_file(project_root.join("outputs").join("rgb-preview-status.json")).ok();
     }
     if !resume && job.targets.iter().any(|target| target == "gaussianSplat") {
         fs::remove_file(project_root.join("outputs").join("splat-checkpoint.pt")).ok();
@@ -1087,9 +1227,6 @@ pub fn start_artifact_job(
                 .to_string(),
         );
     }
-    if !has_rgbd && targets.iter().any(|target| target != "gaussianSplat") {
-        return Err("Photo/video projects currently produce Gaussian splats; disable point-cloud and mesh outputs".to_string());
-    }
     let media_restart = media_restart.unwrap_or_else(|| "reuse".to_string());
     if !matches!(media_restart.as_str(), "reuse" | "analysis" | "decode") {
         return Err("Unknown media restart stage".to_string());
@@ -1130,6 +1267,13 @@ pub fn start_artifact_job(
         stage_eta_seconds: None,
         elapsed_seconds: None,
         compute_backend: None,
+        rgb_preview_active: false,
+        rgb_preview_scale_status: None,
+        rgb_preview_confidence: None,
+        rgb_preview_drift_risk: None,
+        rgb_preview_submap_count: None,
+        rgb_preview_accepted_frames: None,
+        rgb_preview_rejected_frames: None,
         status: "queued".to_string(),
         created_at: now.clone(),
         started_at: None,
@@ -1231,6 +1375,7 @@ fn discard_job_record(root: &Path, job_id: &str) -> Result<ArtifactJob, String> 
         "splat-progress.json",
         "progress.json",
         "build-preview.json",
+        "rgb-preview-status.json",
         "room-splat.preview.splat",
     ] {
         fs::remove_file(outputs.join(transient)).ok();
@@ -1371,6 +1516,13 @@ mod tests {
             stage_eta_seconds: None,
             elapsed_seconds: None,
             compute_backend: None,
+            rgb_preview_active: false,
+            rgb_preview_scale_status: None,
+            rgb_preview_confidence: None,
+            rgb_preview_drift_risk: None,
+            rgb_preview_submap_count: None,
+            rgb_preview_accepted_frames: None,
+            rgb_preview_rejected_frames: None,
             status: "running".to_string(),
             created_at: String::new(),
             started_at: None,
@@ -1408,6 +1560,54 @@ mod tests {
         assert!(plan.iter().any(|(key, _)| *key == "splat"));
         assert!(!plan.iter().any(|(key, _)| *key == "track"));
         assert_eq!(stage_key(&media.stage), Some("media"));
+    }
+
+    #[test]
+    fn media_dense_jobs_plan_cloud_and_mesh_without_forcing_splat_training() {
+        let mut media = job(&["pointCloud", "texturedMesh"], "dense_fusion");
+        media.source_kind = "media".to_string();
+        let plan = stage_plan(&media);
+
+        for expected in ["media", "fuse", "cloud", "mesh", "publish"] {
+            assert!(plan.iter().any(|(key, _)| *key == expected));
+        }
+        assert!(!plan.iter().any(|(key, _)| *key == "splat"));
+        assert_eq!(stage_key(&media.stage), Some("fuse"));
+    }
+
+    #[test]
+    fn desktop_preserves_progressive_rgb_preview_telemetry() {
+        let root = std::env::temp_dir().join(format!("scanlan-rgb-preview-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("outputs")).unwrap();
+        storage::write_json(
+            &root.join("outputs").join("splat-progress.json"),
+            &serde_json::json!({
+                "stage": "rgb_preview_streaming",
+                "progress": 0.15,
+                "metrics": {"rgbPreview": {
+                    "active": true,
+                    "scaleStatus": "MODEL_METRIC_UNVERIFIED",
+                    "confidence": 0.76,
+                    "driftRisk": 0.18,
+                    "residentSubmapCount": 3,
+                    "acceptedFrameCount": 22,
+                    "rejectedFrameCount": 2
+                }}
+            }),
+        )
+        .unwrap();
+        let mut media = job(&["gaussianSplat"], "queued");
+        media.source_kind = "media".to_string();
+        merge_progress(&root, &mut media, true);
+        assert!(media.rgb_preview_active);
+        assert_eq!(
+            media.rgb_preview_scale_status.as_deref(),
+            Some("MODEL_METRIC_UNVERIFIED")
+        );
+        assert_eq!(media.rgb_preview_submap_count, Some(3));
+        assert_eq!(media.rgb_preview_accepted_frames, Some(22));
+        assert_eq!(media.rgb_preview_rejected_frames, Some(2));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

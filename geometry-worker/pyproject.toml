@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scanlan-geometry-worker"
+version = "0.1.0"
+description = "Isolated learned geometry runtime for ScanLan"
+requires-python = ">=3.10,<3.13"
+dependencies = ["numpy>=1.26,<3"]
+
+[project.scripts]
+scanlan-geometry = "scanlan_geometry.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scanlan_geometry*"]

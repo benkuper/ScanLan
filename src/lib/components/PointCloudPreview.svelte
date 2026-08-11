@@ -1301,7 +1301,7 @@
     {processing ? renderMode === 'splat' ? `Training ${splatRepresentation === '3d' ? 'photoreal 3D' : 'surface 2D'} Gaussian splats` : 'Reconstructing geometry' : live ? liveLabel : renderMode === 'splat' ? splatError ? 'Splat preview failed' : splatReady ? `${splatRepresentation === '3d' ? '3D' : '2D'} Gaussian splat` : 'Loading splat' : renderMode === 'mesh' && mesh ? meshViewMode === 'wireframe' ? 'Wireframe' : meshViewMode === 'shaded' ? 'Shaded mesh' : meshViewMode === 'surface-wireframe' ? 'Mesh + wireframe' : 'Textured mesh' : points.length || packedFrame?.pointCount ? 'Point cloud' : 'Awaiting RGB-D frames'}
   </div>
 
-  <div class:live-offset={live} class="view-cube-shell">
+  <div class="view-cube-shell">
     <canvas
       class="view-cube-canvas"
       bind:this={viewCubeCanvas}
@@ -1339,7 +1339,7 @@
   {/if}
 
   {#if renderMode === 'splat' ? splatReady : renderMode === 'mesh' ? mesh : packedFrame ? packedFrame.pointCount > 0 : points.length > 0}
-    <div class="viewer-hud bottom-right">Drag to orbit · Scroll to zoom</div>
+    <div class="viewer-hud bottom-left">Drag to orbit · Scroll to zoom</div>
   {:else}
     <div class="empty-state">
       <strong>{processing ? 'Preparing reconstruction geometry…' : renderMode === 'splat' ? splatError || 'No Gaussian splat yet' : renderMode === 'mesh' ? 'No reconstructed mesh yet' : live ? 'No valid depth in camera range' : 'No live depth points yet'}</strong>
@@ -1355,8 +1355,7 @@
   .scene-canvas:active { cursor: grabbing; }
   .point-pick .scene-canvas, .point-pick .scene-canvas:active { cursor: crosshair; }
   .clip-edit .scene-canvas { cursor: default; }
-  .view-cube-shell { position: absolute; z-index: 7; top: 14px; right: 14px; width: 118px; height: 118px; pointer-events: none; transition: top 180ms ease; }
-  .view-cube-shell.live-offset { top: 82px; }
+  .view-cube-shell { position: absolute; z-index: 7; top: 14px; right: 14px; width: 118px; height: 118px; pointer-events: none; }
   .view-cube-canvas { position: relative; display: block; width: 118px; height: 118px; cursor: grab; pointer-events: auto; touch-action: none; }
   .view-cube-canvas:active { cursor: grabbing; }
   .projection-toggle { position: absolute; z-index: 1; top: 1px; left: 1px; min-width: 37px; height: 27px; padding: 0 7px; border: 1px solid #343a43; border-radius: 4px; background: #171b20; color: #8e98a5; font: 800 7px/1 Inter, Segoe UI, sans-serif; letter-spacing: 0.06em; cursor: pointer; pointer-events: auto; }
@@ -1369,7 +1368,7 @@
   .view-home:focus-visible { outline: 2px solid rgba(99, 199, 231, 0.75); outline-offset: 2px; }
   .viewer-hud { position: absolute; display: flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid #30353d; border-radius: 4px; background: #171b20; color: #b5bbc4; font-size: 11px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; pointer-events: none; }
   .top-left { top: 16px; left: 16px; }
-  .bottom-right { right: 16px; bottom: 16px; text-transform: none; letter-spacing: 0; }
+  .bottom-left { left: 16px; bottom: 16px; text-transform: none; letter-spacing: 0; }
   .floor-hint { left: 50%; bottom: 16px; transform: translateX(-50%); border-color: rgba(240, 183, 107, 0.35); color: #f0c68f; }
   .pulse { width: 7px; height: 7px; border-radius: 50%; background: #54b78d; }
   .processing .pulse { background: #f0b76b; animation: pulse 1.1s infinite; }

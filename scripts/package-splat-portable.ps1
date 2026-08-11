@@ -51,6 +51,7 @@ try {
   Copy-Required (Join-Path $ProjectRoot "build/kinect-capture/Release") (Join-Path $PortableRoot "kinect2")
   Copy-Required (Join-Path $ProjectRoot "build/modern-capture/Release") (Join-Path $PortableRoot "modern")
   Copy-Required (Join-Path $ProjectRoot "splat-worker/dist/scanlan-splat") (Join-Path $PortableRoot "splat-runtime")
+  Copy-Required (Join-Path $ProjectRoot "geometry-worker/dist/scanlan-geometry") (Join-Path $PortableRoot "geometry-runtime")
   Copy-Required (Join-Path $ProjectRoot "LICENSE") (Join-Path $PortableRoot "LICENSE")
 
   if (-not $SkipArchive) {

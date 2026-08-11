@@ -6,6 +6,7 @@ export type DepthFieldOfView = 'narrow' | 'wide';
 export type RgbResolution = 'auto' | '720p' | '1080p' | '1440p' | '1536p' | '2160p' | '3072p';
 export type MeshViewMode = 'surface' | 'surface-wireframe' | 'wireframe' | 'shaded';
 export type LiveReconstructionMode = 'points' | 'mesh';
+export type LiveOverlayMode = 'normal' | 'coverage' | 'tracking' | 'confidence';
 export type MeshRepairProfile = 'faithful' | 'architectural' | 'natural';
 
 export interface CaptureSettings {
@@ -45,18 +46,27 @@ export interface CaptureSettings {
   imuGyroRateHz: number;
   imuGyroRangeDps: number;
   liveReconstruction: LiveReconstructionMode;
+  /** Hard budget for the active sparse live submap. */
+  liveMapMemoryMib: number;
   repairMesh: boolean;
   meshRepairProfile: MeshRepairProfile;
   fillInferredMeshHoles: boolean;
   produceWatertightMesh: boolean;
   /** Run guarded LingBot-Depth completion after metric pose recovery. */
   lingbotDepthRefinement: boolean;
+  /** Guarded learned RGB-D completion backend. */
+  depthRefinementBackend: 'off' | 'auto' | 'lingbot' | 'mapanything' | 'da3';
+  /** Feature-flagged provisional learned-depth preview for imported video. */
+  experimentalRgbPreview: boolean;
+  neuralSdfRefinement: boolean;
 }
 
 export type ArtifactStatus = 'ready' | 'building' | 'stale' | 'failed';
 
 export interface ArtifactSummary {
   path: string;
+  materialPath?: string;
+  refinedCameraPath?: string;
   status: ArtifactStatus;
   sourceFingerprint: string;
   updatedAt: string;
@@ -145,6 +155,18 @@ export interface ProjectSummary {
     modelRevision?: string;
     modelSha256?: string;
   };
+  neuralSdf?: {
+    status: 'disabled' | 'skipped' | 'accepted' | 'rejected';
+    method: string;
+    reason?: string;
+    cacheHit?: boolean;
+    validation?: {
+      heldOutSdfMaeM?: number;
+      heldOutSdfP95M?: number;
+      medianDisplacementM?: number;
+      p95DisplacementM?: number;
+    };
+  };
 }
 
 export interface ProjectCatalogEntry {
@@ -166,8 +188,15 @@ export interface RuntimeInfo {
   sensorWorkerAvailable: boolean;
   sensorStatus: string;
   reconstructionWorkerAvailable: boolean;
+  neuralSdfAvailable: boolean;
+  neuralSdfChecking: boolean;
+  neuralSdfStatus: string;
   splatWorkerAvailable: boolean;
+  splatWorkerChecking: boolean;
   splatStatus: string;
+  geometryWorkerAvailable: boolean;
+  geometryWorkerChecking: boolean;
+  geometryStatus: string;
 }
 
 export type ArtifactTarget = 'pointCloud' | 'texturedMesh' | 'gaussianSplat';
@@ -198,6 +227,13 @@ export interface ArtifactJob {
   stageEtaSeconds: number | null;
   elapsedSeconds: number | null;
   computeBackend: string | null;
+  rgbPreviewActive: boolean;
+  rgbPreviewScaleStatus: 'MODEL_METRIC_UNVERIFIED' | 'MODEL_METRIC_VALIDATED' | 'USER_CALIBRATED' | 'RELATIVE_SCALE' | null;
+  rgbPreviewConfidence: number | null;
+  rgbPreviewDriftRisk: number | null;
+  rgbPreviewSubmapCount: number | null;
+  rgbPreviewAcceptedFrames: number | null;
+  rgbPreviewRejectedFrames: number | null;
   status: ArtifactJobStatus;
   createdAt: string;
   startedAt: string | null;
@@ -210,6 +246,7 @@ export interface ArtifactJob {
 
 export interface CaptureStatus {
   project: ProjectSummary;
+  liveContractVersion: number;
   preview: PreviewPoint[];
   capturing: boolean;
   previewing: boolean;
@@ -223,6 +260,8 @@ export interface CaptureStatus {
   streamFps: number;
   tracking: boolean;
   trackingStatus: string;
+  trackingState: 'ready' | 'preview' | 'tracking' | 'searching' | 'relocalized' | 'frozen' | 'failed' | 'complete';
+  trackingConfidence: number;
   imuActive: boolean;
   imuRateHz: number;
   liveReconstructionActive: boolean;
@@ -235,11 +274,80 @@ export interface CaptureStatus {
   sourceDropCount: number;
   trackingQueueDropCount: number;
   mappingDropCount: number;
+  trackingQueueDepth: number;
+  mappingQueueDepth: number;
   trackingOverlap: number;
+  poseUncertaintyMm?: number;
+  poseUncertaintyDegrees?: number;
+  poseLatencyMs?: number;
+  mapUpdateLatencyMs?: number;
+  mapUpdateHz: number;
+  allocatedLiveMapBytes: number;
+  activeVoxelCount: number;
+  activeSurfelCount: number;
+  residentSubmapCount: number;
+  hostCachedSubmapCount: number;
+  droppedPreviewJobCount: number;
+  degradationLevel: number;
+  loopClosureCount: number;
+  loopCorrectionActive: boolean;
+  liveScaleStatus: 'SENSOR_METRIC' | 'MODEL_METRIC_UNVERIFIED' | 'MODEL_METRIC_VALIDATED' | 'USER_CALIBRATED' | 'RELATIVE_SCALE';
+  integrationFrozen: boolean;
   depthRmseMm?: number;
   liveReconstructionBackend?: string;
   reconstruction?: ReconstructionProgress;
   error?: string;
+}
+
+export interface LiveSubmapDescriptor {
+  id: string;
+  localOrigin: number[];
+  globalFromLocal: number[];
+  state: 'active' | 'complete' | 'corrected' | 'frozen';
+  firstSequence: number;
+  lastSequence: number;
+  voxelSizeM: number;
+  voxelCount: number;
+  pointCount: number;
+  observationCount: number;
+  confidence: number;
+  boundsMin: [number, number, number];
+  boundsMax: [number, number, number];
+  resident: 'gpu' | 'host';
+}
+
+export interface LiveCoverageSummary {
+  contractVersion: 2;
+  frameSequence: number;
+  observedRatio: number;
+  weakRatio: number;
+  singleViewRatio: number;
+  holeBoundaryRatio: number;
+  guidance: string[];
+}
+
+export interface LiveReconstructionGuidance {
+  contractVersion: 2;
+  coverage: LiveCoverageSummary | null;
+  submaps: {
+    contractVersion: 2;
+    frameSequence: number;
+    submaps: LiveSubmapDescriptor[];
+    poseGraph?: {
+      nodeCount: number;
+      loopConstraintCount: number;
+      acceptedCorrectionCount: number;
+      mapFromTrackingWorld: number[];
+    };
+    recentLoopEvents?: Array<{
+      sequence: number;
+      sourceSubmapId: string;
+      targetSubmapId: string;
+      accepted: boolean;
+      requiresProductionRevalidation: boolean;
+    }>;
+    viewportCorrection?: { durationMs: number; active: boolean };
+  } | null;
 }
 
 export interface ReconstructionProgress {

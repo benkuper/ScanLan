@@ -1,0 +1,165 @@
+{
+  "kind": "scanlan-v2-release-evidence-set",
+  "revision": "v2-p19-audit-2026-08-11",
+  "records": [
+    {
+      "schemaVersion": 1,
+      "scenarioId": "rgbd-kinect-v2-room",
+      "status": "not-run",
+      "realInput": false,
+      "source": {"kind": "rgbd", "sensorKind": "kinect_v2"},
+      "gates": {},
+      "metrics": {},
+      "artifacts": {}
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "rgbd-azure-kinect-room",
+      "status": "not-run",
+      "realInput": false,
+      "source": {"kind": "rgbd", "sensorKind": "azure_kinect"},
+      "gates": {},
+      "metrics": {},
+      "artifacts": {}
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "rgbd-femto-mega-room",
+      "status": "failed",
+      "realInput": true,
+      "source": {"kind": "rgbd", "sensorKind": "femto_mega", "capture": "81-frame short mostly-static physical smoke"},
+      "gates": {
+        "archiveFidelity": true,
+        "trackingFullRateOrDegraded": true,
+        "unsafeIntegrationFrozen": true,
+        "relocalizationSafe": false,
+        "loopCorrectionNoDuplicates": false,
+        "provisionalAvailable": true,
+        "productionRevalidated": true,
+        "memoryBounded": true
+      },
+      "metrics": {
+        "tracking": {"acceptedFrameRatio": 1.0},
+        "latency": {"poseP95Ms": 51.65, "pointMapP95Ms": 365.8}
+      },
+      "artifacts": {},
+      "notes": "The real capture proves the measurement path but is not a room-scale relocalization/loop scene and misses the 10 Hz point-map target."
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "photos-production-multiscene",
+      "status": "failed",
+      "realInput": true,
+      "source": {"kind": "photos", "sceneCount": 1, "frameCount": 16},
+      "gates": {
+        "multipleRepresentativeScenes": false,
+        "cameraValidation": true,
+        "heldOutGeometry": false,
+        "freeSpace": true,
+        "sourceTileCoverage": true,
+        "gaussianPhotometricQuality": false,
+        "outputProductsIndependent": true
+      },
+      "metrics": {
+        "camera": {"registrationRatio": 0.9375, "medianReprojectionErrorPx": 0.714},
+        "gaussian": {"medianPsnrDb": 14.22, "medianSsim": 0.488, "medianL1": 0.144}
+      },
+      "artifacts": {},
+      "notes": "The real phone set validates the production camera path, but one scene is not the required matrix and its inspected Gaussian candidate failed PSNR/SSIM."
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "video-production-multiscene",
+      "status": "failed",
+      "realInput": true,
+      "source": {"kind": "video", "sceneCount": 1, "frameCount": 5408, "resolution": "3840x2160"},
+      "gates": {
+        "multipleRepresentativeScenes": false,
+        "boundedProgressivePreview": true,
+        "recordingIsolation": true,
+        "cameraValidation": false,
+        "driftReported": true,
+        "heldOutGeometry": false,
+        "sourceTileCoverage": false,
+        "gaussianPhotometricQuality": false
+      },
+      "metrics": {
+        "camera": {"registrationRatio": 0.4696, "medianReprojectionErrorPx": 0.72},
+        "preview": {"driftRisk": 0.287}
+      },
+      "artifacts": {},
+      "notes": "The bounded real 4K HEVC solve completed but the largest model registered only 85 of 181 selected views."
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "hybrid-production-multiscene",
+      "status": "not-run",
+      "realInput": false,
+      "source": {"kind": "hybrid"},
+      "gates": {},
+      "metrics": {},
+      "artifacts": {}
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "material-annotated-real-captures",
+      "status": "not-run",
+      "realInput": false,
+      "source": {"kind": "photos"},
+      "gates": {"pbrValidator": true},
+      "metrics": {},
+      "artifacts": {},
+      "notes": "Contract/PBR synthetic smokes pass, but no model has the required real annotations, bake-off, and transitive license audit."
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "reflective-transmissive-real-captures",
+      "status": "not-run",
+      "realInput": false,
+      "source": {"kind": "hybrid"},
+      "gates": {},
+      "metrics": {},
+      "artifacts": {}
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "twelve-gib-quality-memory",
+      "status": "failed",
+      "realInput": true,
+      "source": {"kind": "rgbd"},
+      "hardware": {"memoryTier": "16gb"},
+      "gates": {
+        "actualCudaKernels": true,
+        "noOutOfMemory": true,
+        "boundedQueues": true,
+        "qualityPreserved": false,
+        "fallbackValidated": true
+      },
+      "metrics": {
+        "hardware": {"totalVramMiB": 16303.0},
+        "runtime": {"peakVramMiB": 7881.1, "minimumHeadroomMiB": 8421.9}
+      },
+      "artifacts": {},
+      "notes": "CUDA was measured on a 16 GB RTX 5080 Laptop GPU; arithmetic limits and unit tests cannot replace an actual 12 GB quality run."
+    },
+    {
+      "schemaVersion": 1,
+      "scenarioId": "cancellation-resume-stress",
+      "status": "failed",
+      "realInput": true,
+      "source": {"kind": "photos"},
+      "gates": {
+        "rawInputPreserved": true,
+        "boundedCancellation": true,
+        "atomicOutputs": true,
+        "checkpointResume": true,
+        "resumeEquivalent": false,
+        "cacheInvalidation": true,
+        "corruptCacheRecovery": false
+      },
+      "metrics": {"cancellation": {"maximumStopSeconds": 10.0}},
+      "artifacts": {},
+      "notes": "A real 1.19 GB Gaussian checkpoint resumed successfully, but the full cross-product stress and equivalence/corrupt-cache evidence are absent."
+    }
+  ]
+}

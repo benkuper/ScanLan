@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
+from scanlan_validation import validate_depth, validate_ray_depths
 
 from .calibration import project_rgb, robust_depth_mask, world_from_depth_opencv
 from .io import (
@@ -30,9 +31,72 @@ DEPTH_REFINEMENT_VERSION = "lingbot-depth-v0.5-guarded-multiview-v2"
 LINGBOT_DEPTH_CODE_REVISION = "f3a237e434ae987bc38281476d6cfb5df3e4d739"
 LINGBOT_DEPTH_MODEL_REVISION = "79204ed6b837f4fdd192cf563e59481fecfa0295"
 LINGBOT_DEPTH_MODEL_SHA256 = "b60cf27ddbd0e51e9b59b03475c0d39d02d2e48ecf8dbb5866f04d46802b3c23"
+MAPANYTHING_DEPTH_REFINEMENT_VERSION = "mapanything-apache-sensor-anchored-multiview-v1"
+MAPANYTHING_CODE_REVISION = "3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9"
+MAPANYTHING_MODEL_REVISION = "00f9c245bbcb60522d1ed7f9e9d88462c6e3f38a"
+MAPANYTHING_MODEL_SHA256 = "fa06c0fdccefc5048e072c85935d5789b1e36b307f3859033c17f9dcb9fd5201"
+DA3_DEPTH_REFINEMENT_VERSION = "da3nested-giant-large-1.1-pose-conditioned-multiview-v1"
+DA3_CODE_REVISION = "3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
+DA3_MODEL_REVISION = "b2359bdf726fb44ef62acca04d629dcf158053e7"
+DA3_MODEL_SHA256 = "8ebe871a022ed58d2fc8fdfb2ebdb31d57b60fe39611c849095851a7b7c6020c"
 MAX_NEIGHBORS = 4
 MINIMUM_CONFIRMATIONS = 2
 GENERATED_DEPTH_CONFIDENCE = 96
+
+
+@dataclass(frozen=True)
+class DepthBackend:
+    name: str
+    version: str
+    code_revision: str
+    model_revision: str
+    model_sha256: str
+    command: str
+    label: str
+    method: str
+    sensor_anchor_calibration: bool = False
+
+
+DEPTH_BACKENDS = {
+    "lingbot": DepthBackend(
+        name="lingbot",
+        version=DEPTH_REFINEMENT_VERSION,
+        code_revision=LINGBOT_DEPTH_CODE_REVISION,
+        model_revision=LINGBOT_DEPTH_MODEL_REVISION,
+        model_sha256=LINGBOT_DEPTH_MODEL_SHA256,
+        command="refine-rgbd-depth",
+        label="LingBot depth refinement",
+        method="LingBot-Depth v0.5 with metric and multi-view quality gates",
+    ),
+    "mapanything": DepthBackend(
+        name="mapanything",
+        version=MAPANYTHING_DEPTH_REFINEMENT_VERSION,
+        code_revision=MAPANYTHING_CODE_REVISION,
+        model_revision=MAPANYTHING_MODEL_REVISION,
+        model_sha256=MAPANYTHING_MODEL_SHA256,
+        command="refine-rgbd-depth-mapanything",
+        label="MapAnything depth refinement",
+        method=(
+            "MapAnything Apache with held-out sensor-anchor, metric, multi-view, "
+            "and free-space quality gates"
+        ),
+        sensor_anchor_calibration=True,
+    ),
+    "da3": DepthBackend(
+        name="da3",
+        version=DA3_DEPTH_REFINEMENT_VERSION,
+        code_revision=DA3_CODE_REVISION,
+        model_revision=DA3_MODEL_REVISION,
+        model_sha256=DA3_MODEL_SHA256,
+        command="refine-rgbd-depth-da3",
+        label="DA3 pose-conditioned depth refinement",
+        method=(
+            "DA3 Nested Giant-Large 1.1 pose-conditioned metric depth with "
+            "held-out sensor-anchor, multi-view, and free-space quality gates"
+        ),
+        sensor_anchor_calibration=True,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -58,12 +122,12 @@ def frame_depth_key(frame: PosedFrame) -> str:
     return f"{frame.phase_id}:{record.index}"
 
 
-def _cache_fingerprint(frames: list[PosedFrame]) -> str:
+def _cache_fingerprint(frames: list[PosedFrame], backend: DepthBackend = DEPTH_BACKENDS["lingbot"]) -> str:
     digest = hashlib.sha256()
-    digest.update(DEPTH_REFINEMENT_VERSION.encode("ascii"))
-    digest.update(LINGBOT_DEPTH_CODE_REVISION.encode("ascii"))
-    digest.update(LINGBOT_DEPTH_MODEL_REVISION.encode("ascii"))
-    digest.update(LINGBOT_DEPTH_MODEL_SHA256.encode("ascii"))
+    digest.update(backend.version.encode("ascii"))
+    digest.update(backend.code_revision.encode("ascii"))
+    digest.update(backend.model_revision.encode("ascii"))
+    digest.update(backend.model_sha256.encode("ascii"))
     for frame in frames:
         record = frame.source.frames[frame.frame_index]
         digest.update(frame_depth_key(frame).encode("utf-8"))
@@ -113,15 +177,18 @@ def _cache_fingerprint(frames: list[PosedFrame]) -> str:
     return digest.hexdigest()[:24]
 
 
-def _load_cached_result(cache_root: Path) -> DepthRefinementResult | None:
+def _load_cached_result(
+    cache_root: Path,
+    backend: DepthBackend = DEPTH_BACKENDS["lingbot"],
+) -> DepthRefinementResult | None:
     manifest_path = cache_root / "manifest.json"
     if not manifest_path.is_file():
         return None
     try:
         manifest = read_json(manifest_path)
-        if manifest.get("version") != DEPTH_REFINEMENT_VERSION:
+        if manifest.get("version") != backend.version:
             return None
-        if manifest.get("modelSha256") != LINGBOT_DEPTH_MODEL_SHA256:
+        if manifest.get("modelSha256") != backend.model_sha256:
             return None
         overrides: dict[str, DepthOverride] = {}
         for record in manifest.get("frames", []):
@@ -195,47 +262,70 @@ def _metric_gate(
     predicted: np.ndarray,
     model_valid: np.ndarray,
 ) -> dict[str, Any]:
-    overlap = reliable & model_valid & np.isfinite(predicted) & (predicted > 0.0)
-    sample_count = int(overlap.sum())
-    if sample_count < 256:
-        return {
-            "accepted": False,
-            "reason": f"only {sample_count} metric comparison pixels",
-            "sampleCount": sample_count,
-        }
-    raw = measured[overlap]
-    inferred = predicted[overlap]
-    if sample_count > 100_000:
-        stride = max(1, sample_count // 100_000)
-        raw = raw[::stride]
-        inferred = inferred[::stride]
-    residual = np.abs(inferred - raw)
-    relative_ratio = inferred / np.maximum(raw, 1e-6)
-    scene_depth = float(np.median(raw))
-    median_residual = float(np.median(residual))
-    p90_residual = float(np.percentile(residual, 90))
-    scale_bias = float(abs(np.median(relative_ratio) - 1.0))
-    tolerance = np.maximum(0.04, raw * 0.025)
-    inlier_ratio = float(np.mean(residual <= tolerance))
-    accepted = (
-        median_residual <= max(0.03, scene_depth * 0.015)
-        and p90_residual <= max(0.10, scene_depth * 0.05)
-        and scale_bias <= 0.04
-        and inlier_ratio >= 0.65
-    )
-    reason = (
-        "metric agreement accepted"
-        if accepted
-        else "prediction changed measured scale or geometry beyond the quality gate"
-    )
+    validation = validate_depth(measured, predicted, reliable, model_valid)
+    values = validation.metrics
+    accepted = validation.accepted
     return {
         "accepted": accepted,
-        "reason": reason,
-        "sampleCount": sample_count,
-        "medianResidualMm": round(median_residual * 1000.0, 2),
-        "p90ResidualMm": round(p90_residual * 1000.0, 2),
-        "scaleBiasPercent": round(scale_bias * 100.0, 3),
-        "inlierRatio": round(inlier_ratio, 4),
+        "reason": "metric agreement accepted" if accepted else "; ".join(validation.reasons),
+        "sampleCount": int(values.get("sampleCount", 0)),
+        "medianResidualMm": round(float(values.get("medianResidual", 0.0)) * 1000.0, 2),
+        "p90ResidualMm": round(float(values.get("p90Residual", 0.0)) * 1000.0, 2),
+        "scaleBiasPercent": round(float(values.get("scaleBias", 0.0)) * 100.0, 3),
+        "inlierRatio": round(float(values.get("inlierRatio", 0.0)), 4),
+        "validation": validation.to_dict(),
+    }
+
+
+def _sensor_anchor_calibration(
+    measured: np.ndarray,
+    reliable: np.ndarray,
+    predicted: np.ndarray,
+    model_valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Calibrate a learned RGB-D proposal without validating on fit pixels.
+
+    A dense sensor provides enough local metric anchors to estimate the smooth
+    residual left by MapAnything's lower-resolution output. Every sixteenth
+    anchor is withheld from the fit and is the only evidence used by the
+    production depth gate. The support mask also prevents extrapolation into
+    large sensor holes that have no nearby metric evidence.
+    """
+
+    import cv2
+
+    valid = reliable & model_valid
+    yy, xx = np.indices(valid.shape)
+    holdout = valid & ((xx % 4) == 0) & ((yy % 4) == 0)
+    fit = valid & ~holdout
+    if int(np.count_nonzero(fit)) < 4096 or int(np.count_nonzero(holdout)) < 256:
+        return predicted, model_valid, {
+            "accepted": False,
+            "reason": "insufficient independent sensor anchors for MapAnything calibration",
+            "fitSampleCount": int(np.count_nonzero(fit)),
+            "heldOutSampleCount": int(np.count_nonzero(holdout)),
+        }
+    residual = np.where(fit, measured - predicted, 0.0).astype(np.float32)
+    weights = fit.astype(np.float32)
+    sigma = max(2.0, min(valid.shape) / 288.0)
+    numerator = cv2.GaussianBlur(residual, (0, 0), sigma)
+    denominator = cv2.GaussianBlur(weights, (0, 0), sigma)
+    supported = denominator >= 0.05
+    correction = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator),
+        where=supported,
+    )
+    calibrated = np.asarray(predicted, dtype=np.float32) + correction
+    calibrated_valid = model_valid & supported & np.isfinite(calibrated) & (calibrated > 0.0)
+    gate = _metric_gate(measured, holdout, calibrated, calibrated_valid)
+    return calibrated, calibrated_valid, {
+        **gate,
+        "fitSampleCount": int(np.count_nonzero(fit)),
+        "heldOutSampleCount": int(np.count_nonzero(holdout)),
+        "supportedPixelCount": int(np.count_nonzero(supported)),
+        "residualSmoothingSigmaPixels": round(float(sigma), 3),
     }
 
 
@@ -309,11 +399,12 @@ def _projective_support(
     target_reliable: np.ndarray,
     target_prediction: np.ndarray,
     target_model_valid: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     rows, columns = np.nonzero(source_candidates)
     support = np.zeros(source_candidates.shape, dtype=bool)
+    free_space_violation = np.zeros(source_candidates.shape, dtype=bool)
     if not len(rows):
-        return support
+        return support, free_space_violation
     source_camera = source_frame.source.camera
     z = source_depth[rows, columns].astype(np.float64)
     camera_points = np.column_stack(
@@ -344,7 +435,7 @@ def _projective_support(
         & (v < target_camera.height)
     )
     if not np.any(inside):
-        return support
+        return support, free_space_violation
     selected = np.flatnonzero(inside)
     target_u = u[selected]
     target_v = v[selected]
@@ -355,11 +446,14 @@ def _projective_support(
         target_prediction[target_v, target_u],
     )
     reference_valid = has_measured | target_model_valid[target_v, target_u]
-    tolerance = np.maximum(0.035, projected_z[selected] * 0.02)
-    agrees = reference_valid & (np.abs(reference - projected_z[selected]) <= tolerance)
-    supported_source = selected[agrees]
+    ray_validation = validate_ray_depths(
+        projected_z[selected], reference, reference_valid
+    )
+    supported_source = selected[ray_validation.support_mask]
+    violated_source = selected[ray_validation.free_space_violation_mask]
     support[rows[supported_source], columns[supported_source]] = True
-    return support
+    free_space_violation[rows[violated_source], columns[violated_source]] = True
+    return support, free_space_violation
 
 
 def validate_predictions(
@@ -367,13 +461,19 @@ def validate_predictions(
     predictions: list[np.ndarray],
     model_masks: list[np.ndarray],
     output_root: Path,
+    *,
+    sensor_anchor_calibration: bool = False,
+    method: str = "LingBot-Depth v0.5 with metric and multi-view quality gates",
+    model_revision: str = LINGBOT_DEPTH_MODEL_REVISION,
+    model_sha256: str = LINGBOT_DEPTH_MODEL_SHA256,
 ) -> tuple[dict[str, DepthOverride], dict[str, Any], list[dict[str, Any]]]:
+    working_predictions = list(predictions)
     state_root = output_root / "validation-state"
     state_root.mkdir(parents=True, exist_ok=True)
     state_paths: list[dict[str, Path]] = []
     metrics: list[dict[str, Any]] = []
     for index, (frame, prediction, model_mask) in enumerate(
-        zip(frames, predictions, model_masks, strict=True)
+        zip(frames, working_predictions, model_masks, strict=True)
     ):
         camera = frame.source.camera
         record = frame.source.frames[frame.frame_index]
@@ -391,7 +491,19 @@ def validate_predictions(
             & (prediction > 0.0)
             & (prediction <= camera.max_depth_m)
         )
-        gate = _metric_gate(measured, reliable, prediction, model_valid)
+        raw_gate = _metric_gate(measured, reliable, prediction, model_valid)
+        calibration: dict[str, Any] | None = None
+        if sensor_anchor_calibration:
+            prediction, model_valid, calibration = _sensor_anchor_calibration(
+                measured,
+                reliable,
+                prediction,
+                model_valid,
+            )
+            gate = calibration
+            working_predictions[index] = prediction
+        else:
+            gate = raw_gate
         stable_surface = robust_depth_mask(np.where(model_valid, prediction, 0.0))
         rgb_coverage = _true_rgb_coverage(frame, prediction)
         # Completion is strictly hole-only. A nonzero sensor sample remains
@@ -415,6 +527,8 @@ def validate_predictions(
         metrics.append(
             {
                 **gate,
+                "rawProposalValidation": raw_gate,
+                **({"sensorAnchorCalibration": calibration} if calibration is not None else {}),
                 "rawValidPixels": int((measured > 0.0).sum()),
                 "reliableMeasuredPixels": int(reliable.sum()),
                 "candidatePixels": int(candidate.sum()),
@@ -427,13 +541,14 @@ def validate_predictions(
     generated_total = 0
     measured_total = 0
     for index, frame in enumerate(frames):
-        shape = predictions[index].shape
+        shape = working_predictions[index].shape
         source_candidate = np.memmap(
             state_paths[index]["candidate"], dtype=np.uint8, mode="r", shape=shape
         ) > 0
         confirmation_count = np.zeros(shape, dtype=np.uint8)
+        free_space_violation_count = np.zeros(shape, dtype=np.uint8)
         for neighbor in neighbors[index]:
-            target_shape = predictions[neighbor].shape
+            target_shape = working_predictions[neighbor].shape
             target_measured = np.memmap(
                 state_paths[neighbor]["measured"],
                 dtype="<f4",
@@ -452,21 +567,23 @@ def validate_predictions(
                 mode="r",
                 shape=target_shape,
             ) > 0
-            confirmation_count += _projective_support(
+            support, free_space_violation = _projective_support(
                 frame,
                 frames[neighbor],
-                predictions[index],
+                working_predictions[index],
                 source_candidate,
                 target_measured,
                 target_reliable,
-                predictions[neighbor],
+                working_predictions[neighbor],
                 target_model_valid,
             )
+            confirmation_count += support
+            free_space_violation_count += free_space_violation
             del target_measured, target_reliable, target_model_valid
         required_confirmations = min(MINIMUM_CONFIRMATIONS, len(neighbors[index]))
         accepted = source_candidate & (
             confirmation_count >= max(required_confirmations, 1)
-        )
+        ) & (free_space_violation_count == 0)
         if len(neighbors[index]) == 0:
             accepted.fill(False)
         camera = frame.source.camera
@@ -474,7 +591,7 @@ def validate_predictions(
         measured_units = raw.copy()
         refined_units = measured_units.copy()
         predicted_units = np.rint(
-            np.clip(predictions[index], 0.0, 65_535.0 / camera.depth_scale)
+            np.clip(working_predictions[index], 0.0, 65_535.0 / camera.depth_scale)
             * camera.depth_scale
         ).astype(np.uint16)
         refined_units[accepted] = predicted_units[accepted]
@@ -501,6 +618,9 @@ def validate_predictions(
             **metrics[index],
             "neighborCount": len(neighbors[index]),
             "requiredConfirmations": required_confirmations,
+            "freeSpaceViolationPixels": int(
+                np.count_nonzero(source_candidate & (free_space_violation_count > 0))
+            ),
             "generatedPixels": int(accepted.sum()),
             "generatedCoveragePercent": round(float(accepted.mean()) * 100.0, 3),
         }
@@ -530,7 +650,7 @@ def validate_predictions(
     shutil.rmtree(state_root, ignore_errors=True)
     report = {
         "enabled": True,
-        "method": "LingBot-Depth v0.5 with metric and multi-view quality gates",
+        "method": method,
         "frameCount": len(frames),
         "acceptedFrameCount": sum(bool(value["accepted"]) for value in metrics),
         "generatedPixelCount": generated_total,
@@ -540,8 +660,8 @@ def validate_predictions(
         ),
         "generatedFusionWeight": 0.5,
         "generatedTrainingConfidence": GENERATED_DEPTH_CONFIDENCE / 255.0,
-        "modelRevision": LINGBOT_DEPTH_MODEL_REVISION,
-        "modelSha256": LINGBOT_DEPTH_MODEL_SHA256,
+        "modelRevision": model_revision,
+        "modelSha256": model_sha256,
     }
     return overrides, report, manifest_frames
 
@@ -553,13 +673,14 @@ def _run_inference_worker(
     log_path: Path,
     cancel_path: Path,
     progress: ProgressCallback | None,
+    backend: DepthBackend = DEPTH_BACKENDS["lingbot"],
 ) -> None:
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     with log_path.open("a", encoding="utf-8", newline="\n") as log:
         process = subprocess.Popen(
             [
                 str(executable),
-                "refine-rgbd-depth",
+                backend.command,
                 "--request",
                 str(request_path),
                 "--progress",
@@ -580,7 +701,7 @@ def _run_inference_worker(
                         state = read_json(progress_path)
                         if progress:
                             progress(
-                                "LingBot depth refinement",
+                                backend.label,
                                 str(state.get("detail", "Refining aligned RGB-D depth")),
                                 0,
                                 None,
@@ -600,7 +721,7 @@ def _run_inference_worker(
             time.sleep(0.25)
         return_code = process.wait()
     if return_code != 0:
-        detail = "LingBot-Depth inference worker failed"
+        detail = f"{backend.label} worker failed"
         try:
             lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
             if lines:
@@ -618,26 +739,32 @@ def _close_memmaps(arrays: list[np.ndarray]) -> None:
             mapping.close()
 
 
-def prepare_lingbot_depth_refinement(
+def prepare_depth_refinement(
     frames: list[PosedFrame],
     project_root: Path,
     executable: Path,
     progress: ProgressCallback | None = None,
+    *,
+    backend_name: str = "lingbot",
 ) -> DepthRefinementResult:
+    try:
+        backend = DEPTH_BACKENDS[backend_name]
+    except KeyError as error:
+        raise ValueError(f"Unknown depth refinement backend: {backend_name}") from error
     frames = [frame for frame in frames if not frame.depthless]
     if len(frames) < 2:
-        raise RuntimeError("LingBot-Depth refinement requires at least two posed RGB-D keyframes")
+        raise RuntimeError(f"{backend.label} requires at least two posed RGB-D keyframes")
     executable = executable.resolve()
     if not executable.is_file():
-        raise FileNotFoundError(f"LingBot-Depth runtime is missing: {executable}")
-    cache_parent = project_root / "outputs" / "cache" / "lingbot-depth"
-    fingerprint = _cache_fingerprint(frames)
+        raise FileNotFoundError(f"{backend.label} runtime is missing: {executable}")
+    cache_parent = project_root / "outputs" / "cache" / f"{backend.name}-depth"
+    fingerprint = _cache_fingerprint(frames, backend)
     cache_root = cache_parent / fingerprint
-    cached = _load_cached_result(cache_root)
+    cached = _load_cached_result(cache_root, backend)
     if cached is not None:
         if progress:
             progress(
-                "LingBot depth refinement",
+                backend.label,
                 f"Reusing {len(cached.overrides)} quality-gated refined keyframes",
                 0,
                 None,
@@ -667,12 +794,16 @@ def prepare_lingbot_depth_refinement(
                     "cy": camera.cy,
                     "depthScale": camera.depth_scale,
                     "maximumDepthM": camera.max_depth_m,
+                    "cameraPose": world_from_depth_opencv(
+                        frame.camera_to_global, frame.image_y_up
+                    ).reshape(-1).tolist(),
                 }
             )
         request = {
             "schemaVersion": 1,
-            "modelRevision": LINGBOT_DEPTH_MODEL_REVISION,
-            "modelSha256": LINGBOT_DEPTH_MODEL_SHA256,
+            "backend": backend.name,
+            "modelRevision": backend.model_revision,
+            "modelSha256": backend.model_sha256,
             "cancelPath": str((project_root / "outputs" / "cancel.flag").resolve()),
             "resultPath": str((temporary / "inference-result.json").resolve()),
             "frames": request_frames,
@@ -686,10 +817,11 @@ def prepare_lingbot_depth_refinement(
             temporary / "inference.log",
             project_root / "outputs" / "cancel.flag",
             progress,
+            backend,
         )
         result = read_json(temporary / "inference-result.json")
-        if result.get("modelSha256") != LINGBOT_DEPTH_MODEL_SHA256:
-            raise RuntimeError("LingBot-Depth worker used an unpinned model")
+        if result.get("modelSha256") != backend.model_sha256:
+            raise RuntimeError(f"{backend.label} worker used an unpinned model")
         predictions: list[np.ndarray] = []
         model_masks: list[np.ndarray] = []
         try:
@@ -703,28 +835,33 @@ def prepare_lingbot_depth_refinement(
             ]
             if progress:
                 progress(
-                    "LingBot depth validation",
+                    f"{backend.label} validation",
                     "Checking metric agreement, true RGB coverage, and neighbouring views",
                     0,
                     None,
                     stage_progress=0.0,
-                    compute_backend=str(result.get("backend", "LingBot-Depth v0.5")),
+                    compute_backend=str(result.get("backend", backend.label)),
                 )
             overrides, report, manifest_frames = validate_predictions(
                 frames,
                 predictions,
                 model_masks,
                 temporary,
+                sensor_anchor_calibration=backend.sensor_anchor_calibration,
+                method=backend.method,
+                model_revision=backend.model_revision,
+                model_sha256=backend.model_sha256,
             )
         finally:
             _close_memmaps(predictions)
             _close_memmaps(model_masks)
         manifest = {
-            "version": DEPTH_REFINEMENT_VERSION,
+            "version": backend.version,
             "fingerprint": fingerprint,
-            "modelCodeRevision": LINGBOT_DEPTH_CODE_REVISION,
-            "modelRevision": LINGBOT_DEPTH_MODEL_REVISION,
-            "modelSha256": LINGBOT_DEPTH_MODEL_SHA256,
+            "backendName": backend.name,
+            "modelCodeRevision": backend.code_revision,
+            "modelRevision": backend.model_revision,
+            "modelSha256": backend.model_sha256,
             "backend": result.get("backend"),
             "report": report,
             "frames": manifest_frames,
@@ -734,17 +871,17 @@ def prepare_lingbot_depth_refinement(
         try:
             os.replace(temporary, cache_root)
         except FileExistsError:
-            existing = _load_cached_result(cache_root)
+            existing = _load_cached_result(cache_root, backend)
             if existing is None:
                 raise
             shutil.rmtree(temporary, ignore_errors=True)
             return existing
-        published = _load_cached_result(cache_root)
+        published = _load_cached_result(cache_root, backend)
         if published is None:
-            raise RuntimeError("Published LingBot-Depth cache failed validation")
+            raise RuntimeError(f"Published {backend.label} cache failed validation")
         if progress:
             progress(
-                "LingBot depth validation",
+                f"{backend.label} validation",
                 f"Accepted {report['generatedPixelCount']:,} generated depth pixels across {report['acceptedFrameCount']} keyframes",
                 0,
                 None,
@@ -754,3 +891,48 @@ def prepare_lingbot_depth_refinement(
     finally:
         if temporary.exists():
             shutil.rmtree(temporary, ignore_errors=True)
+
+
+def prepare_lingbot_depth_refinement(
+    frames: list[PosedFrame],
+    project_root: Path,
+    executable: Path,
+    progress: ProgressCallback | None = None,
+) -> DepthRefinementResult:
+    return prepare_depth_refinement(
+        frames,
+        project_root,
+        executable,
+        progress,
+        backend_name="lingbot",
+    )
+
+
+def prepare_mapanything_depth_refinement(
+    frames: list[PosedFrame],
+    project_root: Path,
+    executable: Path,
+    progress: ProgressCallback | None = None,
+) -> DepthRefinementResult:
+    return prepare_depth_refinement(
+        frames,
+        project_root,
+        executable,
+        progress,
+        backend_name="mapanything",
+    )
+
+
+def prepare_da3_depth_refinement(
+    frames: list[PosedFrame],
+    project_root: Path,
+    executable: Path,
+    progress: ProgressCallback | None = None,
+) -> DepthRefinementResult:
+    return prepare_depth_refinement(
+        frames,
+        project_root,
+        executable,
+        progress,
+        backend_name="da3",
+    )

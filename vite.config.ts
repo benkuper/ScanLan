@@ -9,6 +9,10 @@ export default defineConfig({
   // Spark is a ~5 MB ESM bundle and is dynamically imported only when a splat
   // is opened. Keep it out of the cold-start prebundle.
   optimizeDeps: {
+    // Vite otherwise discovers every HTML file below the repository root.
+    // Native dependency trees include thousands of generated documentation
+    // pages, which can exhaust Windows file handles during `npm run debug`.
+    entries: ['index.html'],
     exclude: ['@sparkjsdev/spark']
   },
   server: {

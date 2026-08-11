@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import unittest
+from dataclasses import replace
 
 import numpy as np
 
@@ -62,6 +63,36 @@ class RgbdStreamTests(unittest.TestCase):
         self.assertEqual(frames.dropped, 1)
         self.assertEqual(frames.get().sequence, 2)
         self.assertEqual(frames.get().sequence, 3)
+
+    def test_latest_queue_preserves_rotation_across_dropped_frames(self) -> None:
+        frames = LatestFrameQueue(capacity=2)
+        first = frame(1)
+        second = frame(2)
+        third = frame(3)
+        first = replace(
+            first,
+            gyro_delta_xyzw=np.asarray(
+                [0.0, 0.0, np.sin(0.05), np.cos(0.05)]
+            ),
+        )
+        second = replace(
+            second,
+            gyro_delta_xyzw=np.asarray(
+                [0.0, 0.0, np.sin(0.10), np.cos(0.10)]
+            ),
+        )
+        frames.put(first)
+        frames.put(second)
+        frames.put(third)
+
+        retained = frames.get()
+
+        self.assertEqual(retained.sequence, 2)
+        np.testing.assert_allclose(
+            retained.gyro_delta_xyzw,
+            [0.0, 0.0, np.sin(0.15), np.cos(0.15)],
+            atol=1e-7,
+        )
 
     def test_depth_filter_removes_speckles_but_keeps_supported_edges(self) -> None:
         camera = StreamCamera(5, 5, 4.0, 4.0, 2.0, 2.0, 1000.0, 0.2, 5.0)

@@ -1817,27 +1817,33 @@ def reconstruct_open3d(
         local_phases, voxel_size_m, backend, progress
     )
 
-    if artifact_context is not None:
-        from .mesh import PosedFrame
+    from .mesh import PosedFrame
+    from .validation import validate_posed_frames
 
-        display_axes = (-1.0, -1.0, -1.0) if flip_x else (1.0, -1.0, -1.0)
-        posed_frames = [
-            PosedFrame(
-                phase_name=str(local.source.manifest.get("name", f"Phase {phase_index + 1}")),
-                phase_id=str(local.source.manifest.get("id", local.source.root.name)),
-                source=local.source,
-                frame_index=frame_index,
-                camera_to_global=phase_transform @ camera_to_phase,
-                display_axes=display_axes,
-                image_y_up=False,
-            )
-            for phase_index, (local, phase_transform) in enumerate(
-                zip(local_phases, phase_to_global, strict=True)
-            )
-            for frame_index, camera_to_phase in zip(
-                local.frame_indices, local.camera_to_phase, strict=True
-            )
-        ]
+    display_axes = (-1.0, -1.0, -1.0) if flip_x else (1.0, -1.0, -1.0)
+    posed_frames = [
+        PosedFrame(
+            phase_name=str(local.source.manifest.get("name", f"Phase {phase_index + 1}")),
+            phase_id=str(local.source.manifest.get("id", local.source.root.name)),
+            source=local.source,
+            frame_index=frame_index,
+            camera_to_global=phase_transform @ camera_to_phase,
+            display_axes=display_axes,
+            image_y_up=False,
+        )
+        for phase_index, (local, phase_transform) in enumerate(
+            zip(local_phases, phase_to_global, strict=True)
+        )
+        for frame_index, camera_to_phase in zip(
+            local.frame_indices, local.camera_to_phase, strict=True
+        )
+    ]
+    posed_frames, validation_report = validate_posed_frames(posed_frames)
+    accepted_frame_keys = {
+        (str(frame.source.root), frame.frame_index) for frame in posed_frames
+    }
+    if artifact_context is not None:
+        artifact_context["validation_report"] = validation_report
         refinement_callback = artifact_context.get("prepare_depth_refinement")
         if callable(refinement_callback):
             refinement = refinement_callback(posed_frames)
@@ -1924,6 +1930,7 @@ def reconstruct_open3d(
         )
         for local in local_phases
         for frame_index in local.frame_indices
+        if (str(local.source.root), frame_index) in accepted_frame_keys
     )
     needs_mesh = bool(artifact_context and artifact_context.get("needs_mesh"))
     final_fusion_method = "shared_tsdf_cuda" if backend.uses_cuda else "shared_tsdf_cpu"
@@ -1937,9 +1944,17 @@ def reconstruct_open3d(
         entries = []
         entry_details: list[tuple[int, int, str]] = []
         for local, transform in zip(local_phases, phase_to_global, strict=True):
-            for selected_number, (frame_index, camera_to_phase) in enumerate(
-                zip(local.frame_indices, local.camera_to_phase, strict=True), start=1
+            validated_phase_frame_count = sum(
+                (str(local.source.root), frame_index) in accepted_frame_keys
+                for frame_index in local.frame_indices
+            )
+            selected_number = 0
+            for frame_index, camera_to_phase in zip(
+                local.frame_indices, local.camera_to_phase, strict=True
             ):
+                if (str(local.source.root), frame_index) not in accepted_frame_keys:
+                    continue
+                selected_number += 1
                 camera_to_global = transform @ camera_to_phase
                 append_fusion_entries(
                     entries,
@@ -1949,7 +1964,7 @@ def reconstruct_open3d(
                     np.linalg.inv(camera_to_global),
                     (
                         selected_number,
-                        len(local.frame_indices),
+                        validated_phase_frame_count,
                         local.source.manifest["name"],
                     ),
                 )
@@ -2033,9 +2048,17 @@ def reconstruct_open3d(
         entries = []
         entry_details: list[tuple[int, int, str]] = []
         for local, transform in zip(local_phases, phase_to_global, strict=True):
-            for selected_number, (frame_index, camera_to_phase) in enumerate(
-                zip(local.frame_indices, local.camera_to_phase, strict=True), start=1
+            validated_phase_frame_count = sum(
+                (str(local.source.root), frame_index) in accepted_frame_keys
+                for frame_index in local.frame_indices
+            )
+            selected_number = 0
+            for frame_index, camera_to_phase in zip(
+                local.frame_indices, local.camera_to_phase, strict=True
             ):
+                if (str(local.source.root), frame_index) not in accepted_frame_keys:
+                    continue
+                selected_number += 1
                 camera_to_global = transform @ camera_to_phase
                 append_fusion_entries(
                     entries,
@@ -2043,7 +2066,7 @@ def reconstruct_open3d(
                     local.source,
                     frame_index,
                     np.linalg.inv(camera_to_global),
-                    (selected_number, len(local.frame_indices), local.source.manifest["name"]),
+                    (selected_number, validated_phase_frame_count, local.source.manifest["name"]),
                 )
 
         def integrated(entry_index: int, repeated: bool) -> None:
@@ -2102,6 +2125,13 @@ def reconstruct_open3d(
     points = _display_points(cloud, flip_x)
     colors = np.rint(np.asarray(cloud.colors) * 255.0).clip(0, 255).astype(np.uint8)
     quality = _quality_summary(local_phases, alignments)
+    validation_rejected = int(validation_report["rejectedFrameCount"])
+    quality["framesUsed"] = int(validation_report["acceptedFrameCount"])
+    if validation_rejected:
+        quality["detail"] += (
+            f" Shared validation omitted {validation_rejected} unsafe camera"
+            f"{'s' if validation_rejected != 1 else ''} before final fusion."
+        )
     quality["computeBackend"] = backend.label
     quality["localCacheVersion"] = LOCAL_CACHE_VERSION
     if progress:

@@ -5,6 +5,7 @@
       "../build/kinect-capture/Release": "kinect2",
       "../build/modern-capture/Release": "modern",
       "../worker/dist/scanlan-worker": "scanlan-worker",
+      "../geometry-worker/dist/scanlan-geometry": "geometry-runtime",
       "../splat-worker/dist/scanlan-splat": "splat-runtime"
     }
   }

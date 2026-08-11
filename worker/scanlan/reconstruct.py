@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,14 @@ from typing import Literal
 import numpy as np
 
 from .dataset import build_posed_dataset, dataset_fingerprint
+from .dense_fusion import (
+    align_media_samples,
+    bounded_mesh_samples,
+    dense_surface_mesh,
+    fuse_dense_samples,
+    load_dense_samples,
+    samples_from_arrays,
+)
 from .io import phase_roots, read_phase, read_project, save_binary_ply, save_preview, write_json
 from .mesh import (
     PosedFrame,
@@ -20,10 +29,11 @@ from .mesh import (
 )
 from .mesh_repair import MeshRepairSettings, settings_from_project
 from .numpy_engine import reconstruct_known_poses
+from .validation import validate_posed_frames
 
 Engine = Literal["auto", "numpy", "open3d"]
 Device = Literal["auto", "cpu", "cuda"]
-DepthRefinement = Literal["off", "lingbot"]
+DepthRefinement = Literal["off", "auto", "lingbot", "mapanything", "da3"]
 
 
 class ProgressReporter:
@@ -119,6 +129,7 @@ def reconstruct_project(
     mesh_repair_settings: MeshRepairSettings | None = None,
     depth_refinement: DepthRefinement = "off",
     depth_refiner: Path | None = None,
+    neural_sdf_worker: Path | None = None,
 ) -> dict:
     project_root = project_root.resolve()
     project = read_project(project_root)
@@ -133,6 +144,43 @@ def reconstruct_project(
     ]
     if not phases:
         raise ValueError("Capture at least one phase before building a point cloud")
+
+    if depth_refinement == "auto":
+        write_json(
+            project_root / "outputs" / "progress.json",
+            {
+                "stage": "Backend policy",
+                "detail": "Validating hardware and matching RGB-D completion benchmarks",
+                "progress": 0.0,
+                "processedUnits": 0,
+                "totalUnits": max(sum(len(phase.frames) for phase in phases), 1),
+                "computeBackend": "ScanLan adaptive backend policy",
+            },
+        )
+        if depth_refiner is None:
+            depth_refinement = "off"
+            write_json(
+                project_root / "outputs" / "backend-policy.json",
+                {
+                    "schemaVersion": 1,
+                    "kind": "scanlan-adaptive-backend-policy",
+                    "source": {"kind": "rgbd"},
+                    "decisions": {
+                        "depthCompletion": {
+                            "selected": "off",
+                            "selectionMode": "protected-baseline",
+                            "benchmarked": False,
+                            "reason": "The isolated learned-geometry runtime is unavailable.",
+                        }
+                    },
+                },
+            )
+        else:
+            from .backend_policy import select_depth_backend
+
+            depth_refinement, _policy = select_depth_backend(
+                project_root, project, phases, depth_refiner
+            )
 
     voxel_size_m = max(float(project["settings"].get("voxelSizeMm", 15)) / 1000.0, 0.001)
     total_frames = sum(len(phase.frames) for phase in phases)
@@ -158,17 +206,20 @@ def reconstruct_project(
             "needs_mesh": "textured_mesh" in targets,
             "mesh_voxel_size_m": max(voxel_size_m, 0.008),
         }
-        if depth_refinement == "lingbot":
+        if depth_refinement in ("lingbot", "mapanything", "da3"):
             if depth_refiner is None:
-                raise RuntimeError("LingBot depth refinement requires an isolated CUDA worker")
-            from .depth_refinement import prepare_lingbot_depth_refinement
+                raise RuntimeError(
+                    f"{depth_refinement} depth refinement requires an isolated CUDA worker"
+                )
+            from .depth_refinement import prepare_depth_refinement
 
             artifact_context["prepare_depth_refinement"] = lambda frames: (
-                prepare_lingbot_depth_refinement(
+                prepare_depth_refinement(
                     frames,
                     project_root,
                     depth_refiner,
                     reporter.update,
+                    backend_name=depth_refinement,
                 )
             )
         elif depth_refinement != "off":
@@ -199,6 +250,9 @@ def reconstruct_project(
                 for frame_index, frame in enumerate(phase.frames)
                 if frame.pose is not None
             ]
+            posed_frames, artifact_context["validation_report"] = validate_posed_frames(
+                posed_frames
+            )
             depth_overrides: dict[tuple[str, int], object] = {}
             refinement_callback = artifact_context.get("prepare_depth_refinement")
             if callable(refinement_callback):
@@ -227,18 +281,25 @@ def reconstruct_project(
                 artifact_context["depth_refinement_report"] = refinement.report
                 artifact_context["depth_overrides"] = depth_overrides
             artifact_context["posed_frames"] = posed_frames
+            accepted_frame_keys = {
+                (str(frame.source.root), frame.frame_index) for frame in posed_frames
+            }
             points, colors = reconstruct_known_poses(
                 phases,
                 voxel_size_m,
                 reporter.update,
                 depth_overrides,
+                accepted_frame_keys,
             )
             points = points * ([-1.0, 1.0, -1.0] if flip_x else [1.0, 1.0, -1.0])
             quality = {
                 "score": 96,
                 "label": "High",
-                "detail": f"High confidence from known global poses; used all {total_frames} frames.",
-                "framesUsed": total_frames,
+                "detail": (
+                    "High confidence from known global poses; fused "
+                    f"{len(posed_frames)} of {total_frames} frames after shared validation."
+                ),
+                "framesUsed": len(posed_frames),
                 "framesCaptured": total_frames,
                 "tracking": [],
                 "phaseMatches": [],
@@ -281,6 +342,66 @@ def reconstruct_project(
             if posed_frames
             else []
         )
+        media_fusion: dict[str, object] = {
+            "enabled": False,
+            "status": "not_available",
+            "fusionContract": "dense-surface-samples-v1",
+        }
+        aligned_media_samples = None
+        supplemental_mesh = None
+        media_pointer = output_dir / "cache" / "datasets" / "media-current.json"
+        if supplemental_frames and media_pointer.is_file() and any(
+            target in targets for target in ("point_cloud", "textured_mesh")
+        ):
+            try:
+                learned_samples, media_dataset, _media_root = load_dense_samples(media_pointer)
+                aligned_media_samples, alignment = align_media_samples(
+                    learned_samples,
+                    media_dataset,
+                    supplemental_frames,
+                )
+                media_fusion = {
+                    "enabled": True,
+                    "status": "accepted",
+                    "fusionContract": "dense-surface-samples-v1",
+                    "sourceSampleCount": len(aligned_media_samples.points),
+                    "sourceFingerprint": media_dataset.get("fingerprint"),
+                    "alignment": alignment,
+                }
+                if "textured_mesh" in targets:
+                    media_voxel = max(
+                        voxel_size_m,
+                        float(np.median(np.max(aligned_media_samples.scales, axis=1)))
+                        * 0.75,
+                    )
+                    mesh_media_samples, media_voxel = bounded_mesh_samples(
+                        aligned_media_samples, media_voxel
+                    )
+                    learned_vertices, learned_triangles, _learned_colors = dense_surface_mesh(
+                        mesh_media_samples,
+                        media_voxel,
+                    )
+                    supplemental_mesh = (learned_vertices, learned_triangles)
+                    media_fusion["candidateTriangleCount"] = len(learned_triangles)
+            except Exception as error:
+                # Learned geometry is optional evidence in a metric project.
+                # Reject it atomically when camera agreement or meshing fails;
+                # calibrated RGB-D geometry remains the safe production result.
+                aligned_media_samples = None
+                supplemental_mesh = None
+                media_fusion = {
+                    "enabled": True,
+                    "status": "rejected",
+                    "fusionContract": "dense-surface-samples-v1",
+                    "reason": str(error),
+                }
+                reporter.update(
+                    "Dense fusion",
+                    f"Rejected incompatible learned media geometry - {str(error).splitlines()[0]}",
+                    0,
+                    None,
+                    1.0,
+                )
         dataset_frames = (
             [*posed_frames, *supplemental_frames]
             if needs_dataset and posed_frames
@@ -296,6 +417,36 @@ def reconstruct_project(
             if dataset is not None
             else dataset_fingerprint(posed_frames)
         )
+        if media_fusion.get("status") == "accepted":
+            source_fingerprint = hashlib.sha256(
+                (
+                    source_fingerprint
+                    + ":dense-media:"
+                    + str(media_fusion.get("sourceFingerprint", "unknown"))
+                    + ":"
+                    + json.dumps(media_fusion.get("alignment", {}), sort_keys=True)
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+        surface_refiner = None
+        if neural_sdf_worker is not None and "textured_mesh" in targets:
+            from .neural_sdf import refine_surface_with_worker
+
+            def surface_refiner(
+                surface_vertices: np.ndarray,
+                surface_triangles: np.ndarray,
+                surface_voxel_size: float,
+                surface_progress: object,
+            ) -> tuple[np.ndarray, np.ndarray, dict]:
+                return refine_surface_with_worker(
+                    surface_vertices,
+                    surface_triangles,
+                    project_root=project_root,
+                    worker=neural_sdf_worker,
+                    voxel_size_m=surface_voxel_size,
+                    validation_report=artifact_context.get("validation_report"),
+                    progress=surface_progress if callable(surface_progress) else None,
+                )
+
         mesh = (
             build_mesh_artifacts(
                 output_dir,
@@ -305,6 +456,8 @@ def reconstruct_project(
                 prebuilt_mesh=artifact_context.get("fused_mesh"),
                 prebuilt_mesh_method=artifact_context.get("fused_mesh_method"),
                 repair_settings=mesh_repair_settings,
+                supplemental_mesh=supplemental_mesh,
+                surface_refiner=surface_refiner,
             )
             if "textured_mesh" in targets
             else {
@@ -326,6 +479,19 @@ def reconstruct_project(
             "mediaPointColorCoveragePercent": 0.0,
         }
         if "point_cloud" in targets:
+            fusion_batches = [
+                samples_from_arrays(
+                    points,
+                    colors,
+                    voxel_size_m=voxel_size_m,
+                )
+            ]
+            if aligned_media_samples is not None:
+                fusion_batches.append(aligned_media_samples)
+            fused_samples = fuse_dense_samples(fusion_batches, voxel_size_m)
+            points, colors = fused_samples.points, fused_samples.colors
+            if aligned_media_samples is not None:
+                media_fusion["fusedPointCount"] = len(points)
             colors, point_color_metrics = enhance_point_colors_from_media(
                 points,
                 colors,
@@ -356,6 +522,16 @@ def reconstruct_project(
                 "depth_refinement_report",
                 {"enabled": False, "method": "raw calibrated sensor depth"},
             ),
+            "validation": artifact_context.get("validation_report"),
+            "denseFusion": {
+                "fusionContract": "dense-surface-samples-v1",
+                "primarySource": "rgbd",
+                "primaryPolicy": (
+                    "calibrated measured TSDF + half-weight validated generated depth; "
+                    "measured samples win voxel conflicts"
+                ),
+                "media": media_fusion,
+            },
         }
 
         # Gaussian training is a separate worker launched by the desktop job
@@ -415,6 +591,10 @@ def reconstruct_project(
             )
             project["watertightMeshOutputPath"] = result.get(
                 "watertightMeshOutputPath"
+            )
+            project["neuralSdf"] = result.get(
+                "neuralSdf",
+                {"status": "disabled", "method": "scanlan-neural-sdf-v1"},
             )
             artifacts["texturedMesh"] = {
                 "path": "outputs/room-mesh.obj",

@@ -11,6 +11,7 @@ from PIL import Image
 from scanlan.depth_refinement import (
     _close_memmaps,
     _metric_gate,
+    _sensor_anchor_calibration,
     _true_rgb_coverage,
     validate_predictions,
 )
@@ -69,6 +70,24 @@ def _posed_sequence(root: Path) -> tuple[list[PosedFrame], np.ndarray]:
 
 
 class DepthRefinementTests(unittest.TestCase):
+    def test_sensor_anchor_calibration_must_pass_held_out_depth(self) -> None:
+        height, width = 128, 160
+        yy, xx = np.indices((height, width), dtype=np.float32)
+        measured = 2.0 + 0.002 * xx + 0.001 * yy
+        predicted = measured + 0.08 + 0.02 * np.sin(xx / 18.0)
+        reliable = np.ones((height, width), dtype=bool)
+        model_valid = np.ones((height, width), dtype=bool)
+        calibrated, valid, report = _sensor_anchor_calibration(
+            measured,
+            reliable,
+            predicted,
+            model_valid,
+        )
+        self.assertTrue(report["accepted"], report)
+        self.assertGreater(report["heldOutSampleCount"], 256)
+        self.assertTrue(np.isfinite(calibrated[valid]).all())
+        self.assertLess(report["medianResidualMm"], 10.0)
+
     def test_rgb_coverage_ignores_nonfinite_model_depth_without_warnings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             frames, raw = _posed_sequence(Path(temporary))

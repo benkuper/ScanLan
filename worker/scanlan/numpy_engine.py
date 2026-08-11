@@ -70,15 +70,29 @@ def reconstruct_known_poses(
     voxel_size_m: float,
     progress: Callable[..., None] | None = None,
     depth_overrides: dict[tuple[str, int], Any] | None = None,
+    accepted_frame_keys: set[tuple[str, int]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not phases:
         raise ValueError("At least one capture phase is required")
     point_batches: list[np.ndarray] = []
     color_batches: list[np.ndarray] = []
-    total_frames = sum(len(phase.frames) for phase in phases)
+    total_frames = sum(
+        1
+        for phase in phases
+        for frame_index in range(len(phase.frames))
+        if accepted_frame_keys is None
+        or (str(phase.root), frame_index) in accepted_frame_keys
+    )
+    if total_frames == 0:
+        raise RuntimeError("Camera validation left no frames for NumPy fusion")
     completed_frames = 0
     for phase in phases:
         for frame_index in range(len(phase.frames)):
+            if (
+                accepted_frame_keys is not None
+                and (str(phase.root), frame_index) not in accepted_frame_keys
+            ):
+                continue
             override = (depth_overrides or {}).get((str(phase.root), frame_index))
             depth_paths = (
                 [None]
@@ -96,7 +110,7 @@ def reconstruct_known_poses(
             if progress:
                 progress(
                     "Placing frames",
-                    f"Placed frame {frame_index + 1} of {len(phase.frames)} in {phase.manifest['name']}",
+                    f"Placed validated frame {completed_frames} of {total_frames}",
                     1,
                     sum(batch.shape[0] for batch in point_batches),
                     completed_frames / total_frames,

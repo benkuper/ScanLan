@@ -488,6 +488,7 @@ void prepare_root(const Options &options) {
     fs::remove(options.root / "record.flag");
     fs::remove(options.root / "reconstruction-reset.flag");
     fs::remove(options.root / "recording.flag");
+    fs::remove(options.root / "tracking-hold.flag");
     fs::remove(options.root / "preview.flag");
     if(options.preview) std::ofstream(options.root / "preview.flag").close();
     fs::remove(options.root / "live.json");
@@ -755,8 +756,10 @@ int run_azure(const Options &options) {
                 fs::remove(options.root / "record.flag");
             }
             if(recording) ++recording_frames;
-            const bool save_source = recording && scanlan::archive_frame_due(
-                recording_frames, depth_mode.native_fps, options.fps);
+            const bool save_source = recording
+                && !fs::exists(options.root / "tracking-hold.flag")
+                && scanlan::archive_frame_due(
+                    recording_frames, depth_mode.native_fps, options.fps);
             const std::uint64_t timestamp_us = k4a_image_get_device_timestamp_usec(depth_image);
             std::vector<std::uint16_t> depth(static_cast<std::size_t>(camera.width * camera.height));
             const auto *depth_buffer = k4a_image_get_buffer(depth_image);
@@ -841,7 +844,9 @@ int run_azure(const Options &options) {
                 write_live_status(options, sensor, timestamp_us, archive.saved(),
                                   stream_fps, imu_active, imu ? imu->rate_hz() : 0.0F,
                                   recording
-                                      ? "Full-rate RGB-D tracking and bounded background recording"
+                                      ? fs::exists(options.root / "tracking-hold.flag")
+                                          ? "Tracking recovery active; retained recording is paused"
+                                          : "Full-rate RGB-D tracking and bounded background recording"
                                       : "Live RGB-D preview ready; press Capture to begin recording");
             }
             k4a_image_release(depth_image);
@@ -1659,8 +1664,10 @@ int run_orbbec(const Options &options) {
             fs::remove(options.root / "record.flag");
         }
         if(recording.load()) ++recording_frames;
-        const bool save_source = recording.load() && scanlan::archive_frame_due(
-            recording_frames, native_fps, options.fps);
+        const bool save_source = recording.load()
+            && !fs::exists(options.root / "tracking-hold.flag")
+            && scanlan::archive_frame_due(
+                recording_frames, native_fps, options.fps);
         const float scale = depth_frame->getValueScale();
         const auto *raw_depth = reinterpret_cast<const std::uint16_t *>(depth_frame->getData());
         std::vector<std::uint16_t> native_depth(static_cast<std::size_t>(camera.width * camera.height));
@@ -1769,7 +1776,9 @@ int run_orbbec(const Options &options) {
             write_live_status(options, sensor, timestamp_us, archive.saved(),
                               stream_fps, imu_active, imu ? imu->rate_hz() : 0.0F,
                               recording.load()
-                                  ? "Full-rate RGB-D tracking and bounded background recording"
+                                  ? fs::exists(options.root / "tracking-hold.flag")
+                                      ? "Tracking recovery active; retained recording is paused"
+                                      : "Full-rate RGB-D tracking and bounded background recording"
                                   : "Live RGB-D preview ready; press Capture to begin recording");
         }
         frame_set.reset();

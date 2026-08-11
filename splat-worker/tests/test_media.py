@@ -6,23 +6,27 @@ import time
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
 
-from scanlan_splat.cli import _publish_failure
+from scanlan_splat.cli import _publish_failure, parser
 from scanlan_splat.media import (
     _CameraSolveTelemetry,
     MediaPreparationOptions,
     _adaptive_keyframe_reason,
     _configure_sfm,
+    _camera_recovery_pairs,
     _cpu_match_pairs,
     _descriptor_distance,
     _extract_lingbot_context,
     _extract_video_streaming,
     _feature_extraction_groups,
     _feature_extraction_batch_size,
+    _guided_match_pairs,
+    _geometry_fusion_confidence,
     _limited_size,
     _minimum_useful_registration_count,
     _materialize_observation_inputs,
@@ -32,17 +36,66 @@ from scanlan_splat.media import (
     _tracked_visual_motion,
     _video_intrinsic_spread,
     _write_json_atomic,
+    _write_initialization_parameters,
     adaptive_frame_selection_status,
     prepare_media_observations,
 )
+from scanlan_splat.lingbot import LingbotGeometry
 
 
 class MediaPreparationTests(unittest.TestCase):
+    @staticmethod
+    def _camera_proposal(count: int):
+        poses = np.repeat(np.eye(4, dtype=np.float64)[None], count, axis=0)
+        poses[:, 0, 3] = np.linspace(0.0, 3.0, count)
+        poses[:, 2, 3] = 0.1 * np.sin(np.linspace(0.0, np.pi, count))
+        return SimpleNamespace(
+            world_from_cameras=poses,
+            frame_confidence=np.linspace(0.75, 1.0, count),
+            backend="fixture learned cameras",
+        )
+
     def test_default_video_sampling_preserves_handheld_overlap(self) -> None:
         options = MediaPreparationOptions()
 
         self.assertEqual(options.video_fps, 15.0)
         self.assertEqual(options.maximum_video_frames, 3_000)
+
+    def test_dense_fusion_sidecar_separates_geometry_confidence_from_opacity(self) -> None:
+        geometry = LingbotGeometry(
+            world_from_cameras=np.repeat(np.eye(4)[None], 2, axis=0),
+            intrinsics=np.repeat(np.eye(3)[None], 2, axis=0),
+            points=np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]], dtype=np.float32),
+            colors=np.asarray([[10, 20, 30], [40, 50, 60]], dtype=np.uint8),
+            scales=np.full((2, 3), 0.02, dtype=np.float32),
+            quaternions=np.asarray([[1.0, 0.0, 0.0, 0.0]] * 2, dtype=np.float32),
+            source_frame_indices=np.asarray([0, 1], dtype=np.int32),
+            frame_confidence=np.asarray([0.6, 0.9], dtype=np.float32),
+            backend="fixture",
+            model_path="fixture",
+            processed_size=(32, 32),
+            opacities=np.asarray([0.01, 0.8], dtype=np.float32),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "initialization-parameters.npz"
+            _write_initialization_parameters(
+                path,
+                geometry.points,
+                geometry.colors,
+                geometry.scales,
+                geometry.quaternions,
+                confidence=_geometry_fusion_confidence(geometry),
+                opacity=geometry.opacities,
+                fusion_confidence=_geometry_fusion_confidence(geometry),
+                source_frame_indices=geometry.source_frame_indices,
+                provenance=np.full(2, 2, dtype=np.uint8),
+            )
+            with np.load(path, allow_pickle=False) as values:
+                np.testing.assert_allclose(values["confidence"], [0.6, 0.9])
+                np.testing.assert_allclose(values["opacity"], geometry.opacities)
+                np.testing.assert_allclose(values["fusion_confidence"], [0.6, 0.9])
+                np.testing.assert_array_equal(values["source_frame_indices"], [0, 1])
+                np.testing.assert_array_equal(values["provenance"], [2, 2])
 
     def test_adaptive_frame_policy_is_exposed_to_release_diagnostics(self) -> None:
         status = adaptive_frame_selection_status()
@@ -52,6 +105,13 @@ class MediaPreparationTests(unittest.TestCase):
         self.assertTrue(status["maximumFramesIsSafetyCeiling"])
         self.assertIn("tracked_overlap", status["signals"])
         self.assertIn("camera_motion", status["signals"])
+
+    def test_neural_sdf_runtime_has_an_independent_diagnostic_lane(self) -> None:
+        arguments = parser().parse_args(["diagnostics", "--require-neural-sdf"])
+
+        self.assertTrue(arguments.require_neural_sdf)
+        self.assertFalse(arguments.require_learned_features)
+        self.assertFalse(arguments.require_adaptive_frames)
 
     def test_adaptive_keyframes_follow_motion_instead_of_elapsed_video_length(self) -> None:
         import cv2
@@ -137,6 +197,60 @@ class MediaPreparationTests(unittest.TestCase):
         self.assertEqual(len(photo_pairs), 300 * 299 // 2)
         self.assertLess(len(video_pairs), len(photo_pairs) // 5)
         self.assertIn(("000.jpg", "128.jpg"), video_pairs)
+
+    def test_learned_camera_proposal_builds_bounded_connected_pair_graph(self) -> None:
+        names = [f"{index:04}.jpg" for index in range(240)]
+        pairs = _guided_match_pairs(
+            names,
+            self._camera_proposal(len(names)),
+            sequential=True,
+        )
+
+        self.assertLess(len(pairs), len(names) * 40)
+        self.assertIn(("0000.jpg", "0001.jpg"), pairs)
+        self.assertIn(("0000.jpg", "0128.jpg"), pairs)
+        touched = {name for pair in pairs for name in pair}
+        self.assertEqual(touched, set(names))
+
+        photo_names = names[:16]
+        photo_pairs = _guided_match_pairs(
+            photo_names,
+            self._camera_proposal(len(photo_names)),
+            sequential=False,
+        )
+        self.assertLess(len(photo_pairs), len(photo_names) * (len(photo_names) - 1) // 2)
+
+    def test_degenerate_learned_trajectory_cannot_guide_matching(self) -> None:
+        proposal = self._camera_proposal(6)
+        proposal.world_from_cameras[:, :3, 3] = 0.0
+
+        self.assertEqual(
+            _guided_match_pairs(
+                [f"{index}.jpg" for index in range(6)],
+                proposal,
+                sequential=False,
+            ),
+            [],
+        )
+
+    def test_camera_recovery_targets_registered_learned_neighbours(self) -> None:
+        names = [f"{index:02}.jpg" for index in range(8)]
+        registered = {names[index] for index in (0, 1, 2, 5, 6, 7)}
+        pairs = _camera_recovery_pairs(
+            names,
+            self._camera_proposal(len(names)),
+            registered,
+            {("02.jpg", "03.jpg")},
+        )
+
+        self.assertTrue(pairs)
+        self.assertNotIn(("02.jpg", "03.jpg"), pairs)
+        self.assertTrue(
+            all(
+                (left in registered) != (right in registered)
+                for left, right in pairs
+            )
+        )
 
     def test_feature_extraction_batches_bound_native_image_queues(self) -> None:
         self.assertEqual(

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import collections
 import io
 import queue
 import struct
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, replace
 from typing import BinaryIO
 
 import numpy as np
@@ -253,26 +256,72 @@ class LatestFrameQueue:
     def __init__(self, capacity: int = 4) -> None:
         if capacity <= 0:
             raise ValueError("Frame queue capacity must be positive")
-        self._queue: queue.Queue[RgbdFrame] = queue.Queue(capacity)
+        self._capacity = capacity
+        self._frames: collections.deque[RgbdFrame] = collections.deque()
+        self._available = threading.Condition()
         self.dropped = 0
 
     def put(self, frame: RgbdFrame) -> None:
-        while True:
-            try:
-                self._queue.put_nowait(frame)
-                return
-            except queue.Full:
-                try:
-                    self._queue.get_nowait()
-                    self.dropped += 1
-                except queue.Empty:
-                    pass
+        with self._available:
+            if len(self._frames) == self._capacity:
+                dropped = self._frames.popleft()
+                self.dropped += 1
+                if self._frames:
+                    self._frames[0] = _prepend_gyro_delta(self._frames[0], dropped)
+                else:
+                    frame = _prepend_gyro_delta(frame, dropped)
+            self._frames.append(frame)
+            self._available.notify()
 
     def get(self, timeout: float | None = None) -> RgbdFrame:
-        return self._queue.get(timeout=timeout)
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._available:
+            while not self._frames:
+                if deadline is None:
+                    self._available.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise queue.Empty
+                self._available.wait(remaining)
+            return self._frames.popleft()
 
     def qsize(self) -> int:
-        return self._queue.qsize()
+        with self._available:
+            return len(self._frames)
+
+
+def _quaternion_multiply_xyzw(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    lx, ly, lz, lw = np.asarray(left, dtype=np.float64)
+    rx, ry, rz, rw = np.asarray(right, dtype=np.float64)
+    value = np.asarray(
+        [
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        ],
+        dtype=np.float64,
+    )
+    norm = float(np.linalg.norm(value))
+    if np.isfinite(norm) and norm > 1e-12:
+        return value / norm
+    return np.asarray([0, 0, 0, 1])
+
+
+def _prepend_gyro_delta(target: RgbdFrame, dropped: RgbdFrame) -> RgbdFrame:
+    """Preserve the complete rotation interval when a queued image is dropped."""
+
+    earlier = dropped.gyro_delta_xyzw
+    if earlier is None:
+        return target
+    later = target.gyro_delta_xyzw
+    combined = (
+        np.asarray(earlier, dtype=np.float64).copy()
+        if later is None
+        else _quaternion_multiply_xyzw(later, earlier)
+    )
+    return replace(target, gyro_delta_xyzw=combined)
 
 
 def decode_rgbd_frame(payload: bytes) -> RgbdFrame:

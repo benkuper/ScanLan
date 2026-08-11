@@ -13,8 +13,6 @@ from .media import (
     prepare_media_dataset,
     prepare_media_observations,
 )
-from .lingbot import lingbot_runtime_status
-from .lingbot_depth import lingbot_depth_runtime_status, refine_depth_request
 from .runtime import pycolmap_feature_runtime
 from .train import train_dataset
 
@@ -51,6 +49,29 @@ def _cuda_smoke_test() -> None:
     torch.cuda.synchronize()
     if means.grad is None or not torch.isfinite(means.grad).all():
         raise RuntimeError("gsplat CUDA backward smoke test produced invalid gradients")
+
+
+def _neural_sdf_cuda_smoke_test() -> None:
+    """Validate the Torch CUDA/autograd path used by neural SDF refinement.
+
+    Keep this probe independent from gsplat, PyCOLMAP, and adaptive media
+    selection. Those capabilities are required for Gaussian reconstruction,
+    but they must not delay or disable the otherwise compatible neural SDF
+    refinement lane.
+    """
+    import torch
+
+    coordinates = torch.tensor(
+        [[-0.5, 0.25, 0.75], [0.4, -0.2, 0.1]],
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    values = (coordinates.square().sum(dim=1) - 0.5).tanh()
+    values.sum().backward()
+    torch.cuda.synchronize()
+    if coordinates.grad is None or not torch.isfinite(coordinates.grad).all():
+        raise RuntimeError("neural SDF CUDA autograd smoke test produced invalid gradients")
 
 
 def _publish_failure(project_root: Path, error: Exception) -> None:
@@ -93,47 +114,91 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--video-fps", type=float, default=15.0)
     prepare.add_argument("--maximum-video-frames", type=int, default=3_000)
     prepare.add_argument("--maximum-image-dimension", type=int, default=2560)
+    prepare.add_argument("--geometry-worker", type=Path, default=None)
+    prepare.add_argument("--progressive-rgb-preview", action="store_true")
     observations = commands.add_parser("extract-media")
     observations.add_argument("--project", type=Path, required=True)
     observations.add_argument("--source", type=Path, action="append", default=[])
     observations.add_argument("--video-fps", type=float, default=15.0)
     observations.add_argument("--maximum-video-frames", type=int, default=3_000)
     observations.add_argument("--maximum-image-dimension", type=int, default=2560)
+    neural_sdf = commands.add_parser("refine-sdf")
+    neural_sdf.add_argument("--input", type=Path, required=True)
+    neural_sdf.add_argument("--output", type=Path, required=True)
+    neural_sdf.add_argument("--report", type=Path, required=True)
+    neural_sdf.add_argument("--progress", type=Path, default=None)
+    neural_sdf.add_argument("--iterations", type=int, default=1_600)
+    neural_sdf.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    material = commands.add_parser("prepare-material")
+    material.add_argument("--dataset", type=Path, required=True)
+    material.add_argument("--output", type=Path, required=True)
+    material.add_argument("--frame-index", type=int, action="append", default=None)
+    pack = commands.add_parser("material-pack")
+    pack.add_argument("--pack", choices=["commercial", "research"], required=True)
+    pack.add_argument("--output", type=Path, required=True)
     diagnostics = commands.add_parser("diagnostics")
     diagnostics.add_argument("--require-cuda", action="store_true")
     diagnostics.add_argument("--require-learned-features", action="store_true")
-    diagnostics.add_argument("--require-lingbot", action="store_true")
-    diagnostics.add_argument("--require-lingbot-depth", action="store_true")
-    diagnostics.add_argument("--require-flashinfer", action="store_true")
     diagnostics.add_argument("--require-adaptive-frames", action="store_true")
-    refine_depth = commands.add_parser("refine-rgbd-depth")
-    refine_depth.add_argument("--request", type=Path, required=True)
-    refine_depth.add_argument("--progress", type=Path, required=True)
+    diagnostics.add_argument("--require-neural-sdf", action="store_true")
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
-        if arguments.command == "refine-rgbd-depth":
-            refine_depth_request(arguments.request, arguments.progress)
-            return 0
         if arguments.command == "diagnostics":
             import torch
-            import gsplat
+            from .neural_sdf import NEURAL_SDF_VERSION
 
             cuda_available = torch.cuda.is_available()
+            if arguments.require_neural_sdf:
+                if cuda_available:
+                    _neural_sdf_cuda_smoke_test()
+                print(
+                    json.dumps(
+                        {
+                            "version": __version__,
+                            "cuda": cuda_available,
+                            "cudaSmokeTest": cuda_available,
+                            "device": (
+                                torch.cuda.get_device_name(0)
+                                if cuda_available
+                                else None
+                            ),
+                            "cudaCapability": (
+                                ".".join(
+                                    map(str, torch.cuda.get_device_capability(0))
+                                )
+                                if cuda_available
+                                else None
+                            ),
+                            "torch": torch.__version__,
+                            "neuralSdf": {
+                                "version": NEURAL_SDF_VERSION,
+                                "cudaAvailable": cuda_available,
+                                "cudaValidated": cuda_available,
+                            },
+                        }
+                    )
+                )
+                return 0 if cuda_available else 2
+
+            import gsplat
+            from .appearance import GAUSSIAN_MATERIAL_CONTRACT
+            from scanlan_material import (
+                ANALYSIS_VERSION,
+                CONTRACT_VERSION,
+                GEOMETRY_POLICY_VERSION,
+                GEOMETRY_RESULT_VERSION,
+                PBR_CONTRACT_VERSION,
+                RADIOMETRY_VERSION,
+                SURFACE_CONTRACT_VERSION,
+            )
+
             if arguments.require_cuda and cuda_available:
                 _cuda_smoke_test()
             feature_runtime = pycolmap_feature_runtime()
-            lingbot_runtime = lingbot_runtime_status(
-                allow_download=arguments.require_lingbot,
-                validate_flashinfer=arguments.require_flashinfer,
-            )
-            lingbot_depth_runtime = lingbot_depth_runtime_status(
-                verify_model=arguments.require_lingbot_depth,
-                smoke_test=arguments.require_lingbot_depth,
-            )
             adaptive_frames = adaptive_frame_selection_status()
             print(
                 json.dumps(
@@ -150,9 +215,22 @@ def main(argv: list[str] | None = None) -> int:
                         "torch": torch.__version__,
                         "gsplat": getattr(gsplat, "__version__", "unknown"),
                         "pycolmap": feature_runtime,
-                        "lingbotMap": lingbot_runtime,
-                        "lingbotDepth": lingbot_depth_runtime,
+                        "learnedGeometryIsolation": "scanlan-geometry",
                         "adaptiveFrames": adaptive_frames,
+                        "neuralSdf": {
+                            "version": NEURAL_SDF_VERSION,
+                            "cudaAvailable": cuda_available,
+                        },
+                        "materialFoundation": {
+                            "contractVersion": CONTRACT_VERSION,
+                            "radiometryVersion": RADIOMETRY_VERSION,
+                            "analysisVersion": ANALYSIS_VERSION,
+                            "surfaceContractVersion": SURFACE_CONTRACT_VERSION,
+                            "geometryPolicyVersion": GEOMETRY_POLICY_VERSION,
+                            "geometryResultVersion": GEOMETRY_RESULT_VERSION,
+                            "pbrContractVersion": PBR_CONTRACT_VERSION,
+                            "gaussianMaterialContract": GAUSSIAN_MATERIAL_CONTRACT,
+                        },
                     }
                 )
             )
@@ -162,16 +240,26 @@ def main(argv: list[str] | None = None) -> int:
                 and (not cuda_available or not feature_runtime["cudaValidated"])
                 or arguments.require_learned_features
                 and not feature_runtime["learnedValidated"]
-                or arguments.require_lingbot
-                and not lingbot_runtime["available"]
-                or arguments.require_lingbot_depth
-                and not lingbot_depth_runtime["available"]
-                or arguments.require_flashinfer
-                and not lingbot_runtime["flashinferValidated"]
                 or arguments.require_adaptive_frames
                 and not adaptive_frames["enabled"]
                 else 0
             )
+        if arguments.command == "prepare-material":
+            from scanlan_material import prepare_dataset_radiometry
+
+            result = prepare_dataset_radiometry(
+                arguments.dataset.resolve(strict=True),
+                arguments.output.resolve(),
+                frame_indices=arguments.frame_index,
+            )
+            print(json.dumps(result))
+            return 0
+        if arguments.command == "material-pack":
+            from scanlan_material import write_pack_manifest
+
+            result = write_pack_manifest(arguments.output.resolve(), arguments.pack)
+            print(json.dumps(result))
+            return 0
         if arguments.command in {"prepare-media", "extract-media"}:
             media_options = MediaPreparationOptions(
                 video_fps=max(0.1, min(arguments.video_fps, 30.0)),
@@ -183,13 +271,36 @@ def main(argv: list[str] | None = None) -> int:
                 if arguments.command == "extract-media"
                 else prepare_media_dataset
             )
-            result = prepare(
-                arguments.project.resolve(),
-                arguments.source,
-                media_options,
+            result = (
+                prepare(
+                    arguments.project.resolve(),
+                    arguments.source,
+                    media_options,
+                    geometry_worker=arguments.geometry_worker,
+                    progressive_rgb_preview=arguments.progressive_rgb_preview,
+                )
+                if arguments.command == "prepare-media"
+                else prepare(
+                    arguments.project.resolve(),
+                    arguments.source,
+                    media_options,
+                )
             )
             print(json.dumps(result))
             return 0
+        if arguments.command == "refine-sdf":
+            from .neural_sdf import run_refinement
+
+            result = run_refinement(
+                arguments.input.resolve(strict=True),
+                arguments.output.resolve(),
+                arguments.report.resolve(),
+                arguments.progress.resolve() if arguments.progress is not None else None,
+                max(200, min(arguments.iterations, 5_000)),
+                arguments.device,
+            )
+            print(json.dumps(result))
+            return 0 if result["status"] == "accepted" else 3
         result = train_dataset(
             arguments.dataset.resolve(),
             arguments.project.resolve(),

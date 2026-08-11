@@ -33,6 +33,13 @@ htmlcov/
 /splat-worker/dist/
 /splat-worker/*.spec
 /splat-worker/models/
+/geometry-worker/build/
+/geometry-worker/dist/
+/geometry-worker/*.spec
+/validation/build/
+/validation/dist/
+/material/build/
+/material/dist/
 /media-tools/
 *.spec.bak
 

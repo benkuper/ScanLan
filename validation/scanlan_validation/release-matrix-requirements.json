@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "revision": "scanlan-v2-p19-2026-08-11",
+  "candidateDefaults": {
+    "depthRefinement": "adaptive",
+    "mediaCamera": "adaptive",
+    "surface": "validated-dense-fusion",
+    "gaussian": "adaptive"
+  },
+  "scenarios": [
+    {
+      "scenarioId": "rgbd-kinect-v2-room",
+      "category": "rgbd",
+      "matches": {"source.kind": "rgbd", "source.sensorKind": "kinect_v2"},
+      "requiredGates": ["archiveFidelity", "trackingFullRateOrDegraded", "unsafeIntegrationFrozen", "relocalizationSafe", "loopCorrectionNoDuplicates", "provisionalAvailable", "productionRevalidated", "memoryBounded"],
+      "requiredMetrics": {"tracking.acceptedFrameRatio": {"minimum": 0.85}, "latency.poseP95Ms": {"maximum": 100.0}, "latency.pointMapP95Ms": {"maximum": 100.0}},
+      "requiredArtifacts": ["benchmarkReport", "finalPreview"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "rgbd-azure-kinect-room",
+      "category": "rgbd",
+      "matches": {"source.kind": "rgbd", "source.sensorKind": "azure_kinect"},
+      "requiredGates": ["archiveFidelity", "trackingFullRateOrDegraded", "unsafeIntegrationFrozen", "relocalizationSafe", "loopCorrectionNoDuplicates", "provisionalAvailable", "productionRevalidated", "memoryBounded"],
+      "requiredMetrics": {"tracking.acceptedFrameRatio": {"minimum": 0.85}, "latency.poseP95Ms": {"maximum": 100.0}, "latency.pointMapP95Ms": {"maximum": 100.0}},
+      "requiredArtifacts": ["benchmarkReport", "finalPreview"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "rgbd-femto-mega-room",
+      "category": "rgbd",
+      "matches": {"source.kind": "rgbd", "source.sensorKind": "femto_mega"},
+      "requiredGates": ["archiveFidelity", "trackingFullRateOrDegraded", "unsafeIntegrationFrozen", "relocalizationSafe", "loopCorrectionNoDuplicates", "provisionalAvailable", "productionRevalidated", "memoryBounded"],
+      "requiredMetrics": {"tracking.acceptedFrameRatio": {"minimum": 0.85}, "latency.poseP95Ms": {"maximum": 100.0}, "latency.pointMapP95Ms": {"maximum": 100.0}},
+      "requiredArtifacts": ["benchmarkReport", "finalPreview"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "photos-production-multiscene",
+      "category": "photos",
+      "matches": {"source.kind": "photos"},
+      "requiredGates": ["multipleRepresentativeScenes", "cameraValidation", "heldOutGeometry", "freeSpace", "sourceTileCoverage", "gaussianPhotometricQuality", "outputProductsIndependent"],
+      "requiredMetrics": {"camera.registrationRatio": {"minimum": 0.9}, "camera.medianReprojectionErrorPx": {"maximum": 1.0}, "gaussian.medianPsnrDb": {"minimum": 18.0}, "gaussian.medianSsim": {"minimum": 0.55}, "gaussian.medianL1": {"maximum": 0.15}},
+      "requiredArtifacts": ["cameraReport", "pointCloud", "mesh", "gaussian", "qualityReport"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "video-production-multiscene",
+      "category": "video",
+      "matches": {"source.kind": "video"},
+      "requiredGates": ["multipleRepresentativeScenes", "boundedProgressivePreview", "recordingIsolation", "cameraValidation", "driftReported", "heldOutGeometry", "sourceTileCoverage", "gaussianPhotometricQuality"],
+      "requiredMetrics": {"camera.registrationRatio": {"minimum": 0.85}, "camera.medianReprojectionErrorPx": {"maximum": 1.0}, "preview.driftRisk": {"maximum": 0.2}, "gaussian.medianPsnrDb": {"minimum": 18.0}, "gaussian.medianSsim": {"minimum": 0.55}, "gaussian.medianL1": {"maximum": 0.15}},
+      "requiredArtifacts": ["cameraReport", "preview", "mesh", "gaussian", "qualityReport"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "hybrid-production-multiscene",
+      "category": "hybrid",
+      "matches": {"source.kind": "hybrid"},
+      "requiredGates": ["multipleRepresentativeScenes", "metricAnchorImmutable", "mediaAlignment", "cameraValidation", "heldOutGeometry", "freeSpace", "outputProductsIndependent"],
+      "requiredMetrics": {"camera.registrationRatio": {"minimum": 0.9}, "alignment.medianCenterResidual": {"maximum": 0.03}, "alignment.medianRotationDegrees": {"maximum": 2.0}},
+      "requiredArtifacts": ["alignmentReport", "pointCloud", "mesh", "gaussian"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "material-annotated-real-captures",
+      "category": "material",
+      "matches": {"source.kind": ["rgbd", "photos", "video", "hybrid"]},
+      "requiredGates": ["realAnnotations", "radiometricContract", "multiviewFusion", "confidenceCalibration", "transitiveLicenseAudit", "pbrValidator"],
+      "requiredMetrics": {"dataset.annotatedFrameCount": {"minimum": 20}, "quality.materialMeanIou": {"minimum": 0.55}, "quality.multiviewConsistency": {"minimum": 0.8}, "quality.confidenceEce": {"maximum": 0.1}},
+      "requiredArtifacts": ["bakeoffReport", "materialSidecar", "pbrGlb", "pbrReport"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "reflective-transmissive-real-captures",
+      "category": "reflective-transmissive",
+      "matches": {"source.kind": ["rgbd", "photos", "video", "hybrid"]},
+      "requiredGates": ["realAnnotations", "glassScenes", "mirrorScenes", "measuredDepthImmutable", "protectedRegionsFailClosed", "boundedAcceptedDisplacement", "freeSpace"],
+      "requiredMetrics": {"dataset.annotatedFrameCount": {"minimum": 20}, "quality.opticalRiskRecall": {"minimum": 0.9}, "quality.opticalRiskPrecision": {"minimum": 0.65}},
+      "requiredArtifacts": ["riskReport", "baselineGeometry", "candidateGeometry", "geometryReport"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "twelve-gib-quality-memory",
+      "category": "memory-12gb",
+      "matches": {"hardware.memoryTier": "12gb"},
+      "requiredGates": ["actualCudaKernels", "noOutOfMemory", "boundedQueues", "qualityPreserved", "fallbackValidated"],
+      "requiredMetrics": {"hardware.totalVramMiB": {"maximum": 12288.0}, "runtime.peakVramMiB": {"maximum": 10752.0}, "runtime.minimumHeadroomMiB": {"minimum": 1024.0}},
+      "requiredArtifacts": ["memoryTrace", "qualityComparison"],
+      "visualInspection": true
+    },
+    {
+      "scenarioId": "cancellation-resume-stress",
+      "category": "cancellation-resume",
+      "matches": {"source.kind": ["rgbd", "photos", "video", "hybrid"]},
+      "requiredGates": ["rawInputPreserved", "boundedCancellation", "atomicOutputs", "checkpointResume", "resumeEquivalent", "cacheInvalidation", "corruptCacheRecovery"],
+      "requiredMetrics": {"cancellation.maximumStopSeconds": {"maximum": 10.0}, "resume.outputDifference": {"maximum": 0.000001}},
+      "requiredArtifacts": ["stressReport", "resumedOutput"],
+      "visualInspection": false
+    }
+  ]
+}
