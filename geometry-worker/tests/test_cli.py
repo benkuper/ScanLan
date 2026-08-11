@@ -100,6 +100,26 @@ class GeometryWorkerCliTests(unittest.TestCase):
             self.assertEqual(result, 0)
             infer.assert_called_once_with(request, progress)
 
+    def test_backend_policy_command_routes_request_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = Path(directory) / "request.json"
+            report = Path(directory) / "report.json"
+            with patch(
+                "scanlan_geometry.cli.evaluate_backend_policy_file",
+                return_value={"schemaVersion": 1, "decisions": {}},
+            ) as evaluate:
+                result = main(
+                    [
+                        "backend-policy",
+                        "--request",
+                        str(request),
+                        "--report",
+                        str(report),
+                    ]
+                )
+            self.assertEqual(result, 0)
+            evaluate.assert_called_once_with(request, report)
+
 
 if __name__ == "__main__":
     unittest.main()

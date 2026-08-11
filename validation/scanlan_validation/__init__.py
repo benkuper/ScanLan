@@ -18,6 +18,14 @@ from .engine import (
     validate_ray_depths,
     validate_scale,
 )
+from .backend_policy import (
+    BACKEND_POLICY_VERSION,
+    BENCHMARK_MANIFEST_VERSION,
+    BackendPolicyError,
+    load_benchmark_manifest,
+    packaged_benchmark_manifest_path,
+    select_backend_policy,
+)
 
 __all__ = [
     "VALIDATION_CONTRACT_VERSION",
@@ -36,4 +44,10 @@ __all__ = [
     "validate_geometry",
     "validate_ray_depths",
     "validate_scale",
+    "BACKEND_POLICY_VERSION",
+    "BENCHMARK_MANIFEST_VERSION",
+    "BackendPolicyError",
+    "load_benchmark_manifest",
+    "packaged_benchmark_manifest_path",
+    "select_backend_policy",
 ]

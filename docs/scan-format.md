@@ -12,6 +12,7 @@ scan-project/
 │       ├── phase.json
 │       ├── frames.csv
 │       ├── tracking.jsonl
+│       ├── backend-policy.json          # live lane selection evidence
 │       ├── imu.csv                 # when enabled
 │       ├── sensor.log
 │       ├── depth/000000.u16
@@ -32,6 +33,7 @@ scan-project/
     ├── splat-manifest.json
     ├── camera-poses.json
     ├── photo-localization-progress.json
+    ├── backend-policy.json
     ├── preview.json
     ├── result.json
     └── progress.json

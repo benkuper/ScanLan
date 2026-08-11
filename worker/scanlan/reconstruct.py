@@ -33,7 +33,7 @@ from .validation import validate_posed_frames
 
 Engine = Literal["auto", "numpy", "open3d"]
 Device = Literal["auto", "cpu", "cuda"]
-DepthRefinement = Literal["off", "lingbot", "mapanything", "da3"]
+DepthRefinement = Literal["off", "auto", "lingbot", "mapanything", "da3"]
 
 
 class ProgressReporter:
@@ -145,6 +145,43 @@ def reconstruct_project(
     if not phases:
         raise ValueError("Capture at least one phase before building a point cloud")
 
+    if depth_refinement == "auto":
+        write_json(
+            project_root / "outputs" / "progress.json",
+            {
+                "stage": "Backend policy",
+                "detail": "Validating hardware and matching RGB-D completion benchmarks",
+                "progress": 0.0,
+                "processedUnits": 0,
+                "totalUnits": max(sum(len(phase.frames) for phase in phases), 1),
+                "computeBackend": "ScanLan adaptive backend policy",
+            },
+        )
+        if depth_refiner is None:
+            depth_refinement = "off"
+            write_json(
+                project_root / "outputs" / "backend-policy.json",
+                {
+                    "schemaVersion": 1,
+                    "kind": "scanlan-adaptive-backend-policy",
+                    "source": {"kind": "rgbd"},
+                    "decisions": {
+                        "depthCompletion": {
+                            "selected": "off",
+                            "selectionMode": "protected-baseline",
+                            "benchmarked": False,
+                            "reason": "The isolated learned-geometry runtime is unavailable.",
+                        }
+                    },
+                },
+            )
+        else:
+            from .backend_policy import select_depth_backend
+
+            depth_refinement, _policy = select_depth_backend(
+                project_root, project, phases, depth_refiner
+            )
+
     voxel_size_m = max(float(project["settings"].get("voxelSizeMm", 15)) / 1000.0, 0.001)
     total_frames = sum(len(phase.frames) for phase in phases)
     known_global_poses = all(
@@ -169,7 +206,7 @@ def reconstruct_project(
             "needs_mesh": "textured_mesh" in targets,
             "mesh_voxel_size_m": max(voxel_size_m, 0.008),
         }
-        if depth_refinement in ("lingbot", "mapanything"):
+        if depth_refinement in ("lingbot", "mapanything", "da3"):
             if depth_refiner is None:
                 raise RuntimeError(
                     f"{depth_refinement} depth refinement requires an isolated CUDA worker"

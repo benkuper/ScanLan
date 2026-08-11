@@ -12,3 +12,6 @@ dependencies = ["numpy>=1.26,<3"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["scanlan_validation*"]
+
+[tool.setuptools.package-data]
+scanlan_validation = ["backend-benchmarks.json"]

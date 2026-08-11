@@ -903,7 +903,20 @@ Implemented as a prior-gated decomposition in the production trainer:
 
 ## P18 — Adaptive backend policy
 
-Select live and production backends from benchmarked source, hardware and quality characteristics.
+Implemented as a versioned, fail-closed selection boundary:
+
+* live RGB-D, progressive video, production camera, depth, surface, and Gaussian decisions share
+  one source/hardware/runtime/quality contract and publish their evidence;
+* only release-gated benchmark records inside a compatible source, sensor, revision, license,
+  compute-capability, and VRAM envelope may drive an automatic choice;
+* lane-specific quality metrics are ordered lexicographically before latency and memory, so an
+  arbitrary weighted score cannot trade away registration, metric depth, or held-out quality;
+* actual CUDA/model smoke tests establish runtime eligibility, while installation alone is never
+  acceleration evidence;
+* explicit choices remain audited overrides, and missing or incompatible evidence preserves the
+  established validation-gated live/media path or sensor-only depth;
+* atomic backend-policy reports and benchmark-manifest cache identity make each decision
+  reproducible without pre-empting P19's full release matrix and default selection.
 
 ## P19 — Full validation and default selection
 

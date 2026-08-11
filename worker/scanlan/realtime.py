@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import gc
+import os
 import queue
 import struct
 import threading
@@ -2058,6 +2059,8 @@ def run_realtime_engine(
     requested_device: str = "auto",
     session_root: Path | None = None,
     live_map_mib: int = 1024,
+    sensor_kind: str = "unknown",
+    expected_frame_count: int | None = None,
 ) -> dict[str, Any]:
     if mode not in {"points", "mesh"}:
         raise ValueError("Realtime mode must be points or mesh")
@@ -2069,7 +2072,20 @@ def run_realtime_engine(
     except ImportError as error:
         raise RuntimeError("Open3D is required for realtime RGB-D reconstruction") from error
 
-    backend = select_compute_backend(o3d, requested_device)
+    effective_device = os.environ.get("SCANLAN_DEVICE", requested_device).strip().lower()
+    backend = select_compute_backend(o3d, effective_device)
+    from .backend_policy import select_live_backend
+
+    selected_device, _backend_policy = select_live_backend(
+        session_root,
+        sensor_kind=sensor_kind,
+        requested_device=effective_device,
+        cuda_active=backend.uses_cuda,
+        open3d_revision=str(o3d.__version__),
+        expected_frame_count=expected_frame_count,
+    )
+    if selected_device != ("cuda" if backend.uses_cuda else "cpu"):
+        backend = select_compute_backend(o3d, selected_device)
     writer = EngineMessageWriter(output)
     writer.status(
         0,

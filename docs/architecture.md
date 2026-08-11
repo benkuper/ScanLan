@@ -19,6 +19,12 @@ consistency, and point admissibility. Learned adapters propose geometry; they do
 own acceptance policy. Reports remain serializable across process boundaries. See
 [validation-engine.md](validation-engine.md).
 
+That package also owns the P18 adaptive backend contract. It combines source envelopes, actual
+runtime smoke evidence, pinned revisions, license constraints, measured VRAM headroom, and
+lane-specific quality ordering. Live and production callers publish the complete decision and keep
+their protected baseline when evidence is incomplete; see
+[adaptive-backend-policy.md](adaptive-backend-policy.md).
+
 The same runtimes import `scanlan-material`. It owns the exact ICC/sRGB-to-linear preparation,
 source-aligned material and optical-risk array semantics, adaptive coarse/final view planning,
 visibility- and confidence-weighted surface fusion, connected 3D material regions, monotonic depth

@@ -22,6 +22,7 @@ from scanlan_splat.mapanything import (
 )
 
 from . import __version__
+from .policy import evaluate_backend_policy_file
 
 
 def parser() -> argparse.ArgumentParser:
@@ -52,6 +53,9 @@ def parser() -> argparse.ArgumentParser:
     diagnostics.add_argument("--require-flashinfer", action="store_true")
     diagnostics.add_argument("--require-mapanything", action="store_true")
     diagnostics.add_argument("--require-da3", action="store_true")
+    policy = commands.add_parser("backend-policy")
+    policy.add_argument("--request", type=Path, required=True)
+    policy.add_argument("--report", type=Path, default=None)
     return root
 
 
@@ -120,6 +124,10 @@ def main(argv: list[str] | None = None) -> int:
                 and not da3["available"]
                 else 0
             )
+        if arguments.command == "backend-policy":
+            result = evaluate_backend_policy_file(arguments.request, arguments.report)
+            print(json.dumps(result))
+            return 0
         return 2
     except Exception as error:
         print(f"scanlan-geometry: {error}", file=sys.stderr)

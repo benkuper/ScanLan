@@ -2220,17 +2220,18 @@
 
         {#if !mediaOnlyProject}
           <details class="panel collapsible-panel" open>
-            <summary><span>DEPTH REFINEMENT</span><strong>{project.settings.depthRefinementBackend === 'da3' ? 'DA3 MAX' : project.settings.depthRefinementBackend === 'mapanything' ? 'MAPANYTHING' : project.settings.depthRefinementBackend === 'lingbot' ? 'LINGBOT V0.5' : 'SENSOR ONLY'}</strong></summary>
+            <summary><span>DEPTH REFINEMENT</span><strong>{project.settings.depthRefinementBackend === 'auto' ? 'ADAPTIVE' : project.settings.depthRefinementBackend === 'da3' ? 'DA3 MAX' : project.settings.depthRefinementBackend === 'mapanything' ? 'MAPANYTHING' : project.settings.depthRefinementBackend === 'lingbot' ? 'LINGBOT V0.5' : 'SENSOR ONLY'}</strong></summary>
             <div class="collapsible-body settings mesh-repair-settings">
               <label>Completion backend
-                <select value={project.settings.depthRefinementBackend} on:change={(event) => updateSetting('depthRefinementBackend', inputValue(event) as 'off' | 'lingbot' | 'mapanything' | 'da3')} disabled={processing || !runtime?.geometryWorkerAvailable}>
+                <select value={project.settings.depthRefinementBackend} on:change={(event) => updateSetting('depthRefinementBackend', inputValue(event) as 'off' | 'auto' | 'lingbot' | 'mapanything' | 'da3')} disabled={processing || !runtime?.geometryWorkerAvailable}>
                   <option value="off">Sensor depth only</option>
+                  <option value="auto">Adaptive · benchmark gated</option>
                   <option value="lingbot">LingBot-Depth v0.5</option>
                   <option value="mapanything">MapAnything Apache</option>
                   <option value="da3">DA3 Nested Giant-Large 1.1 (noncommercial)</option>
                 </select>
               </label>
-              <p>DA3 Max uses pose-conditioned metric depth from the strongest refreshed Nested Giant-Large model; its checkpoint is CC BY-NC 4.0. Learned proposals are calibrated against independent sensor anchors, preserve every measured pixel, and pass metric, RGB-alignment, multi-view, and free-space gates.</p>
+              <p>Adaptive uses only a compatible release-gated source, hardware, runtime, and memory benchmark; otherwise it keeps sensor-only depth. DA3 Max uses pose-conditioned metric depth from the strongest refreshed Nested Giant-Large model; its checkpoint is CC BY-NC 4.0. Learned proposals are calibrated against independent sensor anchors, preserve every measured pixel, and pass metric, RGB-alignment, multi-view, and free-space gates.</p>
               <p>Generated pixels carry lower fusion weight and are exported with confidence and provenance masks. Camera poses always remain tied to the original sensor depth.</p>
               {#if !runtime?.geometryWorkerAvailable}
                 <p class="warning">The isolated learned-geometry runtime is required for offline completion.</p>

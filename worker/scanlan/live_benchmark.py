@@ -200,6 +200,7 @@ def summarize_live_benchmark(
     loop_entries: list[dict[str, Any]],
     loop_journal_available: bool,
     exit_code: int,
+    backend_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     final_status = statuses[-1] if statuses else {}
     peak_status_value = lambda name: max(
@@ -295,6 +296,7 @@ def summarize_live_benchmark(
             ),
             "finalPoseGraph": (submap_message or {}).get("poseGraph"),
         },
+        "backendPolicy": backend_policy,
     }
 
 
@@ -309,6 +311,9 @@ def benchmark_live_capture(
     session_root: Path | None = None,
 ) -> dict[str, Any]:
     capture = capture.resolve(strict=True)
+    phase_manifest = json.loads((capture / "phase.json").read_text(encoding="utf-8"))
+    sensor_kind = str((phase_manifest.get("sensor") or {}).get("kind", "unknown"))
+    expected_frame_count = int(phase_manifest.get("frameCount", 0) or 0)
     frames = archive_frames(capture)
     owned_session: tempfile.TemporaryDirectory[str] | None = None
     if session_root is None:
@@ -330,17 +335,26 @@ def benchmark_live_capture(
         str(live_map_mib),
         "--session",
         str(session_root),
+        "--sensor-kind",
+        sensor_kind,
+        "--expected-frame-count",
+        str(expected_frame_count),
     ]
     environment = os.environ.copy()
     package_root = str(Path(__file__).resolve().parents[1])
     import_paths = [package_root]
+    # Preserve caller-supplied workspace packages ahead of the environment's
+    # installed copies. This matters when replaying a just-built validation or
+    # policy contract before reinstalling the development virtual environment.
+    if environment.get("PYTHONPATH"):
+        import_paths.extend(
+            value for value in environment["PYTHONPATH"].split(os.pathsep) if value
+        )
     import_paths.extend(
         value
         for value in sys.path
         if value and "site-packages" in value.lower() and Path(value).is_dir()
     )
-    if environment.get("PYTHONPATH"):
-        import_paths.append(environment["PYTHONPATH"])
     environment["PYTHONPATH"] = os.pathsep.join(import_paths)
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     process = subprocess.Popen(
@@ -484,6 +498,13 @@ def benchmark_live_capture(
             for line in loop_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+    backend_policy = None
+    backend_policy_path = session_root / "backend-policy.json"
+    if backend_policy_path.is_file():
+        try:
+            backend_policy = json.loads(backend_policy_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            backend_policy = None
     source_duration_seconds = (
         max(0.0, (last_timestamp_us - first_timestamp_us) / 1_000_000.0)
         if first_timestamp_us is not None and last_timestamp_us is not None
@@ -517,6 +538,7 @@ def benchmark_live_capture(
         loop_entries=loop_entries,
         loop_journal_available=loop_path.is_file(),
         exit_code=exit_code,
+        backend_policy=backend_policy,
     )
     if owned_session is not None:
         owned_session.cleanup()

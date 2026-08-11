@@ -850,7 +850,9 @@ fn run_pipeline(
     }
     let reconstruction = existing_runtime(resources, false)?;
     let depth_refinement_backend = match project.settings.depth_refinement_backend.as_str() {
-        "lingbot" | "mapanything" | "da3" => project.settings.depth_refinement_backend.as_str(),
+        "auto" | "lingbot" | "mapanything" | "da3" => {
+            project.settings.depth_refinement_backend.as_str()
+        }
         _ if project.settings.lingbot_depth_refinement => "lingbot",
         _ => "off",
     };

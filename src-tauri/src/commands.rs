@@ -510,7 +510,7 @@ fn normalize_project(project: &mut ProjectSummary) -> bool {
     }
     if !matches!(
         project.settings.depth_refinement_backend.as_str(),
-        "off" | "lingbot" | "mapanything" | "da3"
+        "off" | "auto" | "lingbot" | "mapanything" | "da3"
     ) {
         project.settings.depth_refinement_backend = "off".to_string();
         changed = true;
@@ -1276,7 +1276,7 @@ fn validate_sensor_settings(settings: &mut CaptureSettings) -> Result<(), String
     }
     if !matches!(
         settings.depth_refinement_backend.as_str(),
-        "off" | "lingbot" | "mapanything" | "da3"
+        "off" | "auto" | "lingbot" | "mapanything" | "da3"
     ) {
         return Err("Unknown depth refinement backend".to_string());
     }
@@ -1328,6 +1328,8 @@ fn start_realtime_engine(
         .arg(settings.live_map_memory_mib.to_string())
         .arg("--session")
         .arg(phase_root)
+        .arg("--sensor-kind")
+        .arg(&settings.sensor_kind)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));

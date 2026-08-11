@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 from PIL import Image, ImageOps
 from scanlan_material.radiometry import to_canonical_srgb
+from scanlan_validation import BACKEND_POLICY_VERSION, packaged_benchmark_manifest_path
 
 from .da3 import DA3_CODE_REVISION, DA3_MODEL_REVISION, DA3_MODEL_SHA256
 from .lingbot import (
@@ -27,6 +28,7 @@ from .geometry_ipc import (
     infer_da3_geometry_isolated,
     infer_lingbot_geometry_isolated,
     infer_mapanything_geometry_isolated,
+    select_backend_policy_isolated,
 )
 from .initialization import (
     GaussianRepresentation,
@@ -323,13 +325,19 @@ def _media_dataset_fingerprint(
     digest = hashlib.sha256()
     # P10 extends the learned-first dataset with a versioned dense-fusion
     # sidecar. Older solutions lack independent fusion confidence/ownership.
-    digest.update(b"scanlan-media-dataset-v20-gaussian-init-contract\0")
+    digest.update(b"scanlan-media-dataset-v21-adaptive-backend-policy\0")
     digest.update(observation_fingerprint.encode("ascii"))
     digest.update(DA3_CODE_REVISION.encode("ascii"))
     digest.update(DA3_MODEL_REVISION.encode("ascii"))
     digest.update(DA3_MODEL_SHA256.encode("ascii"))
     digest.update(f"{LINGBOT_CONTEXT_FPS}:{LINGBOT_MAX_CONTEXT_FRAMES}".encode("ascii"))
     digest.update(str(options.maximum_features).encode("ascii"))
+    digest.update(str(BACKEND_POLICY_VERSION).encode("ascii"))
+    digest.update(hashlib.sha256(packaged_benchmark_manifest_path().read_bytes()).digest())
+    external_manifest = os.environ.get("SCANLAN_BACKEND_BENCHMARKS", "").strip()
+    if external_manifest:
+        manifest_path = Path(external_manifest).resolve(strict=True)
+        digest.update(hashlib.sha256(manifest_path.read_bytes()).digest())
     return digest.hexdigest()
 
 
@@ -2690,6 +2698,84 @@ def prepare_media_dataset(
             len(video_statistics) == 1
             and not any(path.suffix.lower() in PHOTO_EXTENSIONS for path in sources)
         )
+        project = json.loads((project_root / "project.json").read_text(encoding="utf-8"))
+        hybrid_source = bool(project.get("phases"))
+        source_kind = "hybrid" if hybrid_source else "video" if single_video else "photos"
+        maximum_dimension = max(
+            max(int(record["width"]), int(record["height"])) for record in records
+        )
+        source_characteristics = ["physical-capture"]
+        if single_video:
+            source_characteristics.append("adaptive-keyframes")
+        feature_runtime = pycolmap_feature_runtime()
+        policy_path = project_root / "outputs" / "backend-policy.json"
+        camera_policy = "validated-learned-challenger-bakeoff"
+        policy_result: dict[str, Any] | None = None
+        if geometry_worker is not None:
+            _progress(
+                project_root,
+                "backend_policy",
+                "Matching source and hardware to release-gated backend measurements",
+                0.085,
+                compute_backend="ScanLan adaptive backend policy",
+                metrics={"sourceKind": source_kind, "frameCount": len(records)},
+            )
+            policy_request: dict[str, Any] = {
+                "source": {
+                    "kind": source_kind,
+                    "frameCount": len(records),
+                    "maximumImageDimension": maximum_dimension,
+                    "characteristics": source_characteristics,
+                },
+                "quality": {"preference": "max-quality", "commercialUse": False},
+                "overrides": {
+                    "productionCamera": "auto",
+                    "liveVideo": "lingbot-map" if progressive_rgb_preview else "auto",
+                },
+                "lanes": ["productionCamera", "liveVideo"],
+                "validateRuntimes": True,
+                "runtimes": {
+                    "colmap-learned": {
+                        "available": bool(feature_runtime.get("learnedValidated", False)),
+                        "validated": bool(feature_runtime.get("learnedValidated", False)),
+                        "revision": str(feature_runtime.get("version", "unknown")),
+                    },
+                    "gsplat": {"available": True, "validated": True},
+                },
+            }
+            external_manifest = os.environ.get("SCANLAN_BACKEND_BENCHMARKS", "").strip()
+            if external_manifest:
+                policy_request["manifestPath"] = str(Path(external_manifest).resolve(strict=True))
+            try:
+                policy_result = select_backend_policy_isolated(
+                    geometry_worker,
+                    policy_request,
+                    work_root=staging / "geometry-ipc",
+                    report_path=policy_path,
+                )
+                camera_policy = str(
+                    policy_result.get("decisions", {})
+                    .get("productionCamera", {})
+                    .get("selected", camera_policy)
+                )
+            except Exception as error:
+                policy_result = {
+                    "schemaVersion": 1,
+                    "kind": "scanlan-adaptive-backend-policy",
+                    "source": policy_request["source"],
+                    "decisions": {
+                        "productionCamera": {
+                            "selected": camera_policy,
+                            "selectionMode": "protected-baseline",
+                            "benchmarked": False,
+                            "reason": f"Policy probe failed safely: {error}",
+                        }
+                    },
+                }
+                _write_json_atomic(policy_path, policy_result)
+        selected_da3 = camera_policy == "da3-guided-colmap"
+        selected_mapanything = camera_policy == "mapanything-guided-colmap"
+        baseline_bakeoff = camera_policy == "validated-learned-challenger-bakeoff"
         lingbot_geometry: LingbotGeometry | None = None
         lingbot_context: dict[str, Any] | None = None
         mapanything_proposal: LingbotGeometry | None = None
@@ -2709,7 +2795,10 @@ def prepare_media_dataset(
         # cameras first, then high-resolution local features decide which of
         # those relationships survive geometric verification and bundle
         # adjustment.  A failed proposal remains a transparent COLMAP fallback.
-        if geometry_worker is not None and 3 <= len(records) <= 32:
+        evaluate_mapanything = geometry_worker is not None and 3 <= len(records) <= 32 and (
+            baseline_bakeoff or selected_mapanything
+        )
+        if evaluate_mapanything:
             mapanything_evaluated = True
 
             def report_mapanything(
@@ -2739,7 +2828,10 @@ def prepare_media_dataset(
             except Exception as error:
                 mapanything_error = str(error)
             _check_cancelled(project_root)
-        if geometry_worker is not None and len(records) >= 3:
+        evaluate_da3 = geometry_worker is not None and len(records) >= 3 and (
+            baseline_bakeoff or selected_da3
+        )
+        if evaluate_da3:
             da3_evaluated = True
             da3_direct_gaussians = True
 
@@ -2778,12 +2870,18 @@ def prepare_media_dataset(
             except Exception as error:
                 da3_error = str(error)
             _check_cancelled(project_root)
-        camera_proposal = (
-            da3_proposal
-            if _learned_camera_arrays(da3_proposal, len(records)) is not None
-            else mapanything_proposal
-            if _learned_camera_arrays(mapanything_proposal, len(records)) is not None
-            else None
+        proposal_order = (
+            (mapanything_proposal, da3_proposal)
+            if selected_mapanything
+            else (da3_proposal, mapanything_proposal)
+        )
+        camera_proposal = next(
+            (
+                proposal
+                for proposal in proposal_order
+                if _learned_camera_arrays(proposal, len(records)) is not None
+            ),
+            None,
         )
         reconstruction, solve = _run_sfm(
             input_images,
@@ -3251,6 +3349,9 @@ def prepare_media_dataset(
                 "maximumVideoIntrinsicSpread": video_intrinsic_spread,
                 "videoSources": video_statistics,
                 "warnings": warnings,
+                "backendPolicy": (
+                    policy_result.get("decisions") if policy_result is not None else None
+                ),
                 "preparationSeconds": round(time.perf_counter() - started, 3),
             },
             "frames": frames,

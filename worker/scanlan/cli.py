@@ -22,7 +22,7 @@ def parser() -> argparse.ArgumentParser:
     reconstruct.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     reconstruct.add_argument(
         "--depth-refinement",
-        choices=["off", "lingbot", "mapanything", "da3"],
+        choices=["off", "auto", "lingbot", "mapanything", "da3"],
         default="off",
     )
     reconstruct.add_argument("--depth-refiner", type=Path, default=None)
@@ -72,6 +72,10 @@ def parser() -> argparse.ArgumentParser:
     realtime.add_argument(
         "--session", type=Path, required=True, help="Capture directory for the tracking journal"
     )
+    realtime.add_argument(
+        "--sensor-kind", default="unknown", help="Source sensor family for backend policy matching"
+    )
+    realtime.add_argument("--expected-frame-count", type=int, default=None)
 
     replay = commands.add_parser(
         "replay", help="Emit a recorded RGB-D capture using the live stream protocol"
@@ -144,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
                 requested_device=arguments.device,
                 session_root=arguments.session,
                 live_map_mib=arguments.live_map_mib,
+                sensor_kind=arguments.sensor_kind,
+                expected_frame_count=arguments.expected_frame_count,
             )
             return 0
         if arguments.command == "replay":

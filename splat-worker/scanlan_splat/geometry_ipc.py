@@ -49,6 +49,49 @@ ProgressCallback = Callable[[str, str, float, str, dict[str, Any]], None]
 PreviewCallback = Callable[[np.ndarray, np.ndarray, dict[str, Any]], None]
 
 
+def select_backend_policy_isolated(
+    executable: Path,
+    request: dict[str, Any],
+    *,
+    work_root: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    """Run hardware/model policy probing in the isolated geometry process."""
+
+    executable = executable.resolve(strict=True)
+    request_root = work_root / f"backend-policy-{uuid.uuid4().hex}"
+    request_root.mkdir(parents=True, exist_ok=False)
+    request_path = request_root / "request.json"
+    log_path = request_root / "backend-policy.log"
+    _write_json_atomic(request_path, request)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    with log_path.open("w", encoding="utf-8", newline="\n") as log:
+        completed = subprocess.run(
+            [
+                str(executable),
+                "backend-policy",
+                "--request",
+                str(request_path),
+                "--report",
+                str(report_path.resolve()),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            creationflags=flags,
+            check=False,
+        )
+    if completed.returncode != 0 or not report_path.is_file():
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        detail = lines[-1] if lines else "Geometry policy worker failed without diagnostics"
+        raise RuntimeError(detail)
+    result = json.loads(report_path.read_text(encoding="utf-8"))
+    if int(result.get("schemaVersion", 0)) != 1:
+        raise RuntimeError("Geometry worker returned an unsupported backend-policy schema")
+    shutil.rmtree(request_root, ignore_errors=True)
+    return result
+
+
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")

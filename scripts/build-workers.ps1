@@ -206,7 +206,7 @@ if ($NeedsWorkerBuild) {
     # Open3D plus CUDA is close to 1 GB. A one-file executable unpacked that
     # payload on every preview/reconstruction launch and made the UI appear to
     # freeze. Keep the runtime extracted once and launch it directly instead.
-    & $WorkerPython -m PyInstaller --noconfirm --clean --onedir --name scanlan-worker --collect-all open3d --collect-all scanlan_material entry.py
+    & $WorkerPython -m PyInstaller --noconfirm --clean --onedir --name scanlan-worker --collect-all open3d --collect-all scanlan_material --collect-all scanlan_validation entry.py
     if ($LASTEXITCODE -ne 0) { throw "Reconstruction worker packaging failed." }
   } finally {
     Pop-Location
